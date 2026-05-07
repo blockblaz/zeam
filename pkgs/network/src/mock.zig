@@ -103,6 +103,9 @@ pub const Mock = struct {
                 .blocks_by_root => {
                     task.payload = .{ .failure = .{ .code = 1, .message = "mock peer has no block data" } };
                 },
+                .blocks_by_range => {
+                    task.payload = .{ .failure = .{ .code = 1, .message = "mock peer has no block data" } };
+                },
             }
             return task;
         }
@@ -455,6 +458,11 @@ pub const Mock = struct {
                 try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
                 break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
             },
+            .blocks_by_range => |block_resp| blk: {
+                var cloned_block: types.SignedBlock = undefined;
+                try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
+                break :blk interface.ReqRespResponse{ .blocks_by_range = cloned_block };
+            },
         };
     }
 
@@ -466,6 +474,7 @@ pub const Mock = struct {
                 try types.sszClone(self.allocator, types.BlockByRootRequest, block_req, &cloned_request);
                 break :blk interface.ReqRespRequest{ .blocks_by_root = cloned_request };
             },
+            .blocks_by_range => |block_req| interface.ReqRespRequest{ .blocks_by_range = block_req },
         };
     }
 
@@ -935,6 +944,9 @@ test "Mock status RPC between peers" {
                 .blocks_by_root => {
                     try stream.sendError(1, "unsupported");
                 },
+                .blocks_by_range => {
+                    try stream.sendError(1, "unsupported");
+                },
             }
         }
 
@@ -944,6 +956,9 @@ test "Mock status RPC between peers" {
                 .success => |resp| switch (resp) {
                     .status => |status_resp| self.received_status = status_resp,
                     .blocks_by_root => {
+                        self.failures += 1;
+                    },
+                    .blocks_by_range => {
                         self.failures += 1;
                     },
                 },
@@ -1042,4 +1057,428 @@ test "Mock status RPC between peers" {
     try std.testing.expectEqual(status_b.head_slot, received.head_slot);
     try std.testing.expect(peer_a.completed);
     try std.testing.expectEqual(@as(u32, 0), peer_a.failures);
+}
+
+// =====================================================================
+// blocks_by_range mock-network roundtrip tests (PR #824 / issue #823)
+// =====================================================================
+//
+// These tests exercise the wire-level contract of the new
+// blocks_by_range RPC end-to-end through the mock network, without
+// spinning up a full BeamNode. Each test sets up a TestPeer pair where
+// peer_b (the responder) implements a hand-rolled fake server that
+// plays a scripted slot→block sequence, and peer_a (the requester)
+// drives `sendRequest` and accumulates the chunk events received via
+// onReqRespResponse.
+//
+// What these tests pin:
+//   * Multi-chunk delivery: M chunks in slot-ascending order, single
+//     `completed` event at the end. Mirrors the spec contract for
+//     blocks_by_range and the current chain.zig server-side response
+//     order (finalized walk first, then unfinalized via forkchoice).
+//   * Empty-stream-but-finish: server has nothing to send, just
+//     `finish()` — peer sees `completed` with zero chunks, no error.
+//     This is the start_slot > head.slot case Partha listed.
+//   * RESOURCE_UNAVAILABLE error-path: server replies with code 3 +
+//     message; peer sees the failure event, never a chunk, never a
+//     bare `completed`. Pins the MIN_SLOTS_FOR_BLOCK_REQUESTS gate at
+//     `node.zig:1196-1206`.
+//   * Single-chunk happy path: just a sanity check that the
+//     blocks_by_range payload variant flows through cloneResponse +
+//     deferred delivery cleanly (no UAF on the SignedBlock interior).
+//
+// What these tests deliberately do NOT cover:
+//   * Server-side range-walk logic (loadFinalizedSlotIndex,
+//     forkchoice descendant walk, finalized/unfinalized boundary,
+//     empty-slot skip, genesis-parent + self-parent loop guards) —
+//     that lives in chain.zig and exercises a real DB / forkchoice;
+//     better fit for a BeamNode-level integration test.
+//   * Sync-trigger logic (gap > 64 → range vs head-by-root) — that
+//     lives in onReqRespResponse's status arm at `node.zig:957-1000`
+//     and needs a real chain to drive `getSyncStatus` decisions.
+//   * Chunk-handler MissingPreState recovery in
+//     `processBlockByRangeChunk` — same reason.
+//
+// Per @ch4r10t33r's review on PR #824: these mock tests close the
+// "no dedicated unit test for the range RPC" gap on the WIRE
+// contract; the BeamNode-level scenarios remain a follow-up.
+
+fn buildSyntheticBlock(allocator: Allocator, slot: u64, parent_seed: u8) !types.SignedBlock {
+    // Build a minimal synthetic SignedBlock for the mock test fixtures.
+    // We don't run STF over these — the responder hands them back as
+    // opaque payload, the requester just confirms the slot field
+    // round-trips and the chunk sequence is correct.
+    //
+    // Construction uses the standard helpers from `pkgs/types/src/block.zig`
+    // (`BeamBlock.setToDefault` + `createBlockSignatures`) so the
+    // resulting SignedBlock is allocator-aware and `deinit()`-safe.
+    // We then overwrite only the fields the tests actually inspect:
+    // `slot` (asserted in the chunk-order check) and `parent_root` /
+    // `state_root` (set deterministically from `parent_seed` so a
+    // future test that wants to assert chunk identity has stable
+    // bytes).
+    var block: types.BeamBlock = undefined;
+    try block.setToDefault(allocator);
+    block.slot = slot;
+    block.parent_root[0] = parent_seed;
+    block.state_root[0] = parent_seed +% 1;
+
+    const signatures = try types.createBlockSignatures(allocator, 0);
+    return types.SignedBlock{
+        .block = block,
+        .signature = signatures,
+    };
+}
+
+test "Mock blocks_by_range RPC: multi-chunk in slot-ascending order" {
+    const TestPeer = struct {
+        const Self = @This();
+        allocator: Allocator,
+        // Server-side: the slot sequence to emit (in order). Empty for clients.
+        emit_slots: []const u64,
+        // Client-side: accumulated chunks observed.
+        received_slots: std.ArrayList(u64) = .empty,
+        completed: bool = false,
+        failures: u32 = 0,
+        last_error_code: ?u32 = null,
+        connections: std.ArrayList([]u8) = .empty,
+
+        fn init(allocator: Allocator, emit_slots: []const u64) Self {
+            return .{ .allocator = allocator, .emit_slots = emit_slots };
+        }
+
+        fn deinit(self: *Self) void {
+            self.received_slots.deinit(self.allocator);
+            for (self.connections.items) |conn| self.allocator.free(conn);
+            self.connections.deinit(self.allocator);
+        }
+
+        fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const owned = try self.allocator.dupe(u8, peer_id);
+            try self.connections.append(self.allocator, owned);
+        }
+
+        fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection, _: interface.DisconnectionReason) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            for (self.connections.items, 0..) |conn, idx| {
+                if (std.mem.eql(u8, conn, peer_id)) {
+                    const removed = self.connections.swapRemove(idx);
+                    self.allocator.free(removed);
+                    break;
+                }
+            }
+        }
+
+        fn onReqRespRequest(ptr: *anyopaque, request: *const interface.ReqRespRequest, stream: interface.ReqRespServerStream) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (request.*) {
+                .blocks_by_range => {
+                    // Emit one synthetic block per slot in `emit_slots`,
+                    // in order. The block lifetime ends with `sendResponse`
+                    // (which clones into the deferred buffer); we deinit
+                    // the local copy after each call.
+                    for (self.emit_slots, 0..) |slot, i| {
+                        var block = try buildSyntheticBlock(self.allocator, slot, @as(u8, @intCast(i + 1)));
+                        defer block.deinit();
+                        var response = interface.ReqRespResponse{ .blocks_by_range = block };
+                        try stream.sendResponse(&response);
+                    }
+                    try stream.finish();
+                },
+                .status, .blocks_by_root => {
+                    try stream.sendError(1, "test peer only handles blocks_by_range");
+                },
+            }
+        }
+
+        fn onReqRespResponse(ptr: *anyopaque, event: *const interface.ReqRespResponseEvent) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (event.payload) {
+                .success => |resp| switch (resp) {
+                    .blocks_by_range => |signed_block| {
+                        try self.received_slots.append(self.allocator, signed_block.block.slot);
+                    },
+                    else => self.failures += 1,
+                },
+                .failure => |fail| {
+                    self.failures += 1;
+                    self.last_error_code = fail.code;
+                },
+                .completed => self.completed = true,
+            }
+        }
+
+        fn getEventHandler(self: *Self) interface.OnPeerEventCbHandler {
+            return .{ .ptr = self, .onPeerConnectedCb = onPeerConnected, .onPeerDisconnectedCb = onPeerDisconnected };
+        }
+        fn getReqHandler(self: *Self) interface.OnReqRespRequestCbHandler {
+            return .{ .ptr = self, .onReqRespRequestCb = onReqRespRequest };
+        }
+        fn getResponseHandler(self: *Self) interface.OnReqRespResponseCbHandler {
+            return .{ .ptr = self, .onReqRespResponseCb = onReqRespResponse };
+        }
+    };
+
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    try detectBackendOrFail();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(.mock);
+
+    var mock = try Mock.init(allocator, &loop, logger, null);
+    defer mock.deinit();
+
+    const backend_a = mock.getNetworkInterface();
+    const backend_b = mock.getNetworkInterface();
+
+    // Server emits 3 chunks at slots 7, 8, 9 — strictly ascending.
+    const emit_slots = [_]u64{ 7, 8, 9 };
+    var peer_a = TestPeer.init(allocator, &.{}); // requester
+    defer peer_a.deinit();
+    var peer_b = TestPeer.init(allocator, &emit_slots); // responder
+    defer peer_b.deinit();
+
+    try backend_a.peers.subscribe(peer_a.getEventHandler());
+    try backend_b.peers.subscribe(peer_b.getEventHandler());
+    try backend_a.reqresp.subscribe(peer_a.getReqHandler());
+    try backend_b.reqresp.subscribe(peer_b.getReqHandler());
+
+    try std.testing.expectEqual(@as(usize, 1), peer_a.connections.items.len);
+
+    const remote = peer_a.connections.items[0];
+    var request = interface.ReqRespRequest{ .blocks_by_range = .{ .start_slot = 7, .count = 3 } };
+    const request_id = try backend_a.reqresp.sendRequest(remote, &request, peer_a.getResponseHandler());
+    request.deinit();
+    try std.testing.expect(request_id != 0);
+
+    try loop.run(.until_done);
+
+    // Assert: 3 chunks received in [7, 8, 9] order; one completed; no failures.
+    try std.testing.expectEqual(@as(usize, 3), peer_a.received_slots.items.len);
+    try std.testing.expectEqual(@as(u64, 7), peer_a.received_slots.items[0]);
+    try std.testing.expectEqual(@as(u64, 8), peer_a.received_slots.items[1]);
+    try std.testing.expectEqual(@as(u64, 9), peer_a.received_slots.items[2]);
+    try std.testing.expect(peer_a.completed);
+    try std.testing.expectEqual(@as(u32, 0), peer_a.failures);
+}
+
+test "Mock blocks_by_range RPC: empty stream + clean finish (start_slot past head)" {
+    // Pins the start_slot > head.slot path Partha listed. The server
+    // has nothing to emit (empty slot list) and immediately calls
+    // `finish()`. Peer should observe zero chunks + a single `completed`
+    // event, no error.
+    const TestPeer = struct {
+        const Self = @This();
+        allocator: Allocator,
+        received_slots: std.ArrayList(u64) = .empty,
+        completed: bool = false,
+        failures: u32 = 0,
+        connections: std.ArrayList([]u8) = .empty,
+
+        fn init(allocator: Allocator) Self {
+            return .{ .allocator = allocator };
+        }
+        fn deinit(self: *Self) void {
+            self.received_slots.deinit(self.allocator);
+            for (self.connections.items) |conn| self.allocator.free(conn);
+            self.connections.deinit(self.allocator);
+        }
+        fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.connections.append(self.allocator, try self.allocator.dupe(u8, peer_id));
+        }
+        fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection, _: interface.DisconnectionReason) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            for (self.connections.items, 0..) |conn, idx| {
+                if (std.mem.eql(u8, conn, peer_id)) {
+                    const removed = self.connections.swapRemove(idx);
+                    self.allocator.free(removed);
+                    break;
+                }
+            }
+        }
+        fn onReqRespRequestEmpty(ptr: *anyopaque, request: *const interface.ReqRespRequest, stream: interface.ReqRespServerStream) anyerror!void {
+            _ = ptr;
+            switch (request.*) {
+                .blocks_by_range => try stream.finish(), // no chunks, just close
+                else => try stream.sendError(1, "unsupported"),
+            }
+        }
+        fn onReqRespResponse(ptr: *anyopaque, event: *const interface.ReqRespResponseEvent) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (event.payload) {
+                .success => |resp| switch (resp) {
+                    .blocks_by_range => |signed_block| try self.received_slots.append(self.allocator, signed_block.block.slot),
+                    else => self.failures += 1,
+                },
+                .failure => self.failures += 1,
+                .completed => self.completed = true,
+            }
+        }
+        fn getEventHandler(self: *Self) interface.OnPeerEventCbHandler {
+            return .{ .ptr = self, .onPeerConnectedCb = onPeerConnected, .onPeerDisconnectedCb = onPeerDisconnected };
+        }
+        fn getReqHandler(self: *Self) interface.OnReqRespRequestCbHandler {
+            return .{ .ptr = self, .onReqRespRequestCb = onReqRespRequestEmpty };
+        }
+        fn getResponseHandler(self: *Self) interface.OnReqRespResponseCbHandler {
+            return .{ .ptr = self, .onReqRespResponseCb = onReqRespResponse };
+        }
+    };
+
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    try detectBackendOrFail();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(.mock);
+    var mock = try Mock.init(allocator, &loop, logger, null);
+    defer mock.deinit();
+
+    const backend_a = mock.getNetworkInterface();
+    const backend_b = mock.getNetworkInterface();
+
+    var peer_a = TestPeer.init(allocator);
+    defer peer_a.deinit();
+    var peer_b = TestPeer.init(allocator);
+    defer peer_b.deinit();
+
+    try backend_a.peers.subscribe(peer_a.getEventHandler());
+    try backend_b.peers.subscribe(peer_b.getEventHandler());
+    try backend_a.reqresp.subscribe(peer_a.getReqHandler());
+    try backend_b.reqresp.subscribe(peer_b.getReqHandler());
+
+    const remote = peer_a.connections.items[0];
+    // start_slot 9999 > any plausible head — server replies with an
+    // empty stream + finish.
+    var request = interface.ReqRespRequest{ .blocks_by_range = .{ .start_slot = 9999, .count = 5 } };
+    _ = try backend_a.reqresp.sendRequest(remote, &request, peer_a.getResponseHandler());
+    request.deinit();
+
+    try loop.run(.until_done);
+
+    try std.testing.expectEqual(@as(usize, 0), peer_a.received_slots.items.len);
+    try std.testing.expect(peer_a.completed);
+    try std.testing.expectEqual(@as(u32, 0), peer_a.failures);
+}
+
+test "Mock blocks_by_range RPC: RESOURCE_UNAVAILABLE error path (history window)" {
+    // Pins the MIN_SLOTS_FOR_BLOCK_REQUESTS gate at
+    // node.zig:1196-1206. Server replies with code
+    // RPC_ERR_RESOURCE_UNAVAILABLE (3) + message; peer should observe
+    // a `failure` event with that code, NOT a bare `completed`, and
+    // never any chunk.
+    const TestPeer = struct {
+        const Self = @This();
+        allocator: Allocator,
+        received_slots: std.ArrayList(u64) = .empty,
+        completed: bool = false,
+        failures: u32 = 0,
+        last_error_code: ?u32 = null,
+        connections: std.ArrayList([]u8) = .empty,
+
+        fn init(allocator: Allocator) Self {
+            return .{ .allocator = allocator };
+        }
+        fn deinit(self: *Self) void {
+            self.received_slots.deinit(self.allocator);
+            for (self.connections.items) |conn| self.allocator.free(conn);
+            self.connections.deinit(self.allocator);
+        }
+        fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.connections.append(self.allocator, try self.allocator.dupe(u8, peer_id));
+        }
+        fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection, _: interface.DisconnectionReason) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            for (self.connections.items, 0..) |conn, idx| {
+                if (std.mem.eql(u8, conn, peer_id)) {
+                    const removed = self.connections.swapRemove(idx);
+                    self.allocator.free(removed);
+                    break;
+                }
+            }
+        }
+        fn onReqRespRequest(ptr: *anyopaque, request: *const interface.ReqRespRequest, stream: interface.ReqRespServerStream) anyerror!void {
+            _ = ptr;
+            switch (request.*) {
+                .blocks_by_range => try stream.sendError(3, "requested range is outside history window"),
+                else => try stream.sendError(1, "unsupported"),
+            }
+        }
+        fn onReqRespResponse(ptr: *anyopaque, event: *const interface.ReqRespResponseEvent) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (event.payload) {
+                .success => |resp| switch (resp) {
+                    .blocks_by_range => |signed_block| try self.received_slots.append(self.allocator, signed_block.block.slot),
+                    else => self.failures += 1,
+                },
+                .failure => |fail| {
+                    self.failures += 1;
+                    self.last_error_code = fail.code;
+                },
+                .completed => self.completed = true,
+            }
+        }
+        fn getEventHandler(self: *Self) interface.OnPeerEventCbHandler {
+            return .{ .ptr = self, .onPeerConnectedCb = onPeerConnected, .onPeerDisconnectedCb = onPeerDisconnected };
+        }
+        fn getReqHandler(self: *Self) interface.OnReqRespRequestCbHandler {
+            return .{ .ptr = self, .onReqRespRequestCb = onReqRespRequest };
+        }
+        fn getResponseHandler(self: *Self) interface.OnReqRespResponseCbHandler {
+            return .{ .ptr = self, .onReqRespResponseCb = onReqRespResponse };
+        }
+    };
+
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    try detectBackendOrFail();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(.mock);
+    var mock = try Mock.init(allocator, &loop, logger, null);
+    defer mock.deinit();
+
+    const backend_a = mock.getNetworkInterface();
+    const backend_b = mock.getNetworkInterface();
+
+    var peer_a = TestPeer.init(allocator);
+    defer peer_a.deinit();
+    var peer_b = TestPeer.init(allocator);
+    defer peer_b.deinit();
+
+    try backend_a.peers.subscribe(peer_a.getEventHandler());
+    try backend_b.peers.subscribe(peer_b.getEventHandler());
+    try backend_a.reqresp.subscribe(peer_a.getReqHandler());
+    try backend_b.reqresp.subscribe(peer_b.getReqHandler());
+
+    const remote = peer_a.connections.items[0];
+    // start_slot 1 against a "deep chain" — server replies with code 3.
+    var request = interface.ReqRespRequest{ .blocks_by_range = .{ .start_slot = 1, .count = 64 } };
+    _ = try backend_a.reqresp.sendRequest(remote, &request, peer_a.getResponseHandler());
+    request.deinit();
+
+    try loop.run(.until_done);
+
+    // No chunks. One failure with code 3. No bare `completed`.
+    try std.testing.expectEqual(@as(usize, 0), peer_a.received_slots.items.len);
+    try std.testing.expectEqual(@as(u32, 1), peer_a.failures);
+    try std.testing.expect(peer_a.last_error_code != null);
+    try std.testing.expectEqual(@as(u32, 3), peer_a.last_error_code.?);
+    try std.testing.expect(!peer_a.completed);
 }

@@ -41,7 +41,7 @@ pub const Clock = struct {
         const timer = try xev.Timer.init();
 
         const genesis_time_ms: isize = @intCast(genesis_time * std.time.ms_per_s);
-        const current_interval = @divFloor(@as(isize, @intCast(std.time.milliTimestamp())) + CLOCK_DISPARITY_MS - genesis_time_ms, constants.SECONDS_PER_INTERVAL_MS);
+        const current_interval = @divFloor(@as(isize, @intCast(zeam_utils.unixTimestampMillis())) + CLOCK_DISPARITY_MS - genesis_time_ms, constants.SECONDS_PER_INTERVAL_MS);
         const current_interval_time_ms = genesis_time_ms + current_interval * constants.SECONDS_PER_INTERVAL_MS;
 
         return Self{
@@ -66,7 +66,7 @@ pub const Clock = struct {
     }
 
     pub fn tickInterval(self: *Self) void {
-        const time_now_ms: isize = @intCast(std.time.milliTimestamp());
+        const time_now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
         if (self.last_tick_time_ms) |last| {
             const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
             zeam_metrics.lean_tick_interval_duration_seconds.record(elapsed_s);

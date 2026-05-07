@@ -5,18 +5,38 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 const LEAN_BLOCKS_BY_ROOT_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+const LEAN_BLOCKS_BY_RANGE_V1: &str = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
 const LEAN_STATUS_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 
+/// Identifier for the wire-level RPC protocol negotiated over libp2p.
+///
+/// The discriminant values MUST stay in sync with the Zig side
+/// (`pkgs/network/src/interface.zig::LeanSupportedProtocol`) and with the
+/// `TryFrom<u32>` impl below. The cross-FFI invariant runs in BOTH
+/// directions:
+///
+///   * Zig u32 → `try_from(u32)` → `LeanSupportedProtocol` (incoming RPC tag
+///     from the chain side).
+///   * `LeanSupportedProtocol as u32` → Zig u32 (outgoing tag, e.g. for
+///     metric labels or any future ABI-level pinning).
+///
+/// `#[repr(u32)]` plus explicit discriminants pin the round-trip and
+/// kill the foot-gun where Rust's default fieldless-enum `as u32` follows
+/// declaration order while a hand-rolled `TryFrom` uses a different
+/// mapping. Reported by @ch4r10t33r on PR #824.
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeanSupportedProtocol {
-    BlocksByRootV1,
-    StatusV1,
+    BlocksByRootV1 = 0,
+    StatusV1 = 1,
+    BlocksByRangeV1 = 2,
 }
 
 impl LeanSupportedProtocol {
     pub fn message_name(&self) -> &'static str {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => "blocks_by_root",
+            LeanSupportedProtocol::BlocksByRangeV1 => "blocks_by_range",
             LeanSupportedProtocol::StatusV1 => "status",
         }
     }
@@ -24,6 +44,7 @@ impl LeanSupportedProtocol {
     pub fn schema_version(&self) -> &'static str {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => "1",
+            LeanSupportedProtocol::BlocksByRangeV1 => "1",
             LeanSupportedProtocol::StatusV1 => "1",
         }
     }
@@ -31,6 +52,7 @@ impl LeanSupportedProtocol {
     pub fn has_context_bytes(&self) -> bool {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => false,
+            LeanSupportedProtocol::BlocksByRangeV1 => false,
             LeanSupportedProtocol::StatusV1 => false,
         }
     }
@@ -38,6 +60,7 @@ impl LeanSupportedProtocol {
     pub fn protocol_id(&self) -> &'static str {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => LEAN_BLOCKS_BY_ROOT_V1,
+            LeanSupportedProtocol::BlocksByRangeV1 => LEAN_BLOCKS_BY_RANGE_V1,
             LeanSupportedProtocol::StatusV1 => LEAN_STATUS_V1,
         }
     }
@@ -46,10 +69,17 @@ impl LeanSupportedProtocol {
 impl TryFrom<u32> for LeanSupportedProtocol {
     type Error = ();
 
+    /// Inverse of the `#[repr(u32)]` discriminants on the enum above.
+    /// Keep these arms in lock-step with the explicit discriminants
+    /// (`BlocksByRootV1 = 0`, `StatusV1 = 1`, `BlocksByRangeV1 = 2`)
+    /// so `LeanSupportedProtocol::try_from(p as u32) == Ok(p)` holds
+    /// for every variant. Verified by `try_from_round_trip_matches_repr`
+    /// below.
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(LeanSupportedProtocol::BlocksByRootV1),
             1 => Ok(LeanSupportedProtocol::StatusV1),
+            2 => Ok(LeanSupportedProtocol::BlocksByRangeV1),
             _ => Err(()),
         }
     }
@@ -127,5 +157,61 @@ impl Hash for ProtocolId {
 impl AsRef<str> for ProtocolId {
     fn as_ref(&self) -> &str {
         self.protocol.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the cross-FFI invariant: every variant must satisfy
+    /// `try_from(p as u32) == Ok(p)`. Catches the foot-gun where the
+    /// `TryFrom<u32>` mapping silently disagrees with Rust's default
+    /// fieldless-enum `as u32` (declaration-order).
+    ///
+    /// Reported by @ch4r10t33r on PR #824 — prior to the
+    /// `#[repr(u32)]` + explicit-discriminant fix, `StatusV1 as u32`
+    /// returned 2 (declaration ord) while `try_from(2)` returned
+    /// `BlocksByRangeV1`, so a Rust→u32 emission followed by a
+    /// `TryFrom<u32>` decode would lie. Today nothing exercises
+    /// `as u32` on this enum, but the asymmetry was a foot-shaped
+    /// trap left in the codebase. This test makes any future
+    /// regression compile-fail-equivalent (test-fail).
+    #[test]
+    fn try_from_round_trip_matches_repr() {
+        for p in [
+            LeanSupportedProtocol::BlocksByRootV1,
+            LeanSupportedProtocol::StatusV1,
+            LeanSupportedProtocol::BlocksByRangeV1,
+        ] {
+            let raw = p as u32;
+            let decoded = LeanSupportedProtocol::try_from(raw)
+                .unwrap_or_else(|_| panic!("variant {:?} (raw {}) failed try_from", p, raw));
+            assert_eq!(
+                decoded, p,
+                "round-trip mismatch for variant {:?}: as u32 = {} but try_from({}) = {:?}",
+                p, raw, raw, decoded
+            );
+        }
+    }
+
+    /// Pin the explicit discriminant values so any reorder/edit that
+    /// breaks the Zig-side mapping (interface.zig::LeanSupportedProtocol)
+    /// trips this test instead of corrupting wire traffic at runtime.
+    /// Zig side declares `blocks_by_root = 0, status = 1, blocks_by_range = 2`.
+    #[test]
+    fn discriminants_match_zig_side() {
+        assert_eq!(LeanSupportedProtocol::BlocksByRootV1 as u32, 0);
+        assert_eq!(LeanSupportedProtocol::StatusV1 as u32, 1);
+        assert_eq!(LeanSupportedProtocol::BlocksByRangeV1 as u32, 2);
+    }
+
+    /// Pin the rejection of out-of-range u32s. Today only 0/1/2 are
+    /// valid; anything else MUST be `Err(())`.
+    #[test]
+    fn try_from_rejects_out_of_range() {
+        assert!(LeanSupportedProtocol::try_from(3).is_err());
+        assert!(LeanSupportedProtocol::try_from(42).is_err());
+        assert!(LeanSupportedProtocol::try_from(u32::MAX).is_err());
     }
 }

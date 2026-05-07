@@ -22,7 +22,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         const Self = @This();
 
-        const OpenError = Error || std.posix.MakeDirError || std.fs.Dir.StatFileError;
+        const OpenError = Error || std.Io.Dir.CreateDirPathError;
 
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
             logger.info("initializing RocksDB", .{});
@@ -30,7 +30,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             const owned_path = try std.fmt.allocPrintSentinel(allocator, "{s}/rocksdb", .{path}, 0);
             errdefer allocator.free(owned_path);
 
-            try std.fs.cwd().makePath(owned_path);
+            const io = std.Io.Threaded.global_single_threaded.io();
+            try std.Io.Dir.cwd().createDirPath(io, owned_path);
 
             // Ideally this should be configurable via cli args
             const options = rocksdb.DBOptions{
@@ -708,14 +709,14 @@ test "test_column_namespaces" {
 }
 
 test "test_rocksdb_with_default_cn" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespaces = [_]ColumnNamespace{
@@ -748,14 +749,14 @@ test "test_rocksdb_with_default_cn" {
 }
 
 test "test_column_families_with_multiple_cns" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     // Default column family is necessary for the RocksDB API to work
@@ -802,14 +803,14 @@ test "test_column_families_with_multiple_cns" {
 }
 
 test "test_count_function" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
@@ -838,14 +839,14 @@ test "test_count_function" {
 }
 
 test "test_batch_write_function" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
@@ -896,14 +897,14 @@ test "test_batch_write_function" {
 }
 
 test "test_iterator_functionality" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
@@ -1001,7 +1002,7 @@ test "save and load block" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -1062,7 +1063,7 @@ test "save and load state" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -1107,7 +1108,7 @@ test "batch write and commit" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -1189,7 +1190,7 @@ test "loadLatestFinalizedState" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);

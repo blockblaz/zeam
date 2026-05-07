@@ -16,6 +16,7 @@ pub const aggregationBitsToValidatorIndices = attestation.aggregationBitsToValid
 
 const block = @import("./block.zig");
 pub const BlockByRootRequest = block.BlockByRootRequest;
+pub const BlocksByRangeRequest = block.BlocksByRangeRequest;
 pub const ProtoBlock = block.ProtoBlock;
 pub const BeamBlock = block.BeamBlock;
 pub const ExecutionPayloadHeader = block.ExecutionPayloadHeader;

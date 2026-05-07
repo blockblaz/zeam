@@ -1,6 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const datetime = @import("datetime");
+const time_utils = @import("./time.zig");
+
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
 
 const Colors = struct {
     const reset = "\x1b[0m";
@@ -57,9 +62,10 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         const print_str = std.fmt.bufPrint(buf[0..], prefix ++ fmt ++ "\n", args) catch @panic("error formatting log\n");
         io.print_str(print_str);
     } else {
-        std.debug.lockStdErr();
-        defer std.debug.unlockStdErr();
-        const stderr = std.fs.File.stderr();
+        const io = defaultIo();
+        _ = std.debug.lockStderr(&.{});
+        defer std.debug.unlockStderr();
+        const stderr = std.Io.File.stderr();
 
         var ts_buf: [64]u8 = undefined;
         const timestamp_str = getFormattedTimestamp(&ts_buf);
@@ -96,7 +102,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         // Print to stderr
         if (@intFromEnum(activeLevel) >= @intFromEnum(level)) {
             var stderr_write_buf: [4096]u8 = undefined;
-            var stderr_writer = stderr.writer(&stderr_write_buf);
+            var stderr_writer = stderr.writer(io, &stderr_write_buf);
             nosuspend stderr_writer.interface.writeAll(print_str) catch return;
             nosuspend stderr_writer.interface.flush() catch return;
         }
@@ -112,7 +118,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
             }
 
             // Use unbuffered write; buffered writers created per-call cause corruption
-            fileLogParams.?.file.writeAll(print_str) catch |err| {
+            fileLogParams.?.file.writeStreamingAll(io, print_str) catch |err| {
                 std.debug.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err });
                 return;
             };
@@ -178,7 +184,7 @@ pub const ModuleTag = enum {
 
 pub const FileLogParams = struct {
     fileActiveLevel: std.log.Level,
-    file: std.fs.File,
+    file: std.Io.File,
     monocolorFile: bool,
 };
 
@@ -190,9 +196,9 @@ pub const FileBehaviourParams = struct {
 };
 
 pub const FileParams = struct {
-    file: ?std.fs.File = null,
+    file: ?std.Io.File = null,
     fileBehaviour: FileBehaviourParams,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     last_rotation_day: i64 = 0,
 };
 
@@ -212,8 +218,8 @@ pub const ZeamLoggerConfig = struct {
             break :blk FileParams{
                 .file = getFile(scope, params.filePath, params.fileName),
                 .fileBehaviour = params,
-                .mutex = std.Thread.Mutex{},
-                .last_rotation_day = if (builtin.target.os.tag == .freestanding) 0 else @as(i64, @intCast(@divFloor(std.time.timestamp(), 24 * 60 * 60))), // Set in FileParams
+                .mutex = .init,
+                .last_rotation_day = if (builtin.target.os.tag == .freestanding) 0 else @as(i64, @intCast(@divFloor(time_utils.unixTimestampSeconds(), 24 * 60 * 60))), // Set in FileParams
             };
         } else null;
 
@@ -225,9 +231,10 @@ pub const ZeamLoggerConfig = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        const io = defaultIo();
         if (self.fileParams) |*params| {
             if (params.file) |f| {
-                f.close();
+                f.close(io);
                 params.file = null;
             }
         }
@@ -238,7 +245,7 @@ pub const ZeamLoggerConfig = struct {
         if (self.fileParams.?.file == null) return;
 
         if (self.fileParams.?.file) |file| {
-            const now = std.time.timestamp();
+            const now = time_utils.unixTimestampSeconds();
             const sec_per_day = 24 * 60 * 60;
             const current_epoch_day = @as(i64, @intCast(@divFloor(now, sec_per_day)));
 
@@ -270,13 +277,13 @@ pub const ZeamLoggerConfig = struct {
                 else => try std.fmt.bufPrint(&new_buf, "{s}-{s}-{s}.log", .{ self.fileParams.?.fileBehaviour.fileName, @tagName(self.scope), date_ext }),
             };
 
-            self.fileParams.?.mutex.lock();
-            defer self.fileParams.?.mutex.unlock();
-
-            file.close();
-            var dir = std.fs.cwd().openDir(self.fileParams.?.fileBehaviour.filePath, .{}) catch return;
-            defer dir.close();
-            try dir.rename(base_name, rotated_name);
+            const io = defaultIo();
+            self.fileParams.?.mutex.lockUncancelable(io);
+            defer self.fileParams.?.mutex.unlock(io);
+            file.close(io);
+            var dir = std.Io.Dir.cwd().openDir(io, self.fileParams.?.fileBehaviour.filePath, .{}) catch return;
+            defer dir.close(io);
+            try std.Io.Dir.rename(dir, base_name, dir, rotated_name, io);
 
             self.fileParams.?.file = getFile(self.scope, self.fileParams.?.fileBehaviour.filePath, self.fileParams.?.fileBehaviour.fileName);
             self.fileParams.?.last_rotation_day = current_epoch_day;
@@ -378,7 +385,7 @@ pub const OptionalNode = struct {
         return .{ .name = name };
     }
 
-    pub fn format(self: OptionalNode, writer: anytype) !void {
+    pub fn format(self: OptionalNode, writer: *std.Io.Writer) !void {
         const peer_color = Colors.peer;
         const reset_color = Colors.reset;
 
@@ -401,7 +408,7 @@ pub fn getTestLoggerConfig() ZeamLoggerConfig {
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
-    const ts = std.time.milliTimestamp();
+    const ts = time_utils.unixTimestampMillis();
     // converts millisecond to Datetime
     const dt = datetime.datetime.Datetime.fromTimestamp(ts);
 
@@ -419,13 +426,15 @@ pub fn getFormattedTimestamp(buf: []u8) []const u8 {
     }) catch return buf[0..0];
 }
 
-pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?std.fs.File {
+pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?std.Io.File {
+    const io = defaultIo();
+    const cwd = std.Io.Dir.cwd();
     // try to create/open a file
     // do not close here .. will be closed when log file is rotated and new log file is created
     // ensure directory exists - try to create it if it doesn't exist
 
     // Try to create the directory if it doesn't exist
-    std.fs.cwd().makePath(filePath) catch |err| switch (err) {
+    cwd.createDirPath(io, filePath) catch |err| switch (err) {
         error.PathAlreadyExists => {}, // Directory exists, continue
         else => {
             std.debug.print("ERROR: Failed to create directory '{s}': {any}\n", .{ filePath, err });
@@ -433,11 +442,11 @@ pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?
         },
     };
 
-    var dir = std.fs.cwd().openDir(filePath, .{}) catch |err| {
+    var dir = cwd.openDir(io, filePath, .{}) catch |err| {
         std.debug.print("ERROR: Failed to open directory '{s}': {any}\n", .{ filePath, err });
         return null;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var buf: [64]u8 = undefined;
     const filename_withscope = switch (scope) {
@@ -456,6 +465,7 @@ pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?
     };
 
     const file = dir.createFile(
+        io,
         filename_withscope,
         .{
             .read = true,
@@ -466,9 +476,14 @@ pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?
         return null;
     };
 
-    file.seekFromEnd(0) catch |err| {
+    const file_len = file.length(io) catch |err| {
         std.debug.print("WARNING: Failed to seek to end of file '{s}': {any}\n", .{ filename_withscope, err });
-        // Don't return null here - seekFromEnd failure is not fatal
+        return file;
+    };
+    var seek_write_buf: [1]u8 = undefined;
+    var file_writer = file.writer(io, &seek_write_buf);
+    file_writer.seekTo(file_len) catch |err| {
+        std.debug.print("WARNING: Failed to seek to end of file '{s}': {any}\n", .{ filename_withscope, err });
     };
 
     return file;
@@ -521,62 +536,58 @@ test "OptionalNode formatter" {
 
     // Test with node name present
     {
-        var buffer: std.ArrayList(u8) = .empty;
-        defer buffer.deinit(allocator);
-        const writer = buffer.writer(allocator);
+        var writer = std.Io.Writer.Allocating.init(allocator);
+        defer writer.deinit();
 
         const node = OptionalNode.init("alice");
-        try node.format(writer);
-        try writer.print(" Peer connected: {s}, total peers: {d}", .{
+        try node.format(&writer.writer);
+        try writer.writer.print(" Peer connected: {s}, total peers: {d}", .{
             "peer123",
             5,
         });
 
-        try testing.expectEqualStrings("(" ++ Colors.peer ++ "alice" ++ Colors.reset ++ ") Peer connected: peer123, total peers: 5", buffer.items);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "alice" ++ Colors.reset ++ ") Peer connected: peer123, total peers: 5", writer.written());
     }
 
     // Test with node name null
     {
-        var buffer: std.ArrayList(u8) = .empty;
-        defer buffer.deinit(allocator);
-        const writer = buffer.writer(allocator);
+        var writer = std.Io.Writer.Allocating.init(allocator);
+        defer writer.deinit();
 
         const node = OptionalNode.init(null);
-        try node.format(writer);
-        try writer.print("Peer connected: {s}, total peers: {d}", .{
+        try node.format(&writer.writer);
+        try writer.writer.print("Peer connected: {s}, total peers: {d}", .{
             "peer456",
             3,
         });
 
-        try testing.expectEqualStrings("Peer connected: peer456, total peers: 3", buffer.items);
+        try testing.expectEqualStrings("Peer connected: peer456, total peers: 3", writer.written());
     }
 
     // Test in different positions
     {
-        var buffer: std.ArrayList(u8) = .empty;
-        defer buffer.deinit(allocator);
-        const writer = buffer.writer(allocator);
+        var writer = std.Io.Writer.Allocating.init(allocator);
+        defer writer.deinit();
 
         const node = OptionalNode.init("validator-7");
-        try node.format(writer);
-        try writer.print(" Published block: slot={d} proposer={d}", .{
+        try node.format(&writer.writer);
+        try writer.writer.print(" Published block: slot={d} proposer={d}", .{
             100,
             7,
         });
 
-        try testing.expectEqualStrings("(" ++ Colors.peer ++ "validator-7" ++ Colors.reset ++ ") Published block: slot=100 proposer=7", buffer.items);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "validator-7" ++ Colors.reset ++ ") Published block: slot=100 proposer=7", writer.written());
     }
 
     // Test with empty string (should still format)
     {
-        var buffer: std.ArrayList(u8) = .empty;
-        defer buffer.deinit(allocator);
-        const writer = buffer.writer(allocator);
+        var writer = std.Io.Writer.Allocating.init(allocator);
+        defer writer.deinit();
 
         const node = OptionalNode.init("");
-        try node.format(writer);
-        try writer.writeAll(" Message");
+        try node.format(&writer.writer);
+        try writer.writer.writeAll(" Message");
 
-        try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", buffer.items);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", writer.written());
     }
 }

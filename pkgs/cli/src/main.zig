@@ -75,6 +75,10 @@ pub const NodeCommand = struct {
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
     @"db-backend": database.Backend = .rocksdb,
+    /// Slice c-2b commit 3 of #803: route producer-side gossip
+    /// handlers through the chain-worker queue. Default `false`
+    /// preserves slice-(b) synchronous behavior.
+    @"chain-worker": bool = false,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -98,6 +102,7 @@ pub const NodeCommand = struct {
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
+        .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. Off by default; the synchronous path stays in place when disabled.",
         .help = "Show help information for the node command",
     };
 };
@@ -244,8 +249,8 @@ const ZeamArgs = struct {
 const error_handler = @import("error_handler.zig");
 const ErrorHandler = error_handler.ErrorHandler;
 
-pub fn main() void {
-    mainInner() catch |err| {
+pub fn main(init: std.process.Init) void {
+    mainInner(init) catch |err| {
         if (err == error.MissingSubCommand) {
             std.process.exit(1);
         }
@@ -254,8 +259,8 @@ pub fn main() void {
     };
 }
 
-fn mainInner() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+fn mainInner(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}).init;
     const allocator = gpa.allocator();
     defer {
         const leaked = gpa.deinit();
@@ -271,20 +276,23 @@ fn mainInner() !void {
     var parse_arena = std.heap.ArenaAllocator.init(allocator);
     defer parse_arena.deinit();
 
-    const opts = simargs.parse(parse_arena.allocator(), ZeamArgs, app_description, app_version) catch |err| {
+    const opts = simargs.structargs.parse(parse_arena.allocator(), init.io, init.minimal.args, ZeamArgs, .{
+        .argument_prompt = app_description,
+        .version_string = app_version,
+    }) catch |err| {
         std.debug.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)});
         std.debug.print("Run 'zeam --help' for usage information.\n", .{});
         return err;
     };
     defer opts.deinit();
 
-    const genesis = opts.args.genesis;
-    const log_filename = opts.args.log_filename;
-    const log_file_active_level = opts.args.log_file_active_level;
-    const monocolor_file_log = opts.args.monocolor_file_log;
-    const console_log_level = opts.args.console_log_level;
+    const genesis = opts.options.genesis;
+    const log_filename = opts.options.log_filename;
+    const log_file_active_level = opts.options.log_file_active_level;
+    const monocolor_file_log = opts.options.monocolor_file_log;
+    const console_log_level = opts.options.console_log_level;
 
-    std.debug.print("opts={any} genesis={d}\n", .{ opts.args, genesis });
+    std.debug.print("opts={any} genesis={d}\n", .{ opts.options, genesis });
 
     // Detect the best available I/O backend (io_uring or epoll on Linux).
     node_lib.detectBackend() catch |err| {
@@ -292,7 +300,7 @@ fn mainInner() !void {
         return err;
     };
 
-    switch (opts.args.__commands__) {
+    switch (opts.options.__commands__) {
         .clock => {
             var loop = xev.Loop.init(.{}) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize event loop");
@@ -375,7 +383,7 @@ fn mainInner() !void {
 
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
-            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(utils_lib.unixTimestampSeconds()));
 
             // Create logger config for API and metrics servers
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
@@ -410,7 +418,17 @@ fn mainInner() !void {
                 .ignore_unknown_fields = true,
                 .allocate = .alloc_if_needed,
             };
-            var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
+            // See pkgs/cli/src/node.zig (and #831): `parseFromSlice` returns
+            // string fields aliased into the `Parsed` arena. `ChainSpec.deinit`
+            // later calls `allocator.free` on `name` / `fork_digest`, so move
+            // both fields onto the top-level allocator before the arena dies.
+            const parsed = try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options);
+            defer parsed.deinit();
+            var chain_options = parsed.value;
+            chain_options.name = try gpa.allocator().dupe(u8, chain_options.name.?);
+            errdefer if (chain_options.name) |n| gpa.allocator().free(n);
+            chain_options.fork_digest = try gpa.allocator().dupe(u8, chain_options.fork_digest.?);
+            errdefer if (chain_options.fork_digest) |d| gpa.allocator().free(d);
 
             // Create key manager FIRST to get validator pubkeys for genesis
             // Using 3 validators for 3-node setup with initial sync testing
@@ -439,7 +457,7 @@ fn mainInner() !void {
             chain_options.validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys;
             owns_pubkeys = false; // ownership moved into genesis spec
 
-            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
+            const time_now_ms: usize = @intCast(utils_lib.unixTimestampMillis());
             const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
             chain_options.genesis_time = time_now;
 
@@ -455,7 +473,7 @@ fn mainInner() !void {
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
 
-            try std.fs.cwd().makePath(beamcmd.data_dir);
+            try std.Io.Dir.cwd().createDirPath(init.io, beamcmd.data_dir);
 
             // Create loggers first so they can be passed to network implementations
             var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
@@ -532,7 +550,6 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
                     .node_registry = test_registry1,
-                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
@@ -557,7 +574,6 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
                     .node_registry = test_registry2,
-                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
@@ -581,7 +597,6 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses3,
                     .connect_peers = connect_peers3,
                     .node_registry = test_registry3,
-                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
@@ -599,6 +614,7 @@ fn mainInner() !void {
             const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
             const thread_pool = try ThreadPool.init(.{
                 .allocator = allocator,
+                .io = init.io,
                 .thread_count = @intCast(worker_count),
             });
             defer thread_pool.deinit();
@@ -717,12 +733,16 @@ fn mainInner() !void {
                     std.debug.print("=== Finalization reached slot {d} on reference node — starting node 3 ===\n", .{finalized_slot});
                     std.debug.print("=== Node 3 will sync from genesis using parent block syncing ===\n\n", .{});
 
-                    // Start network FIRST so node3 joins fresh without pre-cached gossip blocks
+                    // Start BeamNode first so it registers selective gossip
+                    // topic handlers; EthLibp2p.run() then derives the
+                    // gossipsub subscribe set from those handlers (instead of
+                    // joining every attestation subnet). See
+                    // pkgs/network/src/ethlibp2p.zig run() for the rationale.
+                    try self.beam_node.run();
+
                     if (self.network) |net| {
                         try net.run();
                     }
-
-                    try self.beam_node.run();
                     self.started = true;
 
                     std.debug.print("=== NODE 3 STARTED - will now sync via STATUS and parent block requests ===\n\n", .{});
@@ -740,19 +760,25 @@ fn mainInner() !void {
                 .onIntervalCb = DelayedNodeRunner.onInterval,
             };
 
-            // Start nodes 1, 2 immediately (node 3 starts delayed after finalization)
-            try beam_node_1.run();
-            try beam_node_2.run();
-
-            // Register delayed runner callback with clock
-            try clock.subscribeOnSlot(delayed_cb);
-
+            // Start the rust libp2p networks BEFORE the beam nodes:
+            // `BeamNode.run()` calls `gossip.subscribe(...)`, which now
+            // enqueues `SwarmCommand::SubscribeGossip` on the per-network
+            // command channel. That channel only exists after
+            // `EthLibp2p.run()` returns from `wait_for_network_ready`, so
+            // any earlier subscribe would be dropped with a hard error.
             if (!mock_network) {
                 try network1.run();
                 try network2.run();
                 // network3.run() is called in DelayedNodeRunner.onInterval
                 // to ensure node3 joins fresh without pre-cached gossip blocks
             }
+
+            // Start nodes 1, 2 immediately (node 3 starts delayed after finalization)
+            try beam_node_1.run();
+            try beam_node_2.run();
+
+            // Register delayed runner callback with clock
+            try clock.subscribeOnSlot(delayed_cb);
 
             try clock.run();
         },
@@ -764,14 +790,13 @@ fn mainInner() !void {
                 };
                 defer allocator.free(generated_config);
 
-                const cwd = std.fs.cwd();
-                const config_file = cwd.createFile(genconfig.filename, .{ .truncate = true }) catch |err| {
+                const config_file = std.Io.Dir.cwd().createFile(init.io, genconfig.filename, .{ .truncate = true }) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "create Prometheus config file", .{ .filename = genconfig.filename });
                     return err;
                 };
-                defer config_file.close();
+                defer config_file.close(init.io);
                 var write_buf: [4096]u8 = undefined;
-                var writer = config_file.writer(&write_buf);
+                var writer = config_file.writer(init.io, &write_buf);
                 writer.interface.writeAll(generated_config) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "write Prometheus config", .{ .filename = genconfig.filename });
                     return err;
@@ -784,7 +809,7 @@ fn mainInner() !void {
             },
         },
         .node => |leancmd| {
-            std.fs.cwd().makePath(leancmd.@"data-dir") catch |err| {
+            std.Io.Dir.cwd().createDirPath(init.io, leancmd.@"data-dir") catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "create data directory", .{ .path = leancmd.@"data-dir" });
                 return err;
             };
@@ -908,5 +933,5 @@ fn mainInner() !void {
 }
 
 test {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }
