@@ -150,8 +150,11 @@ const Metrics = struct {
     //     legitimate near-future gossip blocks).
     //   * `lean_pending_blocks_evicted_total{reason}` — cumulative count of
     //     blocks dropped from the queue, by reason: `cap` (capacity hit),
-    //     `pre_finalized` (slot < finalized), `duplicate` (same root
-    //     already queued), `append_oom` (allocator failure).
+    //     `pre_finalized` (slot < finalized), `too_far_future` (slot >
+    //     current_slot + MAX_FUTURE_SLOT_QUEUE_TOLERANCE; drain-side
+    //     eviction added in PR #841 review #8), `duplicate` (same root
+    //     already queued), `append_oom` (allocator failure on capacity
+    //     reservation; the new block is dropped, the queue is unchanged).
     //   * `lean_pending_blocks_replayed_total{result}` — cumulative count
     //     of replays attempted from `processPendingBlocks`, by
     //     terminal result: `accepted` / `rejected` / `error`.
