@@ -77,9 +77,11 @@ pub const NodeCommand = struct {
     @"db-backend": database.Backend = .rocksdb,
     @"chain-spec": ?[]const u8 = null,
     /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `false`
-    /// preserves slice-(b) synchronous behavior.
-    @"chain-worker": bool = false,
+    /// handlers through the chain-worker queue. Default `true` post
+    /// devnet-4 burn-in (#788 follow-up + slice (d)/(e) PR): the
+    /// worker path is the supported prod path; the synchronous path
+    /// stays in place as a kill-switch via `--chain-worker false`.
+    @"chain-worker": bool = true,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -104,7 +106,7 @@ pub const NodeCommand = struct {
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
-        .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. Off by default; the synchronous path stays in place when disabled.",
+        .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .help = "Show help information for the node command",
     };
 };

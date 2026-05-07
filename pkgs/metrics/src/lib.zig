@@ -158,6 +158,27 @@ const Metrics = struct {
     // via `recordChainStateRefcountDistribution` registered as a
     // context-bearing scrape refresher (see `registerScrapeRefresherCtx`).
     lean_chain_state_refcount_distribution: LeanChainStateRefcountDistributionHistogram,
+    // Slice (e) of #803: visibility into the centralised hash-root
+    // cache. Each block ingress now carries the block_root computed
+    // once at the gossip / RPC entry point through every downstream
+    // consumer (chain.onGossip, enqueuePendingBlock,
+    // processPendingBlocks, chain.onBlock, forkchoice.onBlock).
+    // This counter bumps every time a downstream consumer was able
+    // to skip the second `hashTreeRoot` because the producer threaded
+    // a precomputed root through. The `site` label identifies the
+    // skip site (e.g. "chain.onGossip", "chain.onBlock",
+    // "chain.processPendingBlocks", "chain.enqueuePendingBlock"). A
+    // sustained 0 for any site label means the cache plumbing is
+    // broken there — useful for catching a regression that drops
+    // the root on the floor in a future refactor.
+    lean_block_root_compute_skipped_total: LeanBlockRootComputeSkippedCounter,
+    // Slice (d) of #803: visibility into the parallel net-fetch +
+    // missed-root prune dedup. Bumped per `fetchBlockByRoots` call by
+    // outcome bucket: `already_in_forkchoice`, `already_in_block_cache`,
+    // `already_pending`, `fetched`. Lets operators see how much
+    // duplicate fetch work the dedup is saving and — just as
+    // important — catch a regression that bypasses the dedup.
+    lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -254,6 +275,9 @@ const Metrics = struct {
     const LockHoldTimeHistogram = metrics_lib.HistogramVec(f32, LockLabel, &NODE_MUTEX_BUCKETS);
     // pending_blocks drain iteration histogram type (slice a-2)
     const PendingBlocksDrainItersHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 });
+    // Slice (d)/(e) of #803.
+    const LeanBlockRootComputeSkippedCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
+    const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -633,6 +657,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Instantaneous depth of the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
+        // Slice (d)/(e) of #803 — see field doc for label semantics.
+        .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
+        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)

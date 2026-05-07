@@ -96,10 +96,12 @@ pub const NodeOptions = struct {
     db_backend: database.Backend = .rocksdb,
     chain_spec: ?[]const u8 = null,
     /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `false`
-    /// preserves slice-(b) synchronous behavior. Surfaced as
-    /// `--chain-worker` on the `zeam node` CLI.
-    chain_worker_enabled: bool = false,
+    /// handlers through the chain-worker queue. Default `true` post
+    /// devnet-4 burn-in: the worker path is the supported prod path;
+    /// surfaced as `--chain-worker` on the `zeam node` CLI, with
+    /// `--chain-worker false` as the kill-switch for the legacy
+    /// synchronous path.
+    chain_worker_enabled: bool = true,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);

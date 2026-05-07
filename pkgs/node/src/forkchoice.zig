@@ -1668,11 +1668,16 @@ pub const ForkChoice = struct {
                 self.logger.info("[forkchoice] status=ready: first justified checkpoint observed slot={d} root={x} — validator duties now enabled", .{ self.fcStore.latest_justified.slot, &self.fcStore.latest_justified.root });
             }
 
-            const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
+            const block_root: [32]u8 = if (opts.blockRoot) |r| r else r: {
                 var cblock_root: [32]u8 = undefined;
                 try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
-                break :computedroot cblock_root;
+                break :r cblock_root;
             };
+            if (opts.blockRoot != null) {
+                // Slice (e) of #803 — see metrics field doc on
+                // `lean_block_root_compute_skipped_total`.
+                zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
+            }
             const is_timely = self.isBlockTimely(opts.blockDelayMs);
 
             const proto_block = ProtoBlock{
@@ -1790,6 +1795,36 @@ pub const ForkChoice = struct {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
         return self.hasBlockUnlocked(blockRoot);
+    }
+
+    /// Slice (d) of #803: batch presence check.
+    ///
+    /// Snapshots `hasBlock` for every root in `roots` under a single
+    /// shared-lock acquisition, writing results into `out` (which the
+    /// caller pre-allocates with `out.len == roots.len`). The batched
+    /// shape lets the producer (`BeamNode.fetchBlockByRoots`) trade N
+    /// shared-lock acquisitions + N hashmap lookups for 1 + N — the
+    /// hashmap lookup is unchanged but the lock-acquire/release pair
+    /// (and the ConcurrencyKit memory fence inside it) collapses to
+    /// one. Under heavy gossip-fanout the lock-acquire dominates the
+    /// hashmap lookup, so this is the call we want for every dedup
+    /// pass that operates on a list of roots.
+    ///
+    /// Returns `error.LengthMismatch` if `roots.len != out.len` so
+    /// the caller cannot accidentally read garbage past the end of
+    /// `out`.
+    pub fn hasBlocksBatch(
+        self: *Self,
+        roots: []const types.Root,
+        out: []bool,
+    ) error{LengthMismatch}!void {
+        if (roots.len != out.len) return error.LengthMismatch;
+        if (roots.len == 0) return;
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        for (roots, 0..) |root, i| {
+            out[i] = self.hasBlockUnlocked(root);
+        }
     }
 
     pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
@@ -2004,6 +2039,70 @@ test "forkchoice block tree" {
         const searched_idx = fork_choice.protoArray.indices.get(mock_chain.blockRoots[i]);
         try std.testing.expect(searched_idx == i);
     }
+}
+
+test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence semantics" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const module_logger = zeam_logger_config.logger(.forkchoice);
+    var fork_choice = try ForkChoice.init(allocator, .{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .logger = module_logger,
+    });
+
+    // 1. Empty input is a no-op (does not panic / does not deadlock).
+    var empty_buf: [0]bool = .{};
+    try fork_choice.hasBlocksBatch(&[_]types.Root{}, &empty_buf);
+
+    // 2. Length mismatch is reported as an error rather than a UB read.
+    var bad_out: [1]bool = .{false};
+    try std.testing.expectError(
+        error.LengthMismatch,
+        fork_choice.hasBlocksBatch(&[_]types.Root{ mock_chain.blockRoots[0], mock_chain.blockRoots[0] }, &bad_out),
+    );
+
+    // 3. Anchor block (genesis) is present; a synthetic root is not.
+    //    Same shared lock acquisition snapshots both answers.
+    const synthetic = std.mem.zeroes(types.Root);
+    var roots: [3]types.Root = .{ mock_chain.blockRoots[0], synthetic, mock_chain.blockRoots[0] };
+    var present: [3]bool = .{ false, true, false };
+    try fork_choice.hasBlocksBatch(&roots, &present);
+    try std.testing.expect(present[0]);
+    try std.testing.expect(!present[1]);
+    try std.testing.expect(present[2]);
+
+    // 4. After ingesting block[1], `hasBlocksBatch` reflects the new state
+    //    in the same call shape — confirms the shared-lock snapshot is
+    //    re-taken on every call (not cached across).
+    const block1 = mock_chain.blocks[1].block;
+    try stf.apply_transition(allocator, &beam_state, block1, .{ .logger = module_logger });
+    try fork_choice.onInterval(block1.slot * constants.INTERVALS_PER_SLOT, false);
+    _ = try fork_choice.onBlock(block1, &beam_state, .{ .currentSlot = block1.slot, .blockDelayMs = 0, .confirmed = true });
+
+    var roots2: [2]types.Root = .{ mock_chain.blockRoots[1], synthetic };
+    var present2: [2]bool = .{ false, true };
+    try fork_choice.hasBlocksBatch(&roots2, &present2);
+    try std.testing.expect(present2[0]);
+    try std.testing.expect(!present2[1]);
 }
 
 test "aggregate prunes attestation signatures" {

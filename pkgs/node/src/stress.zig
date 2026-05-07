@@ -893,7 +893,11 @@ fn saturationBlockProducerWorker(ctx: *SaturationCtx, thread_id: usize) void {
         };
 
         _ = ctx.block_attempts.fetchAdd(1, .monotonic);
-        ctx.chain.submitBlock(cloned, false) catch |err| {
+        // Slice (e) of #803: pass `null` for `block_root` so the
+        // worker recomputes — the stress harness deliberately
+        // exercises the fallback path. Real producers always pass
+        // a precomputed root.
+        ctx.chain.submitBlock(cloned, false, null) catch |err| {
             // We retain ownership on every error path — free the clone.
             cloned.deinit();
             switch (err) {

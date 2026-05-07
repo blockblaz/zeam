@@ -118,9 +118,21 @@ pub const Message = union(enum) {
     /// gossip handler (after gossipsub validation), or req/resp.
     /// Owns: `signed_block` (transitively the block body's
     /// attestations + signatures slices).
+    ///
+    /// Slice (e) of #803: `block_root` carries the producer's
+    /// already-computed hash-tree root of `signed_block.block` when
+    /// available. Producers always compute it (gossip ingress at
+    /// `BeamNode.onGossip`, RPC ingress at
+    /// `processBlockByRoot|RangeChunk`, locally-produced via
+    /// `publishBlock`); threading it through here lets the worker's
+    /// `onBlock` callback skip the second `hashTreeRoot` call,
+    /// removing one of three duplicate hashes per gossip block.
+    /// `null` means "unknown — recompute"; the worker side handles
+    /// both cases via `CachedProcessedBlockInfo.blockRoot`.
     on_block: struct {
         signed_block: types.SignedBlock,
         prune_forkchoice: bool,
+        block_root: ?types.Root = null,
     },
     /// Single attestation gossip. Producer is libp2p gossip handler.
     /// `SignedAttestation` is plain-old-data (fixed-size validator id,
@@ -372,7 +384,18 @@ pub const AttestationQueue = BoundedQueue(Message);
 /// chain method.
 pub const Handlers = struct {
     ctx: *anyopaque,
-    on_block: *const fn (ctx: *anyopaque, signed_block: types.SignedBlock, prune_forkchoice: bool) void,
+    /// Slice (e) of #803: `block_root` is the producer's already-
+    /// computed hash-tree root of `signed_block.block`, or `null` if
+    /// the producer didn't have one. The handler should pass it
+    /// straight into `BeamChain.onBlock` via
+    /// `CachedProcessedBlockInfo.blockRoot` so the worker thread
+    /// doesn't re-hash the same block.
+    on_block: *const fn (
+        ctx: *anyopaque,
+        signed_block: types.SignedBlock,
+        prune_forkchoice: bool,
+        block_root: ?types.Root,
+    ) void,
     on_gossip_attestation: *const fn (ctx: *anyopaque, gossip: networks.AttestationGossip) void,
     on_gossip_aggregated_attestation: *const fn (ctx: *anyopaque, agg: types.SignedAggregatedAttestation) void,
     process_pending_blocks: *const fn (ctx: *anyopaque, current_slot: types.Slot) void,
@@ -745,7 +768,12 @@ pub const ChainWorker = struct {
             return;
         };
         switch (m) {
-            .on_block => |payload| h.on_block(h.ctx, payload.signed_block, payload.prune_forkchoice),
+            .on_block => |payload| h.on_block(
+                h.ctx,
+                payload.signed_block,
+                payload.prune_forkchoice,
+                payload.block_root,
+            ),
             .on_gossip_attestation => |gossip| h.on_gossip_attestation(h.ctx, gossip),
             .on_gossip_aggregated_attestation => |agg| h.on_gossip_aggregated_attestation(h.ctx, agg),
             .process_pending_blocks => |payload| h.process_pending_blocks(h.ctx, payload.current_slot),
@@ -1196,6 +1224,63 @@ test "Message.deinit: on_block frees the SignedBlock heap (no leak under testing
         },
     };
     msg.deinit();
+}
+
+test "on_block carries optional block_root (slice (e) of #803)" {
+    // Verify the new optional `block_root` field on the on_block
+    // payload defaults to null AND faithfully round-trips through
+    // `Message.deinit`. The default null is the contract that lets
+    // existing callers compile unchanged; round-tripping is the
+    // contract that lets new callers thread their precomputed root
+    // through the queue without it getting silently dropped.
+    const attestations1 = try types.AggregatedAttestations.init(testing.allocator);
+    const signatures1 = try types.createBlockSignatures(testing.allocator, attestations1.len());
+    var msg_default: Message = .{
+        .on_block = .{
+            .signed_block = .{
+                .block = .{
+                    .slot = 1,
+                    .proposer_index = 0,
+                    .parent_root = std.mem.zeroes(types.Root),
+                    .state_root = std.mem.zeroes(types.Root),
+                    .body = .{ .attestations = attestations1 },
+                },
+                .signature = signatures1,
+            },
+            .prune_forkchoice = false,
+        },
+    };
+    try testing.expect(msg_default.on_block.block_root == null);
+    msg_default.deinit();
+
+    // Carry an explicit precomputed root.
+    const attestations2 = try types.AggregatedAttestations.init(testing.allocator);
+    const signatures2 = try types.createBlockSignatures(testing.allocator, attestations2.len());
+    var sentinel: types.Root = undefined;
+    var k: u8 = 0;
+    for (sentinel[0..]) |*b| {
+        b.* = k;
+        k +%= 1;
+    }
+    var msg_with_root: Message = .{
+        .on_block = .{
+            .signed_block = .{
+                .block = .{
+                    .slot = 2,
+                    .proposer_index = 0,
+                    .parent_root = std.mem.zeroes(types.Root),
+                    .state_root = std.mem.zeroes(types.Root),
+                    .body = .{ .attestations = attestations2 },
+                },
+                .signature = signatures2,
+            },
+            .prune_forkchoice = true,
+            .block_root = sentinel,
+        },
+    };
+    try testing.expect(msg_with_root.on_block.block_root != null);
+    try testing.expect(std.mem.eql(u8, &msg_with_root.on_block.block_root.?, &sentinel));
+    msg_with_root.deinit();
 }
 
 test "Message.deinit: POD variants are no-ops" {

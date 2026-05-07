@@ -50,9 +50,11 @@ const NodeOpts = struct {
     /// dedicated worker thread and producer-side handlers for
     /// gossip blocks / attestations route through its bounded
     /// queues instead of running synchronously on the libp2p
-    /// thread. Default `false` preserves slice-(b) behavior.
-    /// Surfaced to the CLI as `--chain-worker=on|off` (bool).
-    chain_worker_enabled: bool = false,
+    /// thread. Default `true` post devnet-4 burn-in: the worker
+    /// path is the supported prod path. Surfaced to the CLI as
+    /// `--chain-worker` (bool); `--chain-worker false` is the
+    /// kill-switch for the legacy synchronous path.
+    chain_worker_enabled: bool = true,
 };
 
 pub const BeamNode = struct {
@@ -305,7 +307,13 @@ pub const BeamNode = struct {
             },
         }
 
-        const result = self.chain.onGossip(data, sender_peer_id) catch |err| {
+        // Slice (e) of #803: thread `precomputed_block_root` through
+        // chain.onGossip so the chain layer doesn't recompute the
+        // hash-tree root we already have. For non-block gossip
+        // (attestation/aggregation) we pass `null`; the chain layer
+        // ignores it on those branches.
+        const root_for_chain: ?types.Root = if (data.* == .block) precomputed_block_root else null;
+        const result = self.chain.onGossip(data, sender_peer_id, root_for_chain) catch |err| {
             switch (err) {
                 // Block rejected because it's before finalized - drop it and prune any cached
                 // descendants we might still be holding onto.
@@ -1374,14 +1382,46 @@ pub const BeamNode = struct {
     ) !void {
         if (roots.len == 0) return;
 
-        // Check if any of the requested blocks are missing
+        // Slice (d) of #803: snapshot forkchoice presence for every
+        // root in one shared-lock acquisition (`hasBlocksBatch`),
+        // then dedup against the network-side caches under their own
+        // independent locks. Pre-#803 `fetchBlockByRoots` did N
+        // shared-lock acquires on the forkchoice and a sequential
+        // walk; under heavy gossip fanout that turned the dedup
+        // step into a serializing hot point. The batched call is
+        // strictly cheaper for any N ≥ 2 and equivalent at N == 1.
+        //
+        // We dedup against three caches in priority order so
+        // `lean_block_fetch_dedup_total{outcome}` faithfully reports
+        // *why* a root was already not-fetched:
+        //   1. forkchoice protoArray (already ingested).
+        //   2. network.block_cache (fetched, awaiting parent or STF).
+        //   3. network.pending_block_roots (RPC in flight; another
+        //      `fetchBlockByRoots` call is already responsible).
+        // The remainder feeds the actual RPC dispatch.
+        var fc_present_buf: std.ArrayListUnmanaged(bool) = .empty;
+        defer fc_present_buf.deinit(self.allocator);
+        try fc_present_buf.resize(self.allocator, roots.len);
+        try self.chain.forkChoice.hasBlocksBatch(roots, fc_present_buf.items);
+
         var missing_roots: std.ArrayList(types.Root) = .empty;
         defer missing_roots.deinit(self.allocator);
+        try missing_roots.ensureTotalCapacityPrecise(self.allocator, roots.len);
 
-        for (roots) |root| {
-            if (!self.chain.forkChoice.hasBlock(root)) {
-                try missing_roots.append(self.allocator, root);
+        for (roots, fc_present_buf.items) |root, fc_present| {
+            if (fc_present) {
+                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "already_in_forkchoice" }) catch {};
+                continue;
             }
+            if (self.network.hasFetchedBlock(root)) {
+                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "already_in_block_cache" }) catch {};
+                continue;
+            }
+            if (self.network.hasPendingBlockRoot(root)) {
+                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "already_pending" }) catch {};
+                continue;
+            }
+            missing_roots.appendAssumeCapacity(root);
         }
 
         if (missing_roots.items.len == 0) return;
@@ -1412,6 +1452,12 @@ pub const BeamNode = struct {
                 self.node_registry.getNodeNameFromPeerId(request_info.peer_id),
                 request_info.request_id,
             });
+            // Slice (d): one bump per actually-fetched root so the
+            // outcome buckets sum to `roots.len` for every call.
+            var i: usize = 0;
+            while (i < missing_roots.items.len) : (i += 1) {
+                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "fetched" }) catch {};
+            }
         }
     }
 
