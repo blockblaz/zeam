@@ -1518,6 +1518,34 @@ pub const BeamNode = struct {
                 .{ .outcome = "fetched" },
                 missing_roots.items.len,
             ) catch {};
+        } else {
+            // PR #842 review followup: `ensureBlocksByRootRequest`
+            // can return `null` non-erroneously when
+            // `shouldRequestBlocksByRoot` rejects the batch — every
+            // root was already in `network.pending_block_roots` or
+            // `network.block_cache` by the time the network helper
+            // re-checked, in between our `hasBlocksBatch` snapshot
+            // and this dispatch (the benign TOCTOU documented at the
+            // top of this function). Without a bucket here those
+            // roots fall through unaccounted and the
+            // `sum(rate(lean_block_fetch_dedup_total)) ==
+            //  sum(rate(… by outcome))` invariant the audit test
+            // claims to lock breaks under any racing-gossip workload.
+            //
+            // The `roots.len == 0` early return inside
+            // `ensureBlocksByRootRequest` is unreachable from this
+            // call site — the surrounding `if (missing_roots.items.len
+            // == 0) return;` guard handles that case before we
+            // dispatch — so `dedup_lost_race` is the only legitimate
+            // null cause we need to account for.
+            self.logger.debug(
+                "blocks-by-root dispatch deduped late: {d} root(s) became known to network caches between snapshot and dispatch",
+                .{missing_roots.items.len},
+            );
+            zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                .{ .outcome = "dedup_lost_race" },
+                missing_roots.items.len,
+            ) catch {};
         }
     }
 

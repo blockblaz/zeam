@@ -187,6 +187,12 @@ const Metrics = struct {
     //     returned `error.NoPeersAvailable` (PR #842 review #1).
     //   * `fetch_failed` — dispatch attempted but failed for any
     //     other reason (queue full, encode failure, …).
+    //   * `dedup_lost_race` — every requested root entered
+    //     `network.pending_block_roots` or `network.block_cache`
+    //     between our `hasBlocksBatch` snapshot and the network
+    //     helper's re-check, so dispatch was suppressed (PR #842
+    //     review followup). The benign TOCTOU window is documented
+    //     in `BeamNode.fetchBlockByRoots`.
     lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -668,7 +674,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
-        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed." }, .{}),
+        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -1023,14 +1029,16 @@ test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in 
     metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
 
     // lean_block_fetch_dedup_total{outcome} — slice (d). PR #842
-    // review #1 added `fetch_no_peers` and `fetch_failed`; assert all
-    // six outcomes appear so a label rename / drop fails CI.
+    // review #1 added `fetch_no_peers` and `fetch_failed`; the
+    // review followup added `dedup_lost_race`. Assert all seven
+    // outcomes appear so a label rename / drop fails CI.
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_forkchoice" }, 3) catch {};
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_block_cache" }, 5) catch {};
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_pending" }, 7) catch {};
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetched" }, 11) catch {};
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_no_peers" }, 13) catch {};
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_failed" }, 17) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "dedup_lost_race" }, 19) catch {};
 
     var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
     defer alloc_writer.deinit();
@@ -1058,6 +1066,7 @@ test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in 
         "outcome=\"fetched\"",
         "outcome=\"fetch_no_peers\"",
         "outcome=\"fetch_failed\"",
+        "outcome=\"dedup_lost_race\"",
     };
     for (fetch_outcomes) |lbl| {
         try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
