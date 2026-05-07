@@ -1039,14 +1039,31 @@ fn refreshSwarmCommandDropMetric() void {
 pub extern fn get_mesh_peers_total(network_id: u32) callconv(.c) u64;
 
 /// leanMetrics PR #35 — `lean_gossip_mesh_peers`.
-/// zeam currently runs a single libp2p network instance per process. If that
-/// changes, switch to per-instance scrape refreshers so each network reports
-/// its own mesh size.
-var mesh_peers_network_id: u32 = 0;
+///
+/// The Rust glue keeps `MESH_PEERS_TOTAL` as a fixed-size
+/// `[AtomicU64; MAX_NETWORKS]` (slots for `network_id` 0…MAX_NETWORKS-1,
+/// matching the hardcoded slot table in `rust/libp2p-glue/src/lib.rs`).
+/// Sum across every slot rather than tracking a single "active"
+/// network_id in a Zig-side global — the previous design silently
+/// reported only the most recently `init`-ed network's count if more
+/// than one `EthLibp2p` was created in-process (multi-network tests,
+/// future multi-network deployments). Inactive slots are 0 (reset by
+/// `stop_network` and never written for unused ids), so summing is the
+/// correct single-gauge answer for every current usage.
+///
+/// A future per-network label scheme (`client=<name>_<N>`) would emit
+/// one labelled gauge per non-zero slot rather than summing. The
+/// fixed-size atomic shape on the Rust side is what makes that change a
+/// localised follow-up rather than a re-architecture.
+const MESH_PEERS_MAX_NETWORKS: u32 = 3;
 
 fn refreshMeshPeersMetric() void {
-    const count = get_mesh_peers_total(mesh_peers_network_id);
-    zeam_metrics.metrics.lean_gossip_mesh_peers.set(count);
+    var total: u64 = 0;
+    var network_id: u32 = 0;
+    while (network_id < MESH_PEERS_MAX_NETWORKS) : (network_id += 1) {
+        total += get_mesh_peers_total(network_id);
+    }
+    zeam_metrics.metrics.lean_gossip_mesh_peers.set(total);
 }
 
 /// Combined scrape refresher for all network-layer metrics. Historically
@@ -1125,12 +1142,14 @@ pub const EthLibp2p = struct {
         // and turns them into deltas on `zeam_libp2p_swarm_command_dropped_total`.
         // Counts are global; registering once is enough even with multiple
         // EthLibp2p instances (the call is idempotent).
-        // leanMetrics PR #35: stash the network_id for the mesh-peers
+        // leanMetrics PR #35: register the network-layer scrape
         // refresher. `registerScrapeRefresher` is now append-only (the
-        // metrics module keeps a bounded list); we still register a single
-        // network-layer fan-out (`refreshNetworkMetrics`) for the reasons
-        // documented at its definition above.
-        mesh_peers_network_id = params.networkId;
+        // metrics module keeps a bounded list); we still register a
+        // single network-layer fan-out (`refreshNetworkMetrics`) for
+        // the reasons documented at its definition above. The mesh-peers
+        // refresher inside the fan-out sums across all `network_id`
+        // slots on the Rust side, so we do not need to stash this
+        // instance's `params.networkId` in a Zig-side global.
         zeam_metrics.registerScrapeRefresher(refreshNetworkMetrics);
 
         const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger, params.node_registry);
