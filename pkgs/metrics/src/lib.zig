@@ -68,6 +68,14 @@ const Metrics = struct {
     // refresher — see `registerScrapeRefresher` and the network-layer
     // implementation in `pkgs/network/src/ethlibp2p.zig`.
     zeam_libp2p_swarm_command_dropped_total: LibP2pSwarmCommandDroppedCounter,
+    // leanMetrics PR #35: number of remote peers in the gossipsub mesh
+    // across all subscribed topics. Refreshed from a Rust-side atomic on
+    // every scrape via a registered refresher — see
+    // `registerScrapeRefresher` and the network-layer implementation in
+    // `pkgs/network/src/ethlibp2p.zig`. TODO: per-remote-peer label scheme
+    // (matching `lean_connected_peers`) requires subscribing to gossipsub
+    // Subscribed/Unsubscribed events; left as follow-up work.
+    lean_gossip_mesh_peers: LeanGossipMeshPeersGauge,
     // Node lifecycle metrics
     lean_node_info: LeanNodeInfoGauge,
     lean_node_start_time_seconds: LeanNodeStartTimeGauge,
@@ -184,6 +192,7 @@ const Metrics = struct {
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
     const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
     const LibP2pSwarmCommandDroppedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const LeanGossipMeshPeersGauge = metrics_lib.Gauge(u64);
     // Node lifecycle metric types
     const LeanNodeInfoGauge = metrics_lib.GaugeVec(u64, struct { name: []const u8, version: []const u8 });
     const LeanNodeStartTimeGauge = metrics_lib.Gauge(u64);
@@ -572,6 +581,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, io, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
         .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, io, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
         .zeam_libp2p_swarm_command_dropped_total = try Metrics.LibP2pSwarmCommandDroppedCounter.init(allocator, io, "zeam_libp2p_swarm_command_dropped_total", .{ .help = "Total number of swarm commands dropped before reaching the rust-libp2p event loop, by reason (issue #808)" }, .{}),
+        .lean_gossip_mesh_peers = Metrics.LeanGossipMeshPeersGauge.init("lean_gossip_mesh_peers", .{ .help = "Number of peers in the gossipsub mesh" }, .{}),
         // Node lifecycle metrics
         .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, io, "lean_node_info", .{ .help = "Node information (always 1)" }, .{}),
         .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Start timestamp" }, .{}),
@@ -670,40 +680,95 @@ pub fn init(allocator: std.mem.Allocator) !void {
     g_initialized = true;
 }
 
-/// Optional pre-scrape refresher. Modules that own state outside the
-/// `Metrics` struct (e.g. a Rust-side atomic counter accessed via FFI) can
-/// register a callback here; it is invoked on every `writeMetrics` so the
-/// counter values reflect the latest source-of-truth at scrape time. Issue
-/// #808 (libp2p swarm command drops) is the first user.
-var g_scrape_refresher: ?*const fn () void = null;
+/// Pre-scrape refresher registry. Modules that own state outside the
+/// `Metrics` struct (e.g. a Rust-side atomic counter accessed via FFI, or
+/// a `*BeamChain` whose in-memory map needs to be sampled) can register
+/// callbacks here; every registered callback is invoked on every
+/// `writeMetrics` so counter/gauge values reflect the latest source of
+/// truth at scrape time.
+///
+/// Two callback shapes are supported:
+///   * `void → void` — for FFI-backed atomic counters that need no
+///     context (issue #808 — libp2p swarm command drops, leanMetrics PR
+///     #35 — `lean_gossip_mesh_peers`).
+///   * `*anyopaque → void` — for callers that need to thread a pointer
+///     back to themselves rather than coerce state into a global (slice
+///     c-2b commit 5 of #803 — `lean_chain_state_refcount_distribution`,
+///     where the observer iterates a `*BeamChain` states map under its
+///     shared lock).
+///
+/// Each kind is stored in its own bounded list. Both lists are appended
+/// to in registration order; on every scrape the void-list runs first,
+/// then the ctx-list, preserving the original `g_scrape_refresher` →
+/// `g_scrape_refresher_ctx` ordering so any caller that relies on it
+/// (e.g. the FFI counters being refreshed before a context-bearing
+/// observer reads from them) keeps working.
+///
+/// The list is bounded (no allocator dependency: this module is used
+/// from ZKVM targets where allocators are constrained, and the registry
+/// is touched at startup only). `MAX_SCRAPE_REFRESHERS` is sized
+/// generously vs. the current ~2 callsites; if a future contributor
+/// needs more, raise the constant rather than adding a parallel slot.
+const MAX_SCRAPE_REFRESHERS: usize = 16;
 
-/// Register (or replace) a scrape refresher. Pass `null` to clear. Safe to
-/// call before `init()`; the registration sticks regardless of init order.
+var g_scrape_refreshers: [MAX_SCRAPE_REFRESHERS]*const fn () void = undefined;
+var g_scrape_refreshers_len: usize = 0;
+
+const CtxRefresher = struct {
+    refresher: *const fn (?*anyopaque) void,
+    ctx: ?*anyopaque,
+};
+var g_scrape_refreshers_ctx: [MAX_SCRAPE_REFRESHERS]CtxRefresher = undefined;
+var g_scrape_refreshers_ctx_len: usize = 0;
+
+/// Append a void-context scrape refresher. Safe to call before `init()`;
+/// the registration sticks regardless of init order. Passing `null` is a
+/// no-op (kept for API symmetry with prior behaviour where `null` cleared
+/// the single slot — the registry is now append-only and individual
+/// callbacks cannot be removed at runtime, which mirrors the actual usage
+/// pattern: every caller is a process-lifetime singleton). Panics if more
+/// than `MAX_SCRAPE_REFRESHERS` callbacks are registered, which would
+/// indicate a bug (callers re-registering on every scrape) rather than
+/// legitimate growth.
 pub fn registerScrapeRefresher(refresher: ?*const fn () void) void {
-    g_scrape_refresher = refresher;
+    const cb = refresher orelse return;
+    if (g_scrape_refreshers_len >= MAX_SCRAPE_REFRESHERS) {
+        std.debug.panic(
+            "registerScrapeRefresher: too many callbacks (limit={d})",
+            .{MAX_SCRAPE_REFRESHERS},
+        );
+    }
+    g_scrape_refreshers[g_scrape_refreshers_len] = cb;
+    g_scrape_refreshers_len += 1;
 }
 
-/// Optional context-bearing pre-scrape refresher. Slice c-2b commit 5 of
-/// #803 (lean_chain_state_refcount_distribution) needed a callback that
-/// receives a `*BeamChain` so the observer could iterate the chain's
-/// in-memory states map under its shared lock and sample each rc's
-/// refcount. The first-form `g_scrape_refresher` slot above is
-/// `void → void` (used for FFI-backed atomic counters that need no
-/// context); rather than coerce the chain into a global, we expose a
-/// parallel slot that takes an opaque pointer back to the caller. The
-/// two slots are independent and both run on every scrape (the FFI
-/// refresher first, then the context-bearing one).
-var g_scrape_refresher_ctx: ?*const fn (?*anyopaque) void = null;
-var g_scrape_refresher_ctx_ptr: ?*anyopaque = null;
-
-/// Register (or replace) a context-bearing scrape refresher. Pass `null`
-/// for `refresher` to clear (the ctx pointer is also cleared).
+/// Append a context-bearing scrape refresher. Passing `null` for
+/// `refresher` is a no-op (see `registerScrapeRefresher` for the
+/// rationale). Panics on overflow for the same reason.
 pub fn registerScrapeRefresherCtx(
     ctx: ?*anyopaque,
     refresher: ?*const fn (?*anyopaque) void,
 ) void {
-    g_scrape_refresher_ctx = refresher;
-    g_scrape_refresher_ctx_ptr = if (refresher == null) null else ctx;
+    const cb = refresher orelse return;
+    if (g_scrape_refreshers_ctx_len >= MAX_SCRAPE_REFRESHERS) {
+        std.debug.panic(
+            "registerScrapeRefresherCtx: too many callbacks (limit={d})",
+            .{MAX_SCRAPE_REFRESHERS},
+        );
+    }
+    g_scrape_refreshers_ctx[g_scrape_refreshers_ctx_len] = .{
+        .refresher = cb,
+        .ctx = ctx,
+    };
+    g_scrape_refreshers_ctx_len += 1;
+}
+
+/// Test-only: drop every registered scrape refresher so unit tests can
+/// exercise `writeMetrics` against a known-empty registry. NOT exposed
+/// outside test code paths in production callers.
+pub fn resetScrapeRefreshersForTest() void {
+    g_scrape_refreshers_len = 0;
+    g_scrape_refreshers_ctx_len = 0;
 }
 
 /// Writes metrics to a writer (for Prometheus endpoint).
@@ -716,13 +781,185 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
         return;
     }
 
-    // Pull in any externally-owned counters (e.g. Rust-side libp2p drops)
-    // before serializing so each scrape returns up-to-date values.
-    if (g_scrape_refresher) |refresher| refresher();
-    // Context-bearing refresher (slice c-2b commit 5 of #803): runs
-    // after the void-refresher so a future contributor can rely on
-    // ordering when the two refreshers' outputs share buckets/labels.
-    if (g_scrape_refresher_ctx) |refresher| refresher(g_scrape_refresher_ctx_ptr);
+    // Pull in any externally-owned counters (e.g. Rust-side libp2p drops,
+    // gossipsub mesh peers, BeamChain refcount distribution) before
+    // serializing so each scrape returns up-to-date values. Void-context
+    // refreshers run first, then context-bearing ones, preserving the
+    // legacy ordering between FFI-backed atomic refreshes and
+    // context-bearing observers that may read from them.
+    var i: usize = 0;
+    while (i < g_scrape_refreshers_len) : (i += 1) {
+        g_scrape_refreshers[i]();
+    }
+    i = 0;
+    while (i < g_scrape_refreshers_ctx_len) : (i += 1) {
+        const entry = g_scrape_refreshers_ctx[i];
+        entry.refresher(entry.ctx);
+    }
 
     try metrics_lib.write(&metrics, writer);
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+const testing = std.testing;
+
+// leanMetrics PR #35 — lock the gauge↑scrape contract for
+// `lean_gossip_mesh_peers` in code so a future contributor cannot drop
+// the gauge from the `Metrics` struct, rename it, or break the
+// `writeMetrics` serializer without a CI failure here. Slice (b)'s
+// explicit lesson (LockTimer → /metrics output test in
+// `pkgs/node/src/locking.zig`) and slice c-2b's
+// `lean_chain_state_refcount_distribution` audit (PR #803) was that
+// doc-only audits regress silently — every Prometheus-exposed metric
+// added by this PR/repo earns a 20-line scrape test.
+//
+// We cannot exercise the FFI side (`get_mesh_peers_total →
+// refreshMeshPeersMetric → gauge`) without a real swarm, but the path
+// from `gauge.set(N)` through the serializer to the Prometheus body is
+// the only place where a future struct-level change would silently
+// break the contract. That path is what we cover here.
+test "lean_gossip_mesh_peers gauge appears in scrape output" {
+    if (isZKVM()) return;
+
+    // The metrics globals (`metrics`, `g_initialized`, the refresher
+    // arrays) are process-wide and may have been initialized by an
+    // earlier test in this binary. `init` is idempotent (it bails on
+    // `g_initialized`); explicitly call it here so this test can run
+    // standalone too.
+    //
+    // Use the page allocator (rather than `testing.allocator`) for the
+    // same reason `pkgs/node/src/locking.zig`'s LockTimer test does:
+    // the labelled metrics under `metrics` allocate buckets/maps that
+    // outlive any single test, and freeing them through a per-test
+    // allocator after teardown trips the DebugAllocator. The metrics
+    // module is a process-lifetime singleton; tracking its footprint
+    // through `testing.allocator` is not the contract we want to assert.
+    try init(std.heap.page_allocator);
+
+    // Set a recognisable, non-default value so we can grep for it in
+    // the scrape body. Pick something that's unlikely to collide with
+    // any other gauge value in the same scrape.
+    const expected: u64 = 4242;
+    metrics.lean_gossip_mesh_peers.set(expected);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    // The metric name itself must appear (TYPE / HELP lines plus the
+    // value line itself).
+    try testing.expect(
+        std.mem.indexOf(u8, body, "lean_gossip_mesh_peers") != null,
+    );
+
+    // And the value line `lean_gossip_mesh_peers <expected>` (with the
+    // surrounding whitespace expected from Prometheus exposition
+    // format) must be present — this is what locks the gauge↑scrape
+    // contract: the value we set really did make it through
+    // `writeMetrics`.
+    var expected_line_buf: [128]u8 = undefined;
+    const expected_line = std.fmt.bufPrint(
+        &expected_line_buf,
+        "lean_gossip_mesh_peers {d}",
+        .{expected},
+    ) catch unreachable;
+    try testing.expect(
+        std.mem.indexOf(u8, body, expected_line) != null,
+    );
+}
+
+// Lock the append-only behaviour of the scrape-refresher registry: a
+// previous design stored a single callback per kind, and registering a
+// second callback silently overwrote the first. The metrics module now
+// keeps a bounded list (`MAX_SCRAPE_REFRESHERS`); this test guards the
+// list semantics in code so a future contributor cannot regress to a
+// single-slot design without CI failing.
+test "registerScrapeRefresher fans out to all registered callbacks" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    // Snapshot + reset the registry for this test, then restore the
+    // production callbacks afterwards so we don't perturb other tests
+    // running in the same binary.
+    const saved_void_len = g_scrape_refreshers_len;
+    const saved_ctx_len = g_scrape_refreshers_ctx_len;
+    var saved_void: [MAX_SCRAPE_REFRESHERS]*const fn () void = undefined;
+    var saved_ctx: [MAX_SCRAPE_REFRESHERS]CtxRefresher = undefined;
+    @memcpy(saved_void[0..saved_void_len], g_scrape_refreshers[0..saved_void_len]);
+    @memcpy(saved_ctx[0..saved_ctx_len], g_scrape_refreshers_ctx[0..saved_ctx_len]);
+    defer {
+        g_scrape_refreshers_len = saved_void_len;
+        g_scrape_refreshers_ctx_len = saved_ctx_len;
+        @memcpy(g_scrape_refreshers[0..saved_void_len], saved_void[0..saved_void_len]);
+        @memcpy(g_scrape_refreshers_ctx[0..saved_ctx_len], saved_ctx[0..saved_ctx_len]);
+    }
+
+    resetScrapeRefreshersForTest();
+
+    const Hits = struct {
+        var first: u32 = 0;
+        var second: u32 = 0;
+        var ctx_first: u32 = 0;
+        var ctx_second: u32 = 0;
+        var ctx_value: u64 = 0;
+
+        fn firstCb() void {
+            first += 1;
+        }
+        fn secondCb() void {
+            second += 1;
+        }
+        fn ctxFirstCb(p: ?*anyopaque) void {
+            ctx_first += 1;
+            if (p) |raw| {
+                const slot: *u64 = @ptrCast(@alignCast(raw));
+                ctx_value = slot.*;
+            }
+        }
+        fn ctxSecondCb(_: ?*anyopaque) void {
+            ctx_second += 1;
+        }
+    };
+
+    Hits.first = 0;
+    Hits.second = 0;
+    Hits.ctx_first = 0;
+    Hits.ctx_second = 0;
+    Hits.ctx_value = 0;
+
+    var ctx_payload: u64 = 7;
+
+    registerScrapeRefresher(Hits.firstCb);
+    registerScrapeRefresher(Hits.secondCb);
+    registerScrapeRefresherCtx(@ptrCast(&ctx_payload), Hits.ctxFirstCb);
+    registerScrapeRefresherCtx(null, Hits.ctxSecondCb);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+
+    // Both void-context callbacks fired exactly once — single-slot
+    // overwrite would have left `first == 0`.
+    try testing.expectEqual(@as(u32, 1), Hits.first);
+    try testing.expectEqual(@as(u32, 1), Hits.second);
+    // Both context-bearing callbacks fired exactly once.
+    try testing.expectEqual(@as(u32, 1), Hits.ctx_first);
+    try testing.expectEqual(@as(u32, 1), Hits.ctx_second);
+    // The opaque pointer was threaded through to the callback.
+    try testing.expectEqual(@as(u64, 7), Hits.ctx_value);
+
+    // Calling writeMetrics again invokes them again, proving the
+    // refreshers run on every scrape (not just first scrape).
+    var alloc_writer2 = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer2.deinit();
+    try writeMetrics(&alloc_writer2.writer);
+    try testing.expectEqual(@as(u32, 2), Hits.first);
+    try testing.expectEqual(@as(u32, 2), Hits.second);
+    try testing.expectEqual(@as(u32, 2), Hits.ctx_first);
+    try testing.expectEqual(@as(u32, 2), Hits.ctx_second);
 }

@@ -289,6 +289,31 @@ fn record_swarm_command_drop(reason: SwarmCommandDropReason) {
     SWARM_COMMAND_DROPPED_TOTAL[reason as usize].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Maximum number of concurrent libp2p networks supported in this
+/// process. Mirrors the `match network_id { 0|1|2 => …, _ => panic }`
+/// hardcoded slot table at the top of this file (`get_swarm_mut`,
+/// `set_swarm`, `get_zig_handler`, etc.) — `MESH_PEERS_TOTAL` reuses the
+/// same fixed-size shape so a metric write on an unsupported
+/// `network_id` cannot grow an unbounded map and stays lock-free.
+const MAX_NETWORKS: usize = 3;
+
+/// Store the latest mesh-peer count for `network_id`. Called from the
+/// swarm task on the gossipsub events that actually change mesh
+/// membership (Subscribed/Unsubscribed/GossipsubNotSupported/SlowPeer
+/// — not Message), on every connection close, and on a 1s liveness
+/// tick; read by Zig on each Prometheus scrape via
+/// `get_mesh_peers_total`.
+///
+/// Out-of-range `network_id` is a silent no-op rather than a panic so
+/// FFI consumers compiled against an older Rust glue cannot crash the
+/// swarm task. The matching `get_mesh_peers_total` returns 0 for the
+/// same out-of-range values.
+fn record_mesh_peers(network_id: u32, count: u64) {
+    if let Some(slot) = MESH_PEERS_TOTAL.get(network_id as usize) {
+        slot.store(count, Ordering::Relaxed);
+    }
+}
+
 /// FFI getter: cumulative count of dropped swarm commands for the given
 /// reason tag (see `SwarmCommandDropReason`). Returns 0 for unknown tags so
 /// future Zig builds compiled against an older Rust glue do not panic.
@@ -301,6 +326,36 @@ pub extern "C" fn get_swarm_command_dropped_total(reason_tag: u32) -> u64 {
     SWARM_COMMAND_DROPPED_TOTAL
         .get(reason_tag as usize)
         .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// FFI getter: current number of remote peers in this node's gossipsub mesh
+/// across all subscribed topics (single snapshot, kept fresh from the swarm
+/// task). Returns 0 for unknown `network_id` so a Zig build compiled against
+/// an older Rust glue cannot panic.
+///
+/// Scrape-vs-lifecycle note: between `stop_network(network_id)` and a
+/// subsequent `create_and_run_network(network_id)`, this returns 0
+/// (the slot is reset on stop). Operators must distinguish "0 mesh
+/// peers on a running network" from "network is restarting" via
+/// orthogonal signals (e.g. `lean_node_info`, the swarm task's own
+/// liveness logging, or a separate per-network running gauge if that
+/// distinction becomes load-bearing — see follow-up TODO in the
+/// 1s-tick / event-loop wiring above).
+///
+/// leanMetrics PR #35 — `lean_gossip_mesh_peers`. The value is updated from
+/// inside the swarm task on the gossipsub events that change mesh
+/// membership (Subscribed/Unsubscribed/GossipsubNotSupported/SlowPeer
+/// — not Message), on every connection close, and on a 1s liveness tick.
+///
+/// Return type is `u64` for FFI stability across 32-bit and 64-bit
+/// architectures (the underlying source is `usize` from
+/// `all_mesh_peers().count()`; cast at the recording site).
+#[no_mangle]
+pub extern "C" fn get_mesh_peers_total(network_id: u32) -> u64 {
+    MESH_PEERS_TOTAL
+        .get(network_id as usize)
+        .map(|a| a.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
 
@@ -318,6 +373,27 @@ lazy_static::lazy_static! {
     static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::Sender<SwarmCommand>>> = Mutex::new(HashMap::new());
     static ref COMMAND_RECEIVERS: Mutex<HashMap<u32, mpsc::Receiver<SwarmCommand>>> = Mutex::new(HashMap::new());
 }
+
+/// Current number of remote peers in this node's gossipsub mesh, across all
+/// subscribed topics. Updated from inside the swarm task on the gossipsub
+/// events that actually change mesh membership
+/// (Subscribed/Unsubscribed/GossipsubNotSupported/SlowPeer — not Message),
+/// on every connection close, and on a 1s liveness tick; read by Zig on
+/// each Prometheus scrape via `get_mesh_peers_total`.
+///
+/// One fixed-size lock-free slot per network, indexed by `network_id`,
+/// mirroring the `[AtomicU64; 3]` shape used by
+/// `SWARM_COMMAND_DROPPED_TOTAL` (issue #808). The hardcoded slot table
+/// at the top of this file (`get_swarm_mut`, `set_swarm`, …) caps live
+/// networks at `MAX_NETWORKS = 3`, so we don't need a `Mutex<HashMap>`
+/// to handle dynamic growth — and avoiding the mutex drops the
+/// poisoning concern entirely (no `lock()`, no `unwrap()`, no
+/// `Err(poisoned).into_inner()`).
+///
+/// Access uses `Relaxed` ordering — Prometheus scrapes are eventually
+/// consistent and a one-tick lag is fine.
+static MESH_PEERS_TOTAL: [AtomicU64; MAX_NETWORKS] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_CHANNEL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -355,6 +431,14 @@ pub unsafe extern "C" fn stop_network(network_id: u32) {
     }
     COMMAND_SENDERS.lock().unwrap().remove(&network_id);
     COMMAND_RECEIVERS.lock().unwrap().remove(&network_id);
+    // Reset the mesh-peers slot so repeated start/stop cycles don't show a
+    // stale count from the previous run; `get_mesh_peers_total` returns 0
+    // for slots that have never been written. The `[AtomicU64; MAX_NETWORKS]`
+    // shape (vs the previous `Mutex<HashMap>`) means there is no entry to
+    // remove — just a counter to zero — and no mutex to poison on shutdown.
+    if let Some(slot) = MESH_PEERS_TOTAL.get(network_id as usize) {
+        slot.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Wait for a network to be fully initialized and ready to accept messages.
@@ -1095,6 +1179,13 @@ impl Network {
             .unwrap()
             .insert(self.network_id, cmd_rx);
 
+        // leanMetrics PR #35: with the fixed-size `[AtomicU64;
+        // MAX_NETWORKS]` shape, slots are always present (default 0). No
+        // explicit allocation is required. The 1s mesh-peers tick will
+        // overwrite the slot with the real count on its first fire, and
+        // the Subscribed/ConnectionClosed paths handle transitions in
+        // between.
+
         // Signal that this network is now ready
         {
             let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
@@ -1126,6 +1217,13 @@ impl Network {
         // so the first iteration's shutdown arm will see the permit and break.
         let shutdown = unsafe { install_shutdown_notify(self.network_id) }
             .expect("unsupported network_id for shutdown signal");
+
+        // leanMetrics PR #35: 1s liveness tick that recomputes the gossipsub
+        // mesh-peer count even when no swarm/gossipsub events are firing.
+        // Gossipsub events should already cover all transitions; the tick is
+        // defensive so an idle topic still reports a fresh value on scrape.
+        let mut mesh_peers_tick = tokio::time::interval(Duration::from_secs(1));
+        mesh_peers_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         'eventloop: loop {
             tokio::select! {
@@ -1332,6 +1430,13 @@ impl Network {
                                 cause,
                                 ..
                             } => {
+                                // leanMetrics PR #35: a peer leaving may evict
+                                // it from the gossipsub mesh; recompute first
+                                // so the metric reflects the new state even if
+                                // a `continue` below skips out early.
+                                let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
+                                record_mesh_peers(self.network_id, mesh_count);
+
                                 let peer_id_string = peer_id.to_string();
 
                             // Retrieve and remove stored direction
@@ -1456,39 +1561,76 @@ impl Network {
                                 }
                             }
                         }
-                        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                            message,
-                            ..
-                        })) => {
-                            let topic = message.topic.as_str();
-                            let topic = match CString::new(topic) {
-                                Ok(cstr) => cstr,
-                                Err(_) => {
-                                    logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic));
-                                    continue;
-                                }
-                            };
-                            let topic = topic.as_ptr();
+                        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub_event)) => {
+                            // leanMetrics PR #35: gate the mesh-peer recompute on
+                            // the gossipsub event variants that actually change
+                            // mesh membership. `Message` does NOT — a busy node
+                            // can deliver hundreds of `Message` events per second
+                            // and the prior "recompute on every event" path
+                            // turned the metric refresh into O(peers²) cumulative
+                            // work just for the gauge.
+                            //
+                            // Variants that DO change mesh membership:
+                            //   * `Subscribed` / `Unsubscribed` — a peer joined or
+                            //     left a topic this node subscribes to.
+                            //   * `GossipsubNotSupported` — a connected peer
+                            //     turned out not to speak gossipsub; gossipsub
+                            //     drops it from any future mesh.
+                            //   * `SlowPeer` — gossipsub may evict the peer from
+                            //     the mesh under backpressure.
+                            //
+                            // The 1s liveness tick (`mesh_peers_tick.tick()`) and
+                            // the `ConnectionClosed` recompute already cover
+                            // "events occurred outside this branch" so a missed
+                            // gauge update inside `Message` cannot drift longer
+                            // than ~1s in the worst case. `all_mesh_peers().count()`
+                            // is itself O(peers) and lock-free for the atomic
+                            // store — the cost we are avoiding here is the
+                            // walk per event, not the store.
+                            let mesh_changed = matches!(
+                                gossipsub_event,
+                                gossipsub::Event::Subscribed { .. }
+                                    | gossipsub::Event::Unsubscribed { .. }
+                                    | gossipsub::Event::GossipsubNotSupported { .. }
+                                    | gossipsub::Event::SlowPeer { .. }
+                            );
+                            if mesh_changed {
+                                let mesh_count =
+                                    swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
+                                record_mesh_peers(self.network_id, mesh_count);
+                            }
 
-                            let message_ptr = message.data.as_ptr();
-                            let message_len = message.data.len();
+                            if let gossipsub::Event::Message { message, .. } = gossipsub_event {
+                                let topic = message.topic.as_str();
+                                let topic = match CString::new(topic) {
+                                    Ok(cstr) => cstr,
+                                    Err(_) => {
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic));
+                                        continue;
+                                    }
+                                };
+                                let topic = topic.as_ptr();
 
-                            let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
-                            let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
-                                Ok(cstring) => cstring,
-                                Err(_) => {
-                                    logger::rustLogger.error(
-                                        self.network_id,
-                                        &format!("Failed to create C string for peer id {}", sender_peer_id_string),
-                                    );
-                                    continue;
-                                }
-                            };
+                                let message_ptr = message.data.as_ptr();
+                                let message_len = message.data.len();
 
-                            unsafe {
-                                handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
-                            };
-                            logger::rustLogger.debug(self.network_id, "zig callback completed");
+                                let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
+                                let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
+                                    Ok(cstring) => cstring,
+                                    Err(_) => {
+                                        logger::rustLogger.error(
+                                            self.network_id,
+                                            &format!("Failed to create C string for peer id {}", sender_peer_id_string),
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                unsafe {
+                                    handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
+                                };
+                                logger::rustLogger.debug(self.network_id, "zig callback completed");
+                            }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Reqresp(ReqRespMessage {
                             peer_id,
@@ -1786,6 +1928,16 @@ impl Network {
                 }
             }
 
+            // leanMetrics PR #35: 1s defensive recompute of the gossipsub
+            // mesh-peer count. Gossipsub events / connection closes already
+            // cover transitions, but this guarantees liveness on idle topics.
+            // `all_mesh_peers().count()` is cheap (O(peers)) and the atomic
+            // store is lock-free; no `await` here, so the swarm task is
+            // never blocked.
+            _ = mesh_peers_tick.tick() => {
+                let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
+                record_mesh_peers(self.network_id, mesh_count);
+            }
 
             }
         }
