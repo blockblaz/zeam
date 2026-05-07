@@ -1953,6 +1953,26 @@ pub const BeamChain = struct {
         };
         if (blockInfo.blockRoot != null) {
             zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onBlock" }) catch {};
+            // PR #842 review #2: see the rationale in
+            // `forkchoice.onBlock`. Same trust-but-verify pattern at
+            // the chain-level public API boundary; debug + ReleaseSafe
+            // only, free in `ReleaseFast` / `ReleaseSmall`.
+            if (std.debug.runtime_safety) verify: {
+                var verify_root: [32]u8 = undefined;
+                zeam_utils.hashTreeRoot(types.BeamBlock, block, &verify_root, self.allocator) catch |err| {
+                    self.logger.warn(
+                        "chain.onBlock: blockRoot verification re-hash failed: {any}",
+                        .{err},
+                    );
+                    break :verify;
+                };
+                if (!std.mem.eql(u8, &block_root, &verify_root)) {
+                    std.debug.panic(
+                        "chain.onBlock: caller-supplied blockRoot=0x{x} does NOT match recomputed=0x{x} for block slot={d} — forkchoice protoArray would be silently corrupted; call site bug",
+                        .{ &block_root, &verify_root, block.slot },
+                    );
+                }
+            }
         }
 
         const post_state_owned = blockInfo.postState == null;

@@ -174,10 +174,19 @@ const Metrics = struct {
     lean_block_root_compute_skipped_total: LeanBlockRootComputeSkippedCounter,
     // Slice (d) of #803: visibility into the parallel net-fetch +
     // missed-root prune dedup. Bumped per `fetchBlockByRoots` call by
-    // outcome bucket: `already_in_forkchoice`, `already_in_block_cache`,
-    // `already_pending`, `fetched`. Lets operators see how much
-    // duplicate fetch work the dedup is saving and — just as
-    // important — catch a regression that bypasses the dedup.
+    // outcome bucket. Every entry of the input `roots` lands in
+    // exactly one bucket, so the outcome counters sum to `roots.len`
+    // per call — useful for asserting `sum(rate(lean_block_fetch_dedup_total))
+    // == sum(rate(… by outcome))` as a Grafana invariant. Buckets:
+    //   * `already_in_forkchoice` — protoArray hit on `hasBlocksBatch`.
+    //   * `already_in_block_cache` — awaiting parent or STF.
+    //   * `already_pending` — RPC in flight; another
+    //     `fetchBlockByRoots` call is already responsible.
+    //   * `fetched` — dispatched to a peer via `blocks_by_root`.
+    //   * `fetch_no_peers` — dispatch attempted but `selectPeer`
+    //     returned `error.NoPeersAvailable` (PR #842 review #1).
+    //   * `fetch_failed` — dispatch attempted but failed for any
+    //     other reason (queue full, encode failure, …).
     lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -659,7 +668,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
-        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched." }, .{}),
+        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -989,4 +998,68 @@ test "registerScrapeRefresher fans out to all registered callbacks" {
     try testing.expectEqual(@as(u32, 2), Hits.second);
     try testing.expectEqual(@as(u32, 2), Hits.ctx_first);
     try testing.expectEqual(@as(u32, 2), Hits.ctx_second);
+}
+
+// Slice (d)/(e) of #803 (PR #842 review #4 / nit followup):
+// lock the metrics scrape contract for the slice (d) per-fetch dedup
+// counters and the slice (e) per-site root-compute-skipped counters
+// in code, so a label rename / family drop / serializer regression
+// fails CI here, not silently in production. Mirrors the slice-(b)
+// LockTimer audit pattern (`pkgs/node/src/locking.zig`) and the #788
+// metric audit added in PR #841.
+test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    // Bump every label the production code emits. `incr` / `incrBy`
+    // failures are swallowed to mirror production usage (the chain /
+    // node code uses `catch {}` on every metric write).
+
+    // lean_block_root_compute_skipped_total{site} — slice (e).
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onGossip" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onBlock" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.processPendingBlocks" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
+
+    // lean_block_fetch_dedup_total{outcome} — slice (d). PR #842
+    // review #1 added `fetch_no_peers` and `fetch_failed`; assert all
+    // six outcomes appear so a label rename / drop fails CI.
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_forkchoice" }, 3) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_block_cache" }, 5) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_pending" }, 7) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetched" }, 11) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_no_peers" }, 13) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_failed" }, 17) catch {};
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    // Top-level metric families must be advertised.
+    try testing.expect(std.mem.indexOf(u8, body, "lean_block_root_compute_skipped_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lean_block_fetch_dedup_total") != null);
+
+    const skip_sites = [_][]const u8{
+        "site=\"chain.onGossip\"",
+        "site=\"chain.onBlock\"",
+        "site=\"chain.processPendingBlocks\"",
+        "site=\"forkchoice.onBlock\"",
+    };
+    for (skip_sites) |lbl| {
+        try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
+    }
+
+    const fetch_outcomes = [_][]const u8{
+        "outcome=\"already_in_forkchoice\"",
+        "outcome=\"already_in_block_cache\"",
+        "outcome=\"already_pending\"",
+        "outcome=\"fetched\"",
+        "outcome=\"fetch_no_peers\"",
+        "outcome=\"fetch_failed\"",
+    };
+    for (fetch_outcomes) |lbl| {
+        try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
+    }
 }

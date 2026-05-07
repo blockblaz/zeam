@@ -1398,30 +1398,76 @@ pub const BeamNode = struct {
         //   2. network.block_cache (fetched, awaiting parent or STF).
         //   3. network.pending_block_roots (RPC in flight; another
         //      `fetchBlockByRoots` call is already responsible).
-        // The remainder feeds the actual RPC dispatch.
+        // The remainder feeds the actual RPC dispatch (counted as
+        // `fetched`) or the per-error path below (counted as
+        // `fetch_no_peers` / `fetch_failed`). Every entry of
+        // `roots` lands in exactly one bucket so the outcome
+        // counters sum to `roots.len` per call — PR #842 review #1.
+        //
+        // **TOCTOU note (PR #842 review #3):** the three cache
+        // lookups are independent (forkchoice rwlock + the two
+        // network LockedMap mutexes), so a concurrent thread can
+        // mutate any of them between our snapshot and the RPC
+        // dispatch — e.g. a gossip handler can ingest a block into
+        // the forkchoice protoArray after our `hasBlocksBatch` call
+        // returned `false` for it. The race is benign: the worst
+        // case is one duplicate `blocks_by_root` request whose
+        // response then takes the existing dedup path inside
+        // `processBlockByRootChunk` (`forkChoice.hasBlock` early
+        // return). The dedup counter still buckets the outcome
+        // correctly because it's snapshot-of-state-at-call-time, not
+        // a global "did we actually fetch the bytes" counter. Taking
+        // a single multi-resource lock to close this race would
+        // serialize the gossip-import and the RPC-fetch paths
+        // against each other for no correctness benefit.
         var fc_present_buf: std.ArrayListUnmanaged(bool) = .empty;
         defer fc_present_buf.deinit(self.allocator);
         try fc_present_buf.resize(self.allocator, roots.len);
         try self.chain.forkChoice.hasBlocksBatch(roots, fc_present_buf.items);
 
+        var already_in_fc: usize = 0;
+        var already_in_cache: usize = 0;
+        var already_pending: usize = 0;
         var missing_roots: std.ArrayList(types.Root) = .empty;
         defer missing_roots.deinit(self.allocator);
         try missing_roots.ensureTotalCapacityPrecise(self.allocator, roots.len);
 
         for (roots, fc_present_buf.items) |root, fc_present| {
             if (fc_present) {
-                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "already_in_forkchoice" }) catch {};
+                already_in_fc += 1;
                 continue;
             }
             if (self.network.hasFetchedBlock(root)) {
-                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "already_in_block_cache" }) catch {};
+                already_in_cache += 1;
                 continue;
             }
             if (self.network.hasPendingBlockRoot(root)) {
-                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "already_pending" }) catch {};
+                already_pending += 1;
                 continue;
             }
             missing_roots.appendAssumeCapacity(root);
+        }
+
+        // PR #842 review (nit): batch the per-bucket counter bumps
+        // via `incrBy(N)` instead of N back-to-back `incr()` calls.
+        // Same observed value, fewer atomic ops on the hot path.
+        if (already_in_fc > 0) {
+            zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                .{ .outcome = "already_in_forkchoice" },
+                already_in_fc,
+            ) catch {};
+        }
+        if (already_in_cache > 0) {
+            zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                .{ .outcome = "already_in_block_cache" },
+                already_in_cache,
+            ) catch {};
+        }
+        if (already_pending > 0) {
+            zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                .{ .outcome = "already_pending" },
+                already_pending,
+            ) catch {};
         }
 
         if (missing_roots.items.len == 0) return;
@@ -1430,16 +1476,30 @@ pub const BeamNode = struct {
         const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler) catch |err| blk: {
             switch (err) {
                 error.NoPeersAvailable => {
+                    // PR #842 review #1: previously this path bumped
+                    // nothing, leaving the outcome buckets summing
+                    // short of `roots.len` whenever the dispatch
+                    // failed. Bucket explicitly so a Grafana panel
+                    // showing "sum(rate(lean_block_fetch_dedup_total))
+                    // == sum(rate(… by outcome))" stays an invariant.
                     self.logger.warn(
                         "no peers available to request {d} block(s) by root",
                         .{missing_roots.items.len},
                     );
+                    zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                        .{ .outcome = "fetch_no_peers" },
+                        missing_roots.items.len,
+                    ) catch {};
                 },
                 else => {
                     self.logger.warn(
                         "failed to send blocks-by-root request to peer: {any}",
                         .{err},
                     );
+                    zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                        .{ .outcome = "fetch_failed" },
+                        missing_roots.items.len,
+                    ) catch {};
                 },
             }
             break :blk null;
@@ -1454,10 +1514,10 @@ pub const BeamNode = struct {
             });
             // Slice (d): one bump per actually-fetched root so the
             // outcome buckets sum to `roots.len` for every call.
-            var i: usize = 0;
-            while (i < missing_roots.items.len) : (i += 1) {
-                zeam_metrics.metrics.lean_block_fetch_dedup_total.incr(.{ .outcome = "fetched" }) catch {};
-            }
+            zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                .{ .outcome = "fetched" },
+                missing_roots.items.len,
+            ) catch {};
         }
     }
 

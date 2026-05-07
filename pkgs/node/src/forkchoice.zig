@@ -1677,6 +1677,42 @@ pub const ForkChoice = struct {
                 // Slice (e) of #803 — see metrics field doc on
                 // `lean_block_root_compute_skipped_total`.
                 zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
+
+                // PR #842 review #2: trust-but-verify the
+                // caller-supplied root against a fresh hash in
+                // debug + ReleaseSafe builds. Cheap (debug-only)
+                // safety net for future call sites that thread a
+                // stale or wrong root through
+                // `OnBlockOpts.blockRoot`. The forkchoice's
+                // protoArray indexes by this root and the spec
+                // guarantees uniqueness via SSZ collision-
+                // resistance; if a caller fabricates a root, we'd
+                // silently corrupt the protoArray. Per-call cost is
+                // one `hashTreeRoot(BeamBlock, ...)` and is paid
+                // ONLY in `Debug` / `ReleaseSafe`; `ReleaseFast` /
+                // `ReleaseSmall` skip the block entirely so
+                // production keeps the slice-(e) win.
+                if (std.debug.runtime_safety) verify: {
+                    var verify_root: [32]u8 = undefined;
+                    zeam_utils.hashTreeRoot(types.BeamBlock, block, &verify_root, self.allocator) catch |err| {
+                        // Re-hash failure here is itself a bug, but
+                        // we don't want a forkchoice panic on an
+                        // OOM during the verification step — log
+                        // and skip so the caller-supplied root is
+                        // still used.
+                        self.logger.warn(
+                            "forkchoice.onBlock: blockRoot verification re-hash failed: {any}",
+                            .{err},
+                        );
+                        break :verify;
+                    };
+                    if (!std.mem.eql(u8, &block_root, &verify_root)) {
+                        std.debug.panic(
+                            "forkchoice.onBlock: caller-supplied blockRoot=0x{x} does NOT match recomputed=0x{x} for block slot={d} — protoArray would be silently corrupted; call site bug",
+                            .{ &block_root, &verify_root, slot },
+                        );
+                    }
+                }
             }
             const is_timely = self.isBlockTimely(opts.blockDelayMs);
 
