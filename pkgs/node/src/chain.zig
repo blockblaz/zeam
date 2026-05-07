@@ -25,6 +25,9 @@ const tree_visualizer = @import("./tree_visualizer.zig");
 const locking = @import("./locking.zig");
 const BorrowedState = locking.BorrowedState;
 const LockTimer = locking.LockTimer;
+const rc_beam_state = @import("./rc_beam_state.zig");
+const RcBeamState = rc_beam_state.RcBeamState;
+const chain_worker = @import("./chain_worker.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -101,7 +104,15 @@ pub const BeamChain = struct {
     forkChoice: fcFactory.ForkChoice,
     allocator: Allocator,
     // from finalized onwards to recent
-    states: std.AutoHashMap(types.Root, *types.BeamState),
+    /// Cached post-states keyed by block root. Migrated to
+    /// `*RcBeamState` in slice c-2b (#803): refcounted state
+    /// pointers let the chain worker (sole writer under c-2b) and
+    /// cross-thread readers (HTTP API, metrics, broadcaster)
+    /// share state without copying. Until commit 4 of this PR
+    /// drops the rwlock, `states_lock` continues to gate
+    /// concurrent map mutation — the rc handles only address
+    /// state-pointer lifetime, not map-shape mutation.
+    states: std.AutoHashMap(types.Root, *RcBeamState),
     nodeId: u32,
     // This struct needs to contain the zeam_logger_config to be able to call `maybeRotate`
     // For all other modules, we just need logger
@@ -131,8 +142,25 @@ pub const BeamChain = struct {
     // and aggregation duties for subnets the node is already subscribed to,
     // matching the hot-standby model documented in leanEthereum/leanSpec#636.
     is_aggregator_enabled: std.atomic.Value(bool),
-    // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
-    cached_finalized_state: ?*types.BeamState = null,
+    /// Counter incremented every time `statesCommitKeepExisting` lands
+    /// on the duplicate / kept-existing branch (i.e. the entry was
+    /// already in `states` when the second writer arrived). Used by the
+    /// concurrent re-import test to assert that the race surface was
+    /// actually exercised — without this, a test that imports the same
+    /// blocks twice would silently pass even if one importer was
+    /// completely starved.
+    ///
+    /// Lock-free monotonic counter; safe to read from any thread.
+    states_kept_existing_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Cached finalized state loaded from database (separate from states
+    // map to avoid affecting pruning).
+    //
+    // Slice c-2b commit 4 of #803: migrated from raw `*types.BeamState`
+    // to `*RcBeamState` (Option B from the PR #828 review thread) so the
+    // cache-hit path in `getFinalizedState` can use the same
+    // tryAcquire-then-drop-lock dance as `statesGet` when chain-worker
+    // is enabled. Mutation is still gated by `events_lock`.
+    cached_finalized_state: ?*RcBeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
@@ -192,6 +220,22 @@ pub const BeamChain = struct {
     root_to_slot_lock: zeam_utils.SyncMutex = .{},
     events_lock: zeam_utils.SyncMutex = .{},
 
+    /// Optional chain-worker thread (slice c-2b commit 3 of #803).
+    /// When non-null, `BeamChain` exposes the `submit*` family of
+    /// methods which enqueue work onto the worker's queues; the
+    /// worker thread serialises the actual chain mutations.
+    /// When null, callers fall through to the synchronous path
+    /// (current behavior). Surface flipped by
+    /// `ChainOpts.chain_worker_enabled`; CLI flag
+    /// `--chain-worker=on|off`.
+    ///
+    /// Lifecycle: allocated + started in `init` when
+    /// `chain_worker_enabled` is true; stopped + freed in `deinit`.
+    /// The worker borrows `*BeamChain` as its handler ctx, so the
+    /// chain MUST outlive the worker — hence the strict
+    /// stop/deinit/destroy ordering at the top of `BeamChain.deinit`.
+    chain_worker: ?*chain_worker.ChainWorker = null,
+
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
@@ -209,14 +253,24 @@ pub const BeamChain = struct {
             .thread_pool = opts.thread_pool,
         });
 
-        var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);
-        const cloned_anchor_state = try allocator.create(types.BeamState);
-        // Destroy outer allocation if sszClone fails (interior not yet allocated).
-        errdefer allocator.destroy(cloned_anchor_state);
-        try types.sszClone(allocator, types.BeamState, opts.anchorState.*, cloned_anchor_state);
-        // Interior fields are now allocated; deinit them if states.put fails (LIFO order).
-        errdefer cloned_anchor_state.deinit();
-        try states.put(fork_choice.head.blockRoot, cloned_anchor_state);
+        var states = std.AutoHashMap(types.Root, *RcBeamState).init(allocator);
+        // Build the anchor state on the stack via sszClone, then
+        // hand it to RcBeamState.create which embeds it into the
+        // heap allocation (and consumes it on either success or
+        // OOM — always-consume contract per c-2a).
+        var cloned_anchor_state: types.BeamState = undefined;
+        try types.sszClone(
+            allocator,
+            types.BeamState,
+            opts.anchorState.*,
+            &cloned_anchor_state,
+        );
+        // Past this line, `cloned_anchor_state` owns interior
+        // allocations. RcBeamState.create takes ownership; on OOM
+        // it will deinit them for us.
+        const anchor_rc = try RcBeamState.create(allocator, cloned_anchor_state);
+        errdefer anchor_rc.release();
+        try states.put(fork_choice.head.blockRoot, anchor_rc);
 
         var chain = Self{
             .nodeId = opts.nodeId,
@@ -248,11 +302,246 @@ pub const BeamChain = struct {
             .pubkey_cache_lock = .{},
             .root_to_slot_lock = .{},
             .events_lock = .{},
+            // chain_worker is started below (after the chain value is
+            // at its final heap location), so the worker's ctx pointer
+            // remains stable for its entire lifetime.
+            .chain_worker = null,
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
         try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
         return chain;
+    }
+
+    /// Allocate, initialise, and start a `chain_worker.ChainWorker`
+    /// against this chain. Called from `BeamNode.init` after the
+    /// chain is at its final heap address — the worker stores `self`
+    /// as its handler ctx, so the chain pointer must NOT move
+    /// afterwards.
+    ///
+    /// On error the partially-allocated worker is freed before
+    /// returning so the caller can treat init as all-or-nothing.
+    /// On success the worker thread is running and ready to drain;
+    /// calling code can now invoke `submit*` to route producer-side
+    /// work through the queue.
+    pub fn startChainWorker(self: *Self) !void {
+        std.debug.assert(self.chain_worker == null);
+        const w = try self.allocator.create(chain_worker.ChainWorker);
+        errdefer self.allocator.destroy(w);
+        w.* = try chain_worker.ChainWorker.init(self.allocator, .{
+            .logger = self.zeam_logger_config.logger(.chain),
+            .handlers = .{
+                .ctx = self,
+                .on_block = chainWorkerOnBlockThunk,
+                .on_gossip_attestation = chainWorkerOnGossipAttestationThunk,
+                .on_gossip_aggregated_attestation = chainWorkerOnGossipAggregatedAttestationThunk,
+                .process_pending_blocks = chainWorkerProcessPendingBlocksThunk,
+                .process_finalization_followup = chainWorkerProcessFinalizationFollowupThunk,
+            },
+        });
+        errdefer w.deinit();
+        try w.start();
+        self.chain_worker = w;
+        self.logger.info("chain-worker: started (block_q={d}, att_q={d})", .{
+            chain_worker.DEFAULT_BLOCK_QUEUE_CAPACITY,
+            chain_worker.DEFAULT_ATTESTATION_QUEUE_CAPACITY,
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // chain_worker handler thunks (slice c-2b commit 3)
+    // ------------------------------------------------------------------
+    //
+    // These thunks adapt the worker's type-erased vtable shape
+    // (`*anyopaque` ctx + value-typed payloads) to the real
+    // `BeamChain` methods. Each one:
+    //
+    //   1. Casts ctx back to `*BeamChain` (debug-build alignment
+    //      asserts via `@alignCast`).
+    //   2. Calls the synchronous chain method.
+    //   3. Catches and logs any error — the producer side already
+    //      fired-and-forgot, so there is no upstream error channel.
+    //   4. Frees any heap returned by the method (e.g. the
+    //      `missing_roots` slice from `onBlock` /
+    //      `processPendingBlocks`). In the chain-worker path, the
+    //      missing-attestation-roots feedback loop into the gossip
+    //      layer's RPC fetch is intentionally dropped — a follow-up
+    //      commit can plumb a back-channel if it proves necessary
+    //      on devnet, but for c-2b's narrow gossip-block-and-
+    //      attestation migration the loss is the same as a dropped
+    //      gossip message.
+    //
+    // The thunks live in `chain.zig` (not `chain_worker.zig`)
+    // because they need access to `BeamChain` and its private
+    // method `processFinalizationAdvancement`. Putting them here
+    // also keeps `chain_worker.zig` free of any `chain.zig`
+    // import — the layering this whole vtable design exists to
+    // preserve.
+
+    fn chainWorkerOnBlockThunk(
+        ctx: *anyopaque,
+        signed_block: types.SignedBlock,
+        prune_forkchoice: bool,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const missing_roots = self.onBlock(signed_block, .{
+            .pruneForkchoice = prune_forkchoice,
+        }) catch |err| {
+            self.logger.err("chain-worker: onBlock failed slot={d}: {any}", .{
+                signed_block.block.slot,
+                err,
+            });
+            return;
+        };
+        defer self.allocator.free(missing_roots);
+        // Mirror the gossip path: followup runs after a successful
+        // import. We pass the (immutable) signed_block by reference
+        // for symmetry with chain.onGossip; current onBlockFollowup
+        // ignores the parameter (see the explicit `_ = signedBlock`
+        // at its top), so the value is functionally unused here.
+        self.onBlockFollowup(prune_forkchoice, &signed_block);
+    }
+
+    fn chainWorkerOnGossipAttestationThunk(
+        ctx: *anyopaque,
+        gossip: networks.AttestationGossip,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.onGossipAttestation(gossip) catch |err| {
+            self.logger.warn(
+                "chain-worker: onGossipAttestation failed slot={d} validator={d}: {any}",
+                .{ gossip.message.message.slot, gossip.message.validator_id, err },
+            );
+        };
+    }
+
+    fn chainWorkerOnGossipAggregatedAttestationThunk(
+        ctx: *anyopaque,
+        agg: types.SignedAggregatedAttestation,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.onGossipAggregatedAttestation(agg) catch |err| {
+            self.logger.warn(
+                "chain-worker: onGossipAggregatedAttestation failed slot={d}: {any}",
+                .{ agg.data.slot, err },
+            );
+        };
+    }
+
+    fn chainWorkerProcessPendingBlocksThunk(
+        ctx: *anyopaque,
+        current_slot: types.Slot,
+    ) void {
+        // current_slot is unused by the current `processPendingBlocks`
+        // implementation (it consults `forkChoice.fcStore.slot_clock`
+        // directly), but kept on the message so a future refactor
+        // that wants the producer's view of the slot doesn't need
+        // a Message-shape change.
+        _ = current_slot;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const missing_roots = self.processPendingBlocks();
+        self.allocator.free(missing_roots);
+    }
+
+    fn chainWorkerProcessFinalizationFollowupThunk(
+        ctx: *anyopaque,
+        previous_finalized: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        prune_forkchoice: bool,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.processFinalizationAdvancement(
+            previous_finalized,
+            latest_finalized,
+            prune_forkchoice,
+        ) catch |err| {
+            self.logger.err(
+                "chain-worker: processFinalizationAdvancement failed prev={d} latest={d}: {any}",
+                .{ previous_finalized.slot, latest_finalized.slot, err },
+            );
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // submit* family (slice c-2b commit 3)
+    // ------------------------------------------------------------------
+    //
+    // These wrappers route producer-side work through the
+    // chain_worker queues. They are ALWAYS available (the chain
+    // exposes them regardless of whether the worker is running);
+    // when the worker is disabled they return
+    // `error.ChainWorkerDisabled` so the caller can fall back to
+    // the direct synchronous path. This keeps the off-mode
+    // semantics identical to slice (b) — the call site decides
+    // which path to take, the submit* wrappers never silently
+    // change behaviour.
+    //
+    // Ownership contract on success: the caller transfers ownership
+    // of any heap-bearing payload (currently `signed_block` and
+    // `signed_aggregation`) to the worker. The worker calls
+    // `Message.deinit` after dispatch. On `error.QueueFull`,
+    // `error.QueueClosed`, or `error.ChainWorkerDisabled` the
+    // caller retains ownership and is responsible for cleanup
+    // (including calling `.deinit()` on the payload).
+
+    pub const SubmitError = chain_worker.BlockQueue.TrySendError || error{ChainWorkerDisabled};
+
+    /// Route a block import through the chain-worker queue.
+    pub fn submitBlock(
+        self: *Self,
+        signed_block: types.SignedBlock,
+        prune_forkchoice: bool,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendBlock(.{ .on_block = .{
+            .signed_block = signed_block,
+            .prune_forkchoice = prune_forkchoice,
+        } });
+    }
+
+    /// Route a gossip-attestation through the chain-worker queue.
+    pub fn submitGossipAttestation(
+        self: *Self,
+        gossip: networks.AttestationGossip,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendAttestation(.{ .on_gossip_attestation = gossip });
+    }
+
+    /// Route a gossip aggregated-attestation through the worker queue.
+    pub fn submitGossipAggregatedAttestation(
+        self: *Self,
+        agg: types.SignedAggregatedAttestation,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendAttestation(.{ .on_gossip_aggregated_attestation = agg });
+    }
+
+    /// Route a `processPendingBlocks` tick through the worker queue.
+    /// (Not migrated by any caller in commit 3 — included so the
+    /// vtable + queue plumbing is exercised end-to-end and the API
+    /// shape is stable for the follow-up commit that migrates the
+    /// libxev tick path.)
+    pub fn submitProcessPendingBlocks(self: *Self, current_slot: types.Slot) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendBlock(.{ .process_pending_blocks = .{ .current_slot = current_slot } });
+    }
+
+    /// Route a `processFinalizationFollowup` move-off through the worker queue.
+    /// (Not migrated by any caller in commit 3; see
+    /// `submitProcessPendingBlocks` for the rationale.)
+    pub fn submitProcessFinalizationFollowup(
+        self: *Self,
+        previous_finalized: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        prune_forkchoice: bool,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendBlock(.{ .process_finalization_followup = .{
+            .previous_finalized = previous_finalized,
+            .latest_finalized = latest_finalized,
+            .prune_forkchoice = prune_forkchoice,
+        } });
     }
 
     pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
@@ -261,20 +550,49 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Clear the refcount-distribution scrape refresher BEFORE any
+        // chain state is torn down so the metrics endpoint cannot call
+        // back into freed memory between deinit phases. (Idempotent:
+        // safe to call even if startChainStateRefcountObserver was
+        // never called.)
+        self.stopChainStateRefcountObserver();
+
+        // Stop and free the chain-worker FIRST (before any chain
+        // state the worker's handler thunks may touch is freed).
+        // `stop()` is idempotent and joins the worker thread; after
+        // it returns no handler can re-enter `self`. Only then is
+        // it safe to tear down `forkChoice`, `states`, etc.
+        if (self.chain_worker) |w| {
+            w.stop();
+            w.deinit();
+            self.allocator.destroy(w);
+            self.chain_worker = null;
+        }
+
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
 
+        // Each entry holds an RcBeamState we own a reference on.
+        // release() drops the count and frees the wrapper +
+        // interior state when refcount reaches 0. Under c-2b
+        // commit 2 nothing else takes acquires on map-resident
+        // states yet, so refcount is always 1 at deinit time.
         var it = self.states.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
+            entry.value_ptr.*.release();
         }
         self.states.deinit();
 
-        // Clean up cached finalized state if present
-        if (self.cached_finalized_state) |cached_state| {
-            cached_state.deinit();
-            self.allocator.destroy(cached_state);
+        // Clean up cached finalized state if present.
+        // Slice c-2b commit 4: cached_finalized_state is an
+        // RcBeamState now — release drives state.deinit + destroy when
+        // refcount reaches 0. Under chain_worker_enabled the cache may
+        // have outstanding reader acquires; the rc keeps the underlying
+        // allocation alive until the last reader releases. (At deinit
+        // time we are single-threaded by contract, so refcount=1 in
+        // practice.)
+        if (self.cached_finalized_state) |cached_rc| {
+            cached_rc.release();
         }
 
         // Clean up public key cache
@@ -325,23 +643,67 @@ pub const BeamChain = struct {
     // release.
     // ------------------------------------------------------------------
 
-    /// Acquire the shared (read) side of `states_lock` and return a
-    /// `BorrowedState` for the requested root, or null if the state is not
-    /// in the in-memory map. Caller MUST call either `borrow.deinit()` or
-    /// `borrow.cloneAndRelease(allocator)` exactly once before the borrow
-    /// goes out of scope. Debug builds enforce one-release via
-    /// `BorrowedState.released`.
+    /// Return a `BorrowedState` for the requested root, or null if the
+    /// state is not in the in-memory map. Caller MUST call either
+    /// `borrow.deinit()` or `borrow.cloneAndRelease(allocator)` exactly
+    /// once before the borrow goes out of scope. Debug builds enforce
+    /// one-release via `BorrowedState.released`.
+    ///
+    /// Two paths, gated by chain-worker mode (slice c-2b commit 4 of #803):
+    ///
+    ///   * `chain_worker != null` (chain-worker is the sole writer to
+    ///     `BeamChain.states`): take the shared lock for the lookup,
+    ///     `tryAcquire` the rc, drop the lock, and return a
+    ///     `Backing.none` borrow whose lifetime is gated by the rc
+    ///     refcount. Cross-thread readers (HTTP API, metrics scrape,
+    ///     event broadcaster) NO LONGER hold `states_lock.shared` for
+    ///     the borrow lifetime, so a long-lived read does not block the
+    ///     chain worker's next exclusive-side mutation. This is the
+    ///     entire point of the c-2b migration.
+    ///
+    ///   * `chain_worker == null` (kill-switch / backward-compat under
+    ///     `--chain-worker=off`): keep the legacy lock-based borrow.
+    ///     The shared lock is held for the borrow lifetime; map mutation
+    ///     by the gossip/req-resp paths is gated by the exclusive side
+    ///     as before. Slice (b) semantics are preserved exactly.
     pub fn statesGet(self: *Self, root: types.Root) ?BorrowedState {
         var t = LockTimer.start("states", "statesGet");
         self.states_lock.lockShared();
         t.acquired();
-        if (self.states.get(root)) |state| {
-            // Hand the lock off to the borrow. The borrow's deinit calls
-            // states_lock.unlockShared() AND closes the LockTimer
-            // observation — so the hold-span histogram correctly
-            // attributes the entire borrow lifetime to this site.
+        if (self.states.get(root)) |rc| {
+            if (self.chain_worker != null) {
+                // Lock-free read path: tryAcquire under the shared
+                // lock to defeat any concurrent free race, then drop
+                // the lock so the borrow lifetime no longer pins
+                // `states_lock`. The LockTimer ends HERE because the
+                // hold span is over; we do not hand it off to the
+                // borrow.
+                const acq = rc.tryAcquire();
+                self.states_lock.unlockShared();
+                t.released();
+                if (acq) |acquired_rc| {
+                    return BorrowedState{
+                        .state = &acquired_rc.state,
+                        .backing = .none,
+                        .acquired_rc = acquired_rc,
+                    };
+                }
+                // tryAcquire returned null: rc is in the freeing
+                // process (refcount→0 elsewhere). Today this should
+                // never happen because the only acquires today come
+                // from the worker thread itself, but the safe-by-
+                // default behavior is to report the entry as missing
+                // rather than dereference a dying allocation. The
+                // c-2b removal protocol ("remove-from-map then
+                // release") is what makes this branch theoretically
+                // reachable in the future without a UAF.
+                return null;
+            }
+            // Legacy lock-based path: hand the shared lock off to the
+            // borrow.  Backward-compat with --chain-worker=off; PR
+            // #820 / #803 kill-switch.
             return BorrowedState{
-                .state = state,
+                .state = &rc.state,
                 .backing = .{ .states_shared_rwlock = &self.states_lock },
                 .timer = t,
             };
@@ -353,15 +715,96 @@ pub const BeamChain = struct {
         return null;
     }
 
-    /// Take the exclusive side of `states_lock` and `put` the entry. Used
-    /// by produceBlock / onBlock STF commit and similar single-key writes.
-    fn statesPutExclusive(self: *Self, comptime site: []const u8, root: types.Root, state_ptr: *types.BeamState) !void {
+    /// Move the value out of a heap-allocated `*BeamState` wrapper
+    /// into a freshly-`create`d `RcBeamState`, freeing the now-empty
+    /// wrapper. Centralises the value-copy + destroy + create dance
+    /// shared by `produceBlock` and `onBlock`'s owned-post_state path.
+    ///
+    /// Ownership story (single, identical at every call site):
+    ///
+    ///   * Pre-call: caller owns `post_state` (a `*BeamState`
+    ///     pointing at heap memory). The interior of the BeamState
+    ///     value (lists, slices, etc.) is also caller-owned. Caller
+    ///     has an upstream errdefer gated by `gate_consumed.* == false`
+    ///     that frees both the wrapper and the interior on early
+    ///     return.
+    ///
+    ///   * Post-call (success): the BeamState value has been moved
+    ///     into the rc; the wrapper has been freed. `gate_consumed`
+    ///     has been set to `true` so the caller's upstream errdefer
+    ///     does not fire. The caller now owns the returned
+    ///     `*RcBeamState` and must transfer it (e.g. via
+    ///     `statesPutExclusive` / `statesCommitKeepExisting`) or
+    ///     release it.
+    ///
+    ///   * Post-call (error): the wrapper has been freed (we
+    ///     destroyed it BEFORE the create attempt so an OOM cannot
+    ///     leave a wrapper-allocator leak); the BeamState value's
+    ///     interior has been consumed by `RcBeamState.create`'s
+    ///     always-consume contract. `gate_consumed` has still been
+    ///     set to `true` (BEFORE the create call) so the caller's
+    ///     upstream errdefer does NOT run — it would deref the
+    ///     freed wrapper. Net: nothing leaks, the caller's gate
+    ///     correctly suppresses the upstream cleanup, and the
+    ///     caller propagates the error.
+    ///
+    /// Why a `*bool` gate parameter rather than nulling an
+    /// `?*BeamState` (the original `produceBlock` shape)? The
+    /// `onBlock` path also distinguishes a NOT-OWNED case (caller
+    /// supplied `post_state` and we sszClone before wrapping) where
+    /// the upstream errdefer is gated by an additional
+    /// `post_state_owned` flag, not by an optional. A bool gate
+    /// matches both call sites; the optional gate did not. Pre-c-2b
+    /// the two sites used different mechanisms for identical work
+    /// (PR #828 review by @ch4r10t33r) — this helper unifies them.
+    ///
+    /// NOTE: the helper is for the OWNED case only. `onBlock`'s
+    /// caller-supplied path still does its own `sszClone` +
+    /// `RcBeamState.create` inline because the value-source there
+    /// is not a heap wrapper to free.
+    fn wrapOwnedStateIntoRc(
+        self: *Self,
+        post_state: *types.BeamState,
+        gate_consumed: *bool,
+    ) !*RcBeamState {
+        // Move the BeamState value out of the heap wrapper into a
+        // local. After this point the wrapper memory holds a stale
+        // shallow copy whose interior pointers have been logically
+        // transferred to `value`.
+        const value = post_state.*;
+        // Free the wrapper BEFORE attempting create so an OOM in
+        // create does not leave a wrapper-allocator leak. The
+        // value's interior is consumed by create's always-consume
+        // contract on either success or its own OOM path.
+        self.allocator.destroy(post_state);
+        // Set the gate BEFORE the (fallible) create call: on
+        // failure the upstream errdefer must not run (it would
+        // deref the now-freed wrapper); on success the gate stays
+        // true forever. Either way the caller's gate is correctly
+        // false ONLY for the window between heap-wrapper-allocation
+        // and this helper call.
+        gate_consumed.* = true;
+        return RcBeamState.create(self.allocator, value);
+    }
+
+    /// Take the exclusive side of `states_lock` and `put` the entry.
+    /// Used by produceBlock / onBlock STF commit and similar
+    /// single-key writes.
+    ///
+    /// Under c-2b commit 2 the helper takes `*RcBeamState` directly
+    /// (callers wrap their `*BeamState` via `RcBeamState.create`
+    /// before calling). Map ownership transfers in: on success the
+    /// map holds the rc and will release it on `deinit`. On
+    /// `map.put` OOM the helper releases `rc` so the caller never
+    /// has to clean up.
+    fn statesPutExclusive(self: *Self, comptime site: []const u8, root: types.Root, rc: *RcBeamState) !void {
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
         defer t.released();
         defer self.states_lock.unlock();
-        try self.states.put(root, state_ptr);
+        errdefer rc.release();
+        try self.states.put(root, rc);
     }
 
     /// Insert under `states_lock.exclusive` if the entry is not already in
@@ -398,36 +841,113 @@ pub const BeamChain = struct {
         self: *Self,
         comptime site: []const u8,
         root: types.Root,
-        state_ptr: *types.BeamState,
+        rc: *RcBeamState,
     ) !struct { borrow: BorrowedState, kept_existing: bool } {
+        // INTENTIONAL: this helper holds the EXCLUSIVE side of
+        // `states_lock` across the returned borrow even when chain-
+        // worker mode is enabled. Slice c-2b commit 4 of #803 dropped
+        // the rwlock for `statesGet` / `getFinalizedState` cache-hit
+        // borrows, but the cross-call write barrier rationale from
+        // PR #820 / #803 still applies here: the borrow lifetime
+        // spans (DB write → forkChoice.confirmBlock); both must
+        // observe the in-map pointer atomically, so unlock/reacquire
+        // is exactly the UAF race we are closing. The chain-worker
+        // is the only writer to `states` under c-2b, but that does
+        // NOT make the cross-call barrier redundant — the worker
+        // executes its own helpers serially, and the barrier is
+        // about ordering against `pruneStates` (also exclusive),
+        // which can run from the same worker between this helper's
+        // borrow handoff and the caller's last deref. Switching to
+        // a Backing.none / tryAcquire shape here would re-open
+        // exactly the issue PR #820 fixed.
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
-        // NOTE: NO `defer self.states_lock.unlock()` here — the exclusive
-        // lock is owned by the returned BorrowedState and released by its
-        // deinit. errdefer below covers the OOM path on `getOrPut`. The
-        // LockTimer is moved into the borrow as well so the hold-span
-        // observation closes at the deinit site, not here. PR #820.
+        // NOTE: NO `defer self.states_lock.unlock()` here — the
+        // exclusive lock is owned by the returned BorrowedState and
+        // released by its deinit. errdefer below covers the OOM path
+        // on `getOrPut`. The LockTimer is moved into the borrow as
+        // well so the hold-span observation closes at the deinit
+        // site, not here. PR #820.
+        //
+        // Ownership: the helper takes responsibility for `rc` cleanup
+        // on every error path (mirroring `statesPutExclusive`). The
+        // `rc_owned` flag is cleared before each path that explicitly
+        // disposes of `rc` (the kept-existing release, the new-insert
+        // hand-off into the map) so the errdefer below cannot
+        // double-release. After the function returns successfully,
+        // ownership has either been transferred into the map
+        // (new-insert path) or dropped via `rc.release()`
+        // (kept-existing path) — `rc_owned` is false in both cases.
+        // Without this flag, an OOM in `states.getOrPut` would leak
+        // the freshly-`create`d rc + its heap-owned BeamState
+        // interior; the caller has no way to recover the pointer
+        // because the helper consumes it on success.
+        var rc_owned = true;
         errdefer {
             self.states_lock.unlock();
             t.released();
+            if (rc_owned) rc.release();
         }
         const gop = try self.states.getOrPut(root);
-        const effective_ptr: *types.BeamState = if (gop.found_existing) blk: {
-            // Decision policy: keep the existing pointer (it's referenced
-            // elsewhere — e.g. produceBlock just inserted it before
-            // publishBlock landed here) and tell the caller to free the
-            // freshly-computed copy. We never want to invalidate a pointer
-            // that other borrows might still observe through
-            // `states_lock.shared`.
+        // After this point getOrPut succeeded; on either branch the
+        // helper now disposes of `rc` (release-or-transfer), so the
+        // errdefer must NOT double-act on it. Clear `rc_owned`
+        // BEFORE the synchronous release / map write so the cleared
+        // flag is observed even if the map write itself were ever
+        // changed to be fallible (currently `value_ptr.* = rc;` is
+        // infallible, but pinning the invariant here keeps the
+        // pattern safe under future edits).
+        rc_owned = false;
+        const effective_rc: *RcBeamState = if (gop.found_existing) blk: {
+            // Decision policy: keep the existing rc (other readers
+            // may still hold acquires on it) and release the
+            // freshly-computed copy the caller handed us. The
+            // "kept_existing" return tells the caller their rc was
+            // dropped so they don't double-release.
+            //
+            // Lock-hold note: when this release drops the refcount
+            // to 0 (the common case under c-2b commit 2 — the only
+            // acquires today come from the chain worker thread
+            // itself, which is the SAME thread executing this
+            // helper, so no concurrent acquire holds the rc alive),
+            // `release()` synchronously runs `state.deinit()` +
+            // `allocator.destroy(rc)` while holding
+            // `states_lock.exclusive`. For production-sized states
+            // BeamState.deinit walks every interior list/slice and
+            // is non-trivial work. Pre-c-2b the equivalent free was
+            // done by the CALLER outside the lock.
+            //
+            // The hold span is observable via
+            // `zeam_lock_hold_seconds{lock="states", site=...}` —
+            // the `site` argument differentiates `onBlock.commit`
+            // from `produceBlock.commit`, so a regression vs slice
+            // (b) baselines is visible per call site without any
+            // new instrumentation. Devnet should watch the
+            // `onBlock.commit` p99 across the slice (b)→(c-2b) cut.
+            //
+            // TODO(slice-c-2c): if the kept-existing free shows up
+            // as a hold-span regression on devnet, switch the
+            // helper to return the to-be-released rc alongside the
+            // borrow and have the caller release after dropping the
+            // lock (option (b) in the PR #828 review thread). Adds
+            // API surface but moves deinit work out of the critical
+            // section. Tracking-only until devnet has data; the
+            // single-writer assumption above means the cost is
+            // entirely allocator work, not contention with other
+            // chain mutators.
+            rc.release();
             break :blk gop.value_ptr.*;
         } else blk: {
-            gop.value_ptr.* = state_ptr;
-            break :blk state_ptr;
+            gop.value_ptr.* = rc;
+            break :blk rc;
         };
+        if (gop.found_existing) {
+            _ = self.states_kept_existing_count.fetchAdd(1, .monotonic);
+        }
         return .{
             .borrow = BorrowedState{
-                .state = effective_ptr,
+                .state = &effective_rc.state,
                 .backing = .{ .states_exclusive_rwlock = &self.states_lock },
                 .timer = t,
             },
@@ -436,8 +956,12 @@ pub const BeamChain = struct {
     }
 
     /// Take the exclusive side of `states_lock` and remove the entry.
-    /// Returns the removed pointer (or null) so the caller can free it.
-    fn statesFetchRemoveExclusivePtr(self: *Self, comptime site: []const u8, root: types.Root) ?*types.BeamState {
+    /// Returns the removed `*RcBeamState` (or null) so the caller can
+    /// release it. Under c-2b the caller MUST call `.release()` on
+    /// the returned rc to drop the map's reference; if other readers
+    /// hold acquires the underlying state stays alive until the last
+    /// release.
+    fn statesFetchRemoveExclusivePtr(self: *Self, comptime site: []const u8, root: types.Root) ?*RcBeamState {
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
@@ -447,6 +971,108 @@ pub const BeamChain = struct {
             return entry.value;
         }
         return null;
+    }
+
+    /// Sample `rc.count()` for every entry in `BeamChain.states` and
+    /// emit one observation per entry into the
+    /// `lean_chain_state_refcount_distribution` histogram. Slice c-2b
+    /// commit 5 of #803.
+    ///
+    /// Pattern: take `states_lock.shared` for the iteration only, drop
+    /// the lock before observing values (no allocations or fallible
+    /// ops happen inside the critical section). The lock hold span is
+    /// O(N) in the number of map entries; under c-2b this stays small
+    /// (≤ the un-pruned post-finalized state set, typically O(1) to O(10)).
+    ///
+    /// Infallible: any iteration failure path would silently drop the
+    /// scrape sample rather than crash the metrics endpoint. The
+    /// histogram observe() call is itself infallible (the metrics-lib
+    /// histogram type is non-vector, so no labels-allocation).
+    ///
+    /// Wired into the `/metrics` pre-scrape path via a context-bearing
+    /// scrape refresher: `BeamChain.startChainStateRefcountObserver()`
+    /// (called from `init` after the chain is at its final heap
+    /// address) registers this method against `zeam_metrics`'s
+    /// `g_scrape_refresher_ctx` slot.
+    pub fn recordChainStateRefcountDistribution(self: *Self) void {
+        // Snapshot the per-entry counts under the shared lock into a
+        // small stack buffer when possible. For larger maps we fall
+        // back to observing under the lock; the observe call is just
+        // an atomic-ish bucket increment, no allocations, no IO.
+        //
+        // The buffered-snapshot path is the safer shape: it minimizes
+        // the lock hold span. The on-stack buffer is sized for the
+        // expected upper bound on devnet (un-pruned post-finalized
+        // states + cached anchor) plus headroom.
+        var buf: [128]u32 = undefined;
+        var n: usize = 0;
+        var overflow = false;
+
+        self.states_lock.lockShared();
+        var it = self.states.valueIterator();
+        while (it.next()) |rc_ptr| {
+            const rc: *RcBeamState = rc_ptr.*;
+            if (n < buf.len) {
+                buf[n] = rc.count();
+                n += 1;
+            } else {
+                // Map has more entries than the stack buffer can
+                // hold; emit the rest under the lock. This is a
+                // graceful degradation — the lock hold span grows
+                // with map size, but since we don't allocate or do
+                // IO it stays bounded by the map size.
+                overflow = true;
+                zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+                    @floatFromInt(rc.count()),
+                );
+            }
+        }
+        self.states_lock.unlockShared();
+
+        // Observe the buffered samples outside the critical section.
+        for (buf[0..n]) |c| {
+            zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+                @floatFromInt(c),
+            );
+        }
+        // Log the overflow case once per scrape so devnet operators
+        // notice maps growing past the buffer; not fatal.
+        if (overflow) {
+            self.logger.debug(
+                "recordChainStateRefcountDistribution: map size exceeded stack buffer ({d}), emitted overflow samples under lock",
+                .{buf.len},
+            );
+        }
+    }
+
+    /// Trampoline for the context-bearing scrape refresher. The opaque
+    /// `ctx` pointer is the `*BeamChain` registered in `init`.
+    fn chainStateRefcountScrapeRefresher(ctx: ?*anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx orelse return));
+        self.recordChainStateRefcountDistribution();
+    }
+
+    /// Register this chain as the source for the
+    /// `lean_chain_state_refcount_distribution` scrape refresher.
+    /// Called from `init` after the chain is at its final heap address
+    /// so the refresher's ctx pointer is stable.
+    ///
+    /// Idempotent across init/deinit cycles within a single process:
+    /// `deinit` clears the refresher slot. Note that the metrics
+    /// module holds a single context-bearing refresher slot; if a
+    /// second BeamChain is initialized in the same process (e.g. test
+    /// harnesses spinning multiple chains) the second init silently
+    /// replaces the first registration. Today only one chain is alive
+    /// per process; revisit if that changes.
+    pub fn startChainStateRefcountObserver(self: *Self) void {
+        zeam_metrics.registerScrapeRefresherCtx(self, &chainStateRefcountScrapeRefresher);
+    }
+
+    /// Clear this chain's refcount-distribution scrape refresher. Idempotent.
+    /// Called from `deinit` so the metrics module does not call back into
+    /// freed chain memory after teardown.
+    pub fn stopChainStateRefcountObserver(_: *Self) void {
+        zeam_metrics.registerScrapeRefresherCtx(null, null);
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -677,12 +1303,19 @@ pub const BeamChain = struct {
             self.allocator.destroy(pre_snapshot);
         }
 
-        var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
-        errdefer if (post_state_opt) |post_state_ptr| {
-            post_state_ptr.deinit();
-            self.allocator.destroy(post_state_ptr);
+        const post_state = try self.allocator.create(types.BeamState);
+        // c-2b: switched from `?*BeamState` (nulled on consume) to a
+        // bool gate to match `onBlock`'s post_state_settled shape.
+        // `wrapOwnedStateIntoRc` flips this on consume; the upstream
+        // errdefer below covers every early-return path before the
+        // wrap, including a partial sszClone that left interior
+        // allocations behind (BeamState.deinit is tolerant of
+        // partial init by design).
+        var post_state_consumed = false;
+        errdefer if (!post_state_consumed) {
+            post_state.deinit();
+            self.allocator.destroy(post_state);
         };
-        const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_snapshot.*, post_state);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
@@ -778,14 +1411,22 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
-        try self.statesPutExclusive("produceBlock.commit", block_root, post_state);
-        post_state_opt = null;
+        // c-2b: move the heap-allocated post_state into a freshly-
+        // `create`d RcBeamState via the shared helper that
+        // centralises the value-copy + destroy + create dance.
+        // Helper sets `post_state_consumed = true` BEFORE its
+        // (fallible) create call, so the upstream errdefer does
+        // not deref freed memory on OOM and does not double-free
+        // on success. PR #828 review by @ch4r10t33r.
+        const post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_consumed);
+        // statesPutExclusive takes ownership of the rc on success;
+        // releases on its own OOM path.
+        try self.statesPutExclusive("produceBlock.commit", block_root, post_state_rc);
 
         var forkchoice_added = false;
         errdefer if (!forkchoice_added) {
-            if (self.statesFetchRemoveExclusivePtr("produceBlock.errdefer", block_root)) |entry_ptr| {
-                entry_ptr.deinit();
-                self.allocator.destroy(entry_ptr);
+            if (self.statesFetchRemoveExclusivePtr("produceBlock.errdefer", block_root)) |rc_ptr| {
+                rc_ptr.release();
             }
         };
 
@@ -1001,6 +1642,56 @@ pub const BeamChain = struct {
                         }
                     }
 
+                    // Slice c-2b commit 3 of #803: route through the
+                    // chain-worker queue when enabled. We clone
+                    // `signed_block` here — the gossip layer owns the
+                    // borrowed copy for the duration of this callback,
+                    // but the worker takes ownership and runs
+                    // asynchronously, so it needs an independent
+                    // allocation. On `submitBlock` success the worker
+                    // owns the clone (and will deinit it after
+                    // dispatch); on failure the errdefer frees it.
+                    //
+                    // Trade-offs of the worker path:
+                    //   * `missing_attestation_roots` feedback is
+                    //     dropped — the worker thunk swallows the
+                    //     return value because there is no upstream
+                    //     channel to surface it on. The same dataset
+                    //     is rediscovered on the next attestation
+                    //     gossip whose `head/source/target` is still
+                    //     unknown (gossip clients re-broadcast
+                    //     liberally), so this is observably equivalent
+                    //     to a dropped first attempt.
+                    //   * `processed_block_root` is returned
+                    //     immediately so `BeamNode.onGossip` can still
+                    //     fan out `processCachedDescendants(root)` and
+                    //     give cached children a retry chance.
+                    if (self.chain_worker != null) {
+                        var cloned: types.SignedBlock = undefined;
+                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                        var cloned_consumed = false;
+                        errdefer if (!cloned_consumed) cloned.deinit();
+                        self.submitBlock(cloned, true) catch |err| switch (err) {
+                            error.QueueFull => {
+                                self.logger.warn(
+                                    "chain-worker: block queue full, dropping slot={d} root=0x{x}",
+                                    .{ block.slot, &block_root },
+                                );
+                                return .{};
+                            },
+                            error.QueueClosed => {
+                                self.logger.warn(
+                                    "chain-worker: block queue closed, dropping slot={d} root=0x{x}",
+                                    .{ block.slot, &block_root },
+                                );
+                                return .{};
+                            },
+                            error.ChainWorkerDisabled => unreachable,
+                        };
+                        cloned_consumed = true;
+                        return .{ .processed_block_root = block_root };
+                    }
+
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
@@ -1075,12 +1766,39 @@ pub const BeamChain = struct {
                 };
 
                 if (self.is_aggregator_enabled.load(.acquire)) {
-                    // Process validated attestation
-                    self.onGossipAttestation(signed_attestation) catch |err| {
-                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                        self.logger.err("attestation processing error: {any}", .{err});
-                        return err;
-                    };
+                    // Slice c-2b commit 3 of #803: when the chain-worker
+                    // is enabled, route the validated attestation
+                    // through its queue. `AttestationGossip` is plain-
+                    // old-data (see `Message.deinit` in chain_worker.zig),
+                    // so no clone is required — the value is copied into
+                    // the `Message` enum at queue push time.
+                    if (self.chain_worker != null) {
+                        self.submitGossipAttestation(signed_attestation) catch |err| switch (err) {
+                            error.QueueFull => {
+                                zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                                self.logger.warn(
+                                    "chain-worker: attestation queue full, dropping slot={d} validator={d}",
+                                    .{ slot, validator_id },
+                                );
+                                return .{};
+                            },
+                            error.QueueClosed => {
+                                self.logger.warn(
+                                    "chain-worker: attestation queue closed, dropping slot={d} validator={d}",
+                                    .{ slot, validator_id },
+                                );
+                                return .{};
+                            },
+                            error.ChainWorkerDisabled => unreachable,
+                        };
+                    } else {
+                        // Process validated attestation synchronously.
+                        self.onGossipAttestation(signed_attestation) catch |err| {
+                            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                            self.logger.err("attestation processing error: {any}", .{err});
+                            return err;
+                        };
+                    }
                     self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
                         slot,
                         validator_id,
@@ -1412,20 +2130,48 @@ pub const BeamChain = struct {
         // This blocks `pruneStates` (also exclusive on `states_lock`) from
         // racing in via another thread's `onBlockFollowup` and freeing the
         // entry under us. See PR #820 / issue #803.
-        var commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state);
+        // c-2b: wrap post_state in an RcBeamState before commit.
+        // Two paths depending on ownership:
+        //   * post_state_owned (we allocated it locally above):
+        //     route through `wrapOwnedStateIntoRc` — it does the
+        //     value-move + wrapper-destroy + create + gate-flip
+        //     dance, identical to `produceBlock`'s commit path.
+        //   * !post_state_owned (caller supplied a *BeamState we
+        //     don't own): sszClone into a fresh value, then
+        //     `RcBeamState.create` consumes that. The caller's
+        //     allocation is left untouched; nothing to free, no
+        //     gate to flip (post_state_settled stays false here
+        //     and is flipped after the commit succeeds because the
+        //     gate's errdefer is gated on `post_state_owned` too).
+        //
+        // PR #828 review by @ch4r10t33r: pre-c-2b the owned path
+        // used a different gate mechanism than `produceBlock`
+        // (post_state_settled bool vs ?*BeamState nulling); the
+        // helper unifies them.
+        var post_state_rc: *RcBeamState = undefined;
+        if (post_state_owned) {
+            // Helper flips `post_state_settled = true` BEFORE the
+            // create call so the upstream errdefer at line ~1712
+            // does not deref the freed wrapper if create OOMs.
+            post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_settled);
+        } else {
+            // Caller owns post_state; clone its value into a fresh
+            // BeamState, then wrap. Past sszClone success, `value`
+            // owns interior allocations; `RcBeamState.create`'s
+            // always-consume contract handles cleanup on OOM.
+            var value: types.BeamState = undefined;
+            try types.sszClone(self.allocator, types.BeamState, post_state.*, &value);
+            post_state_rc = try RcBeamState.create(self.allocator, value);
+        }
+        // statesCommitKeepExisting takes the rc on either path:
+        //   kept-existing: helper releases our rc, returns a
+        //     borrow on the in-map rc;
+        //   new-insert:    helper transfers our rc into the map.
+        // On the helper's own OOM path it releases the rc for us.
+        var commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state_rc);
         // Release the exclusive lock on every exit path (success or error).
         defer commit.borrow.assertReleasedOrPanic();
         defer commit.borrow.deinit();
-        if (commit.kept_existing and post_state_owned) {
-            // Existing entry kept — free the freshly-computed (and now
-            // redundant) post_state. The borrow points at the in-map
-            // pointer (a different allocation), so this free does not
-            // invalidate `commit.borrow.state`. Caller-supplied post-states
-            // (i.e. `post_state_owned == false`) belong to the caller; we
-            // don't touch them.
-            post_state.deinit();
-            self.allocator.destroy(post_state);
-        }
         // From here on use the borrow's pointer (the in-map one): if the
         // commit kept an existing entry, our `post_state` is freed and
         // unsafe to deref. The borrow keeps the in-map pointer alive for
@@ -1620,12 +2366,13 @@ pub const BeamChain = struct {
         });
 
         // We keep the canonical chain from finalized to head, so we can safely prune all non-canonical states
-        // Actually remove and deallocate the pruned states
+        // Actually remove and deallocate the pruned states (under
+        // c-2b: release the rc — the underlying state may stay
+        // alive if other readers hold acquires; freed when last
+        // release runs).
         for (roots) |root| {
             if (self.states.fetchRemove(root)) |entry| {
-                const state_ptr = entry.value;
-                state_ptr.deinit();
-                self.allocator.destroy(state_ptr);
+                entry.value.release();
                 self.logger.debug("pruned state for root 0x{x}", .{
                     &root,
                 });
@@ -2145,12 +2892,18 @@ pub const BeamChain = struct {
     /// borrowed from the in-memory map under `BeamNode.mutex`. After (a-2)
     /// it returns a `BorrowedState` whose backing lock depends on which
     /// path produced the result:
-    ///   * In-memory map hit  → backed by `states_lock` (shared).
-    ///   * Cache hit / DB load → backed by `events_lock` (mutex), since
-    ///     `cached_finalized_state` is mutated under `events_lock` (the
-    ///     DB-load path also writes the cache field, and that write is
-    ///     guarded by the mutex). Callers MUST release the borrow exactly
-    ///     once via `deinit()` or `cloneAndRelease(allocator)`.
+    ///   * In-memory map hit  → backed by `states_lock` (shared) when
+    ///     `--chain-worker=off`; `Backing.none` (rc-only lifetime)
+    ///     when `--chain-worker=on` (slice c-2b commit 4 of #803).
+    ///   * Cache hit / DB load → backed by `events_lock` (mutex) when
+    ///     `--chain-worker=off`, since `cached_finalized_state` is
+    ///     mutated under `events_lock` (the DB-load path also writes
+    ///     the cache field, and that write is guarded by the mutex).
+    ///     When `--chain-worker=on`, the cache hit path tryAcquires the
+    ///     RcBeamState refcount and drops `events_lock` before
+    ///     returning, mirroring the lock-free path in `statesGet`.
+    /// Callers MUST release the borrow exactly once via `deinit()` or
+    /// `cloneAndRelease(allocator)`.
     ///
     /// PR description (a-2) enumerates every caller migrated under this
     /// API change — grepping `states.get` will not find them.
@@ -2193,14 +2946,42 @@ pub const BeamChain = struct {
         // the current finalized checkpoint (can happen if the cache was
         // seeded from the DB at startup before any in-memory finalization
         // happened).
-        if (self.cached_finalized_state) |cached_state| {
-            if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
+        if (self.cached_finalized_state) |cached_rc| {
+            if (std.mem.eql(u8, &cached_rc.state.latest_finalized.root, &finalized_checkpoint.root)) {
+                if (self.chain_worker != null) {
+                    // Lock-free read path: tryAcquire under the events
+                    // lock to defeat any concurrent free race, then drop
+                    // the lock so the borrow lifetime no longer pins
+                    // `events_lock`. Tier-5 depth must be decremented
+                    // BEFORE we return because we are NOT handing off
+                    // the lock to the borrow; the next tier-5 acquire
+                    // on this thread should see depth=0.
+                    const acq = cached_rc.tryAcquire();
+                    self.events_lock.unlock();
+                    locking.leaveTier5();
+                    t_ev.released();
+                    lock_held = false;
+                    if (acq) |acquired_rc| {
+                        return BorrowedState{
+                            .state = &acquired_rc.state,
+                            .backing = .none,
+                            .acquired_rc = acquired_rc,
+                        };
+                    }
+                    // tryAcquire returned null — freeing thread won.
+                    // Today this should never happen (refcount stays
+                    // at 1 in production), but the safe-by-default
+                    // behavior is to report no entry.
+                    return null;
+                }
+                // Legacy lock-based path: hand the events_lock off to
+                // the borrow.  Backward-compat with --chain-worker=off.
                 lock_held = false; // ownership of the lock moves into the borrow
                 // tier-5 depth and LockTimer are HANDED OFF to the borrow:
                 // BorrowedState.deinit calls leaveTier5() and t.released()
                 // after unlocking. Do NOT close them here.
                 return BorrowedState{
-                    .state = cached_state,
+                    .state = &cached_rc.state,
                     .backing = .{ .events_mutex = &self.events_lock },
                     .tier5_held = true,
                     .timer = t_ev,
@@ -2209,37 +2990,61 @@ pub const BeamChain = struct {
             // Stale — fall through to DB load below.
         }
 
-        // Fallback: try to load from database. Allocate the cache slot, load,
-        // store in `cached_finalized_state`, return a borrow over it.
-        const state_ptr = self.allocator.create(types.BeamState) catch |err| {
-            self.logger.warn("failed to allocate memory for finalized state: {any}", .{err});
-            return null;
-        };
-
-        self.db.loadLatestFinalizedState(state_ptr) catch |err| {
-            self.allocator.destroy(state_ptr);
+        // Fallback: try to load from database. Allocate a BeamState
+        // value on the stack (well — a local), load into it, then
+        // hand it to RcBeamState.create which embeds it into the heap
+        // allocation (always-consume contract per c-2a).
+        var loaded_state: types.BeamState = undefined;
+        self.db.loadLatestFinalizedState(&loaded_state) catch |err| {
             self.logger.warn("finalized state not available in database: {any}", .{err});
             return null;
         };
+        // Past this line `loaded_state` owns interior allocations.
+        // RcBeamState.create takes ownership; on OOM it deinits the
+        // interior for us.
+        const new_rc = RcBeamState.create(self.allocator, loaded_state) catch |err| {
+            self.logger.warn("failed to allocate RcBeamState for finalized state: {any}", .{err});
+            return null;
+        };
 
-        // If a previous cached state is being replaced, free it now (we
-        // hold events_lock so no concurrent borrow of the old pointer can
-        // exist past this critical section).
-        if (self.cached_finalized_state) |old_cached| {
-            old_cached.deinit();
-            self.allocator.destroy(old_cached);
+        // If a previous cached state is being replaced, release the old
+        // rc now (we hold events_lock so any concurrent reader either
+        // tryAcquired before this critical section — in which case its
+        // acquire keeps the underlying allocation alive past our release
+        // — or will look it up after our store below and observe the
+        // new rc).
+        if (self.cached_finalized_state) |old_cached_rc| {
+            old_cached_rc.release();
         }
 
         // Cache in separate field (not in states map to avoid affecting pruning)
-        self.cached_finalized_state = state_ptr;
+        self.cached_finalized_state = new_rc;
 
-        self.logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
+        self.logger.info("loaded finalized state from database at slot {d}", .{new_rc.state.slot});
 
+        if (self.chain_worker != null) {
+            // Lock-free read path: bump the refcount we just stored and
+            // drop the lock so the borrow lifetime is gated by the
+            // refcount alone. The cache field holds one reference, the
+            // borrow holds another. tryAcquire is guaranteed to succeed
+            // here — we own the only reference and we hold events_lock.
+            const acq = new_rc.tryAcquire() orelse unreachable;
+            self.events_lock.unlock();
+            locking.leaveTier5();
+            t_ev.released();
+            lock_held = false;
+            return BorrowedState{
+                .state = &acq.state,
+                .backing = .none,
+                .acquired_rc = acq,
+            };
+        }
+        // Legacy lock-based path: hand the events_lock off to the borrow.
         lock_held = false;
         // tier-5 depth + LockTimer handed off to the borrow; deinit will
         // leaveTier5() and t.released() after unlocking.
         return BorrowedState{
-            .state = state_ptr,
+            .state = &new_rc.state,
             .backing = .{ .events_mutex = &self.events_lock },
             .tier5_held = true,
             .timer = t_ev,
@@ -2428,9 +3233,9 @@ test "process and add mock blocks into a node's chain" {
         // should have matching states in the state
         // SAFETY: test-only, single-threaded — no states_lock acquisition
         // needed (the chain under test has no concurrent mutators).
-        const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
+        const block_state_rc = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
+        try zeam_utils.hashTreeRoot(types.BeamState, block_state_rc.state, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match
@@ -3214,8 +4019,8 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // (att_data_known at slot=1) is the one that actually matters.
     // SAFETY: test-only, single-threaded — no states_lock acquisition
     // needed (the chain under test has no concurrent mutators).
-    const post_state = beam_chain.states.get(produced.blockRoot) orelse @panic("post state should exist");
-    try std.testing.expect(post_state.latest_justified.slot >= 1);
+    const post_state_rc = beam_chain.states.get(produced.blockRoot) orelse @panic("post state should exist");
+    try std.testing.expect(post_state_rc.state.latest_justified.slot >= 1);
 
     // Count how many attestation entries reference the unseen vs known block
     var unseen_count: usize = 0;
@@ -3721,11 +4526,12 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
         // The 0-keyed root would alias genesis (zeroes); we offset by +1.
         unrelated_roots[k] = r;
 
-        const cloned_state = try std.testing.allocator.create(types.BeamState);
-        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, cloned_state);
+        var cloned_value: types.BeamState = undefined;
+        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &cloned_value);
+        const cloned_rc = try RcBeamState.create(std.testing.allocator, cloned_value);
         // Insert directly under exclusive lock (test-internal access).
         beam_chain.states_lock.lock();
-        try beam_chain.states.put(r, cloned_state);
+        try beam_chain.states.put(r, cloned_rc);
         beam_chain.states_lock.unlock();
     }
 
@@ -3773,9 +4579,8 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
         fn pruner(ctx: *TestCtx) void {
             ctx.waitForStart();
             for (ctx.unrelated) |r| {
-                if (ctx.chain.statesFetchRemoveExclusivePtr("test.pruner", r)) |state_ptr| {
-                    state_ptr.deinit();
-                    std.testing.allocator.destroy(state_ptr);
+                if (ctx.chain.statesFetchRemoveExclusivePtr("test.pruner", r)) |rc_ptr| {
+                    rc_ptr.release();
                     _ = ctx.b_done.fetchAdd(1, .monotonic);
                 }
             }
@@ -3809,6 +4614,165 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
     const still_present = beam_chain.states.get(target_root) != null;
     beam_chain.states_lock.unlockShared();
     try std.testing.expect(still_present);
+}
+
+test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)" {
+    // Regression for the post_state_rc leak Partha caught on PR #828:
+    // statesCommitKeepExisting flips its rc-ownership-transfer at the
+    // `getOrPut` step; if `getOrPut` itself OOMs, the helper is the
+    // ONLY place that knows about the rc (the upstream caller in
+    // onBlock has already flipped `post_state_settled = true` to keep
+    // the outer errdefer from double-freeing the now-Rc-wrapped
+    // BeamState). Without an `errdefer rc.release()` covering the
+    // OOM path, the freshly-`create`d rc + its heap-owned BeamState
+    // interior leak permanently. testing.allocator's leak detector
+    // catches the regression: this test passes ONLY when the helper
+    // releases the rc on its own OOM path.
+    //
+    // Mechanism:
+    //   1. Build a real BeamChain with testing.allocator so the chain
+    //      is fully functional and tear-down works.
+    //   2. Swap the chain's `states` map allocator with a
+    //      FailingAllocator that fails its very first allocation.
+    //      AutoHashMap exposes its allocator as a public field, so
+    //      this is a one-line swap.
+    //   3. Build a BeamState + RcBeamState the same way `onBlock`
+    //      does (sszClone the genesis state, wrap with
+    //      RcBeamState.create — both via testing.allocator so the
+    //      FailingAllocator only affects the map).
+    //   4. Pick a fresh root that is NOT already in the map (so the
+    //      getOrPut triggers a backing-array grow that fails — the
+    //      genesis root would hit the found_existing branch and not
+    //      reach the OOM site).
+    //   5. Call statesCommitKeepExisting and expect OutOfMemory. The
+    //      helper must release the caller's rc; testing.allocator
+    //      then verifies no leak at scope exit.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 2, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+
+    var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 12,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // To make `getOrPut` actually fail under the FailingAllocator we
+    // need to FORCE a grow. After init, the states map has spare
+    // capacity (only genesis is in it), so a single insert would just
+    // land in the existing buffer with no allocation — bypassing the
+    // FailingAllocator entirely.
+    //
+    // The hash map's `unmanaged.available` field tracks remaining
+    // slots before a grow is triggered (see std/hash_map.zig
+    // `growIfNeeded`: `new_count > self.available` → grow). Set it
+    // to 0 so the very next insert MUST grow. This is white-box but
+    // it's the cleanest deterministic way to put the map in the
+    // "next insert grows" state without poking real-data invariants:
+    // we never call any other map method between this poke and the
+    // helper-under-test call, so the only thing observing
+    // `available == 0` is `growIfNeeded` itself — exactly the path
+    // we want to fail. Restore the original `available` before
+    // deinit so the chain's teardown path doesn't trip on a stale
+    // value (deinit only iterates and releases; it shouldn't matter
+    // for the iteration walk, but defensive restoration is cheap).
+    const original_available = beam_chain.states.unmanaged.available;
+    beam_chain.states.unmanaged.available = 0;
+    defer beam_chain.states.unmanaged.available = original_available;
+
+    // Now swap the states map allocator with a FailingAllocator.
+    // The next `getOrPut` of a NEW key will need to grow the backing
+    // array; the very first allocation through the FailingAllocator
+    // returns null → OutOfMemory. Restore before deinit so the chain's
+    // own teardown path uses the real allocator.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_states_allocator = beam_chain.states.allocator;
+    beam_chain.states.allocator = failing.allocator();
+    defer beam_chain.states.allocator = original_states_allocator;
+
+    // Build the rc the way onBlock does: clone genesis state into a
+    // fresh value, hand to RcBeamState.create. Both via
+    // testing.allocator so the FailingAllocator above only affects
+    // the states map.
+    var cloned_value: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &cloned_value);
+    const post_state_rc = try RcBeamState.create(std.testing.allocator, cloned_value);
+    // No errdefer post_state_rc.release() here — the helper under
+    // test is responsible for releasing it on its own OOM path.
+    // That IS the contract this test pins.
+
+    // A root that is NOT already in the map (genesis root WOULD be
+    // there, which would hit the found_existing branch and never
+    // reach the OOM site). Use a synthetic non-zero root distinct
+    // from any filler key.
+    var fresh_root = std.mem.zeroes(types.Root);
+    std.mem.writeInt(u64, fresh_root[0..8], 0xDEAD_BEEF_CAFE_BABE, .little);
+
+    const result = beam_chain.statesCommitKeepExisting(
+        "test.oom_regression",
+        fresh_root,
+        post_state_rc,
+    );
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // states_lock must be released — try a quick exclusive
+    // lock+unlock to prove no thread is hung on it. tryLock would be
+    // ideal but SyncRwLock doesn't expose one; a successful
+    // lock()/unlock() pair after the failed call is the same proof
+    // (any leak of the lock would deadlock here forever; CI timeout
+    // would catch that, but in practice the lock IS released by the
+    // helper's errdefer). Doing a real lock here also means the
+    // chain's deinit path doesn't have to fight a held lock.
+    beam_chain.states_lock.lock();
+    beam_chain.states_lock.unlock();
+
+    // The freshly-created rc must NOT have made it into the map
+    // (getOrPut failed before insertion). Genesis must still be the
+    // sole entry under the genesis root.
+    try std.testing.expect(beam_chain.states.get(fresh_root) == null);
 }
 
 test "chain.onBlock: two-thread concurrent import of same block — no UAF, coherent state" {
@@ -3967,4 +4931,901 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
         // We just assert the imported block is known to forkchoice.
         try std.testing.expect(beam_chain.forkChoice.hasBlock(block_root));
     }
+}
+
+test "chain: concurrent re-import pressure — kept_existing path race + attestation spam" {
+    // Slice (b) cross-thread test scenario: two onBlock threads race
+    // the import of the SAME block sequence in opposite orders
+    // (forward 1..N, reverse N..1) while an attestation thread spams
+    // mixed-validity attestations. This is NOT a reorg test — we
+    // never build a divergent fork. What we exercise is the
+    // statesCommitKeepExisting / kept_existing path under contention:
+    // whichever importer wins the race for a given block populates
+    // `states`; the loser then takes the kept_existing branch and
+    // frees its redundantly-computed post-state. (A real reorg test
+    // would need genMockChain to expose a fork-from-shared-parent
+    // helper; not in scope for slice (b).)
+    //
+    // The contract under test:
+    //
+    //   * Forkchoice settles on a single head after all imports finish.
+    //   * No panic / UAF in the attestation pool (events_lock +
+    //     forkchoice attestation map are concurrently mutated).
+    //   * statesGet on the eventual head root succeeds and the slot
+    //     is coherent with one of the imported chain tips.
+    //   * The kept_existing branch is actually exercised
+    //     (`states_kept_existing_count` strictly increases) — without
+    //     this, the test would silently pass on a serialized run.
+    //
+    // Iteration count is modest (50) so the whole test stays under ~30s
+    // in Debug. Each iteration builds a fresh BeamChain, imports the
+    // shared mock chain, and then concurrently re-imports + spams
+    // attestations. The slow part is XMSS attestation signing; we limit
+    // attestation messages per iteration to keep runtime sane.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    // 4-block mock chain shared across all iterations as the import
+    // template. We don't fork — see the test header for the rationale.
+    const mock_chain = try stf.genMockChain(arena, 4, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const ITERS: usize = 50;
+    var iter: usize = 0;
+    while (iter < ITERS) : (iter += 1) {
+        const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+        const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+        const chain_config = configs.ChainConfig{
+            .id = configs.Chain.custom,
+            .genesis = mock_chain.genesis_config,
+            .spec = .{
+                .preset = params.Preset.mainnet,
+                .name = spec_name,
+                .fork_digest = fork_digest,
+                .attestation_committee_count = 1,
+                .max_attestations_data = 16,
+            },
+        };
+
+        var beam_state: types.BeamState = undefined;
+        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+        defer beam_state.deinit();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var path_buf: [128]u8 = undefined;
+        const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+        var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+        defer db.deinit();
+
+        const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+        defer std.testing.allocator.destroy(connected_peers);
+        connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+        defer connected_peers.deinit();
+
+        const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+        defer std.testing.allocator.destroy(test_registry);
+        test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+        defer test_registry.deinit();
+
+        var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+            .config = chain_config,
+            .anchorState = &beam_state,
+            .nodeId = 21,
+            .logger_config = &zeam_logger_config,
+            .db = db,
+            .node_registry = test_registry,
+        }, connected_peers);
+        defer beam_chain.deinit();
+
+        // Advance forkchoice clock past the last block's slot so block
+        // imports are not FutureSlot-rejected and attestations are not
+        // FutureSlot either.
+        const last_slot = mock_chain.blocks[mock_chain.blocks.len - 1].block.slot;
+        try beam_chain.forkChoice.onInterval((last_slot + 4) * constants.INTERVALS_PER_SLOT, false);
+
+        const Ctx = struct {
+            chain: *BeamChain,
+            blocks: []types.SignedBlock,
+            block_roots: []types.Root,
+            attn_iters: usize,
+            // counters
+            imports_a: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            imports_b: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            attn_ok: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            // start barrier
+            start: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+            ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            fatal_msg: [128]u8 = undefined,
+            fatal_set: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        };
+
+        const Worker = struct {
+            fn waitStart(ctx: *Ctx) void {
+                _ = ctx.ready.fetchAdd(1, .acq_rel);
+                while (ctx.start.load(.acquire) == 0) std.Thread.yield() catch {};
+            }
+            // Forward import 1..N
+            fn importerForward(ctx: *Ctx) void {
+                waitStart(ctx);
+                for (1..ctx.blocks.len) |i| {
+                    const missing = ctx.chain.onBlock(ctx.blocks[i], .{ .pruneForkchoice = false }) catch continue;
+                    ctx.chain.allocator.free(missing);
+                    _ = ctx.imports_a.fetchAdd(1, .monotonic);
+                }
+            }
+            // Reverse import N..1 — different order = different
+            // interleavings of forkchoice insert vs kept_existing.
+            fn importerReverse(ctx: *Ctx) void {
+                waitStart(ctx);
+                var i: usize = ctx.blocks.len;
+                while (i > 1) {
+                    i -= 1;
+                    const missing = ctx.chain.onBlock(ctx.blocks[i], .{ .pruneForkchoice = false }) catch continue;
+                    ctx.chain.allocator.free(missing);
+                    _ = ctx.imports_b.fetchAdd(1, .monotonic);
+                }
+            }
+            fn attestationSpammer(ctx: *Ctx, key_manager: *keymanager.KeyManager) void {
+                waitStart(ctx);
+                const allocator = ctx.chain.allocator;
+                var i: usize = 0;
+                while (i < ctx.attn_iters) : (i += 1) {
+                    const slot_idx = 1 + (i % (ctx.blocks.len - 1));
+                    const target_root = ctx.block_roots[slot_idx];
+                    const target_slot: types.Slot = ctx.blocks[slot_idx].block.slot;
+                    const source_idx = if (slot_idx > 1) slot_idx - 1 else 0;
+                    const validator_id: usize = i % 4;
+                    const message = types.Attestation{
+                        .validator_id = @intCast(validator_id),
+                        .data = .{
+                            .slot = target_slot,
+                            .head = .{ .root = target_root, .slot = target_slot },
+                            .source = .{ .root = ctx.block_roots[source_idx], .slot = ctx.blocks[source_idx].block.slot },
+                            .target = .{ .root = target_root, .slot = target_slot },
+                        },
+                    };
+                    const signature = key_manager.signAttestation(&message, allocator) catch continue;
+                    const valid_attestation = types.SignedAttestation{
+                        .validator_id = message.validator_id,
+                        .message = message.data,
+                        .signature = signature,
+                    };
+                    const subnet_id = types.computeSubnetId(
+                        @intCast(valid_attestation.validator_id),
+                        ctx.chain.config.spec.attestation_committee_count,
+                    ) catch continue;
+                    const gossip = networks.AttestationGossip{
+                        .subnet_id = @intCast(subnet_id),
+                        .message = valid_attestation,
+                    };
+                    ctx.chain.onGossipAttestation(gossip) catch continue;
+                    _ = ctx.attn_ok.fetchAdd(1, .monotonic);
+                }
+            }
+        };
+
+        var key_manager = try keymanager.getTestKeyManager(std.testing.allocator, 4, mock_chain.blocks.len);
+        defer key_manager.deinit();
+
+        var ctx = Ctx{
+            .chain = &beam_chain,
+            .blocks = mock_chain.blocks,
+            .block_roots = mock_chain.blockRoots,
+            .attn_iters = 30,
+        };
+
+        var t_a = try std.Thread.spawn(.{}, Worker.importerForward, .{&ctx});
+        var t_b = try std.Thread.spawn(.{}, Worker.importerReverse, .{&ctx});
+        var t_c = try std.Thread.spawn(.{}, Worker.attestationSpammer, .{ &ctx, &key_manager });
+
+        while (ctx.ready.load(.acquire) < 3) std.Thread.yield() catch {};
+        ctx.start.store(1, .release);
+
+        t_a.join();
+        t_b.join();
+        t_c.join();
+
+        // Forkchoice must have settled on a single head.
+        const head = beam_chain.forkChoice.getHead();
+        // The head must be one of the imported block roots (or genesis
+        // if every import failed, which would itself be a bug). At
+        // minimum every block root must be observable in the chain.
+        for (mock_chain.blockRoots[1..]) |r| {
+            try std.testing.expect(beam_chain.forkChoice.hasBlock(r));
+        }
+        // The forward importer is deterministic on a fresh chain (each
+        // parent is in `states` by the time we reach the next block),
+        // so it MUST contribute every block. Use strict equality so a
+        // future regression that breaks the forward path can't be
+        // masked by the reverse importer's contributions.
+        try std.testing.expectEqual(
+            @as(u32, @intCast(mock_chain.blocks.len - 1)),
+            ctx.imports_a.load(.monotonic),
+        );
+        // The kept_existing race surface MUST have been exercised at
+        // least once during this iteration. This is the actual
+        // assertion that distinguishes "two threads ran in parallel"
+        // from "two threads serialized". The reverse importer's
+        // success count is inherently racy (it depends on whether the
+        // forward importer has populated states[block-1] yet) so we
+        // assert via the kept_existing counter rather than
+        // imports_b.
+        try std.testing.expect(beam_chain.states_kept_existing_count.load(.monotonic) > 0);
+        // Head's slot is finite and not in the future relative to last
+        // imported slot.
+        try std.testing.expect(head.slot <= last_slot);
+        // statesGet on the head root must succeed.
+        var head_borrow = beam_chain.statesGet(head.blockRoot) orelse {
+            try std.testing.expect(false);
+            unreachable;
+        };
+        const owned = try head_borrow.cloneAndRelease(std.testing.allocator);
+        owned.deinit();
+        std.testing.allocator.destroy(owned);
+    }
+}
+
+test "chain: finalization race — onBlockFollowup + statesGet from API-shaped reader" {
+    // Slice (b) cross-thread test scenario: while a writer thread imports
+    // blocks and advances finalization (via onBlockFollowup), an
+    // HTTP-API-shaped reader thread loops over chain.statesGet +
+    // cloneAndRelease for both finalized and non-finalized roots.
+    //
+    // NOTE on iteration semantics: the writer's first pass over
+    // blocks 1..N is the only pass that actually advances
+    // finalization. Subsequent passes hit `kept_existing` in
+    // statesCommitKeepExisting and onBlockFollowup is then a no-op
+    // for finalization. The outer `iters` loop therefore exists to
+    // give the readers enough wall-clock to race against the *first*
+    // pass and to exercise the kept_existing-vs-statesGet contention
+    // afterwards — it is NOT 20 independent finalization advances.
+    // The `>0` finalized-observation assertion below ensures we
+    // actually hit the racing window at least once; otherwise the
+    // test would pass even if finalization never advanced.
+    //
+    // The contract under test:
+    //
+    //   * No UAF in the reader: every cloneAndRelease either returns a
+    //     coherent state or null (entry pruned away during the borrow
+    //     opportunity window — acceptable, the reader retries).
+    //   * No torn read: every observed slot is one of the imported
+    //     slots (or 0 for genesis).
+    //   * No deadlock: the test must complete in well under 30s.
+    //   * latest_finalized as observed via forkChoice.getLatestFinalized
+    //     never goes backwards across reader observations.
+    //   * At least one reader observation saw `latest_finalized.slot > 0`
+    //     (proves finalization actually advanced during the race window;
+    //     guards against a regression that silently never finalizes).
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 6, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 22,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    const last_slot = mock_chain.blocks[mock_chain.blocks.len - 1].block.slot;
+    try beam_chain.forkChoice.onInterval((last_slot + 4) * constants.INTERVALS_PER_SLOT, false);
+
+    const Ctx = struct {
+        chain: *BeamChain,
+        blocks: []types.SignedBlock,
+        block_roots: []types.Root,
+        iters: usize,
+        writer_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        reader_ok: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        reader_null: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        reader_torn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        finalized_regression: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        /// Maximum `latest_finalized.slot` observed by any reader
+        /// across the whole run. Asserting this is `>0` guards
+        /// against a regression where finalization silently never
+        /// advances during the race window.
+        max_observed_finalized_slot: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        start: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    };
+
+    const Worker = struct {
+        fn waitStart(ctx: *Ctx) void {
+            _ = ctx.ready.fetchAdd(1, .acq_rel);
+            while (ctx.start.load(.acquire) == 0) std.Thread.yield() catch {};
+        }
+        // Writer: import blocks 1..N, calling onBlockFollowup after
+        // each. onBlockFollowup is what drives processFinalizationAdvancement.
+        fn writer(ctx: *Ctx) void {
+            waitStart(ctx);
+            var i: usize = 0;
+            while (i < ctx.iters) : (i += 1) {
+                for (1..ctx.blocks.len) |k| {
+                    const missing = ctx.chain.onBlock(ctx.blocks[k], .{ .pruneForkchoice = false }) catch continue;
+                    ctx.chain.allocator.free(missing);
+                    // Drive followup so finalization advances on the
+                    // canonical chain. signedBlock parameter is unused
+                    // by current impl (per source).
+                    ctx.chain.onBlockFollowup(false, null);
+                }
+            }
+            ctx.writer_done.store(true, .release);
+        }
+        // Reader: HTTP-API-shaped pattern — statesGet on a random known
+        // root, cloneAndRelease, sanity-check the slot. Loop until
+        // writer signals done. Also tracks latest_finalized monotonicity.
+        fn reader(ctx: *Ctx) void {
+            waitStart(ctx);
+            var prng = std.Random.DefaultPrng.init(0x517A715A);
+            const rand = prng.random();
+            var last_finalized_slot: types.Slot = 0;
+            const allocator = ctx.chain.allocator;
+            while (!ctx.writer_done.load(.acquire)) {
+                const idx = rand.uintLessThan(usize, ctx.block_roots.len);
+                const root = ctx.block_roots[idx];
+                if (ctx.chain.statesGet(root)) |b| {
+                    var borrow = b;
+                    const owned = borrow.cloneAndRelease(allocator) catch {
+                        continue;
+                    };
+                    defer {
+                        owned.deinit();
+                        allocator.destroy(owned);
+                    }
+                    var coherent = owned.slot == 0;
+                    if (!coherent) {
+                        for (ctx.blocks) |bl| {
+                            if (bl.block.slot == owned.slot) {
+                                coherent = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (coherent) {
+                        _ = ctx.reader_ok.fetchAdd(1, .monotonic);
+                    } else {
+                        _ = ctx.reader_torn.fetchAdd(1, .monotonic);
+                    }
+                } else {
+                    _ = ctx.reader_null.fetchAdd(1, .monotonic);
+                }
+                // Monotonicity check on latest_finalized.
+                const lf = ctx.chain.forkChoice.getLatestFinalized();
+                if (lf.slot < last_finalized_slot) {
+                    _ = ctx.finalized_regression.fetchAdd(1, .monotonic);
+                }
+                last_finalized_slot = lf.slot;
+                // Track the highest finalized slot any reader has
+                // observed (compare-and-swap loop; `max` is not yet
+                // a built-in atomic op).
+                var prev_max = ctx.max_observed_finalized_slot.load(.monotonic);
+                while (lf.slot > prev_max) {
+                    if (ctx.max_observed_finalized_slot.cmpxchgWeak(
+                        prev_max,
+                        lf.slot,
+                        .monotonic,
+                        .monotonic,
+                    )) |actual| {
+                        prev_max = actual;
+                    } else break;
+                }
+            }
+        }
+    };
+
+    var ctx = Ctx{
+        .chain = &beam_chain,
+        .blocks = mock_chain.blocks,
+        .block_roots = mock_chain.blockRoots,
+        .iters = 20,
+    };
+
+    var t_w = try std.Thread.spawn(.{}, Worker.writer, .{&ctx});
+    var t_r1 = try std.Thread.spawn(.{}, Worker.reader, .{&ctx});
+    var t_r2 = try std.Thread.spawn(.{}, Worker.reader, .{&ctx});
+
+    while (ctx.ready.load(.acquire) < 3) std.Thread.yield() catch {};
+    ctx.start.store(1, .release);
+
+    t_w.join();
+    t_r1.join();
+    t_r2.join();
+
+    // Contract: no torn reads, no finalization regressions.
+    try std.testing.expectEqual(@as(u32, 0), ctx.reader_torn.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.finalized_regression.load(.monotonic));
+    // Sanity: at least some successful reads happened (otherwise the
+    // race window collapsed and the test proves nothing).
+    try std.testing.expect(ctx.reader_ok.load(.monotonic) > 100);
+    // Critical: the readers must have actually observed finalization
+    // advance to a non-zero slot during the race window. Without this
+    // assertion the test would pass on a regression that silently
+    // failed to finalize — the no-torn-read + no-regression checks
+    // would still trivially hold on a chain stuck at genesis.
+    try std.testing.expect(ctx.max_observed_finalized_slot.load(.monotonic) > 0);
+}
+
+test "chain-worker: end-to-end submitBlock advances state via the worker thread" {
+    // Slice c-2b commit 3 of #803 integration test.
+    //
+    // Boots a BeamChain with the chain-worker started, submits a real
+    // block via `submitBlock` (the worker-routed producer wrapper),
+    // waits for the worker to drain its queue, and asserts the chain
+    // state advanced as if the synchronous path had been taken:
+    //
+    //   * `states` map gains an entry for the imported block root.
+    //   * `forkChoice.hasBlock(root)` is true.
+    //   * The post-state's slot matches the imported block.
+    //
+    // This exercises every layer the commit touches end-to-end:
+    //
+    //   producer thread (this test) ──submitBlock──▶ BlockQueue
+    //   ChainWorker.runLoop ──tryRecv──▶ dispatch ──vtable──▶
+    //   chainWorkerOnBlockThunk ──▶ BeamChain.onBlock + onBlockFollowup
+    //
+    // We deliberately do NOT use the BeamChain ctor's auto-start path
+    // (there is none), instead calling `startChainWorker()` after the
+    // chain is at its final stack address. This mirrors the production
+    // call site in `BeamNode.init` which does the same after the chain
+    // is at its heap address. (The chain in this test is on the test
+    // function's stack, but doesn't move once allocated, which is
+    // sufficient for the worker's lifetime here.)
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 3, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    // spec_name + fork_digest live as long as the chain (BeamChain.deinit
+    // frees them via self.allocator).
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+
+    var db = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir,
+    );
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 0,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Start the chain-worker. After this point any submit* call may
+    // race with the worker thread; deinit (via defer above) calls
+    // `chain_worker.stop()` first which is the only safe shutdown
+    // ordering.
+    try beam_chain.startChainWorker();
+    try std.testing.expect(beam_chain.chain_worker != null);
+
+    // Advance forkchoice clock past the imported block's slot so the
+    // worker's onBlock call doesn't reject with FutureSlot.
+    const signed_block = mock_chain.blocks[1];
+    const block_root = mock_chain.blockRoots[1];
+    try beam_chain.forkChoice.onInterval(
+        signed_block.block.slot * constants.INTERVALS_PER_SLOT,
+        false,
+    );
+
+    // The worker takes ownership of the SignedBlock on a successful
+    // send, so we must clone the mock-chain block (which is owned by
+    // the arena and will be freed when the arena deinits, NOT by the
+    // worker after dispatch).
+    var cloned: types.SignedBlock = undefined;
+    try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &cloned);
+    var cloned_consumed = false;
+    errdefer if (!cloned_consumed) cloned.deinit();
+
+    try beam_chain.submitBlock(cloned, false);
+    cloned_consumed = true;
+
+    // Wait for the worker to drain the queue. We poll on the
+    // states map (the post-condition we actually care about); the
+    // forkchoice insert happens synchronously inside onBlock and
+    // states is populated by `statesCommitKeepExisting` shortly
+    // after, so observing the entry is the strongest single signal
+    // that the message was processed end-to-end.
+    //
+    // 5s timeout is generous: a single STF on this 9-validator
+    // mock chain is well under 100 ms in Debug.
+    const start_ns = zeam_utils.monotonicTimestampNs();
+    const deadline_ns: i128 = start_ns + 5 * std.time.ns_per_s;
+    var observed = false;
+    while (zeam_utils.monotonicTimestampNs() < deadline_ns) {
+        beam_chain.states_lock.lockShared();
+        const present = beam_chain.states.get(block_root) != null;
+        beam_chain.states_lock.unlockShared();
+        if (present) {
+            observed = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(observed);
+
+    // Forkchoice must have observed the import.
+    try std.testing.expect(beam_chain.forkChoice.hasBlock(block_root));
+
+    // Post-state slot must match the imported block.
+    var borrow = beam_chain.statesGet(block_root) orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    defer borrow.deinit();
+    try std.testing.expectEqual(signed_block.block.slot, borrow.state.slot);
+
+    // Disabled-mode contract: with no worker, the submit* family
+    // returns ChainWorkerDisabled rather than silently doing the
+    // synchronous path. We can't test that on this chain (the
+    // worker is started), so spot-check it on a fresh chain.
+    var beam_state_2: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state_2);
+    defer beam_state_2.deinit();
+
+    const spec_name_2 = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest_2 = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config_2 = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name_2,
+            .fork_digest = fork_digest_2,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var tmp_dir_2 = std.testing.tmpDir(.{});
+    defer tmp_dir_2.cleanup();
+    var path_buf_2: [128]u8 = undefined;
+    const data_dir_2 = try std.fmt.bufPrint(&path_buf_2, ".zig-cache/tmp/{s}", .{tmp_dir_2.sub_path});
+    var db2 = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir_2,
+    );
+    defer db2.deinit();
+
+    const connected_peers_2 = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers_2);
+    connected_peers_2.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers_2.deinit();
+
+    const registry_2 = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(registry_2);
+    registry_2.* = NodeNameRegistry.init(std.testing.allocator);
+    defer registry_2.deinit();
+
+    var beam_chain_off = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config_2,
+        .anchorState = &beam_state_2,
+        .nodeId = 1,
+        .logger_config = &zeam_logger_config,
+        .db = db2,
+        .node_registry = registry_2,
+    }, connected_peers_2);
+    defer beam_chain_off.deinit();
+
+    try std.testing.expect(beam_chain_off.chain_worker == null);
+    // Caller still owns this clone (errdefer below frees it after the
+    // expected ChainWorkerDisabled comes back).
+    var off_cloned: types.SignedBlock = undefined;
+    try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &off_cloned);
+    defer off_cloned.deinit();
+    try std.testing.expectError(
+        error.ChainWorkerDisabled,
+        beam_chain_off.submitBlock(off_cloned, false),
+    );
+}
+
+test "chain.statesGet under chain_worker enabled returns Backing.none + acquired_rc (slice c-2b commit 4)" {
+    // Slice c-2b commit 4 of #803: when chain_worker != null, statesGet
+    // takes the lock-free path — it tryAcquires the rc under the shared
+    // lock, drops the lock, and returns a Backing.none borrow. This
+    // test verifies the contract: the borrow is Backing.none, has a
+    // non-null acquired_rc, and the rc refcount tracks acquire/release.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 2, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    var db = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir,
+    );
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 42,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Start the worker so chain_worker != null (this is the
+    // --chain-worker=on runtime indicator).
+    try beam_chain.startChainWorker();
+    try std.testing.expect(beam_chain.chain_worker != null);
+
+    const target_root = mock_chain.blockRoots[0]; // genesis root, populated by init
+
+    // Snapshot refcount before the borrow.
+    beam_chain.states_lock.lockShared();
+    const rc_before = beam_chain.states.get(target_root).?;
+    const refcount_before = rc_before.count();
+    beam_chain.states_lock.unlockShared();
+    try std.testing.expectEqual(@as(u32, 1), refcount_before);
+
+    // Take a borrow.
+    var borrow = beam_chain.statesGet(target_root) orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+
+    // Verify lock-free shape: Backing.none + non-null acquired_rc.
+    try std.testing.expect(borrow.backing == .none);
+    try std.testing.expect(borrow.acquired_rc != null);
+    try std.testing.expect(borrow.acquired_rc.? == rc_before);
+
+    // Refcount must have bumped to 2 (map=1 + borrow=1).
+    try std.testing.expectEqual(@as(u32, 2), rc_before.count());
+
+    // Drop the borrow — refcount returns to 1 (map only).
+    borrow.deinit();
+    try std.testing.expectEqual(@as(u32, 1), rc_before.count());
+}
+
+test "chain.statesGet under chain_worker enabled does not block exclusive writers (slice c-2b commit 4)" {
+    // The whole point of slice c-2b commit 4: a long-lived reader borrow
+    // must NOT block an exclusive-side mutation by the chain worker
+    // path. We hold a Backing.none borrow open across the lifetime of
+    // a writer thread that takes the exclusive lock and inserts an
+    // unrelated entry; under the old shared-held-for-borrow behavior
+    // the writer would deadlock against the reader (or rather, block
+    // until the reader released). A 1-second watchdog asserts the
+    // writer completed within bound; a regression hangs CI rather
+    // than silently passing.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 2, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    var db = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir,
+    );
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 43,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    try beam_chain.startChainWorker();
+    try std.testing.expect(beam_chain.chain_worker != null);
+
+    const target_root = mock_chain.blockRoots[0];
+
+    // Reader: take a long-lived borrow.
+    var borrow = beam_chain.statesGet(target_root) orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    defer borrow.deinit();
+    try std.testing.expect(borrow.backing == .none);
+
+    // Writer: take the exclusive lock + insert an unrelated entry.
+    // Under the OLD shared-held-for-borrow behavior this would block
+    // until the reader released; under c-2b commit 4 the reader's
+    // borrow does NOT hold the lock, so the writer completes
+    // immediately.
+    const WriterCtx = struct {
+        chain: *BeamChain,
+        genesis_state: *const types.BeamState,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(ctx: *@This()) void {
+            // Synthetic root distinct from genesis (zeroes); first byte 0xab.
+            var fake_root: types.Root = std.mem.zeroes(types.Root);
+            fake_root[0] = 0xab;
+
+            var cloned_value: types.BeamState = undefined;
+            types.sszClone(std.testing.allocator, types.BeamState, ctx.genesis_state.*, &cloned_value) catch return;
+            const new_rc = RcBeamState.create(std.testing.allocator, cloned_value) catch return;
+
+            // Take the exclusive side. With the lock-free reader this
+            // returns immediately even though a borrow is alive in the
+            // main thread.
+            ctx.chain.states_lock.lock();
+            ctx.chain.states.put(fake_root, new_rc) catch {
+                ctx.chain.states_lock.unlock();
+                new_rc.release();
+                return;
+            };
+            ctx.chain.states_lock.unlock();
+            ctx.done.store(true, .release);
+        }
+    };
+    var writer_ctx = WriterCtx{
+        .chain = &beam_chain,
+        .genesis_state = &mock_chain.genesis_state,
+    };
+    var writer_thread = try std.Thread.spawn(.{}, WriterCtx.run, .{&writer_ctx});
+
+    // Watchdog: spin for at most 1 second waiting for the writer.
+    // Under a regression (e.g. a future change re-imposing the
+    // shared-held-for-borrow shape) the writer would block on the
+    // reader's borrow and this would time out.
+    const start_ns = zeam_utils.monotonicTimestampNs();
+    const deadline_ns: i128 = start_ns + 1 * std.time.ns_per_s;
+    while (zeam_utils.monotonicTimestampNs() < deadline_ns) {
+        if (writer_ctx.done.load(.acquire)) break;
+        std.Thread.yield() catch {};
+    }
+    writer_thread.join();
+    try std.testing.expect(writer_ctx.done.load(.acquire));
+
+    // The reader's borrow is still valid even after the writer mutated
+    // the map: refcount kept the underlying state alive.
+    try std.testing.expectEqual(mock_chain.genesis_state.slot, borrow.state.slot);
 }

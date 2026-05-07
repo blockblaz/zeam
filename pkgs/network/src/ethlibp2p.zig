@@ -924,15 +924,12 @@ export fn handleLogFromRustBridge(
     }
 }
 
-export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void {
+export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8) void {
     const listen_slice = std.mem.span(listen_addresses);
     zig_handler.allocator.free(listen_slice);
 
     const connect_slice = std.mem.span(connect_addresses);
     zig_handler.allocator.free(connect_slice);
-
-    const topics_slice = std.mem.span(topics);
-    zig_handler.allocator.free(topics_slice);
 
     const private_key_slice = std.mem.span(local_private_key);
     zig_handler.allocator.free(private_key_slice);
@@ -946,7 +943,6 @@ pub const CreateNetworkParams = extern struct {
     local_private_key: [*:0]const u8,
     listen_addresses: [*:0]const u8,
     connect_addresses: [*:0]const u8,
-    topics: [*:0]const u8,
 };
 
 pub extern fn create_and_run_network(params: *const CreateNetworkParams) callconv(.c) void;
@@ -968,6 +964,15 @@ pub extern fn publish_msg_to_rust_bridge(
     topic_str: [*:0]const u8,
     message_ptr: [*]const u8,
     message_len: usize,
+) callconv(.c) bool;
+/// Enqueue a gossipsub mesh subscription on the Rust-side swarm command channel.
+/// Returns `true` if the command was enqueued, `false` if dropped (network not
+/// initialized, channel full / closed, or null `topic_str`). Driven from
+/// `EthLibp2p.subscribe`, which keeps `gossip.subscribe` on the Zig side as
+/// the single source of truth for which subnets a node joins.
+pub extern fn subscribe_gossip_topic_to_rust_bridge(
+    networkId: u32,
+    topic_str: [*:0]const u8,
 ) callconv(.c) bool;
 pub extern fn send_rpc_request(
     networkId: u32,
@@ -1036,7 +1041,6 @@ const CreateNetworkThreadArgs = struct {
     local_private_key: [*:0]const u8,
     listen_addresses: [*:0]const u8,
     connect_addresses: [*:0]const u8,
-    topics: [*:0]const u8,
 };
 
 fn createAndRunNetworkThread(args: CreateNetworkThreadArgs) void {
@@ -1047,7 +1051,6 @@ fn createAndRunNetworkThread(args: CreateNetworkThreadArgs) void {
         .local_private_key = args.local_private_key,
         .listen_addresses = args.listen_addresses,
         .connect_addresses = args.connect_addresses,
-        .topics = args.topics,
     };
     create_and_run_network(&c_params);
 }
@@ -1059,7 +1062,6 @@ pub const EthLibp2pParams = struct {
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
     node_registry: *const NodeNameRegistry,
-    attestation_committee_count: types.SubnetId,
 };
 
 pub const EthLibp2p = struct {
@@ -1074,11 +1076,6 @@ pub const EthLibp2p = struct {
     node_registry: *const NodeNameRegistry,
 
     const Self = @This();
-
-    fn getAttestationSubnetCount(committee_count: types.SubnetId) !usize {
-        if (committee_count == 0) return error.InvalidAttestationCommitteeCount;
-        return @intCast(committee_count);
-    }
 
     pub fn init(
         allocator: Allocator,
@@ -1114,7 +1111,6 @@ pub const EthLibp2p = struct {
                 .listen_addresses = params.listen_addresses,
                 .connect_peers = params.connect_peers,
                 .node_registry = params.node_registry,
-                .attestation_committee_count = params.attestation_committee_count,
             },
             .gossipHandler = gossip_handler,
             .peerEventHandler = peer_event_handler,
@@ -1171,45 +1167,24 @@ pub const EthLibp2p = struct {
             try self.allocator.dupeZ(u8, "");
         const local_private_key = try self.allocator.dupeZ(u8, self.params.local_private_key);
 
-        var topics_list: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (topics_list.items) |topic_str| {
-                self.allocator.free(topic_str);
-            }
-            topics_list.deinit(self.allocator);
-        }
-
-        for (std.enums.values(interface.GossipTopicKind)) |kind| {
-            switch (kind) {
-                .attestation => {
-                    const subnet_count = try getAttestationSubnetCount(self.params.attestation_committee_count);
-                    for (0..subnet_count) |i| {
-                        const subnet_id: types.SubnetId = @intCast(i);
-                        const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
-                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
-                        defer topic.deinit();
-                        const topic_str = try topic.encode();
-                        try topics_list.append(self.allocator, topic_str);
-                    }
-                },
-                else => {
-                    const gossip_topic = interface.GossipTopic{ .kind = kind };
-                    var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
-                    defer topic.deinit();
-                    const topic_str = try topic.encode();
-                    try topics_list.append(self.allocator, topic_str);
-                },
-            }
-        }
-        const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
-
+        // Topic subscriptions are not passed to the Rust bridge at startup.
+        // `EthLibp2p.subscribe` drives them via
+        // `subscribe_gossip_topic_to_rust_bridge` once the swarm command
+        // channel is up, keeping `gossip.subscribe` (called from `BeamNode`)
+        // as the single source of truth for joined subnets. The previous
+        // approach (enumerate every attestation subnet at startup) joined the
+        // mesh to every subnet on every node and defeated the bandwidth
+        // savings of attestation subnets; the intermediate fix (read the
+        // handler map after BeamNode.run()) required a strict startup order
+        // and did not surface late changes to the subscription set. See
+        // https://github.com/leanEthereum/leanSpec/blob/main/src/lean_spec/__main__.py
+        // for the spec-conformant selective subscribe.
         self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetworkThread, .{CreateNetworkThreadArgs{
             .network_id = self.params.networkId,
             .handle = self,
             .local_private_key = local_private_key.ptr,
             .listen_addresses = listen_addresses_str.ptr,
             .connect_addresses = connect_peers_str.ptr,
-            .topics = topics_str.ptr,
         }});
 
         // Wait for the network to be fully initialized before returning
@@ -1245,7 +1220,27 @@ pub const EthLibp2p = struct {
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.subscribe(topics, handler);
+        // Drive the Rust gossipsub mesh subscriptions from the same call site
+        // that registers the in-process Zig handlers. After this, the subnet
+        // set the node joins on the wire is exactly the set whose handlers
+        // are wired up in `gossipHandler.onGossipHandlers`. Caller (BeamNode)
+        // must invoke this AFTER `EthLibp2p.run()` has spawned the rust
+        // bridge thread; `run()`'s `wait_for_network_ready` ensures the swarm
+        // command channel exists by the time `run()` returns.
+        for (topics) |gossip_topic| {
+            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
+            defer topic.deinit();
+            const topic_str = try topic.encodeZ();
+            defer self.allocator.free(topic_str);
+            if (!subscribe_gossip_topic_to_rust_bridge(self.params.networkId, topic_str.ptr)) {
+                self.logger.err(
+                    "network-{d}:: gossip mesh subscribe dropped for topic={f} (network not ready or swarm command channel full — see rust-bridge logs)",
+                    .{ self.params.networkId, gossip_topic },
+                );
+                return error.GossipMeshSubscribeFailed;
+            }
+        }
+        try self.gossipHandler.subscribe(topics, handler);
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
