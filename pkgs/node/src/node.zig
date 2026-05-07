@@ -881,6 +881,72 @@ pub const BeamNode = struct {
         self.flushPendingParentFetches();
     }
 
+    /// Process a single block chunk received in response to a blocks_by_range request.
+    /// Reuses onBlock for STF + forkchoice integration; on missing-parent we cache the block
+    /// and queue a parent fetch (same as the by-root path), but we don't track per-root
+    /// pending state since the original request was slot-based.
+    fn processBlockByRangeChunk(self: *Self, peer_id: []const u8, signed_block: *const types.SignedBlock) !void {
+        var block_root: types.Root = undefined;
+        zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator) catch |err| {
+            self.logger.warn("failed to compute block root from blocks_by_range response from peer={s}{f}: {any}", .{
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                err,
+            });
+            return;
+        };
+
+        // Skip if already known to fork choice — same guard as processBlockByRootChunk.
+        if (self.chain.forkChoice.hasBlock(block_root)) {
+            self.logger.debug(
+                "blocks_by_range: block 0x{x} already known to fork choice, skipping",
+                .{&block_root},
+            );
+            self.processCachedDescendants(block_root);
+            return;
+        }
+
+        const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
+            if (err == chainFactory.BlockProcessingError.MissingPreState) {
+                // Cache and try to fetch parent. Range responses arrive ordered by slot,
+                // but the first chunk in a batch may still need its parent fetched.
+                if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
+                    self.logger.debug(
+                        "blocks_by_range: cached block 0x{x}, fetching parent 0x{x}",
+                        .{ &block_root, &parent_root },
+                    );
+                } else |cache_err| {
+                    if (cache_err == CacheBlockError.PreFinalized) {
+                        _ = self.network.pruneCachedBlocks(block_root, null);
+                    } else {
+                        self.logger.warn("blocks_by_range: failed to cache block 0x{x}: {any}", .{ &block_root, cache_err });
+                    }
+                }
+                self.flushPendingParentFetches();
+                return;
+            }
+            if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                _ = self.network.pruneCachedBlocks(block_root, null);
+                return;
+            }
+            self.logger.warn("blocks_by_range: failed to import block 0x{x} from peer={s}{f}: {any}", .{
+                &block_root,
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                err,
+            });
+            return;
+        };
+        defer self.allocator.free(missing_roots);
+
+        self.chain.onBlockFollowup(true, signed_block);
+        self.processCachedDescendants(block_root);
+        self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+        };
+        self.flushPendingParentFetches();
+    }
+
     fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
         const request_id = event.request_id;
         // Snapshot the pending entry so we don't hold the
@@ -924,21 +990,55 @@ pub const BeamNode = struct {
                                 // Only sync from this peer if their finalized slot is ahead of ours
                                 const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
                                 if (status_resp.finalized_slot > our_finalized_slot) {
-                                    self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
-                                        status_ctx.peer_id,
-                                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                        status_resp.finalized_slot,
-                                        info.head_slot,
-                                        &status_resp.head_root,
-                                    });
-                                    const roots = [_]types.Root{status_resp.head_root};
-                                    self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                        self.logger.warn("failed to initiate sync by fetching head block from peer {s}{f}: {any}", .{
+                                    // If the peer is far ahead, prefer a blocks_by_range bulk fetch
+                                    // for efficient catch-up. The head-block-by-root path walks parents
+                                    // one round-trip at a time which is too slow for large gaps.
+                                    const gap: u64 = if (status_resp.head_slot > info.head_slot)
+                                        status_resp.head_slot - info.head_slot
+                                    else
+                                        0;
+                                    if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+                                        const start_slot: types.Slot = info.head_slot + 1;
+                                        const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
+                                        self.logger.info("peer {s}{f} is far ahead (gap={d} slots), initiating bulk sync via blocks_by_range start_slot={d} count={d}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            err,
+                                            gap,
+                                            start_slot,
+                                            requested_count,
                                         });
-                                    };
+                                        const handler = networks.OnReqRespResponseCbHandler{
+                                            .ptr = self,
+                                            .onReqRespResponseCb = onReqRespResponse,
+                                        };
+                                        _ = self.network.sendBlocksByRangeRequest(status_ctx.peer_id, start_slot, requested_count, handler) catch |err| {
+                                            self.logger.warn("failed to initiate blocks_by_range sync from peer {s}{f}: {any}; falling back to head-by-root", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                            const roots = [_]types.Root{status_resp.head_root};
+                                            self.fetchBlockByRoots(&roots, 0) catch |fetch_err| {
+                                                self.logger.warn("fallback head-by-root fetch also failed: {any}", .{fetch_err});
+                                            };
+                                        };
+                                    } else {
+                                        self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
+                                            status_ctx.peer_id,
+                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                            status_resp.finalized_slot,
+                                            info.head_slot,
+                                            &status_resp.head_root,
+                                        });
+                                        const roots = [_]types.Root{status_resp.head_root};
+                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{f}: {any}", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                        };
+                                    }
                                 }
                             },
                             .fc_initing => {
@@ -977,7 +1077,7 @@ pub const BeamNode = struct {
                         }
                         break :blk;
                     },
-                    .blocks_by_root => self.logger.warn("status response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name }),
+                    .blocks_by_root, .blocks_by_range => self.logger.warn("status response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name }),
                 },
                 .blocks_by_root => |block_resp| {
                     switch (snap.request_kind) {
@@ -998,6 +1098,21 @@ pub const BeamNode = struct {
                         },
                     }
                 },
+                .blocks_by_range => |block_resp| {
+                    switch (snap.request_kind) {
+                        .blocks_by_range => {
+                            self.logger.info("received blocks-by-range chunk from peer {s}{f} slot={d}", .{
+                                peer_id,
+                                node_name,
+                                block_resp.block.slot,
+                            });
+                            try self.processBlockByRangeChunk(peer_id, &block_resp);
+                        },
+                        else => {
+                            self.logger.warn("blocks-by-range response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
+                        },
+                    }
+                },
             },
             .failure => |err_payload| {
                 switch (snap.request_kind) {
@@ -1011,6 +1126,14 @@ pub const BeamNode = struct {
                     },
                     .blocks_by_root => {
                         self.logger.warn("blocks-by-root request to peer {s}{f} failed ({d}): {s}", .{
+                            peer_id,
+                            node_name,
+                            err_payload.code,
+                            err_payload.message,
+                        });
+                    },
+                    .blocks_by_range => {
+                        self.logger.warn("blocks-by-range request to peer {s}{f} failed ({d}): {s}", .{
                             peer_id,
                             node_name,
                             err_payload.code,
@@ -1078,6 +1201,112 @@ pub const BeamNode = struct {
                             "node-{d}:: Requested block root=0x{x} not found",
                             .{ self.nodeId, &root },
                         );
+                    }
+                }
+
+                try responder.finish();
+            },
+            .blocks_by_range => |request| {
+                const start_slot = request.start_slot;
+                const requested_count = request.count;
+                // Cap count at MAX_REQUEST_BLOCKS to bound work per request
+                const count = @min(requested_count, params.MAX_REQUEST_BLOCKS);
+
+                self.logger.debug(
+                    "node-{d}:: Handling blocks_by_range request start_slot={d} count={d} (capped from {d})",
+                    .{ self.nodeId, start_slot, count, requested_count },
+                );
+
+                // Enforce MIN_SLOTS_FOR_BLOCK_REQUESTS history window.
+                // Responders MUST keep at least MIN_SLOTS_FOR_BLOCK_REQUESTS recent slots
+                // available. Requests whose start_slot falls before that window get
+                // RESOURCE_UNAVAILABLE (code 3) so callers can skip to a better peer.
+                const head = self.chain.forkChoice.getHead();
+                if (head.slot >= constants.MIN_SLOTS_FOR_BLOCK_REQUESTS) {
+                    const history_start = head.slot - constants.MIN_SLOTS_FOR_BLOCK_REQUESTS;
+                    if (start_slot < history_start) {
+                        self.logger.warn(
+                            "node-{d}:: blocks_by_range: start_slot={d} is before history window start={d} (head={d}), sending RESOURCE_UNAVAILABLE",
+                            .{ self.nodeId, start_slot, history_start, head.slot },
+                        );
+                        try responder.sendError(constants.RPC_ERR_RESOURCE_UNAVAILABLE, "requested range is outside history window");
+                        return;
+                    }
+                }
+
+                const end_slot_exclusive: types.Slot = start_slot + count;
+                const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+
+                // ---- Finalized range: use DB slot index ----
+                // Slots <= finalized_slot are indexed in DbFinalizedSlotsNamespace (slot → root).
+                // This works even after forkChoice has been rebased and those nodes pruned.
+                if (start_slot <= finalized_slot) {
+                    const fin_end = @min(end_slot_exclusive, finalized_slot + 1);
+                    var slot: types.Slot = start_slot;
+                    while (slot < fin_end) : (slot += 1) {
+                        const root = self.chain.db.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot) orelse {
+                            // Slot may be empty (no block produced that slot) — skip silently.
+                            continue;
+                        };
+                        if (self.chain.db.loadBlock(database.DbBlocksNamespace, root)) |signed_block_value| {
+                            var signed_block = signed_block_value;
+                            defer signed_block.deinit();
+
+                            var response = networks.ReqRespResponse{ .blocks_by_range = undefined };
+                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_range);
+                            defer response.deinit();
+
+                            try responder.sendResponse(&response);
+                        } else {
+                            self.logger.warn(
+                                "node-{d}:: blocks_by_range: finalized block root=0x{x} at slot={d} not found in DB",
+                                .{ self.nodeId, &root, slot },
+                            );
+                        }
+                    }
+                }
+
+                // ---- Unfinalized range: walk forkChoice from head ----
+                // For slots above the finalized checkpoint the canonical chain is still
+                // tracked in the in-memory forkChoice ProtoArray.
+                if (end_slot_exclusive > finalized_slot + 1) {
+                    const unfin_start = @max(start_slot, finalized_slot + 1);
+
+                    var collected: std.ArrayList(types.Root) = .empty;
+                    defer collected.deinit(self.allocator);
+
+                    var current_opt: ?types.Root = head.blockRoot;
+                    while (current_opt) |current_root| {
+                        const node = self.chain.forkChoice.getBlock(current_root) orelse break;
+                        if (node.slot < unfin_start) break;
+                        if (node.slot < end_slot_exclusive) {
+                            collected.append(self.allocator, current_root) catch break;
+                        }
+                        // Step to parent. Genesis / anchor has parentRoot == zero.
+                        if (std.mem.eql(u8, &node.parentRoot, &ZERO_HASH)) break;
+                        if (std.mem.eql(u8, &node.parentRoot, &current_root)) break;
+                        current_opt = node.parentRoot;
+                    }
+
+                    // Collected in reverse-chronological order; reverse to send ascending by slot.
+                    std.mem.reverse(types.Root, collected.items);
+
+                    for (collected.items) |root| {
+                        if (self.chain.db.loadBlock(database.DbBlocksNamespace, root)) |signed_block_value| {
+                            var signed_block = signed_block_value;
+                            defer signed_block.deinit();
+
+                            var response = networks.ReqRespResponse{ .blocks_by_range = undefined };
+                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_range);
+                            defer response.deinit();
+
+                            try responder.sendResponse(&response);
+                        } else {
+                            self.logger.warn(
+                                "node-{d}:: blocks_by_range: unfinalized block root=0x{x} not found in DB",
+                                .{ self.nodeId, &root },
+                            );
+                        }
                     }
                 }
 
@@ -1511,6 +1740,14 @@ pub const BeamNode = struct {
                 },
                 .status => {
                     self.logger.warn("status RPC request_id={d} to peer {s}{f} timed out, finalizing", .{
+                        request_id,
+                        snap.peer_id_copy,
+                        self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
+                    });
+                    self.network.finalizePendingRequest(request_id);
+                },
+                .blocks_by_range => {
+                    self.logger.warn("blocks_by_range RPC request_id={d} to peer {s}{f} timed out, finalizing", .{
                         request_id,
                         snap.peer_id_copy,
                         self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
