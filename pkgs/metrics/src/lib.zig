@@ -217,6 +217,26 @@ const Metrics = struct {
     //     review followup). The benign TOCTOU window is documented
     //     in `BeamNode.fetchBlockByRoots`.
     lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
+    // Issue #837: per-site error counter for application-layer
+    // failures inside `BeamNode.onInterval`. The slot tick is
+    // decoupled from these failures (a failure here logs + bumps
+    // this counter and the loop continues; the chain clock advances
+    // either way). Sustained non-zero rate per site is what should
+    // alarm operators — a single bump per scrape is normal
+    // background noise from gossip races.
+    //
+    // Sites:
+    //   * `validator.onInterval` — validator client failed to
+    //     produce duties for this interval.
+    //   * `publishBlock` / `publishAttestation` /
+    //     `publishAggregation` — gossip publish failed.
+    //   * `maybeAggregateOnInterval` — aggregator role failed to
+    //     produce aggregations (the wedge site in #837 —
+    //     `UnknownSourceBlock` from a stale aggregator vote
+    //     against a missing canonical-chain block).
+    //   * `publishProducedAggregations` — aggregations produced
+    //     but failed to publish.
+    lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -321,6 +341,8 @@ const Metrics = struct {
     // Slice (d)/(e) of #803.
     const LeanBlockRootComputeSkippedCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
+    // Issue #837 — see `lean_node_interval_error_total` field doc.
+    const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -707,6 +729,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         // Slice (d)/(e) of #803 — see field doc for label semantics.
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
         .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race." }, .{}),
+        // Issue #837 — see field doc for label semantics.
+        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site indicates a wedge-class bug. Labeled by site: validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)

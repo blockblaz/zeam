@@ -2361,18 +2361,42 @@ pub const BeamChain = struct {
             }
 
             // Each unique AttestationData must appear at most once per block.
+            //
+            // Issue #837 ask #5: log the duplicate's distinguishing
+            // fields (slot + checkpoint roots) so the next reproduction
+            // has enough on-the-wire context to diagnose without
+            // pulling block bytes from a peer. Two `AttestationData`
+            // values are equal iff every field (slot, head, target,
+            // source) matches; logging the slot + roots tells
+            // operators which validators voted on the same
+            // checkpoint pair.
             {
-                var att_data_set = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
+                var att_data_set = std.AutoHashMap(types.AttestationData, usize).init(self.allocator);
                 defer att_data_set.deinit();
-                for (aggregated_attestations) |agg_att| {
+                for (aggregated_attestations, 0..) |agg_att, idx| {
                     const result = try att_data_set.getOrPut(agg_att.data);
                     if (result.found_existing) {
+                        const first_idx = result.value_ptr.*;
                         self.logger.err(
-                            "block contains duplicate AttestationData entries for block root=0x{x}",
-                            .{&freshFcBlock.blockRoot},
+                            "block contains duplicate AttestationData entries for block root=0x{x} slot={d} proposer={d}: indices [{d}, {d}] both have data={{ slot={d}, head={{ root=0x{x}, slot={d} }}, target={{ root=0x{x}, slot={d} }}, source={{ root=0x{x}, slot={d} }} }}",
+                            .{
+                                &freshFcBlock.blockRoot,
+                                block.slot,
+                                block.proposer_index,
+                                first_idx,
+                                idx,
+                                agg_att.data.slot,
+                                &agg_att.data.head.root,
+                                agg_att.data.head.slot,
+                                &agg_att.data.target.root,
+                                agg_att.data.target.slot,
+                                &agg_att.data.source.root,
+                                agg_att.data.source.slot,
+                            },
                         );
                         return BlockProcessingError.DuplicateAttestationData;
                     }
+                    result.value_ptr.* = idx;
                 }
                 if (att_data_set.count() > self.config.spec.max_attestations_data) {
                     self.logger.err(
