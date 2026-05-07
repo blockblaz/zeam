@@ -427,7 +427,22 @@ pub const LeanSupportedProtocol = enum(u32) {
 /// FFI thread and brings down the whole zeam process. We return an error
 /// instead so the request handler's existing catch path can send an RPC
 /// error back and keep the node alive.
+///
+/// Intentionally module-private: this is a wire-shape shim for
+/// `ReqRespRequest.deserialize` only and exists purely to dodge an upstream
+/// SSZ panic surface (see #843). Once the bounds checks land in `ssz.zig`
+/// itself this whole helper goes away. If a future caller in `pkgs/network/`
+/// needs the same validation, lift it then — don't widen the API now and
+/// invite reuse of a fix that is meant to be temporary.
 fn validateBlocksByRootRequestBytes(bytes: []const u8) !void {
+    // The body-length checks below assume the SSZ wire size of `Root` is 32
+    // bytes (i.e. `Root` is `[32]u8` with no padding). If anyone ever wraps
+    // `Root` in a struct with padding or otherwise drifts the in-memory size,
+    // `@sizeOf(types.Root)` and the SSZ wire size diverge silently and these
+    // checks misclassify well-formed payloads as malformed (or vice versa).
+    // Catch that at compile time rather than waiting for it to reach Hive.
+    comptime std.debug.assert(@sizeOf(types.Root) == 32);
+
     if (bytes.len < 4) return error.MalformedReqRespRequest;
     const offset = std.mem.readInt(u32, bytes[0..4], .little);
     if (offset != 4) return error.MalformedReqRespRequest;
@@ -1107,11 +1122,22 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
         );
     }
 
+    // Cases 2-4 below also call `ReqRespRequest.deserialize` end-to-end, not
+    // just the validator helper directly. Without that we'd only be testing
+    // the validator function in isolation — if a future contributor wired the
+    // pre-validation switch to the wrong protocol tag (e.g. only `.status`),
+    // the per-shape checks would still pass while the production path
+    // silently regressed back to a panicking SSZ codec. The end-to-end calls
+    // lock that wiring in place.
     {
         var bad_offset: [36]u8 = undefined;
         std.mem.writeInt(u32, bad_offset[0..4], 8, .little);
         @memset(bad_offset[4..], 0);
         try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&bad_offset));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &bad_offset),
+        );
     }
 
     {
@@ -1119,6 +1145,10 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
         std.mem.writeInt(u32, ragged[0..4], 4, .little);
         @memset(ragged[4..], 0);
         try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&ragged));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &ragged),
+        );
     }
 
     {
@@ -1129,6 +1159,10 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
         std.mem.writeInt(u32, oversize[0..4], 4, .little);
         @memset(oversize[4..], 0);
         try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(oversize));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, oversize),
+        );
     }
 
     // Sanity: the well-formed empty list still deserializes cleanly so we
