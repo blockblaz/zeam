@@ -821,6 +821,13 @@ unsafe fn send_rpc_request_inner(
 
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     let request_message = RequestMessage::new(protocol_id.clone(), request_bytes);
+    // NOTE: do NOT touch REQUEST_ID_MAP / REQUEST_PROTOCOL_MAP here — both
+    // inserts now happen on the event-loop side (`SendRpcRequest` arm). See
+    // the comment on `SendRpcRequest` for the rationale: `HashMapDelay::insert`
+    // schedules a `tokio::time::sleep` for the entry timeout and panics if
+    // called outside a Tokio runtime, but FFI entry points run on whatever
+    // thread Zig calls in on (typically the libxev event loop), which has no
+    // runtime attached. Issue #837.
     match tx.try_send(SwarmCommand::SendRpcRequest {
         peer_id,
         request_id,
@@ -849,10 +856,6 @@ unsafe fn send_rpc_request_inner(
             return 0;
         }
     }
-    REQUEST_ID_MAP.lock_recover().insert(request_id, ());
-    REQUEST_PROTOCOL_MAP
-        .lock_recover()
-        .insert(request_id, protocol_id.clone());
     logger::rustLogger.info(
         network_id,
         &format!(
@@ -897,21 +900,24 @@ unsafe fn send_rpc_response_chunk_inner(
     };
     let response_bytes = response_slice.to_vec();
 
-    // Look up the response channel and refresh its timeout under a single lock,
-    // and pass the resolved (peer_id, connection_id, stream_id) inside the
-    // command. The executor side then does not need to re-lock
-    // `RESPONSE_CHANNEL_MAP`, which closes the race against
-    // `send_rpc_end_of_stream` / the response-channel timeout sweep that
-    // would otherwise drop the chunk and log a spurious `No response channel
-    // found` between the two locks.
-    let channel = {
-        let mut response_map = RESPONSE_CHANNEL_MAP.lock_recover();
-        let c = response_map.get(&channel_id).cloned();
-        if c.is_some() {
-            _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
-        }
-        c
-    };
+    // Look up the response channel and pass the resolved (peer_id,
+    // connection_id, stream_id) inside the command. The executor side then
+    // does not need to re-lock `RESPONSE_CHANNEL_MAP` to fan the chunk out,
+    // which closes the race against `send_rpc_end_of_stream` / the
+    // response-channel timeout sweep that would otherwise drop the chunk and
+    // log a spurious `No response channel found` between the two locks.
+    //
+    // The idle-timeout refresh that used to live in this same locked block
+    // was moved to the event-loop side: `HashMapDelay::update_timeout`
+    // schedules a `tokio::time::sleep` and panics if called outside a Tokio
+    // runtime, which is exactly what happens here when Zig's libxev thread
+    // calls in. Refreshing on the executor side is also the more accurate
+    // semantic — the timeout reflects "still actively serving" and we are
+    // about to call `send_response` over there. #837
+    let channel = RESPONSE_CHANNEL_MAP
+        .lock_recover()
+        .get(&channel_id)
+        .cloned();
     if let Some(channel) = channel {
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
         send_swarm_command(
@@ -1873,6 +1879,18 @@ impl Network {
                         }
                     }
                     SwarmCommand::SendRpcRequest { peer_id, request_id, request_message } => {
+                        // Register the request on the timeout/protocol maps
+                        // BEFORE handing the request to the swarm: by the time
+                        // libp2p surfaces a response, timeout, or error event,
+                        // both maps must already contain `request_id` for the
+                        // reqresp arms below to match it. The inserts live here
+                        // (and not in the FFI entry point) because
+                        // `HashMapDelay::insert` requires a live Tokio runtime
+                        // — see the matching note in `send_rpc_request`. #837
+                        REQUEST_ID_MAP.lock_recover().insert(request_id, ());
+                        REQUEST_PROTOCOL_MAP
+                            .lock_recover()
+                            .insert(request_id, request_message.protocol.clone());
                         swarm.behaviour_mut().reqresp.send_request(peer_id, request_id, request_message);
                     }
                     SwarmCommand::SendRpcResponseChunk { channel_id, peer_id, connection_id, stream_id, response_message } => {
@@ -1885,6 +1903,18 @@ impl Network {
                         swarm.behaviour_mut().reqresp.send_response(
                             peer_id, connection_id, stream_id, response_message,
                         );
+                        // Refresh the response-channel idle timeout now that
+                        // we've made progress. This used to be done on the
+                        // FFI side under the same lock as the lookup, but
+                        // `update_timeout` schedules a `tokio::time::sleep`
+                        // and panics outside a Tokio runtime — see the note
+                        // in `send_rpc_response_chunk`. If the channel was
+                        // already torn down (end-of-stream / sweep) between
+                        // dispatch and now, `update_timeout` is a no-op,
+                        // which is the desired semantics. #837
+                        let _ = RESPONSE_CHANNEL_MAP
+                            .lock_recover()
+                            .update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
                         logger::rustLogger.info(self.network_id, &format!(
                             "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, peer_id));
                     }
@@ -2190,6 +2220,56 @@ mod tests {
             request_id, 0,
             "Should return 0 when network is not initialized"
         );
+    }
+
+    #[test]
+    fn test_send_rpc_request_does_not_panic_outside_tokio_runtime() {
+        // Regression test for #837. Before the fix, `send_rpc_request`
+        // called `REQUEST_ID_MAP.lock().insert(...)` on whatever thread the
+        // FFI was invoked from. `HashMapDelay::insert` schedules a
+        // `tokio::time::sleep` for the entry timeout and panics with
+        // "there is no reactor running" when called outside a Tokio runtime
+        // — which is exactly what happens when Zig's libxev event loop
+        // calls in. Under the panic="abort" prover profiles this aborts the
+        // whole process; here it would surface as a panicked test thread.
+        //
+        // We install a per-network command sender (so the function actually
+        // gets past `get_command_sender` and reaches the formerly-panicking
+        // code path) and call `send_rpc_request` from a freshly-spawned
+        // OS thread that is guaranteed to have no Tokio context attached.
+        // The fix moves both delay-map inserts to the event-loop side, so
+        // this call must now succeed (non-zero id, no panic).
+        let network_id = 101;
+        let (tx, mut rx) = mpsc::channel::<SwarmCommand>(8);
+        COMMAND_SENDERS.lock_recover().insert(network_id, tx);
+
+        let peer_id =
+            std::ffi::CString::new("12D3KooWGRUacXc8jUuvtJYCgxUYHFYCCREXSjkZnzGqUwYj4Mxo").unwrap();
+        let request_data = b"test request";
+
+        let request_id = std::thread::spawn(move || unsafe {
+            send_rpc_request(
+                network_id,
+                peer_id.as_ptr(),
+                LeanSupportedProtocol::StatusV1 as u32,
+                request_data.as_ptr(),
+                request_data.len(),
+            )
+        })
+        .join()
+        .expect("send_rpc_request panicked outside Tokio runtime — #837 regression");
+
+        assert!(
+            request_id > 0,
+            "send_rpc_request should return a non-zero id on success, got {}",
+            request_id
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(SwarmCommand::SendRpcRequest { request_id: r, .. }) if r == request_id),
+            "command channel should have received the SendRpcRequest with the same id"
+        );
+
+        COMMAND_SENDERS.lock_recover().remove(&network_id);
     }
 
     #[test]
