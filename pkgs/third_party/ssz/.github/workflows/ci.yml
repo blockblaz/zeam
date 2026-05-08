@@ -1,0 +1,48 @@
+name: Lint and test
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Zig
+      uses: korandoru/setup-zig@v1
+      with:
+        zig-version: 0.16.0
+
+    - name: Build
+      run: zig build
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Zig
+      uses: korandoru/setup-zig@v1
+      with:
+        zig-version: 0.16.0
+
+    - name: Lint
+      run: zig fmt --check src/*.zig
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Zig
+      uses: korandoru/setup-zig@v1
+      with:
+        zig-version: 0.16.0
+
+    - name: Test
+      run: zig build test --summary all

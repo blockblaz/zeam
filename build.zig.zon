@@ -5,8 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ssz = .{
-            .url = "git+https://github.com/blockblaz/ssz.zig#404762835d6890fdf3e71e79c81fc8798a43b6c7",
-            .hash = "ssz-0.0.9-Lfwd6676AgAVislFL76qdTcxDnpYCyJRVBNClx1phXd2",
+            .path = "pkgs/third_party/ssz",
         },
         .zigcli = .{
             .url = "git+https://github.com/jiacai2050/zigcli#621920da8f2235c6b9c15addf353e7747e1e899c",
