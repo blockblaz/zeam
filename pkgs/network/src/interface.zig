@@ -1088,21 +1088,29 @@ test LeanNetworkTopic {
 
 test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panicking" {
     // Regression test for the Hive `reqresp/blocks_by_root/malformed_request`
-    // failure (May 7 2026, image 993f193 / v0.4.15). The simulator sent a
-    // 24-byte payload whose first 4 bytes decode to a u32 offset of
-    // ~2.88e9 — well past the payload length. The vendored ssz.zig
-    // container deserializer at lib.zig:604 then sliced
-    // `bytes[indices[0]..end]` without bounds-checking and panicked
-    // ("start index 2880154539 is larger than end index 64"), which
-    // killed the FFI thread and aborted the whole process. Any peer
-    // could DoS zeam with a single bad request.
+    // failures (v0.4.15 and v0.4.16, both failed with the same Hive bytes).
     //
-    // After the fix `ReqRespRequest.deserialize` rejects this with
+    // The Hive simulator sends `encode_request_raw(&[0xab; 64])`:
+    //   - Wire: 25 bytes = varint(64) || snappy_compress([0xab; 64])
+    //   - Decompressed (what `validateBlocksByRootRequestBytes` receives):
+    //     64 bytes all `0xAB`
+    //   - SSZ offset field (bytes 0..4 little-endian): 0xABABABAB = 2880154539
+    //
+    // Without the guard the vendored ssz.zig container deserializer at
+    // lib.zig:604 sliced `bytes[2880154539..]` on a 64-byte buffer and
+    // panicked ("start index 2880154539 is larger than end index 64"),
+    // killing the FFI thread and aborting the whole process. Any peer
+    // could DoS zeam with a single malformed request.
+    //
+    // Incidents: Hive suite 1778164266 (v0.4.15 / 993f193, May 7 2026)
+    //            Hive suite 1778192103 test-506 (v0.4.16 / 14222bc, May 7 2026)
+    //
+    // After the fix `ReqRespRequest.deserialize` rejects these with
     // `error.MalformedReqRespRequest` so the request-handler's existing
-    // catch path can return an RPC error to the peer and keep the node
-    // alive. We exercise four shapes here:
-    //   1. The exact-on-the-wire panic trigger from the Hive run
-    //      (4-byte offset of 0xABABAAAB followed by 20 garbage bytes).
+    // catch path sends an RPC error to the peer and keeps the node alive.
+    // We exercise four shapes here:
+    //   1. The exact decompressed bytes from the Hive test
+    //      (64 bytes all 0xAB → offset 0xABABABAB, well past the buffer).
     //   2. Any non-`4` offset (the only legal value for a single-variable
     //      -field container).
     //   3. A body length that isn't a multiple of `sizeOf(Root) = 32`.
@@ -1112,9 +1120,10 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
     const allocator = std.testing.allocator;
 
     {
-        var malformed: [24]u8 = undefined;
-        std.mem.writeInt(u32, malformed[0..4], 0xABABAAAB, .little);
-        @memset(malformed[4..], 0xAB);
+        // Case 1: exact Hive malformed_request bytes after snappy decompression.
+        // The simulator sends `encode_request_raw(&[0xab; 64])` which
+        // decompresses to 64 bytes all `0xAB`. Offset = 0xABABABAB ≠ 4.
+        var malformed = [_]u8{0xAB} ** 64;
         try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&malformed));
         try std.testing.expectError(
             error.MalformedReqRespRequest,
