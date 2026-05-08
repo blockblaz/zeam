@@ -1088,33 +1088,45 @@ test LeanNetworkTopic {
 
 test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panicking" {
     // Regression test for the Hive `reqresp/blocks_by_root/malformed_request`
-    // failure (May 7 2026, image 993f193 / v0.4.15). The simulator sent a
-    // 24-byte payload whose first 4 bytes decode to a u32 offset of
-    // ~2.88e9 — well past the payload length. The vendored ssz.zig
-    // container deserializer at lib.zig:604 then sliced
-    // `bytes[indices[0]..end]` without bounds-checking and panicked
-    // ("start index 2880154539 is larger than end index 64"), which
-    // killed the FFI thread and aborted the whole process. Any peer
-    // could DoS zeam with a single bad request.
+    // failures. The regression test merged with #845 used a hand-crafted
+    // 24-byte approximation; this test pins the real simulator input.
     //
-    // After the fix `ReqRespRequest.deserialize` rejects this with
-    // `error.MalformedReqRespRequest` so the request-handler's existing
-    // catch path can return an RPC error to the peer and keep the node
-    // alive. We exercise four shapes here:
-    //   1. The exact-on-the-wire panic trigger from the Hive run
-    //      (4-byte offset of 0xABABAAAB followed by 20 garbage bytes).
-    //   2. Any non-`4` offset (the only legal value for a single-variable
-    //      -field container).
-    //   3. A body length that isn't a multiple of `sizeOf(Root) = 32`.
-    //   4. A body whose root count exceeds `MAX_REQUEST_BLOCKS`.
-    // For each, we additionally call `ReqRespRequest.deserialize` to
-    // confirm the panic path is no longer reachable end-to-end.
+    // The Hive simulator sends `encode_request_raw(&[0xab; 64])`:
+    //   - Wire:  25 bytes = varint(64) || snappy_frame_compress([0xab; 64])
+    //   - After zeam's snappy frame decode: 64 bytes all `0xAB`
+    //   - SSZ offset field (bytes 0..4 LE): 0xABABABAB = 2880154539
+    //
+    // Without the guard added in #845, the ssz.zig container deserializer at
+    // lib.zig:604 sliced `bytes[2880154539..]` on a 64-byte buffer and
+    // panicked, killing the FFI thread and aborting zeam.
+    //
+    // Scope: this test exercises the post-decompression validation path only.
+    // The snappy framing layer and the varint length pre-checks are not
+    // covered here; a full end-to-end harness (not yet in this project)
+    // would be needed to lock those against regression too.
+    //
+    // Incidents: image 993f193 (v0.4.15, May 7 2026)
+    //            image 14222bc (v0.4.16, May 7 2026, Hive test-506)
+    //
+    // The `@sizeOf(types.Root) == 32` compile-time assert inside
+    // `validateBlocksByRootRequestBytes` ensures the 32-byte step assumption
+    // used in cases 3, 6, and 7 holds. If `Root` ever gets padding the build
+    // will fail at compile time rather than silently misclassifying payloads.
+    //
+    // All rejection cases also call `ReqRespRequest.deserialize` end-to-end.
+    // Without the end-to-end call, a future contributor who mis-wires the
+    // pre-validation switch (e.g. only `.status`, not `.blocks_by_root`)
+    // would leave the production SSZ panic path reachable while the
+    // per-shape validator checks still pass. The end-to-end calls lock that
+    // wiring. The `errdefer req.deinit()` inside `deserialize` means any
+    // allocation made before the validator fires is cleaned up on error;
+    // `std.testing.allocator` enforces this by detecting leaks at test exit.
     const allocator = std.testing.allocator;
 
     {
-        var malformed: [24]u8 = undefined;
-        std.mem.writeInt(u32, malformed[0..4], 0xABABAAAB, .little);
-        @memset(malformed[4..], 0xAB);
+        // Case 1: exact decompressed bytes from the Hive malformed_request test.
+        // 64 bytes all 0xAB → offset 0xABABABAB (2880154539), way past the end.
+        var malformed = [_]u8{0xAB} ** 64;
         try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&malformed));
         try std.testing.expectError(
             error.MalformedReqRespRequest,
@@ -1122,14 +1134,34 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
         );
     }
 
-    // Cases 2-4 below also call `ReqRespRequest.deserialize` end-to-end, not
-    // just the validator helper directly. Without that we'd only be testing
-    // the validator function in isolation — if a future contributor wired the
-    // pre-validation switch to the wrong protocol tag (e.g. only `.status`),
-    // the per-shape checks would still pass while the production path
-    // silently regressed back to a panicking SSZ codec. The end-to-end calls
-    // lock that wiring in place.
     {
+        // Case 2: non-uniform garbage — offset 0xDEADBEEF, mixed body bytes.
+        // Guards against an (unlikely) optimisation that only rejects
+        // homogeneous byte patterns.
+        var mixed: [36]u8 = undefined;
+        std.mem.writeInt(u32, mixed[0..4], 0xDEADBEEF, .little);
+        @memset(mixed[4..], 0x5A);
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&mixed));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &mixed),
+        );
+    }
+
+    {
+        // Case 3: offset = 0 (null-prefix / classic adversarial first try).
+        var zero_offset: [36]u8 = undefined;
+        std.mem.writeInt(u32, zero_offset[0..4], 0, .little);
+        @memset(zero_offset[4..], 0);
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&zero_offset));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &zero_offset),
+        );
+    }
+
+    {
+        // Case 4: offset = 8 (close to legal but wrong — "near-legal" family).
         var bad_offset: [36]u8 = undefined;
         std.mem.writeInt(u32, bad_offset[0..4], 8, .little);
         @memset(bad_offset[4..], 0);
@@ -1141,6 +1173,7 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
     }
 
     {
+        // Case 5: body length not a multiple of 32 (ragged root list).
         var ragged: [37]u8 = undefined;
         std.mem.writeInt(u32, ragged[0..4], 4, .little);
         @memset(ragged[4..], 0);
@@ -1152,6 +1185,7 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
     }
 
     {
+        // Case 6: root count exceeds MAX_REQUEST_BLOCKS.
         const oversize_count = consensus_params.MAX_REQUEST_BLOCKS + 1;
         const oversize_len = 4 + oversize_count * @sizeOf(types.Root);
         const oversize = try allocator.alloc(u8, oversize_len);
@@ -1165,14 +1199,27 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
         );
     }
 
-    // Sanity: the well-formed empty list still deserializes cleanly so we
-    // haven't made the validator over-strict.
+    // Sanity cases: the validator must not over-reject well-formed payloads.
     {
+        // Case 7: empty root list (offset=4, body empty). Valid.
         var empty: [4]u8 = undefined;
         std.mem.writeInt(u32, empty[0..4], 4, .little);
         try validateBlocksByRootRequestBytes(&empty);
         var req = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &empty);
         defer req.deinit();
         try std.testing.expectEqual(@as(usize, 0), req.blocks_by_root.roots.constSlice().len);
+    }
+
+    {
+        // Case 8: exactly one root (offset=4, body=32 bytes). Valid.
+        // Ensures the rejection path doesn't drift to over-rejecting
+        // legitimate non-empty requests.
+        var one_root: [4 + 32]u8 = undefined;
+        std.mem.writeInt(u32, one_root[0..4], 4, .little);
+        @memset(one_root[4..], 0); // zero root hash is a valid hash value
+        try validateBlocksByRootRequestBytes(&one_root);
+        var req = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &one_root);
+        defer req.deinit();
+        try std.testing.expectEqual(@as(usize, 1), req.blocks_by_root.roots.constSlice().len);
     }
 }
