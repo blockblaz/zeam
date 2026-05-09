@@ -75,6 +75,22 @@ fn validateGossipSnappyHeader(message_bytes: []const u8) (uvarint.VarintParseErr
     };
 }
 
+/// Lightweight snappy block-format header check used by the gossip path.
+/// Returns true iff the leading varint decodes cleanly and declares an
+/// uncompressed size that is within `max_size`. We use this as a guard before
+/// `snappyz.decodeWithMax` so that malformed headers (e.g. 10+ continuation
+/// bytes from a peer publishing random bytes on a valid topic) are rejected
+/// even if the underlying decoder ever regresses to a panicking implementation.
+fn validateSnappyBlockHeader(message_bytes: []const u8, max_size: usize) bool {
+    if (message_bytes.len == 0) return false;
+    const decoded = decodeVarint(message_bytes) catch return false;
+    if (decoded.value > max_size) return false;
+    // A valid snappy block must have at least the header byte(s) and may have
+    // zero compressed bytes only when the declared uncompressed size is zero.
+    if (decoded.value > 0 and decoded.length == message_bytes.len) return false;
+    return true;
+}
+
 /// Build a request frame with varint-encoded uncompressed size followed by snappy-framed payload.
 fn buildRequestFrame(allocator: Allocator, uncompressed_size: usize, snappy_payload: []const u8) ![]u8 {
     if (uncompressed_size > MAX_RPC_MESSAGE_SIZE) {
@@ -334,6 +350,21 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         .block => MAX_GOSSIP_BLOCK_SIZE,
         else => MAX_RPC_MESSAGE_SIZE,
     };
+
+    // Defense in depth against malformed gossip payloads (Hive
+    // `gossip: ignores malformed ssz`): screen the snappy block-format header
+    // with our own uvarint before handing the bytes to the third-party decoder.
+    // A peer can ship 1024 bytes of `0xef` on a valid topic; without this gate
+    // a buggy decoder would walk the uvarint into integer overflow and crash
+    // the network thread. zeam's uvarint rejects unterminated/oversized
+    // varints with a clean error.
+    if (!validateSnappyBlockHeader(message_bytes, decode_limit)) {
+        zigHandler.logger.err("Rejecting malformed snappy header on topic={s} (len={d})", .{ std.mem.span(topic_str), message_bytes.len });
+        if (!writeFailedBytes(message_bytes, "snappyz_header", zigHandler.allocator, null, zigHandler.logger)) {
+            zigHandler.logger.err("Malformed snappy header - could not create debug file", .{});
+        }
+        return;
+    }
 
     const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
         zigHandler.logger.err("Error in snappyz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), e });
@@ -1552,4 +1583,57 @@ test "validateGossipSnappyHeader rejects oversized declared size" {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
     const encoded = uvarint.encode(usize, MAX_RPC_MESSAGE_SIZE + 1, &scratch);
     try std.testing.expectError(error.PayloadTooLarge, validateGossipSnappyHeader(encoded));
+}
+
+test "validateSnappyBlockHeader rejects malformed gossip payloads" {
+    // Regression for Hive `gossip: ignores malformed ssz` (test 390 on
+    // hive.leanroadmap.org / suite 1778305924-...). The simulator publishes
+    // 1024 bytes of 0xef on a valid block topic; an unguarded decoder hit an
+    // `integer overflow` panic in the third-party snappy uvarint and crashed
+    // the network thread, cascading into ~26 follow-up failures as the second
+    // node became unreachable.
+    const garbage = [_]u8{0xef} ** 1024;
+    try std.testing.expect(!validateSnappyBlockHeader(&garbage, MAX_GOSSIP_BLOCK_SIZE));
+
+    // 11 continuation bytes then a terminator: still corrupt (varint > u64).
+    var long_varint: [12]u8 = undefined;
+    @memset(long_varint[0..11], 0xff);
+    long_varint[11] = 0x01;
+    try std.testing.expect(!validateSnappyBlockHeader(&long_varint, MAX_GOSSIP_BLOCK_SIZE));
+
+    // Empty payload: nothing to decode.
+    const empty = [_]u8{};
+    try std.testing.expect(!validateSnappyBlockHeader(&empty, MAX_GOSSIP_BLOCK_SIZE));
+
+    // Declared size exceeds the per-topic limit (oversized block claim).
+    var oversize_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
+    const oversize_header = uvarint.encode(usize, MAX_GOSSIP_BLOCK_SIZE + 1, oversize_buf[0..MAX_VARINT_BYTES]);
+    oversize_buf[oversize_header.len] = 0x00; // payload byte so it isn't header-only
+    try std.testing.expect(!validateSnappyBlockHeader(oversize_buf[0 .. oversize_header.len + 1], MAX_GOSSIP_BLOCK_SIZE));
+
+    // Header-only buffer for a non-zero declared size: invalid (no body).
+    var header_only_buf: [MAX_VARINT_BYTES]u8 = undefined;
+    const header_only = uvarint.encode(usize, 32, &header_only_buf);
+    try std.testing.expect(!validateSnappyBlockHeader(header_only, MAX_GOSSIP_BLOCK_SIZE));
+
+    // Well-formed header followed by at least one payload byte: accepted.
+    var ok_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
+    const ok_header = uvarint.encode(usize, 32, ok_buf[0..MAX_VARINT_BYTES]);
+    ok_buf[ok_header.len] = 0x00;
+    try std.testing.expect(validateSnappyBlockHeader(ok_buf[0 .. ok_header.len + 1], MAX_GOSSIP_BLOCK_SIZE));
+
+    // Zero-length declared payload with no body is also accepted (snappy can
+    // legitimately describe an empty uncompressed block as just the varint 0).
+    const zero_header = [_]u8{0x00};
+    try std.testing.expect(validateSnappyBlockHeader(&zero_header, MAX_GOSSIP_BLOCK_SIZE));
+}
+
+test "snappyz.decodeWithMax does not panic on 1024 bytes of 0xef" {
+    // Belt-and-suspenders: the upstream zig-snappy fix (uvarint overflow)
+    // means this returns error.Corrupt instead of panicking. If the dep is
+    // ever rolled back, the test above (validateSnappyBlockHeader) still
+    // ensures the gossip handler short-circuits before reaching the decoder.
+    const garbage = [_]u8{0xef} ** 1024;
+    const result = snappyz.decodeWithMax(std.testing.allocator, &garbage, MAX_GOSSIP_BLOCK_SIZE);
+    try std.testing.expectError(error.Corrupt, result);
 }
