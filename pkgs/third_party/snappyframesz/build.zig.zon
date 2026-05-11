@@ -36,10 +36,6 @@
             .url = "https://github.com/blockblaz/zig-snappy/archive/0ae2a122ea7e37b027b33a48287f7b842a35bd77.tar.gz",
             .hash = "zig_snappy-0.0.3-bDFzXmBjAAAd1yTK5LQvRJ-srdnJbhkHZajl0KcXVJDx",
         },
-        .zig_snappy = .{
-            .url = "https://github.com/blockblaz/zig-snappy/archive/0ae2a122ea7e37b027b33a48287f7b842a35bd77.tar.gz",
-            .hash = "zig_snappy-0.0.3-bDFzXmBjAAAd1yTK5LQvRJ-srdnJbhkHZajl0KcXVJDx",
-        },
     },
 
     // This field is optional.
