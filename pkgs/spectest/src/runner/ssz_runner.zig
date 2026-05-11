@@ -45,6 +45,25 @@ const SampleBytes32List8 = ssz.utils.List([32]u8, 8);
 const SampleUint32List16 = ssz.utils.List(u32, 16);
 const ByteListMiB = xmss.ByteListMiB;
 
+// Boundary fixture types (leanSpec test_merkleization_boundaries) — exercise
+// the bit-packed encoding at exactly chunk boundaries and at the byte/bit
+// transitions inside a single byte.
+const BoundaryBitvector1 = [1]bool;
+const BoundaryBitvector7 = [7]bool;
+const BoundaryBitvector9 = [9]bool;
+const BoundaryBitvector255 = [255]bool;
+const BoundaryBitvector256 = [256]bool;
+const BoundaryBitvector257 = [257]bool;
+const BoundaryBitlist256 = ssz.utils.Bitlist(256);
+const BoundaryUint64List32 = ssz.utils.List(u64, 32);
+
+// Decode-rejection fixture types (leanSpec test_decode_rejections /
+// test_decode_failure_smoke) — paired with `expectException` in the fixture
+// so the runner can assert that the malformed input is rejected.
+const DecodeBitlist8 = ssz.utils.Bitlist(8);
+const DecodeBitvector16 = [16]bool;
+const SmokeBitlist8 = ssz.utils.Bitlist(8);
+
 // xmss HashTreeOpening: Container{ siblings: List[Vector[Fp, HASH_LEN_FE],
 // NODE_LIST_LIMIT] }. For leanEnv=test, HASH_LEN_FE=8 and LOG_LIFETIME=8,
 // so NODE_LIST_LIMIT = 1 << (8/2 + 1) = 32.
@@ -187,6 +206,19 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "SampleBytes32List8", .zig_type = SampleBytes32List8, .has_deinit = true },
     .{ .name = "SampleUint32List16", .zig_type = SampleUint32List16, .has_deinit = true },
     .{ .name = "ByteListMiB", .zig_type = ByteListMiB, .has_deinit = true },
+    // Merkleization-boundary fixtures (leanSpec PR #646).
+    .{ .name = "BoundaryBitvector1", .zig_type = BoundaryBitvector1, .has_deinit = false },
+    .{ .name = "BoundaryBitvector7", .zig_type = BoundaryBitvector7, .has_deinit = false },
+    .{ .name = "BoundaryBitvector9", .zig_type = BoundaryBitvector9, .has_deinit = false },
+    .{ .name = "BoundaryBitvector255", .zig_type = BoundaryBitvector255, .has_deinit = false },
+    .{ .name = "BoundaryBitvector256", .zig_type = BoundaryBitvector256, .has_deinit = false },
+    .{ .name = "BoundaryBitvector257", .zig_type = BoundaryBitvector257, .has_deinit = false },
+    .{ .name = "BoundaryBitlist256", .zig_type = BoundaryBitlist256, .has_deinit = true },
+    .{ .name = "BoundaryUint64List32", .zig_type = BoundaryUint64List32, .has_deinit = true },
+    // Decode-rejection fixtures (leanSpec PRs #649 / decode_failure_smoke).
+    .{ .name = "DecodeBitlist8", .zig_type = DecodeBitlist8, .has_deinit = true },
+    .{ .name = "DecodeBitvector16", .zig_type = DecodeBitvector16, .has_deinit = false },
+    .{ .name = "SmokeBitlist8", .zig_type = SmokeBitlist8, .has_deinit = true },
     // xmss HashTreeOpening / HashTreeLayer (test-env only; prod LOG_LIFETIME differs).
     .{ .name = "HashTreeOpening", .zig_type = TestHashTreeOpening, .has_deinit = true },
     .{ .name = "HashTreeLayer", .zig_type = TestHashTreeLayer, .has_deinit = true },
@@ -293,16 +325,38 @@ fn runCase(
 
     const type_name = try expect_mod.expectStringField(FixtureError, case_obj, &.{"typeName"}, ctx, "typeName");
     const lean_env = try expect_mod.expectStringField(FixtureError, case_obj, &.{"leanEnv"}, ctx, "leanEnv");
-    const serialized_hex = try expect_mod.expectStringField(FixtureError, case_obj, &.{"serialized"}, ctx, "serialized");
+
+    // Decode-rejection fixtures (leanSpec PRs #649 / decode_failure_smoke /
+    // test_decode_rejections) ship `expectException` + `rawBytes` instead of
+    // a roundtrippable `serialized`. When present, the input is intentionally
+    // malformed and the runner asserts that deserialization rejects it.
+    const expect_exception_opt = blk: {
+        const v = case_obj.get("expectException") orelse break :blk null;
+        switch (v) {
+            .string => |s| break :blk s,
+            else => break :blk null,
+        }
+    };
+
+    // Prefer `rawBytes` when present (decode-rejection cases). Otherwise fall
+    // back to `serialized`. Both encode the input bytes the runner feeds to
+    // ssz.deserialize.
+    const input_hex = blk: {
+        if (case_obj.get("rawBytes")) |v| switch (v) {
+            .string => |s| break :blk s,
+            else => {},
+        };
+        break :blk try expect_mod.expectStringField(FixtureError, case_obj, &.{"serialized"}, ctx, "serialized");
+    };
 
     // Decode hex to bytes
-    if (serialized_hex.len < 2 or !std.mem.eql(u8, serialized_hex[0..2], "0x")) {
-        std.debug.print("fixture {s} case {s}: serialized missing 0x prefix\n", .{ ctx.fixture_label, ctx.case_name });
+    if (input_hex.len < 2 or !std.mem.eql(u8, input_hex[0..2], "0x")) {
+        std.debug.print("fixture {s} case {s}: input hex missing 0x prefix\n", .{ ctx.fixture_label, ctx.case_name });
         return FixtureError.InvalidFixture;
     }
-    const hex_body = serialized_hex[2..];
+    const hex_body = input_hex[2..];
     if (hex_body.len % 2 != 0) {
-        std.debug.print("fixture {s} case {s}: serialized hex length not even\n", .{ ctx.fixture_label, ctx.case_name });
+        std.debug.print("fixture {s} case {s}: input hex length not even\n", .{ ctx.fixture_label, ctx.case_name });
         return FixtureError.InvalidFixture;
     }
     const byte_len = hex_body.len / 2;
@@ -313,11 +367,11 @@ fn runCase(
     defer allocator.free(raw_bytes);
 
     _ = std.fmt.hexToBytes(raw_bytes, hex_body) catch {
-        std.debug.print("fixture {s} case {s}: invalid hex in serialized\n", .{ ctx.fixture_label, ctx.case_name });
+        std.debug.print("fixture {s} case {s}: invalid hex in input\n", .{ ctx.fixture_label, ctx.case_name });
         return FixtureError.InvalidFixture;
     };
 
-    try dispatchSszRoundtrip(allocator, ctx, type_name, lean_env, raw_bytes);
+    try dispatchSszRoundtrip(allocator, ctx, type_name, lean_env, raw_bytes, expect_exception_opt);
 }
 
 /// Types that leanSpec exercises but zeam cannot yet roundtrip:
@@ -341,6 +395,7 @@ fn dispatchSszRoundtrip(
     type_name: []const u8,
     lean_env: []const u8,
     raw_bytes: []const u8,
+    expect_exception: ?[]const u8,
 ) FixtureError!void {
     if (shouldSkipType(type_name)) {
         return FixtureError.SkippedFixture;
@@ -352,11 +407,11 @@ fn dispatchSszRoundtrip(
         if (std.mem.eql(u8, type_name, entry.name)) {
             if (entry.test_zig_type) |TestType| {
                 if (is_test_env) {
-                    try sszRoundtrip(TestType, entry.test_has_deinit, allocator, ctx, raw_bytes);
+                    try sszRoundtrip(TestType, entry.test_has_deinit, allocator, ctx, raw_bytes, expect_exception);
                     return;
                 }
             }
-            try sszRoundtrip(entry.zig_type, entry.has_deinit, allocator, ctx, raw_bytes);
+            try sszRoundtrip(entry.zig_type, entry.has_deinit, allocator, ctx, raw_bytes, expect_exception);
             return;
         }
     }
@@ -374,10 +429,38 @@ fn sszRoundtrip(
     allocator: Allocator,
     ctx: Context,
     raw_bytes: []const u8,
+    expect_exception: ?[]const u8,
 ) FixtureError!void {
     // Deserialize
     var decoded: T = undefined;
-    ssz.deserialize(T, raw_bytes, &decoded, allocator) catch |err| {
+    const deserialize_result = ssz.deserialize(T, raw_bytes, &decoded, allocator);
+
+    if (expect_exception) |exc_name| {
+        // Decode-rejection fixture: deserialization must fail. The Python
+        // fixture stores the qualified exception class (e.g. `SSZValueError`,
+        // `SSZSerializationError`); zeam's SSZ library raises a single zig
+        // error set, so we only assert "rejected" not "rejected with this
+        // exact name". On success (deserialize accepted malformed input) we
+        // surface that as a mismatch — the spec says the input must be
+        // rejected.
+        if (deserialize_result) |_| {
+            // Successful decode — drain any heap allocations the deinit path
+            // owns so the leak detector stays clean.
+            if (has_deinit) {
+                decoded.deinit();
+            }
+            std.debug.print(
+                "fixture {s} case {s}: expected {s} but deserialize succeeded\n",
+                .{ ctx.fixture_label, ctx.case_name, exc_name },
+            );
+            return FixtureError.FixtureMismatch;
+        } else |_| {
+            // Rejected as the spec requires.
+            return;
+        }
+    }
+
+    deserialize_result catch |err| {
         std.debug.print(
             "fixture {s} case {s}: SSZ deserialize failed: {s}\n",
             .{ ctx.fixture_label, ctx.case_name, @errorName(err) },

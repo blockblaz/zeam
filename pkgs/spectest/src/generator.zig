@@ -288,7 +288,13 @@ fn makeHeaderWithPrefix(allocator: Allocator, prefix: []const u8, kind: FixtureK
     try writer.writeAll("const test_allocator = std.testing.allocator;\n");
     try writer.writeAll("const fixture_root_candidate = \"leanSpec/fixtures\";\n\n");
     try writer.writeAll("const ResolveError = error{\n    FixturesNotFound,\n};\n\n");
-    try writer.writeAll("fn resolveFixturesRoot(allocator: std.mem.Allocator) ResolveError![]u8 {\n");
+    // realPathFileAlloc in zig 0.16 returns `[:0]u8` — a null-terminated
+    // slice. Preserve the sentinel through this helper's return type so the
+    // caller's `allocator.free(...)` sees the same length the allocator
+    // sized; demoting to a plain `[]u8` drops the sentinel byte from the
+    // slice length and crashes the DebugAllocator with
+    // "Allocation size N bytes does not match free size N-1".
+    try writer.writeAll("fn resolveFixturesRoot(allocator: std.mem.Allocator) ResolveError![:0]u8 {\n");
     try writer.writeAll("    const cwd = std.Io.Dir.cwd();\n");
     try writer.writeAll("    const resolved = cwd.realPathFileAlloc(std.testing.io, fixture_root_candidate, allocator) catch {\n");
     try writer.writeAll("        std.debug.print(\n");

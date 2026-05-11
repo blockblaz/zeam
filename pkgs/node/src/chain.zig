@@ -328,6 +328,12 @@ pub const BeamChain = struct {
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .thread_pool = opts.thread_pool,
+            // pending_blocks is the future-slot queue (issue #788). It's an
+            // unmanaged ArrayList, so default-init to `.empty`; the lock
+            // below guards mutation. Required field — without it the
+            // struct literal fails to compile under the merged main
+            // pending-blocks plumbing.
+            .pending_blocks = .empty,
             // Per-resource locks default-initialised. RwLock and Mutex have
             // no special init; init() runs single-threaded so no acquire
             // here.
@@ -5031,14 +5037,20 @@ test "processFinalizationAdvancement: below PRUNE_NODE_THRESHOLD keeps pre-final
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    // Zig 0.16 renamed `Dir.realpathAlloc` to `Dir.realPathFileAlloc` and
+    // the new signature takes (io, sub_path, gpa) and returns `[:0]u8`.
+    const data_dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
-    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
-    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+    // Main's slice (a-2) network refactor replaced the raw
+    // `std.StringHashMap(PeerInfo)` with `network.ConnectedPeers`. Use the
+    // new type — every other in-tree chain test does the same construction
+    // (e.g. `chain.zig:3645`).
+    const connected_peers = try allocator.create(ConnectedPeers);
+    connected_peers.* = ConnectedPeers.init(allocator);
 
     const test_registry = try allocator.create(NodeNameRegistry);
     defer allocator.destroy(test_registry);

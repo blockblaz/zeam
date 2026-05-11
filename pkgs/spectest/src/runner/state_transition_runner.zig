@@ -199,15 +199,28 @@ fn runCase(
     };
 
     if (blocks_array.items.len == 0 and expect_exception != null) {
-        if (skipExpectExceptionIfEnabled(ctx)) {
-            return FixtureError.SkippedFixture;
+        // Slots-only monotonicity fixtures (leanSpec PR #643:
+        // test_process_slots_*) ship `pre` + `expectException` with no
+        // blocks. The test is that `process_slots(state, state.slot)` (or
+        // any `target <= state.slot`) must be rejected. There's no explicit
+        // `targetSlot` in the JSON — the test name and the fixture shape
+        // imply target == pre.slot. zeam's `state.process_slots` asserts
+        // `slot > self.slot` and returns `InvalidPreState` on violation,
+        // which is what the spec calls `AssertionError` ("Target slot must
+        // be in the future").
+        var logger_config_slots = zeam_utils.getTestLoggerConfig();
+        defer logger_config_slots.deinit();
+        const logger_slots = logger_config_slots.logger(.state_transition);
+        const target_slot = pre_state.slot;
+        if (pre_state.process_slots(allocator, target_slot, logger_slots)) |_| {
+            std.debug.print(
+                "fixture {s} case {s}: expected {s} from process_slots(target={d}, state.slot={d}) but it succeeded\n",
+                .{ ctx.fixture_label, ctx.case_name, expect_exception.?, target_slot, pre_state.slot },
+            );
+            return FixtureError.FixtureMismatch;
+        } else |_| {
+            return;
         }
-
-        std.debug.print(
-            "fixture {s} case {s}: expectException present but no blocks supplied\n",
-            .{ ctx.fixture_label, ctx.case_name },
-        );
-        return FixtureError.FixtureMismatch;
     }
 
     const post_obj = switch (case_obj.get("post") orelse JsonValue{ .null = {} }) {

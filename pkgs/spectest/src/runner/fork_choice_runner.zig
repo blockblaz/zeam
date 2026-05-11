@@ -1117,9 +1117,15 @@ fn validateAttestationDataForGossip(
     }
 
     // 5. Attestation slot must not be too far in future.
-    // leanSpec allows a 1-slot tolerance: data.slot <= current_slot + 1.
-    const current_slot = ctx.fork_choice.getCurrentSlot();
-    if (data.slot > current_slot + 1) {
+    //
+    // leanSpec PR #682 tightened this from "1 whole slot" to
+    // "GOSSIP_DISPARITY_INTERVALS intervals". The check now operates in
+    // interval units (forkchoice time vs `data.slot * INTERVALS_PER_SLOT`).
+    // zeam mirrors the spec in `chain.validateAttestation`; the spectest
+    // runner is a lighter-weight path so we replicate the same rule here.
+    const time_intervals = ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic);
+    const attestation_start_interval = data.slot * node_constants.INTERVALS_PER_SLOT;
+    if (attestation_start_interval > time_intervals + node_constants.GOSSIP_DISPARITY_INTERVALS) {
         return error.AttestationTooFarInFuture;
     }
 }
@@ -1859,14 +1865,28 @@ fn verifyAttestationChecks(
         const validator = try expectU64Field(obj, &.{"validator"}, fixture_path, case_name, step_index, "validator");
         const location = try expectStringField(obj, &.{"location"}, fixture_path, case_name, step_index, "location");
 
-        // leanSpec store_checks.extract_attestations_from_aggregated_payloads iterates
-        // the target payload map and picks, for each participating validator, the
-        // AttestationData with the largest slot. Mirror that here against
-        // latest_new_aggregated_payloads or latest_known_aggregated_payloads.
-        const payloads_map = if (std.mem.eql(u8, location, "new"))
-            &ctx.fork_choice.latest_new_aggregated_payloads
+        // The spec function `extract_attestations_from_aggregated_payloads`
+        // iterates the relevant payload dict in insertion order and, per
+        // validator, retains the entry with the strictly-larger slot. That's
+        // exactly what zeam's per-validator `AttestationTracker` already
+        // computes incrementally — `latestKnown` and `latestNew` are
+        // populated by `onAttestation` using a strict-`>` comparison, so the
+        // first attestation a validator submits at a given slot wins ties.
+        // Reading from the tracker sidesteps the hashmap-iteration
+        // non-determinism of `latest_*_aggregated_payloads` and makes the
+        // spec-test outcome stable under equivocation (leanSpec PR #690).
+        const tracker = ctx.fork_choice.attestations.get(validator) orelse {
+            std.debug.print(
+                "fixture {s} case {s}{f}: validator {d} has no attestation tracker entry\n",
+                .{ fixture_path, case_name, formatStep(step_index), validator },
+            );
+            return FixtureError.FixtureMismatch;
+        };
+
+        const proto_att_opt = if (std.mem.eql(u8, location, "new"))
+            tracker.latestNew
         else if (std.mem.eql(u8, location, "known"))
-            &ctx.fork_choice.latest_known_aggregated_payloads
+            tracker.latestKnown
         else {
             std.debug.print(
                 "fixture {s} case {s}{f}: unknown attestationCheck location {s}\n",
@@ -1875,32 +1895,17 @@ fn verifyAttestationChecks(
             return FixtureError.InvalidFixture;
         };
 
-        var best_att_data: ?types.AttestationData = null;
-        {
-            var map_it = payloads_map.iterator();
-            while (map_it.next()) |payload_entry| {
-                const att_data = payload_entry.key_ptr.*;
-                const proof_list = payload_entry.value_ptr.*;
-                for (proof_list.items) |stored| {
-                    const bits = &stored.proof.participants;
-                    if (validator >= bits.len()) continue;
-                    const has_bit = bits.get(@intCast(validator)) catch false;
-                    if (!has_bit) continue;
-                    if (best_att_data) |existing| {
-                        if (existing.slot < att_data.slot) {
-                            best_att_data = att_data;
-                        }
-                    } else {
-                        best_att_data = att_data;
-                    }
-                    break;
-                }
-            }
-        }
-
-        const attestation_data = best_att_data orelse {
+        const proto_att = proto_att_opt orelse {
             std.debug.print(
-                "fixture {s} case {s}{f}: validator {d} not found in latest_{s}_aggregated_payloads\n",
+                "fixture {s} case {s}{f}: validator {d} has no {s} attestation in tracker\n",
+                .{ fixture_path, case_name, formatStep(step_index), validator, location },
+            );
+            return FixtureError.FixtureMismatch;
+        };
+
+        const attestation_data = proto_att.attestation_data orelse {
+            std.debug.print(
+                "fixture {s} case {s}{f}: validator {d} tracker {s} entry has no attestation_data\n",
                 .{ fixture_path, case_name, formatStep(step_index), validator, location },
             );
             return FixtureError.FixtureMismatch;

@@ -1395,11 +1395,14 @@ pub const ForkChoice = struct {
                     .attestation_data = attestation_data,
                 };
 
-                // also clear out our latest new non included attestation if this is even later than that
-                const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
-                if (attestation_slot > attestation_tracker_latest_new_slot) {
-                    attestation_tracker.latestNew = attestation_tracker.latestKnown;
-                }
+                // leanSpec PR #680 keeps the gossip ("new") and on-chain
+                // ("known") pools strictly separate: `update_safe_target`
+                // operates on the new pool only, while head selection uses
+                // the known pool. Mirroring `latestKnown → latestNew` here
+                // would smuggle on-chain weight back into the safe-target
+                // computation and break the
+                // `test_safe_target_ignores_known_pool_at_interval_3`
+                // contract from the spec test vectors.
             }
         } else {
             // leanSpec allows attestations up to 1 slot in the future:
