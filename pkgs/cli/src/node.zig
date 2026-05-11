@@ -341,11 +341,15 @@ pub const Node = struct {
                         self.anchor_state.* = downloaded_state;
                         // Fetch the real anchor block from the checkpoint provider and store it
                         // in the DB so blocks_by_root can serve it with the correct hash_tree_root.
-                        // Compute anchor_block_root the same way ForkChoice.init does.
+                        // Mirrors leanSpec fetch_finalized_anchor: compute anchor_block_root from
+                        // latest_block_header, fetch block, verify root AND state_root pairing.
+                        var anchor_state_root: types.Root = undefined;
+                        const state_root_ok = if (zeam_utils.hashTreeRoot(types.BeamState, self.anchor_state.*, &anchor_state_root, allocator)) true else |_| false;
                         if (self.anchor_state.genStateBlockHeader(allocator)) |hdr| {
                             var anchor_block_root: types.Root = undefined;
                             if (zeam_utils.hashTreeRoot(types.BeamBlockHeader, hdr, &anchor_block_root, allocator)) {
-                                downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, &db, self.logger);
+                                const expected_state_root: ?types.Root = if (state_root_ok) anchor_state_root else null;
+                                downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, expected_state_root, &db, self.logger);
                             } else |err| {
                                 self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamBlockHeader) failed: {}", .{err});
                             }
@@ -1013,6 +1017,10 @@ fn downloadAndStoreCheckpointBlock(
     allocator: std.mem.Allocator,
     state_url: []const u8,
     expected_root: types.Root,
+    /// hash_tree_root(anchor_state); if non-null the downloaded block's
+    /// state_root is checked against this for block/state pairing
+    /// (mirrors leanSpec fetch_finalized_anchor pairing assertion).
+    expected_state_root: ?types.Root,
     db: *database.Db,
     logger: zeam_utils.ModuleLogger,
 ) void {
@@ -1046,6 +1054,8 @@ fn downloadAndStoreCheckpointBlock(
         .location = .{ .url = block_url },
         .method = .GET,
         .response_writer = &body_writer.writer,
+        // Spec: Accept: application/octet-stream for SSZ binary response.
+        .extra_headers = &.{.{ .name = "Accept", .value = "application/octet-stream" }},
     }) catch |err| {
         logger.warn("checkpoint block fetch: HTTP request failed: {}", .{err});
         return;
@@ -1080,6 +1090,22 @@ fn downloadAndStoreCheckpointBlock(
     if (!std.mem.eql(u8, &computed_root, &expected_root)) {
         logger.warn("checkpoint block fetch: root mismatch — computed=0x{x} expected=0x{x}, discarding", .{ &computed_root, &expected_root });
         return;
+    }
+
+    // Pairing check: block.state_root must equal hash_tree_root(anchor_state).
+    // Mirrors leanSpec fetch_finalized_anchor assertion:
+    //   signed_block.block.state_root != hash_tree_root(state) → retry.
+    // If the server advanced finalization between the two requests the pairing
+    // assertion will fail; we discard and the node falls back to an empty
+    // blocks_by_root response for this root (non-fatal).
+    if (expected_state_root) |state_root| {
+        if (!std.mem.eql(u8, &block.block.state_root, &state_root)) {
+            logger.warn(
+                "checkpoint block fetch: anchor block/state mismatch — block.state_root=0x{x} hash_tree_root(state)=0x{x}; server may have advanced finalization, discarding",
+                .{ &block.block.state_root, &state_root },
+            );
+            return;
+        }
     }
 
     // Re-serialize from the deserialized value to get canonical SSZ bytes.
