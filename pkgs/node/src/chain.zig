@@ -3246,6 +3246,11 @@ pub const BeamChain = struct {
                 // Aggregate even with no peers: local fork-choice benefits from aggregated
                 // attestation weight, and aggregates will propagate once peers connect.
                 // Consistent with proposer and attester which also proceed through .no_peers.
+                //
+                // No double-counting: aggregate() maps per-AttestationData key, replacing
+                // raw attestations with their aggregate. Fork-choice counts each
+                // AttestationData key once regardless of whether the raw or aggregated
+                // form arrived first.
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
@@ -3452,15 +3457,11 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Load a block from the DB and return its SSZ bytes, or null if not found.
-    /// Caller owns the returned ArrayList and must call deinit(allocator) on it.
-    pub fn loadBlockSsz(self: *Self, root: types.Root, allocator: Allocator) !?std.ArrayList(u8) {
-        var block = self.db.loadBlock(database.DbBlocksNamespace, root) orelse return null;
-        defer block.deinit();
-        var bytes: std.ArrayList(u8) = .empty;
-        errdefer bytes.deinit(allocator);
-        try ssz.serialize(types.SignedBlock, block, &bytes, allocator);
-        return bytes;
+    /// Load a block from the DB and return its raw SSZ bytes, or null if not found.
+    /// Uses `Db.loadBlockBytes` to avoid a deserialise+reserialise round-trip.
+    /// Caller must free the returned slice with `allocator.free`.
+    pub fn loadBlockSsz(self: *Self, root: types.Root, allocator: Allocator) ?[]u8 {
+        return self.db.loadBlockBytes(database.DbBlocksNamespace, root, allocator);
     }
 
     /// Get the latest justified checkpoint.

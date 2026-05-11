@@ -323,31 +323,30 @@ pub const ApiServer = struct {
 
     /// Serves the finalized anchor block as SSZ at GET /lean/v0/blocks/finalized.
     /// Used by downstream nodes during checkpoint sync to obtain the real anchor
-    /// block with a correct hash_tree_root (as opposed to a synthetic placeholder).
+    /// block with a correct hash_tree_root (leanSpec FINALIZED_BLOCK_ENDPOINT).
+    ///
+    /// Note: finalized root is snapshotted then the DB is queried in a separate
+    /// step.  If finalization advances between the two, the block may have been
+    /// pruned and the response is 404.  Callers (e.g. fetch_finalized_anchor)
+    /// should retry on 404.
     fn handleFinalizedCheckpointBlock(self: *const Self, request: *std.http.Server.Request) !void {
         const chain = self.getChain() orelse {
             _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
             return;
         };
 
-        // forkChoice is a public field on BeamChain.
         const finalized = chain.forkChoice.getLatestFinalized();
-
-        const maybe_ssz = try chain.loadBlockSsz(finalized.root, self.allocator);
-        if (maybe_ssz == null) {
+        const ssz_bytes = chain.loadBlockSsz(finalized.root, self.allocator) orelse {
             _ = request.respond("Not Found: Finalized block not available\n", .{ .status = .not_found }) catch {};
             return;
-        }
-        var ssz_output = maybe_ssz.?;
-        defer ssz_output.deinit(self.allocator);
+        };
+        defer self.allocator.free(ssz_bytes);
 
-        var content_length_buf: [32]u8 = undefined;
-        const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{ssz_output.items.len});
-
-        _ = request.respond(ssz_output.items, .{
+        // `respond` auto-adds content-length from the body slice; do not add
+        // a manual content-length header to avoid duplicate or colliding values.
+        _ = request.respond(ssz_bytes, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/octet-stream" },
-                .{ .name = "content-length", .value = content_length_str },
             },
         }) catch |err| {
             self.logger.warn("failed to respond with finalized block: {}", .{err});

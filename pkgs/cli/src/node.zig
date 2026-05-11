@@ -339,22 +339,31 @@ pub const Node = struct {
                         self.logger.info("checkpoint sync completed successfully with a recent state at slot={d} as anchor", .{downloaded_state.slot});
                         self.anchor_state.deinit();
                         self.anchor_state.* = downloaded_state;
-                        // Fetch the real anchor block from the checkpoint provider and store it
-                        // in the DB so blocks_by_root can serve it with the correct hash_tree_root.
-                        // Mirrors leanSpec fetch_finalized_anchor: compute anchor_block_root from
-                        // latest_block_header, fetch block, verify root AND state_root pairing.
-                        var anchor_state_root: types.Root = undefined;
-                        const state_root_ok = if (zeam_utils.hashTreeRoot(types.BeamState, self.anchor_state.*, &anchor_state_root, allocator)) true else |_| false;
-                        if (self.anchor_state.genStateBlockHeader(allocator)) |hdr| {
+                        // Fetch the real anchor block from the checkpoint provider and store
+                        // it in the DB so blocks_by_root can serve it with the correct
+                        // hash_tree_root.  Mirrors leanSpec fetch_finalized_anchor: compute
+                        // anchor_block_root + expected_state_root, then fetch + verify both
+                        // root and state_root pairing before persisting.
+                        //
+                        // Fail closed: if any hash computation fails we skip the block fetch
+                        // rather than passing null to downloadAndStoreCheckpointBlock and
+                        // silently skipping the pairing check.
+                        anchor_block_fetch: {
+                            var anchor_state_root: types.Root = undefined;
+                            zeam_utils.hashTreeRoot(types.BeamState, self.anchor_state.*, &anchor_state_root, allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamState) failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            const hdr = self.anchor_state.genStateBlockHeader(allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: genStateBlockHeader failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
                             var anchor_block_root: types.Root = undefined;
-                            if (zeam_utils.hashTreeRoot(types.BeamBlockHeader, hdr, &anchor_block_root, allocator)) {
-                                const expected_state_root: ?types.Root = if (state_root_ok) anchor_state_root else null;
-                                downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, expected_state_root, &db, self.logger);
-                            } else |err| {
-                                self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamBlockHeader) failed: {}", .{err});
-                            }
-                        } else |err| {
-                            self.logger.warn("checkpoint block fetch: genStateBlockHeader failed: {}", .{err});
+                            zeam_utils.hashTreeRoot(types.BeamBlockHeader, hdr, &anchor_block_root, allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamBlockHeader) failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, anchor_state_root, &db, self.logger);
                         }
                     } else {
                         self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
@@ -1004,11 +1013,17 @@ fn verifyCheckpointState(
     });
 }
 
+/// Path suffix that the checkpoint-sync state URL must end with.
+/// Used to derive the block URL (same base, different path tail).
+const FINALIZED_STATE_PATH = "/lean/v0/states/finalized";
+/// Path for the finalized block endpoint (leanSpec FINALIZED_BLOCK_ENDPOINT).
+const FINALIZED_BLOCK_PATH = "/lean/v0/blocks/finalized";
+
 /// Tries to fetch the real SignedBlock for the checkpoint anchor from the
 /// checkpoint provider and persist it to the DB.
 ///
-/// The block URL is derived from the state URL by replacing "states/finalized"
-/// with "blocks/finalized".
+/// The block URL is derived from the state URL by stripping the known
+/// `FINALIZED_STATE_PATH` suffix and appending `FINALIZED_BLOCK_PATH`.
 ///
 /// On any failure the error is logged and the function returns without storing
 /// anything — a missing anchor block is non-fatal: blocks_by_root will return
@@ -1017,25 +1032,25 @@ fn downloadAndStoreCheckpointBlock(
     allocator: std.mem.Allocator,
     state_url: []const u8,
     expected_root: types.Root,
-    /// hash_tree_root(anchor_state); if non-null the downloaded block's
-    /// state_root is checked against this for block/state pairing
-    /// (mirrors leanSpec fetch_finalized_anchor pairing assertion).
-    expected_state_root: ?types.Root,
+    /// hash_tree_root(anchor_state) — required. Block's state_root is checked
+    /// against this for block/state pairing (leanSpec fetch_finalized_anchor).
+    expected_state_root: types.Root,
     db: *database.Db,
     logger: zeam_utils.ModuleLogger,
 ) void {
-    // Derive block URL by replacing the path segment.
-    const needle = "states/finalized";
-    const replacement = "blocks/finalized";
-    const idx = std.mem.indexOf(u8, state_url, needle) orelse {
-        logger.warn("checkpoint block fetch: URL '{s}' does not contain '{s}', cannot derive block URL", .{ state_url, needle });
+    // Derive block URL: strip the known state path suffix and append the block path.
+    // Using endsWith avoids ambiguous first-occurrence matches in hostname/query params.
+    const trimmed = std.mem.trimEnd(u8, state_url, "/");
+    const base_url = if (std.mem.endsWith(u8, trimmed, FINALIZED_STATE_PATH))
+        trimmed[0 .. trimmed.len - FINALIZED_STATE_PATH.len]
+    else {
+        logger.warn(
+            "checkpoint block fetch: state URL '{s}' does not end with '{s}', cannot derive block URL",
+            .{ state_url, FINALIZED_STATE_PATH },
+        );
         return;
     };
-    const block_url = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-        state_url[0..idx],
-        replacement,
-        state_url[idx + needle.len ..],
-    }) catch |err| {
+    const block_url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, FINALIZED_BLOCK_PATH }) catch |err| {
         logger.warn("checkpoint block fetch: failed to allocate block URL: {}", .{err});
         return;
     };
@@ -1079,13 +1094,13 @@ fn downloadAndStoreCheckpointBlock(
         return;
     };
 
-    // Verify block root: compute hash_tree_root(BeamBlock) and compare to expected_root.
-    // The block root is hash_tree_root of the inner BeamBlock (not the signed wrapper).
+    // Verify block root: hash_tree_root(BeamBlock) must equal expected_root.
+    // Fail closed: if hashing fails something is seriously wrong (hashTreeRoot is
+    // deterministic over well-typed values); drop rather than store unverified.
     var computed_root: types.Root = undefined;
     zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &computed_root, allocator) catch |err| {
-        logger.warn("checkpoint block fetch: hashTreeRoot verification failed: {} — storing without root check", .{err});
-        // Continue without verification rather than dropping the block entirely.
-        computed_root = expected_root;
+        logger.warn("checkpoint block fetch: hash verification failed: {}, discarding", .{err});
+        return;
     };
     if (!std.mem.eql(u8, &computed_root, &expected_root)) {
         logger.warn("checkpoint block fetch: root mismatch — computed=0x{x} expected=0x{x}, discarding", .{ &computed_root, &expected_root });
@@ -1093,41 +1108,35 @@ fn downloadAndStoreCheckpointBlock(
     }
 
     // Pairing check: block.state_root must equal hash_tree_root(anchor_state).
-    // Mirrors leanSpec fetch_finalized_anchor assertion:
-    //   signed_block.block.state_root != hash_tree_root(state) → retry.
-    // If the server advanced finalization between the two requests the pairing
-    // assertion will fail; we discard and the node falls back to an empty
-    // blocks_by_root response for this root (non-fatal).
-    if (expected_state_root) |state_root| {
-        if (!std.mem.eql(u8, &block.block.state_root, &state_root)) {
-            logger.warn(
-                "checkpoint block fetch: anchor block/state mismatch — block.state_root=0x{x} hash_tree_root(state)=0x{x}; server may have advanced finalization, discarding",
-                .{ &block.block.state_root, &state_root },
-            );
-            return;
-        }
+    // Mirrors leanSpec fetch_finalized_anchor assertion. Detects server advancing
+    // finalization between the two requests (state then block).
+    if (!std.mem.eql(u8, &block.block.state_root, &expected_state_root)) {
+        logger.warn(
+            "checkpoint block fetch: anchor block/state mismatch — block.state_root=0x{x} hash_tree_root(state)=0x{x}; server may have advanced finalization, discarding",
+            .{ &block.block.state_root, &expected_state_root },
+        );
+        return;
     }
 
-    // Re-serialize from the deserialized value to get canonical SSZ bytes.
-    var re_serialized: std.ArrayList(u8) = .empty;
-    defer re_serialized.deinit(allocator);
-    ssz.serialize(types.SignedBlock, block, &re_serialized, allocator) catch |err| {
-        logger.warn("checkpoint block fetch: SSZ re-serialize failed: {}", .{err});
-        return;
-    };
-
+    // Store the original SSZ bytes directly — no re-serialise round-trip.
+    // The bytes already passed deserialise + hash_tree_root verification so they
+    // are valid; re-encoding would waste CPU and could diverge on non-canonical
+    // encodings (though hash_tree_root catches those too).
     var batch = db.initWriteBatch() catch |err| {
         logger.warn("checkpoint block fetch: write-batch init failed: {}", .{err});
         return;
     };
     defer batch.deinit();
-    batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, re_serialized.items);
+    batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, ssz_data.items);
     db.commit(&batch) catch |err| {
         logger.warn("checkpoint block fetch: DB commit failed: {}", .{err});
         return;
     };
 
-    logger.info("checkpoint block fetch: stored real anchor block root=0x{x} slot={d}", .{ &expected_root, block.block.slot });
+    logger.info(
+        "checkpoint block fetch: stored real anchor block root=0x{x} slot={d} ({d} bytes)",
+        .{ &expected_root, block.block.slot, ssz_data.items.len },
+    );
 }
 
 /// Parses the nodes from a YAML configuration.
