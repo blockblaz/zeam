@@ -421,11 +421,7 @@ fn runStep(
         } else if (std.mem.eql(u8, step_type, "tick")) {
             break :blk processTickStep(ctx, json_ctx.fixture_label, json_ctx.case_name, step_index, step_obj);
         } else if (std.mem.eql(u8, step_type, "attestation")) {
-            std.debug.print(
-                "fixture {s} case {s}{f}: attestation steps unsupported\n",
-                .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep() },
-            );
-            return FixtureError.UnsupportedFixture;
+            break :blk processAttestationStep(ctx, json_ctx.fixture_label, json_ctx.case_name, step_index, step_obj);
         } else {
             std.debug.print(
                 "fixture {s} case {s}{f}: unknown stepType {s}\n",
@@ -1047,11 +1043,187 @@ fn applyChecks(
             continue;
         }
 
+        if (std.mem.eql(u8, key, "justifiedCheckpoint")) {
+            const cp_obj = switch (value) {
+                .object => |m| m,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint must be object\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            if (cp_obj.get("slot")) |sv| {
+                const expected = try expectU64Value(sv, fixture_path, case_name, step_index, "justifiedCheckpoint.slot");
+                const actual = ctx.fork_choice.fcStore.latest_justified.slot;
+                if (actual != expected) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint.slot mismatch got {d} expected {d}\n",
+                        .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            if (cp_obj.get("root")) |rv| {
+                const expected = try expectRootValue(rv, fixture_path, case_name, step_index, "justifiedCheckpoint.root");
+                if (!std.mem.eql(u8, &ctx.fork_choice.fcStore.latest_justified.root, &expected)) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint.root mismatch\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "finalizedCheckpoint")) {
+            const cp_obj = switch (value) {
+                .object => |m| m,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint must be object\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            if (cp_obj.get("slot")) |sv| {
+                const expected = try expectU64Value(sv, fixture_path, case_name, step_index, "finalizedCheckpoint.slot");
+                const actual = ctx.fork_choice.fcStore.latest_finalized.slot;
+                if (actual != expected) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint.slot mismatch got {d} expected {d}\n",
+                        .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            if (cp_obj.get("root")) |rv| {
+                const expected = try expectRootValue(rv, fixture_path, case_name, step_index, "finalizedCheckpoint.root");
+                if (!std.mem.eql(u8, &ctx.fork_choice.fcStore.latest_finalized.root, &expected)) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint.root mismatch\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "safeTarget")) {
+            const expected = try expectRootValue(value, fixture_path, case_name, step_index, "safeTarget");
+            const safe = ctx.fork_choice.getSafeTarget();
+            if (!std.mem.eql(u8, &safe.blockRoot, &expected)) {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: safeTarget mismatch\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.FixtureMismatch;
+            }
+            continue;
+        }
+
         std.debug.print(
             "fixture {s} case {s}{f}: unsupported check {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), key },
         );
         return FixtureError.UnsupportedFixture;
+    }
+}
+
+fn processAttestationStep(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    step_obj: std.json.ObjectMap,
+) !void {
+    const att_value = step_obj.get("attestation") orelse {
+        std.debug.print(
+            "fixture {s} case {s}{f}: attestation step missing attestation field\n",
+            .{ fixture_path, case_name, formatStep(step_index) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    const att_obj = switch (att_value) {
+        .object => |m| m,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{f}: attestation must be object\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+
+    // Parse aggregation bits
+    const bits_value = att_obj.get("aggregationBits") orelse {
+        std.debug.print(
+            "fixture {s} case {s}{f}: attestation missing aggregationBits\n",
+            .{ fixture_path, case_name, formatStep(step_index) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    const bits_obj = switch (bits_value) {
+        .object => |m| m,
+        else => return FixtureError.InvalidFixture,
+    };
+    const bits_data = bits_obj.get("data") orelse return FixtureError.InvalidFixture;
+    const bits_arr = switch (bits_data) {
+        .array => |a| a,
+        else => return FixtureError.InvalidFixture,
+    };
+
+    var aggregation_bits = types.AggregationBits.init(ctx.allocator) catch return FixtureError.InvalidFixture;
+    defer aggregation_bits.deinit();
+    for (bits_arr.items) |bit_val| {
+        const b = switch (bit_val) {
+            .bool => |v| v,
+            else => return FixtureError.InvalidFixture,
+        };
+        aggregation_bits.append(b) catch return FixtureError.InvalidFixture;
+    }
+
+    const data_obj = try expectObject(att_obj, "data", fixture_path, case_name, step_index);
+    const att_slot = try expectU64Field(data_obj, &.{"slot"}, fixture_path, case_name, step_index, "attestation.data.slot");
+    const head_obj = try expectObject(data_obj, "head", fixture_path, case_name, step_index);
+    const target_obj = try expectObject(data_obj, "target", fixture_path, case_name, step_index);
+    const source_obj = try expectObject(data_obj, "source", fixture_path, case_name, step_index);
+
+    const att_data = types.AttestationData{
+        .slot = att_slot,
+        .head = .{
+            .root = try expectRootField(head_obj, &.{"root"}, fixture_path, case_name, step_index, "attestation.head.root"),
+            .slot = try expectU64Field(head_obj, &.{"slot"}, fixture_path, case_name, step_index, "attestation.head.slot"),
+        },
+        .target = .{
+            .root = try expectRootField(target_obj, &.{"root"}, fixture_path, case_name, step_index, "attestation.target.root"),
+            .slot = try expectU64Field(target_obj, &.{"slot"}, fixture_path, case_name, step_index, "attestation.target.slot"),
+        },
+        .source = .{
+            .root = try expectRootField(source_obj, &.{"root"}, fixture_path, case_name, step_index, "attestation.source.root"),
+            .slot = try expectU64Field(source_obj, &.{"slot"}, fixture_path, case_name, step_index, "attestation.source.slot"),
+        },
+    };
+
+    var indices = types.aggregationBitsToValidatorIndices(&aggregation_bits, ctx.allocator) catch {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to parse attestation aggregation bits\n",
+            .{ fixture_path, case_name, formatStep(step_index) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    defer indices.deinit(ctx.allocator);
+
+    for (indices.items) |vi| {
+        const att = types.Attestation{
+            .validator_id = @intCast(vi),
+            .data = att_data,
+        };
+        ctx.fork_choice.onAttestation(att, false) catch {};
     }
 }
 
