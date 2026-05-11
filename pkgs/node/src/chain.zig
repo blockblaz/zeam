@@ -2792,34 +2792,9 @@ pub const BeamChain = struct {
             pruned_count,
         });
 
-        // 5 Rebase forkchoice — lazy prune with node-count threshold.
-        //
-        // Eager rebase drops pre-finalized ancestors from proto-array and
-        // remaps attestation-tracker indices. In-flight attestations whose
-        // source/target/head still points at one of those ancestors then
-        // fail the existence checks in validateAttestationData with
-        // Unknown{Source,Target,Head}Block, and the node burns bandwidth
-        // re-fetching blocks that will never come back. The grace window
-        // is measured in proto-array node count — see
-        // constants.PRUNE_NODE_THRESHOLD for the sizing rationale.
+        // 5 Rebase forkchoice on finalization advance.
         if (pruneForkchoice) {
-            if (self.forkChoice.getProtoNodeIndex(latestFinalized.root)) |finalized_idx| {
-                if (finalized_idx >= constants.PRUNE_NODE_THRESHOLD) {
-                    try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
-                }
-                // else: threshold not reached; keep pre-finalized ancestors
-                // in proto-array so in-flight attestations still resolve.
-            } else {
-                // Shouldn't happen: getCanonicalViewAndAnalysis already resolved
-                // latestFinalized.root via protoArray.indices. If it ever does,
-                // proto-array has fallen out of sync with fcStore — log loudly so
-                // the invariant violation is visible, and keep skipping the rebase
-                // (which also drops pruning) rather than dereferencing a stale node.
-                self.logger.warn(
-                    "forkchoice: finalized root 0x{x} missing from proto-array; skipping rebase (invariant violation)",
-                    .{&latestFinalized.root},
-                );
-            }
+            try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
         }
 
         // TODO:
@@ -5002,106 +4977,6 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
 }
-
-
-test "processFinalizationAdvancement: below PRUNE_NODE_THRESHOLD keeps pre-finalized ancestors" {
-    // Regression: eager ProtoArray.rebase dropped pre-finalized ancestors on
-    // every finalization advance, so in-flight attestations whose source /
-    // target / head referenced those ancestors failed the existence check in
-    // validateAttestationData with Unknown{Source,Target,Head}Block.
-    //
-    // With the threshold gate, rebase is skipped while the finalized node's
-    // index in protoArray is below PRUNE_NODE_THRESHOLD. A short mock chain
-    // never crosses the threshold, so all recently-finalized ancestors must
-    // still be addressable after the chain finalizes.
-    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    const allocator = arena_allocator.allocator();
-
-    const mock_chain = try stf.genMockChain(allocator, 5, null);
-    const spec_name = try allocator.dupe(u8, "beamdev");
-    const fork_digest = try allocator.dupe(u8, "12345678");
-    const chain_config = configs.ChainConfig{
-        .id = configs.Chain.custom,
-        .genesis = mock_chain.genesis_config,
-        .spec = .{
-            .preset = params.Preset.mainnet,
-            .name = spec_name,
-            .fork_digest = fork_digest,
-            .attestation_committee_count = 1,
-            .max_attestations_data = 16,
-        },
-    };
-    var beam_state = mock_chain.genesis_state;
-    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    // Zig 0.16 renamed `Dir.realpathAlloc` to `Dir.realPathFileAlloc` and
-    // the new signature takes (io, sub_path, gpa) and returns `[:0]u8`.
-    const data_dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    defer allocator.free(data_dir);
-
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
-    defer db.deinit();
-
-    // Main's slice (a-2) network refactor replaced the raw
-    // `std.StringHashMap(PeerInfo)` with `network.ConnectedPeers`. Use the
-    // new type — every other in-tree chain test does the same construction
-    // (e.g. `chain.zig:3645`).
-    const connected_peers = try allocator.create(ConnectedPeers);
-    connected_peers.* = ConnectedPeers.init(allocator);
-
-    const test_registry = try allocator.create(NodeNameRegistry);
-    defer allocator.destroy(test_registry);
-    test_registry.* = NodeNameRegistry.init(allocator);
-    defer test_registry.deinit();
-
-    var beam_chain = try BeamChain.init(
-        allocator,
-        ChainOpts{
-            .config = chain_config,
-            .anchorState = &beam_state,
-            .nodeId = 7,
-            .logger_config = &zeam_logger_config,
-            .db = db,
-            .node_registry = test_registry,
-        },
-        connected_peers,
-    );
-    defer beam_chain.deinit();
-
-    // Drive the chain through the same entrypoint node.zig uses so the gate
-    // (fired inside processFinalizationAdvancement → onBlockFollowup) is
-    // actually exercised. Calling onBlock alone never triggers the rebase
-    // path, so the test would pass even without the threshold fix.
-    for (1..mock_chain.blocks.len) |i| {
-        const signed_block = mock_chain.blocks[i];
-        const current_slot = signed_block.block.slot;
-        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(signed_block, .{});
-        allocator.free(missing_roots);
-        beam_chain.onBlockFollowup(true, &signed_block);
-    }
-
-    // Sanity-check: mock chain must actually advance finalization for this
-    // regression to mean anything.
-    try std.testing.expect(beam_chain.forkChoice.getLatestFinalized().slot > 0);
-
-    // The finalized node's index in protoArray should be well under the
-    // threshold (5 blocks total, threshold = 64).
-    const finalized_idx = beam_chain.forkChoice.getProtoNodeIndex(beam_chain.forkChoice.getLatestFinalized().root);
-    try std.testing.expect(finalized_idx != null);
-    try std.testing.expect(finalized_idx.? < constants.PRUNE_NODE_THRESHOLD);
-
-    // All processed block roots — including the pre-finalized ones — must
-    // still resolve through the fork-choice API that validateAttestationData
-    // consults. Pre-gate, rebase would have dropped the below-finalized ones.
-    for (1..mock_chain.blocks.len) |i| {
-        try std.testing.expect(beam_chain.forkChoice.getProtoNode(mock_chain.blockRoots[i]) != null);
-    }
-}
-
 test "BorrowedState: cloneAndRelease success path against real BeamState" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
