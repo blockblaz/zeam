@@ -140,6 +140,11 @@ fn routeConnection(io: std.Io, connection: net.Stream, allocator: std.mem.Alloca
                 ctx.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/blocks/finalized")) {
+            ctx.handleFinalizedCheckpointBlock(&request) catch |err| {
+                ctx.logger.warn("failed to handle finalized checkpoint block request: {}", .{err});
+                _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            };
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/checkpoints/justified")) {
             ctx.handleJustifiedCheckpoint(&request) catch |err| {
                 ctx.logger.warn("failed to handle justified checkpoint request: {}", .{err});
@@ -312,6 +317,40 @@ pub const ApiServer = struct {
             },
         }) catch |err| {
             self.logger.warn("failed to respond with finalized lean state: {}", .{err});
+            return err;
+        };
+    }
+
+    /// Serves the finalized anchor block as SSZ at GET /lean/v0/blocks/finalized.
+    /// Used by downstream nodes during checkpoint sync to obtain the real anchor
+    /// block with a correct hash_tree_root (as opposed to a synthetic placeholder).
+    fn handleFinalizedCheckpointBlock(self: *const Self, request: *std.http.Server.Request) !void {
+        const chain = self.getChain() orelse {
+            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+
+        // forkChoice is a public field on BeamChain.
+        const finalized = chain.forkChoice.getLatestFinalized();
+
+        const maybe_ssz = try chain.loadBlockSsz(finalized.root, self.allocator);
+        if (maybe_ssz == null) {
+            _ = request.respond("Not Found: Finalized block not available\n", .{ .status = .not_found }) catch {};
+            return;
+        }
+        var ssz_output = maybe_ssz.?;
+        defer ssz_output.deinit(self.allocator);
+
+        var content_length_buf: [32]u8 = undefined;
+        const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{ssz_output.items.len});
+
+        _ = request.respond(ssz_output.items, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/octet-stream" },
+                .{ .name = "content-length", .value = content_length_str },
+            },
+        }) catch |err| {
+            self.logger.warn("failed to respond with finalized block: {}", .{err});
             return err;
         };
     }
