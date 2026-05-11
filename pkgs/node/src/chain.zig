@@ -125,79 +125,6 @@ pub const PendingBlockEntry = struct {
     block_root: types.Root,
 };
 
-/// Store a synthetic SignedBlock for the fork-choice anchor root in DbBlocksNamespace.
-///
-/// This is called during chain initialisation when the DB does not yet contain
-/// a block for the current head (the typical case after checkpoint-sync, where
-/// only the BeamState is downloaded, not the block).
-///
-/// The synthetic block is built from the ProtoBlock metadata available at init
-/// time (slot, proposer_index, parent_root, state_root) with an EMPTY body and
-/// a zeroed proposer signature.  It exists solely so that blocks_by_root
-/// queries for the anchor root return a decodable response instead of nothing.
-///
-/// Memory contract (important): `atts` and `sigs` are heap-allocated and then
-/// moved (by value copy in Zig) into `block`.  Only `block.deinit()` must be
-/// called; the caller must NOT call `atts.deinit()` or `sigs.deinit()` after
-/// the block is constructed.
-fn storeSyntheticAnchorBlock(
-    allocator: Allocator,
-    db: *database.Db,
-    anchor: types.ProtoBlock,
-    logger: zeam_utils.ModuleLogger,
-) void {
-    var atts = types.AggregatedAttestations.init(allocator) catch |err| {
-        logger.warn("anchor block store: failed to alloc attestations list: {}", .{err});
-        return;
-    };
-    // atts is not yet owned by a block; free it if sigs init fails.
-    const sigs = types.AttestationSignatures.init(allocator) catch |err| {
-        logger.warn("anchor block store: failed to alloc signatures list: {}", .{err});
-        atts.deinit();
-        return;
-    };
-
-    // From this point atts and sigs are owned by `block` (via value copy).
-    // Call block.deinit() at the end; do NOT call atts.deinit()/sigs.deinit().
-    var block = types.SignedBlock{
-        .block = types.BeamBlock{
-            .slot = anchor.slot,
-            .proposer_index = anchor.proposer_index,
-            .parent_root = anchor.parentRoot,
-            .state_root = anchor.stateRoot,
-            .body = types.BeamBlockBody{ .attestations = atts },
-        },
-        .signature = types.BlockSignatures{
-            .attestation_signatures = sigs,
-            .proposer_signature = types.ZERO_SIGBYTES,
-        },
-    };
-    defer block.deinit();
-
-    var ssz_bytes: std.ArrayList(u8) = .empty;
-    defer ssz_bytes.deinit(allocator);
-    ssz.serialize(types.SignedBlock, block, &ssz_bytes, allocator) catch |err| {
-        logger.warn("anchor block store: SSZ serialisation failed: {}", .{err});
-        return;
-    };
-
-    var batch = db.initWriteBatch() catch |err| {
-        logger.warn("anchor block store: write-batch init failed: {}", .{err});
-        return;
-    };
-    defer batch.deinit();
-    batch.putBlockSerialized(database.DbBlocksNamespace, anchor.blockRoot, ssz_bytes.items);
-    db.commit(&batch) catch |err| {
-        logger.warn("anchor block store: DB commit failed: {}", .{err});
-        return;
-    };
-
-    logger.info(
-        "stored synthetic anchor block root=0x{x} slot={d} (checkpoint-sync placeholder)",
-        .{ &anchor.blockRoot, anchor.slot },
-    );
-}
-
 pub const BeamChain = struct {
     config: configs.ChainConfig,
     anchor_state: *types.BeamState,
@@ -419,34 +346,26 @@ pub const BeamChain = struct {
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
         try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
 
-        // Ensure the anchor block is persisted in DbBlocksNamespace so that
-        // blocks_by_root requests for the anchor (head) root can be served.
+        // Check whether the anchor block is already in the DB.
+        // NodeRunner.downloadAndStoreCheckpointBlock fetches the real block from the
+        // checkpoint provider before BeamChain.init is called, so the common path here
+        // is the non-null branch (block already present).
         //
-        // When zeam starts via checkpoint-sync it downloads only the BeamState,
-        // not the actual SignedBlock. The fork-choice head is computed from
-        // the anchor state's latest_block_header so the root is known, but
-        // the DB has no entry for it. Without this a peer requesting the
-        // anchor block via blocks_by_root would receive zero blocks.
-        //
-        // We store a synthetic SignedBlock built from the ProtoBlock fields
-        // (slot, proposer_index, parent_root, state_root) with an empty body
-        // and a zeroed proposer signature.  The reqresp hive test only verifies
-        // slot / parent_root / proposer_index, so this is sufficient.
-        //
-        // Caveat: when the real anchor block contained attestations its
-        // body_root (and therefore its hash_tree_root) will differ from the
-        // synthetic one.  Peers MUST NOT re-import this block via onBlock; it
-        // is intentionally served only to satisfy blocks_by_root queries for
-        // the initial head before any real block is imported.
-        //
-        // For genesis starts (slot == 0) the lean spec mandates an empty body,
-        // so the synthetic block is identical to the real one.
-        if (chain.db.loadBlock(database.DbBlocksNamespace, fork_choice.head.blockRoot) == null) {
-            storeSyntheticAnchorBlock(
-                allocator,
-                &chain.db,
-                fork_choice.head,
-                logger_config.logger(.chain),
+        // Memory note: loadBlock returns an owned SignedBlock by value.  The non-null
+        // branch must call deinit to release the heap-allocated attestation lists;
+        // previously this branch dropped the value silently, leaking on every warm-start.
+        if (chain.db.loadBlock(database.DbBlocksNamespace, fork_choice.head.blockRoot)) |loaded| {
+            var owned = loaded;
+            owned.deinit();
+        } else {
+            // Anchor block not in DB.  NodeRunner tries to fetch it from the checkpoint
+            // provider during startup; if that fetch failed (provider doesn't expose
+            // /lean/v0/blocks/finalized, or timed out) we log and continue.
+            // blocks_by_root returns empty for this root until the real block arrives
+            // via reqresp or gossip from a peer.
+            logger_config.logger(.chain).warn(
+                "anchor block root=0x{x} slot={d} not in DB — blocks_by_root will return empty for this root until real block is received",
+                .{ &fork_choice.head.blockRoot, opts.anchorState.slot },
             );
         }
 
@@ -3324,8 +3243,15 @@ pub const BeamChain = struct {
                 return null;
             },
             .no_peers => {
-                self.logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
-                return null;
+                // Aggregate even with no peers: local fork-choice benefits from aggregated
+                // attestation weight, and aggregates will propagate once peers connect.
+                // Consistent with proposer and attester which also proceed through .no_peers.
+                //
+                // No double-counting: aggregate() maps per-AttestationData key, replacing
+                // raw attestations with their aggregate. Fork-choice counts each
+                // AttestationData key once regardless of whether the raw or aggregated
+                // form arrived first.
+                self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
                 self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
@@ -3529,6 +3455,13 @@ pub const BeamChain = struct {
             .tier5_held = true,
             .timer = t_ev,
         };
+    }
+
+    /// Load a block from the DB and return its raw SSZ bytes, or null if not found.
+    /// Uses `Db.loadBlockBytes` to avoid a deserialise+reserialise round-trip.
+    /// Caller must free the returned slice with `allocator.free`.
+    pub fn loadBlockSsz(self: *Self, root: types.Root, allocator: Allocator) ?[]u8 {
+        return self.db.loadBlockBytes(database.DbBlocksNamespace, root, allocator);
     }
 
     /// Get the latest justified checkpoint.
