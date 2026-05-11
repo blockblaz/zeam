@@ -17,9 +17,9 @@ pub const Checkpoint = struct {
     slot: Slot,
 
     pub fn toJson(self: *const Checkpoint, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("root", json.Value{ .string = try bytesToHex(allocator, &self.root) });
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "root", json.Value{ .string = try bytesToHex(allocator, &self.root) });
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
         return json.Value{ .object = obj };
     }
 
@@ -31,7 +31,7 @@ pub const Checkpoint = struct {
 
     pub fn freeJson(val: *json.Value, allocator: Allocator) void {
         allocator.free(val.object.get("root").?.string);
-        val.object.deinit();
+        val.object.deinit(allocator);
     }
 };
 
@@ -42,11 +42,11 @@ pub const Status = struct {
     head_slot: Slot,
 
     pub fn toJson(self: *const Status, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("finalized_root", json.Value{ .string = try bytesToHex(allocator, &self.finalized_root) });
-        try obj.put("finalized_slot", json.Value{ .integer = @as(i64, @intCast(self.finalized_slot)) });
-        try obj.put("head_root", json.Value{ .string = try bytesToHex(allocator, &self.head_root) });
-        try obj.put("head_slot", json.Value{ .integer = @as(i64, @intCast(self.head_slot)) });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "finalized_root", json.Value{ .string = try bytesToHex(allocator, &self.finalized_root) });
+        try obj.put(allocator, "finalized_slot", json.Value{ .integer = @as(i64, @intCast(self.finalized_slot)) });
+        try obj.put(allocator, "head_root", json.Value{ .string = try bytesToHex(allocator, &self.head_root) });
+        try obj.put(allocator, "head_slot", json.Value{ .integer = @as(i64, @intCast(self.head_slot)) });
         return json.Value{ .object = obj };
     }
 
@@ -59,6 +59,6 @@ pub const Status = struct {
     pub fn freeJson(val: *json.Value, allocator: Allocator) void {
         allocator.free(val.object.get("finalized_root").?.string);
         allocator.free(val.object.get("head_root").?.string);
-        val.object.deinit();
+        val.object.deinit(allocator);
     }
 };

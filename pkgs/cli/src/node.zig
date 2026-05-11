@@ -94,6 +94,14 @@ pub const NodeOptions = struct {
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
     db_backend: database.Backend = .rocksdb,
+    chain_spec: ?[]const u8 = null,
+    /// Slice c-2b commit 3 of #803: route producer-side gossip
+    /// handlers through the chain-worker queue. Default `true` post
+    /// devnet-4 burn-in: the worker path is the supported prod path;
+    /// surfaced as `--chain-worker` on the `zeam node` CLI, with
+    /// `--chain-worker false` as the kill-switch for the legacy
+    /// synchronous path.
+    chain_worker_enabled: bool = true,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -165,6 +173,7 @@ pub const Node = struct {
         ignore_not_found: bool,
     ) !void {
         db.deinit();
+        const io = std.Io.Threaded.global_single_threaded.io();
         // Both backends store their working set under the same base
         // directory; deleting it yields a clean slate for either engine.
         const backend_dir = switch (backend) {
@@ -173,7 +182,7 @@ pub const Node = struct {
         };
         const db_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ database_path, backend_dir });
         defer allocator.free(db_path);
-        std.fs.deleteTreeAbsolute(db_path) catch |wipe_err| {
+        std.Io.Dir.cwd().deleteTree(io, db_path) catch |wipe_err| {
             if (!ignore_not_found or wipe_err != error.FileNotFound) {
                 logger.err("failed to delete database directory '{s}': {any}", .{ db_path, wipe_err });
                 return wipe_err;
@@ -191,17 +200,56 @@ pub const Node = struct {
         self.options = options;
         self.api_server_handle = null;
         self.metrics_server_handle = null;
-
-        // some base mainnet spec would be loaded to build this up
-        const chain_spec =
+        self.logger = options.logger_config.logger(.node);
+        // If path is specified load from it, otherwise use default settings
+        const chain_spec_owned = self.options.chain_spec != null;
+        const chain_spec = if (self.options.chain_spec) |path|
+            std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1024 * 1024)) catch |err| {
+                self.logger.err("failed to load chain spec at '{s}': {any}", .{ path, err });
+                return err;
+            }
+        else
             \\{"preset": "mainnet", "name": "devnet0", "fork_digest": "12345678"}
         ;
+
+        defer if (chain_spec_owned) allocator.free(chain_spec);
+
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
-        var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
+        // `parseFromSlice` allocates string fields inside the `Parsed` arena.
+        // The slice headers it returns alias arena memory; `chain_config` later
+        // owns these fields and `ChainSpec.deinit(allocator)` calls
+        // `allocator.free(self.name)` / `allocator.free(self.fork_digest)`. We
+        // must move both fields out of the arena onto the top-level allocator
+        // before dropping the arena, otherwise shutdown panics with
+        // "Invalid free" once `chain.deinit -> config.deinit` runs (see #831).
+        const parsed = try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options);
+        defer parsed.deinit();
+        var chain_options = parsed.value;
+        chain_options.name = try allocator.dupe(u8, chain_options.name.?);
+        errdefer if (chain_options.name) |n| allocator.free(n);
+        chain_options.fork_digest = try allocator.dupe(u8, chain_options.fork_digest.?);
+        errdefer if (chain_options.fork_digest) |d| allocator.free(d);
         chain_options.genesis_time = options.genesis_spec.genesis_time;
+
+        if (chain_spec_owned) {
+            if (chain_options.preset == null) {
+                self.logger.err("chain spec: 'preset' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.name == null or chain_options.name.?.len == 0) {
+                self.logger.err("chain spec: 'name' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.fork_digest == null or chain_options.fork_digest.?.len != 8) {
+                self.logger.err("chain spec: 'fork_digest' field must be 4 bytes (8 hex characters)", .{});
+                return error.InvalidChainSpec;
+            }
+        }
 
         // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
         chain_options.validator_attestation_pubkeys = options.genesis_spec.validator_attestation_pubkeys;
@@ -236,7 +284,6 @@ pub const Node = struct {
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
             .node_registry = options.node_registry,
-            .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.logger_config);
@@ -249,8 +296,6 @@ pub const Node = struct {
             options.db_backend,
         );
         errdefer db.deinit();
-
-        self.logger = options.logger_config.logger(.node);
 
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
@@ -321,7 +366,7 @@ pub const Node = struct {
         // metrics instead of being discarded by noop metrics.
         if (options.metrics_enable) {
             try api.init(allocator);
-            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(zeam_utils.unixTimestampSeconds()));
         }
 
         const cpu_count = std.Thread.getCpuCount() catch 2;
@@ -330,6 +375,7 @@ pub const Node = struct {
         const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
         self.thread_pool = try ThreadPool.init(.{
             .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
             .thread_count = @intCast(worker_count),
         });
         errdefer self.thread_pool.deinit();
@@ -358,6 +404,7 @@ pub const Node = struct {
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
+            .chain_worker_enabled = options.chain_worker_enabled,
         });
         errdefer self.beam_node.deinit();
 
@@ -429,6 +476,14 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
+        // Start the Rust libp2p network BEFORE BeamNode: since #812,
+        // `BeamNode.run()` calls `gossip.subscribe(...)`, which enqueues
+        // `SwarmCommand::SubscribeGossip` on the per-network command channel.
+        // That channel only exists after `EthLibp2p.run()` returns from
+        // `wait_for_network_ready`. Reversing the order drops every subscribe
+        // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
+        // command already does network-first; this is the matching swap for
+        // the production node path.
         try self.network.run();
         try self.beam_node.run();
 
@@ -752,7 +807,9 @@ pub fn buildStartOptions(
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+    opts.chain_spec = node_cmd.@"chain-spec";
     opts.is_aggregator = node_cmd.@"is-aggregator";
+    opts.chain_worker_enabled = node_cmd.@"chain-worker";
 
     // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
     // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
@@ -809,7 +866,11 @@ fn downloadCheckpointState(
 ) !types.BeamState {
     logger.info("downloading checkpoint state from: {s}", .{url});
 
-    var client = std.http.Client{ .allocator = allocator };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var client = std.http.Client{
+        .allocator = allocator,
+        .io = io,
+    };
     defer client.deinit();
 
     // Use an Allocating writer so client.fetch handles both Content-Length and
@@ -1178,10 +1239,10 @@ fn constructENRFromFields(
 
     // Set IP address (IPv4)
     if (enr_fields.ip) |ip_str| {
-        const ip_addr = std.net.Ip4Address.parse(ip_str, 0) catch {
+        const ip_addr = std.Io.net.Ip4Address.parse(ip_str, 0) catch {
             return error.InvalidIPAddress;
         };
-        const ip_addr_bytes = std.mem.asBytes(&ip_addr.sa.addr);
+        const ip_addr_bytes = &ip_addr.bytes;
         signable_enr.set("ip", ip_addr_bytes) catch {
             return error.ENRSetIPFailed;
         };
@@ -1189,10 +1250,10 @@ fn constructENRFromFields(
 
     // Set IP address (IPv6)
     if (enr_fields.ip6) |ip6_str| {
-        const ip6_addr = std.net.Ip6Address.parse(ip6_str, 0) catch {
+        const ip6_addr = std.Io.net.Ip6Address.parse(ip6_str, 0) catch {
             return error.InvalidIP6Address;
         };
-        const ip6_addr_bytes = std.mem.asBytes(&ip6_addr.sa.addr);
+        const ip6_addr_bytes = &ip6_addr.bytes;
         signable_enr.set("ip6", ip6_addr_bytes) catch {
             return error.ENRSetIP6Failed;
         };
@@ -1272,11 +1333,11 @@ fn constructENRFromFields(
     }
 
     // Convert SignableENR to ENR
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
 
-    try enr_lib.writeSignableENR(buffer.writer(allocator), &signable_enr);
-    const enr_text = buffer.items;
+    try enr_lib.writeSignableENR(&writer_alloc.writer, &signable_enr);
+    const enr_text = writer_alloc.writer.buffered();
 
     var enr: ENR = undefined;
     try ENR.decodeTxtInto(&enr, enr_text);

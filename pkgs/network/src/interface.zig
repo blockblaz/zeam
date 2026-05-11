@@ -35,7 +35,12 @@ pub const DisconnectionReason = enum(u32) {
 
 const topic_prefix = "leanconsensus";
 const lean_blocks_by_root_protocol = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+const lean_blocks_by_range_protocol = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
+
+fn unionPayloadType(comptime UnionType: type, comptime tag: anytype) type {
+    return @FieldType(UnionType, @tagName(tag));
+}
 
 fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     switch (val.*) {
@@ -44,7 +49,7 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
             while (it.next()) |entry| {
                 freeJsonValue(&entry.value_ptr.*, allocator);
             }
-            o.deinit();
+            o.deinit(allocator);
         },
         .array => |*a| {
             for (a.items) |*item| {
@@ -294,7 +299,7 @@ pub const GossipMessage = union(GossipTopicKind) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 switch (tag) {
                     .attestation => try ssz.serialize(types.SignedAttestation, payload.message, &serialized, allocator),
                     else => try ssz.serialize(PayloadType, payload, &serialized, allocator),
@@ -359,13 +364,23 @@ pub const GossipMessage = union(GossipTopicKind) {
     }
 };
 
-pub const LeanSupportedProtocol = enum {
-    blocks_by_root,
-    status,
+pub const LeanSupportedProtocol = enum(u32) {
+    // Ordinals must match the Rust side's `#[repr(u32)]` discriminants
+    // AND `TryFrom<u32>` mapping in
+    // `rust/libp2p-glue/src/req_resp/protocol_id.rs::LeanSupportedProtocol`.
+    // The cross-FFI invariant runs in BOTH directions: Zig u32 → Rust
+    // try_from (incoming RPC tag) AND Rust enum → u32 (outgoing tag).
+    // The Rust side pins both via `#[repr(u32)]` + explicit discriminants;
+    // a unit test (`try_from_round_trip_matches_repr` in the Rust file)
+    // guards against future drift. Reported by @ch4r10t33r on PR #824.
+    blocks_by_root = 0,
+    status = 1,
+    blocks_by_range = 2,
 
     pub fn protocolId(self: LeanSupportedProtocol) []const u8 {
         return switch (self) {
             .blocks_by_root => lean_blocks_by_root_protocol,
+            .blocks_by_range => lean_blocks_by_range_protocol,
             .status => lean_status_protocol,
         };
     }
@@ -391,19 +406,64 @@ pub const LeanSupportedProtocol = enum {
             return .blocks_by_root;
         }
 
+        if (std.mem.eql(u8, protocol_id, lean_blocks_by_range_protocol)) {
+            return .blocks_by_range;
+        }
+
         return error.UnsupportedProtocol;
     }
 };
 
+/// Validate the wire shape of a `BlocksByRootV1` request payload.
+///
+/// `BlockByRootRequest = struct { roots: List<Root, MAX_REQUEST_BLOCKS> }`
+/// serialises as a 4-byte little-endian offset prefix followed by the packed
+/// list body of `N × 32` bytes. The struct has only one variable-length field,
+/// so the offset must point exactly at the end of the offset section, i.e.
+/// must equal `4`.
+///
+/// Anything else is malformed: a peer-supplied garbage offset would otherwise
+/// trigger a slice-bounds panic deep inside the SSZ decoder, which aborts the
+/// FFI thread and brings down the whole zeam process. We return an error
+/// instead so the request handler's existing catch path can send an RPC
+/// error back and keep the node alive.
+///
+/// Intentionally module-private: this is a wire-shape shim for
+/// `ReqRespRequest.deserialize` only and exists purely to dodge an upstream
+/// SSZ panic surface (see #843). Once the bounds checks land in `ssz.zig`
+/// itself this whole helper goes away. If a future caller in `pkgs/network/`
+/// needs the same validation, lift it then — don't widen the API now and
+/// invite reuse of a fix that is meant to be temporary.
+fn validateBlocksByRootRequestBytes(bytes: []const u8) !void {
+    // The body-length checks below assume the SSZ wire size of `Root` is 32
+    // bytes (i.e. `Root` is `[32]u8` with no padding). If anyone ever wraps
+    // `Root` in a struct with padding or otherwise drifts the in-memory size,
+    // `@sizeOf(types.Root)` and the SSZ wire size diverge silently and these
+    // checks misclassify well-formed payloads as malformed (or vice versa).
+    // Catch that at compile time rather than waiting for it to reach Hive.
+    comptime std.debug.assert(@sizeOf(types.Root) == 32);
+
+    if (bytes.len < 4) return error.MalformedReqRespRequest;
+    const offset = std.mem.readInt(u32, bytes[0..4], .little);
+    if (offset != 4) return error.MalformedReqRespRequest;
+    const body = bytes[offset..];
+    if (body.len % @sizeOf(types.Root) != 0) return error.MalformedReqRespRequest;
+    if (body.len / @sizeOf(types.Root) > consensus_params.MAX_REQUEST_BLOCKS) {
+        return error.MalformedReqRespRequest;
+    }
+}
+
 pub const ReqRespRequest = union(LeanSupportedProtocol) {
     blocks_by_root: types.BlockByRootRequest,
     status: types.Status,
+    blocks_by_range: types.BlocksByRangeRequest,
 
     const Self = @This();
 
     pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .blocks_by_root => try writer.writeAll("ReqRespRequest{ blocks_by_root }"),
+            .blocks_by_range => try writer.writeAll("ReqRespRequest{ blocks_by_range }"),
             .status => try writer.writeAll("ReqRespRequest{ status }"),
         }
     }
@@ -412,6 +472,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
             .blocks_by_root => |request| request.toJson(allocator),
+            .blocks_by_range => |request| request.toJson(allocator),
         };
     }
 
@@ -427,7 +488,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
@@ -435,8 +496,8 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         return serialized.toOwnedSlice(allocator);
     }
 
-    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
-        const PayloadType = std.meta.TagPayload(Self, tag);
+    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !unionPayloadType(Self, tag) {
+        const PayloadType = unionPayloadType(Self, tag);
         return switch (tag) {
             .blocks_by_root => PayloadType{
                 .roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator),
@@ -445,17 +506,40 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         };
     }
 
-    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *std.meta.TagPayload(Self, tag)) void {
+    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *unionPayloadType(Self, tag)) void {
         switch (tag) {
             .blocks_by_root => payload.roots.deinit(),
+            .blocks_by_range => {},
             inline else => {},
         }
     }
 
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !Self {
+        // Pre-validate the wire shape before handing it to the SSZ codec.
+        //
+        // The vendored ssz.zig has bounds checks on its array/list deserializer
+        // (out-of-range offsets surface as `error.OffsetExceedsSize`) but not yet
+        // on the variable-field offsets inside its container/struct deserializer.
+        // A malformed `BlocksByRootV1` request that puts garbage in the offset
+        // prefix slips past the upfront `minInLength`/`maxInLength` check
+        // (24 bytes is comfortably inside `[4, 4 + 32 * MAX_REQUEST_BLOCKS]`)
+        // and slice-overruns inside the wrapping struct's deserializer, which
+        // panics the FFI thread and aborts the whole zeam process — any peer
+        // can DoS the node by sending one bad RPC. Reject malformed input
+        // here so the callsite's existing error path can send an RPC error
+        // back without crashing.
+        //
+        // `Status` and `BlocksByRange` are fixed-size containers; ssz.zig's
+        // upfront length check already rejects malformed input for those, so
+        // no extra pre-validation is needed for them.
+        switch (method) {
+            .status, .blocks_by_range => {},
+            .blocks_by_root => try validateBlocksByRootRequestBytes(bytes),
+        }
+
         return switch (method) {
             inline else => |tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 var payload = try initPayload(tag, allocator);
                 var succeeded = false;
                 defer if (!succeeded) deinitPayload(tag, &payload);
@@ -475,6 +559,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 pub const ReqRespResponse = union(LeanSupportedProtocol) {
     blocks_by_root: types.SignedBlock,
     status: types.Status,
+    blocks_by_range: types.SignedBlock,
 
     const Self = @This();
 
@@ -482,6 +567,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
             .blocks_by_root => |block| block.toJson(allocator),
+            .blocks_by_range => |block| block.toJson(allocator),
         };
     }
 
@@ -497,7 +583,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
@@ -508,7 +594,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !ReqRespResponse {
         return switch (method) {
             inline else => |tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 var payload: PayloadType = undefined;
                 try ssz.deserialize(PayloadType, bytes, &payload, allocator);
                 return @unionInit(Self, @tagName(tag), payload);
@@ -520,6 +606,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
         switch (self.*) {
             .status => {},
             .blocks_by_root => |*block| block.deinit(),
+            .blocks_by_range => |*block| block.deinit(),
         }
     }
 };
@@ -997,4 +1084,142 @@ test LeanNetworkTopic {
     try std.testing.expectEqual(topic.gossip_topic, decoded_topic.gossip_topic);
     try std.testing.expectEqual(topic.encoding, decoded_topic.encoding);
     try std.testing.expect(std.mem.eql(u8, topic.fork_digest, decoded_topic.fork_digest));
+}
+
+test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panicking" {
+    // Regression test for the Hive `reqresp/blocks_by_root/malformed_request`
+    // failures. The regression test merged with #845 used a hand-crafted
+    // 24-byte approximation; this test pins the real simulator input.
+    //
+    // The Hive simulator sends `encode_request_raw(&[0xab; 64])`:
+    //   - Wire:  25 bytes = varint(64) || snappy_frame_compress([0xab; 64])
+    //   - After zeam's snappy frame decode: 64 bytes all `0xAB`
+    //   - SSZ offset field (bytes 0..4 LE): 0xABABABAB = 2880154539
+    //
+    // Without the guard added in #845, the ssz.zig container deserializer at
+    // lib.zig:604 sliced `bytes[2880154539..]` on a 64-byte buffer and
+    // panicked, killing the FFI thread and aborting zeam.
+    //
+    // Scope: this test exercises the post-decompression validation path only.
+    // The snappy framing layer and the varint length pre-checks are not
+    // covered here; a full end-to-end harness (not yet in this project)
+    // would be needed to lock those against regression too.
+    //
+    // Incidents: image 993f193 (v0.4.15, May 7 2026)
+    //            image 14222bc (v0.4.16, May 7 2026, Hive test-506)
+    //
+    // The `@sizeOf(types.Root) == 32` compile-time assert inside
+    // `validateBlocksByRootRequestBytes` ensures the 32-byte step assumption
+    // used in cases 3, 6, and 7 holds. If `Root` ever gets padding the build
+    // will fail at compile time rather than silently misclassifying payloads.
+    //
+    // All rejection cases also call `ReqRespRequest.deserialize` end-to-end.
+    // Without the end-to-end call, a future contributor who mis-wires the
+    // pre-validation switch (e.g. only `.status`, not `.blocks_by_root`)
+    // would leave the production SSZ panic path reachable while the
+    // per-shape validator checks still pass. The end-to-end calls lock that
+    // wiring. The `errdefer req.deinit()` inside `deserialize` means any
+    // allocation made before the validator fires is cleaned up on error;
+    // `std.testing.allocator` enforces this by detecting leaks at test exit.
+    const allocator = std.testing.allocator;
+
+    {
+        // Case 1: exact decompressed bytes from the Hive malformed_request test.
+        // 64 bytes all 0xAB → offset 0xABABABAB (2880154539), way past the end.
+        var malformed = [_]u8{0xAB} ** 64;
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&malformed));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &malformed),
+        );
+    }
+
+    {
+        // Case 2: non-uniform garbage — offset 0xDEADBEEF, mixed body bytes.
+        // Guards against an (unlikely) optimisation that only rejects
+        // homogeneous byte patterns.
+        var mixed: [36]u8 = undefined;
+        std.mem.writeInt(u32, mixed[0..4], 0xDEADBEEF, .little);
+        @memset(mixed[4..], 0x5A);
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&mixed));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &mixed),
+        );
+    }
+
+    {
+        // Case 3: offset = 0 (null-prefix / classic adversarial first try).
+        var zero_offset: [36]u8 = undefined;
+        std.mem.writeInt(u32, zero_offset[0..4], 0, .little);
+        @memset(zero_offset[4..], 0);
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&zero_offset));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &zero_offset),
+        );
+    }
+
+    {
+        // Case 4: offset = 8 (close to legal but wrong — "near-legal" family).
+        var bad_offset: [36]u8 = undefined;
+        std.mem.writeInt(u32, bad_offset[0..4], 8, .little);
+        @memset(bad_offset[4..], 0);
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&bad_offset));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &bad_offset),
+        );
+    }
+
+    {
+        // Case 5: body length not a multiple of 32 (ragged root list).
+        var ragged: [37]u8 = undefined;
+        std.mem.writeInt(u32, ragged[0..4], 4, .little);
+        @memset(ragged[4..], 0);
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(&ragged));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, &ragged),
+        );
+    }
+
+    {
+        // Case 6: root count exceeds MAX_REQUEST_BLOCKS.
+        const oversize_count = consensus_params.MAX_REQUEST_BLOCKS + 1;
+        const oversize_len = 4 + oversize_count * @sizeOf(types.Root);
+        const oversize = try allocator.alloc(u8, oversize_len);
+        defer allocator.free(oversize);
+        std.mem.writeInt(u32, oversize[0..4], 4, .little);
+        @memset(oversize[4..], 0);
+        try std.testing.expectError(error.MalformedReqRespRequest, validateBlocksByRootRequestBytes(oversize));
+        try std.testing.expectError(
+            error.MalformedReqRespRequest,
+            ReqRespRequest.deserialize(allocator, .blocks_by_root, oversize),
+        );
+    }
+
+    // Sanity cases: the validator must not over-reject well-formed payloads.
+    {
+        // Case 7: empty root list (offset=4, body empty). Valid.
+        var empty: [4]u8 = undefined;
+        std.mem.writeInt(u32, empty[0..4], 4, .little);
+        try validateBlocksByRootRequestBytes(&empty);
+        var req = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &empty);
+        defer req.deinit();
+        try std.testing.expectEqual(@as(usize, 0), req.blocks_by_root.roots.constSlice().len);
+    }
+
+    {
+        // Case 8: exactly one root (offset=4, body=32 bytes). Valid.
+        // Ensures the rejection path doesn't drift to over-rejecting
+        // legitimate non-empty requests.
+        var one_root: [4 + 32]u8 = undefined;
+        std.mem.writeInt(u32, one_root[0..4], 4, .little);
+        @memset(one_root[4..], 0); // zero root hash is a valid hash value
+        try validateBlocksByRootRequestBytes(&one_root);
+        var req = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &one_root);
+        defer req.deinit();
+        try std.testing.expectEqual(@as(usize, 1), req.blocks_by_root.roots.constSlice().len);
+    }
 }

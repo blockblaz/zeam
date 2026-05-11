@@ -13,5 +13,5 @@ pub const skip = @import("./skip.zig");
 pub const generated = @import("./generated/index.zig");
 
 test "generated fixtures" {
-    std.testing.refAllDeclsRecursive(generated);
+    std.testing.refAllDecls(generated);
 }

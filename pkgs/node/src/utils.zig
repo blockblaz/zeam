@@ -1,9 +1,9 @@
 const std = @import("std");
-const Thread = std.Thread;
-const Mutex = Thread.Mutex;
 
 const xev = @import("xev").Dynamic;
 const types = @import("@zeam/types");
+const zeam_utils = @import("@zeam/utils");
+const Mutex = zeam_utils.SyncMutex;
 
 /// Detect the best available I/O backend at runtime.
 /// On Linux this probes io_uring, falling back to epoll (needed for Shadow).
