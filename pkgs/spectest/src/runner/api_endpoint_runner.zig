@@ -41,7 +41,7 @@ pub fn TestCase(
 
         const Self = @This();
 
-        pub fn execute(allocator: Allocator, dir: std.fs.Dir) RunnerError!void {
+        pub fn execute(allocator: Allocator, dir: std.Io.Dir) RunnerError!void {
             var tc = try Self.init(allocator, dir);
             defer tc.deinit(allocator);
             tc.run(allocator) catch |err| switch (err) {
@@ -50,8 +50,8 @@ pub fn TestCase(
             };
         }
 
-        pub fn init(allocator: Allocator, dir: std.fs.Dir) RunnerError!Self {
-            const payload = dir.readFileAlloc(allocator, rel_path, read_max_bytes) catch |err| {
+        pub fn init(allocator: Allocator, dir: std.Io.Dir) RunnerError!Self {
+            const payload = dir.readFileAlloc(std.testing.io, rel_path, allocator, std.Io.Limit.limited(read_max_bytes)) catch |err| {
                 std.debug.print(
                     "spectest: failed to read {s}: {s}\n",
                     .{ rel_path, @errorName(err) },
@@ -143,9 +143,10 @@ fn runHealth(allocator: Allocator, ctx: Context, case_obj: std.json.ObjectMap, m
     // Mirror the production handler at pkgs/cli/src/api_server.zig:255.
     const status: u16 = 200;
     const content_type = "application/json";
-    var body_map = std.json.ObjectMap.init(allocator);
-    putString(&body_map, "status", "healthy") catch return FixtureError.InvalidFixture;
-    putString(&body_map, "service", "lean-rpc-api") catch return FixtureError.InvalidFixture;
+    var body_map: std.json.ObjectMap = .empty;
+    defer body_map.deinit(allocator);
+    putString(allocator, &body_map, "status", "healthy") catch return FixtureError.InvalidFixture;
+    putString(allocator, &body_map, "service", "lean-rpc-api") catch return FixtureError.InvalidFixture;
     try assertResponse(allocator, ctx, case_obj, status, content_type, JsonValue{ .object = body_map });
 }
 
@@ -156,8 +157,9 @@ fn runAggregatorAdmin(allocator: Allocator, ctx: Context, case_obj: std.json.Obj
     };
 
     if (std.mem.eql(u8, method, "GET")) {
-        var map = std.json.ObjectMap.init(allocator);
-        map.put("is_aggregator", .{ .bool = initial_is_aggregator }) catch return FixtureError.InvalidFixture;
+        var map: std.json.ObjectMap = .empty;
+        defer map.deinit(allocator);
+        map.put(allocator, "is_aggregator", .{ .bool = initial_is_aggregator }) catch return FixtureError.InvalidFixture;
         try assertResponse(allocator, ctx, case_obj, 200, "application/json", JsonValue{ .object = map });
         return;
     }
@@ -169,9 +171,10 @@ fn runAggregatorAdmin(allocator: Allocator, ctx: Context, case_obj: std.json.Obj
         // Mirror handleAggregatorPost — set flag to `enabled`, return both
         // the new state and the previous one. (Idempotent enable/disable
         // covered: previous == enabled is allowed.)
-        var map = std.json.ObjectMap.init(allocator);
-        map.put("is_aggregator", .{ .bool = enabled }) catch return FixtureError.InvalidFixture;
-        map.put("previous", .{ .bool = previous }) catch return FixtureError.InvalidFixture;
+        var map: std.json.ObjectMap = .empty;
+        defer map.deinit(allocator);
+        map.put(allocator, "is_aggregator", .{ .bool = enabled }) catch return FixtureError.InvalidFixture;
+        map.put(allocator, "previous", .{ .bool = previous }) catch return FixtureError.InvalidFixture;
         try assertResponse(allocator, ctx, case_obj, 200, "application/json", JsonValue{ .object = map });
         return;
     }
@@ -278,8 +281,8 @@ fn jsonEquals(a: JsonValue, b: JsonValue) bool {
     };
 }
 
-fn putString(map: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
-    try map.put(key, .{ .string = value });
+fn putString(allocator: Allocator, map: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try map.put(allocator, key, .{ .string = value });
 }
 
 fn expectBoolField(

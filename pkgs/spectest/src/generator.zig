@@ -367,7 +367,6 @@ fn writeTestCase(
     try writer.writeAll("    configureSkipBehaviour();\n");
     try writer.writeAll("    const fixtures_path = resolveFixturesRoot(test_allocator) catch |err| switch (err) {\n");
     try writer.writeAll("        ResolveError.FixturesNotFound => return error.SkipZigTest,\n");
-    try writer.writeAll("        else => return err,\n");
     try writer.writeAll("    };\n");
     try writer.writeAll("    defer test_allocator.free(fixtures_path);\n");
     try writer.writeAll("    var fixtures_dir = std.Io.Dir.openDirAbsolute(std.testing.io, fixtures_path, .{}) catch |err| {\n");

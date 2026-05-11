@@ -66,13 +66,13 @@ pub fn TestCase(
 
         const Self = @This();
 
-        pub fn execute(allocator: std.mem.Allocator, dir: std.fs.Dir) RunnerError!void {
+        pub fn execute(allocator: std.mem.Allocator, dir: std.Io.Dir) RunnerError!void {
             var tc = try Self.init(allocator, dir);
             defer tc.deinit(allocator);
             try tc.run(allocator);
         }
 
-        pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir) RunnerError!Self {
+        pub fn init(allocator: std.mem.Allocator, dir: std.Io.Dir) RunnerError!Self {
             const payload = try loadFixturePayload(allocator, dir, rel_path);
             return Self{ .payload = payload };
         }
@@ -93,10 +93,10 @@ pub fn TestCase(
 
 fn loadFixturePayload(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     rel_path: []const u8,
 ) RunnerError![]u8 {
-    const payload = dir.readFileAlloc(allocator, rel_path, read_max_bytes) catch |err| switch (err) {
+    const payload = dir.readFileAlloc(std.testing.io, rel_path, allocator, std.Io.Limit.limited(read_max_bytes)) catch |err| switch (err) {
         error.FileTooBig => {
             std.debug.print("spectest: fixture {s} exceeds allowed size\n", .{rel_path});
             return RunnerError.IoFailure;

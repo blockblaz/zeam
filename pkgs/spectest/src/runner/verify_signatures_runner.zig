@@ -39,7 +39,7 @@ pub fn TestCase(
 
         const Self = @This();
 
-        pub fn execute(allocator: Allocator, dir: std.fs.Dir) RunnerError!void {
+        pub fn execute(allocator: Allocator, dir: std.Io.Dir) RunnerError!void {
             var tc = try Self.init(allocator, dir);
             defer tc.deinit(allocator);
             tc.run(allocator) catch |err| switch (err) {
@@ -48,8 +48,8 @@ pub fn TestCase(
             };
         }
 
-        pub fn init(allocator: Allocator, dir: std.fs.Dir) RunnerError!Self {
-            const payload = dir.readFileAlloc(allocator, rel_path, read_max_bytes) catch |err| {
+        pub fn init(allocator: Allocator, dir: std.Io.Dir) RunnerError!Self {
+            const payload = dir.readFileAlloc(std.testing.io, rel_path, allocator, std.Io.Limit.limited(read_max_bytes)) catch |err| {
                 std.debug.print(
                     "spectest: failed to read {s}: {s}\n",
                     .{ rel_path, @errorName(err) },
