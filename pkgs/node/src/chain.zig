@@ -1447,15 +1447,7 @@ pub const BeamChain = struct {
             has_proposal,
         });
 
-        // Issue #837 review #2: only the forkchoice tick itself
-        // truly means "clock advanced". Everything below this line
-        // is observability + periodic maintenance — a partial
-        // failure there must NOT signal "chain didn't tick" to the
-        // outer `BeamNode.onInterval` cursor commit, otherwise an
-        // observability bug wedges the slot prefix the same way the
-        // pre-fix application-layer bubble-up did. The forkchoice
-        // tick stays fatal-on-error (its own internal failure is the
-        // only legitimate "clock didn't tick" signal).
+        // Only forkchoice tick failure means the chain clock did not advance.
         try self.forkChoice.onInterval(time_intervals, has_proposal);
 
         if (interval == 1) {
@@ -1464,21 +1456,7 @@ pub const BeamChain = struct {
             const islot: isize = @intCast(slot);
             self.printSlot(islot, constants.MAX_FC_CHAIN_PRINT_DEPTH, self.connected_peers.count());
 
-            // Periodic pruning: prune old non-canonical states every N slots.
-            // This ensures we prune even when finalization doesn't advance.
-            //
-            // Issue #837 review #2: pruning failures (e.g. an FFI
-            // hiccup in `getCanonicalAncestorAtDepth` /
-            // `getCanonicalityAnalysis` / a transient state-map
-            // contention surfacing as `error.MissingState`) must NOT
-            // bubble out of `chain.onInterval`. The forkchoice
-            // clock has already ticked above; failing the pruning
-            // step would force the caller to treat "clock ticked"
-            // as "clock didn't tick" and recreate the wedge
-            // symptom one layer up. Wrap the entire pruning
-            // sub-block in a log-and-continue so the next interval
-            // gets a fresh chance and a sustained non-zero error
-            // rate is the alarm signal instead of a permanent freeze.
+            // Pruning is housekeeping; do not fail the already-applied tick.
             if (slot > 0 and slot % constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS == 0) {
                 self.runPeriodicPruning(slot) catch |err| {
                     self.logger.err(
@@ -1497,11 +1475,7 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Periodic pruning helper extracted from `chain.onInterval`
-    /// (issue #837 review #2). Errors here log + bump the
-    /// `chain.runPeriodicPruning` site of the interval-error
-    /// counter so the outer `chain.onInterval` can swallow them
-    /// without freezing the slot tick.
+    /// Periodic pruning helper; caller logs and continues on failure.
     fn runPeriodicPruning(self: *Self, slot: types.Slot) !void {
         const finalized = self.forkChoice.getLatestFinalized();
         // no need to work extra if finalization is not far behind

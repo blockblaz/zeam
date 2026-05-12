@@ -217,49 +217,8 @@ const Metrics = struct {
     //     review followup). The benign TOCTOU window is documented
     //     in `BeamNode.fetchBlockByRoots`.
     lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
-    // Issue #837: per-site error counter for application-layer
-    // failures inside `BeamNode.onInterval`. The slot tick is
-    // decoupled from these failures (a failure here logs + bumps
-    // this counter and the loop continues; the chain clock advances
-    // either way). A single bump per scrape is normal background
-    // noise from gossip races / sync transitions.
-    //
-    // ALERTING CONTRACT: a sustained non-zero rate on this metric
-    // — with the wall-clock slot/interval cursor still advancing in
-    // logs — means "node alive, validator/aggregator/publish layer
-    // silently failing". Operators MUST alert on this. Pre-#848 the
-    // same failure would have wedged the node and produced a flat
-    // `lean_current_slot` / `lean_head_slot`, which is what monitors
-    // historically detected. Post-#848 the node keeps ticking, so
-    // the wedge-class signal moves here. Suggested rule:
-    //
-    //   sum(rate(lean_node_interval_error_total[5m])) by (site)
-    //     > 0.05  // i.e. >= one failure every 20s for 5 minutes
-    //
-    // tuned per-site if necessary. The `validator.onInterval` /
-    // `maybeAggregateOnInterval` sites are the most operator-
-    // visible because they fire every slot a validator is meant to
-    // be active; gossip-publish sites tend to be noisier (libp2p
-    // backend can drop publishes under peer churn).
-    //
-    // Sites:
-    //   * `chain.onInterval` — chain clock tick failed (rare; the
-    //     forkchoice slot_clock guard makes this a no-op on retry).
-    //   * `chain.runPeriodicPruning` — periodic state pruning
-    //     (issue #837 review #2) failed inside `chain.onInterval`;
-    //     the forkchoice clock has already advanced for this
-    //     interval, only the housekeeping step failed.
-    //   * `validator.onInterval` — validator client failed to
-    //     produce duties for this interval.
-    //   * `publishBlock` / `publishAttestation` /
-    //     `publishAggregation` — gossip publish failed.
-    //   * `maybeAggregateOnInterval` — aggregator role failed to
-    //     produce aggregations (the wedge site in #837 —
-    //     `UnknownSourceBlock` from a stale aggregator vote
-    //     against a missing canonical-chain block).
-    //   * `publishProducedAggregations` — aggregation produced
-    //     but failed to publish (one increment per failing
-    //     aggregation, post-#848 review #4 fanout).
+    // Per-site errors swallowed by `BeamNode.onInterval`; sustained non-zero
+    // rates mean the node is ticking but a duty/publish layer is failing.
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });

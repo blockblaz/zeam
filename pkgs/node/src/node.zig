@@ -90,14 +90,7 @@ pub const BeamNode = struct {
     batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
     batch_pending_parent_roots_lock: zeam_utils.SyncMutex = .{},
 
-    /// Issue #837 review #1 test seams. Non-empty only in regression
-    /// tests (`testNode` / per-test setup leaves them at the default
-    /// empty slice in production paths). When `current_interval` is
-    /// in either slice, `onInterval` skips the corresponding sub-step
-    /// and exercises the catch+metric+continue path on the actual
-    /// production code instead of needing a real STF reject /
-    /// missing pre-state failure to be set up. Production callers
-    /// (cli/main.zig) never touch these fields.
+    /// Test-only failure injection for `onInterval` catch-and-continue paths.
     test_inject_validator_error_at_intervals: []const usize = &.{},
     test_inject_aggregator_error_at_intervals: []const usize = &.{},
 
@@ -1698,64 +1691,11 @@ pub const BeamNode = struct {
             const interval: usize = @intCast(current_interval);
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
-            // Issue #837: commit the cursor BEFORE running any sub-step
-            // for `current_interval`. Rationale (mirrors leanSpec
-            // `validator/service.py:217` which commits the slot cursor
-            // unconditionally at the bottom of every iteration —
-            // equivalent to top-of-next-iteration here):
-            //
-            // (a) Partial progress survives ANY sub-step failure.
-            //     `chain.onInterval`, `validator.onInterval`, gossip
-            //     publishes and `maybeAggregateOnInterval` are now ALL
-            //     log-and-continue (no early `return e` paths). The
-            //     loop never exits between cursor reads/writes, so
-            //     committing the cursor early cannot leave the chain
-            //     in a half-ticked state that the next wall-clock
-            //     fire would re-execute.
-            //
-            // (b) A sub-step that failed at iteration N will retry
-            //     on the next wall-clock fire ONLY if its effect is
-            //     idempotent (because `current_interval > self.last_interval`
-            //     is false, so the application-layer steps for N are
-            //     skipped — but `chain.onInterval(N)` advances the
-            //     forkchoice clock just to N, never replays it). All
-            //     three sub-steps in zeam today are idempotent:
-            //       - `chain.onInterval(N)` is a clock tick: calling
-            //         it for the same N twice is a no-op (the second
-            //         call returns early via the slot_clock guard).
-            //       - `validator.onInterval(N)` reads chain state and
-            //         emits at most one block / one attestation /
-            //         null per validator role; running it twice for
-            //         the same N is harmless because gossip
-            //         deduplicates the published message.
-            //       - Gossip publishes are dedup'd by libp2p/gossipsub
-            //         on message-id, so a re-publish is a no-op.
-            //
-            // The leanSpec `validator/service.py:217` analogue commits
-            // its cursor at end-of-iteration; loop shape difference
-            // means top-of-iteration here gives the same
-            // partial-progress invariant. `// D1` (deviation #1)
-            // from the PR review is now resolved: zeam's bookkeeping
-            // matches leanSpec.
+            // Commit per interval before sub-steps so later errors cannot replay it.
             self.last_interval = current_interval;
 
             {
-                // Slice (a-3): no outer mutex. `chain.onInterval` /
-                // `chain.processPendingBlocks` take their own per-resource
-                // locks (forkchoice RwLock, pending_blocks_lock,
-                // states_lock, events_lock) and `sweepTimedOutRequests` /
-                // `processReadyCachedBlocks` go through
-                // network/block_cache helpers.
-                //
-                // `chain.onInterval` is now log-and-continue too
-                // (review of #848 #2): the cursor was already
-                // committed above, so a chain-tick failure here
-                // simply skips the application-layer steps for this
-                // iteration and the next wall-clock fire takes a
-                // fresh shot at the next interval. Forkchoice's
-                // own slot_clock guard makes the missed tick safe to
-                // skip — it stays at its previous value and advances
-                // when the next `chain.onInterval(N+k)` succeeds.
+                // No outer mutex: each sub-system owns its locks.
 
                 self.chain.onInterval(interval) catch |e| {
                     self.logger.err("error ticking chain to time(intervals)={d} err={any} (continuing tick)", .{ interval, e });
@@ -1782,33 +1722,7 @@ pub const BeamNode = struct {
                 self.processReadyCachedBlocks(slot);
             }
 
-            // Issue #837: from this point on every step is
-            // application-layer (validator duties, gossip publishing,
-            // aggregator role). Failures must NOT abort the per-tick
-            // loop — the cursor has already been committed above, so
-            // bubbling an error here would prevent the application
-            // layer from being attempted for any later iteration in
-            // this same `onInterval` call (and crucially, the next
-            // wall-clock fire would skip them entirely because
-            // `self.last_interval` is already past). devnet-4
-            // incident on 2026-05-07 had `zeam_0` wedged at
-            // `[s=139 i=2]` for 70+ minutes producing one
-            // `error.UnknownSourceBlock` per second, until restart.
-            //
-            // Policy: log + bump a metric + continue. The chain clock
-            // is decoupled from validator/aggregator/publish errors;
-            // the next interval gets a fresh attempt and the wall-
-            // clock prefix advances normally. If a real systemic
-            // problem persists it shows up as a sustained non-zero
-            // rate on `lean_node_interval_error_total{site=…}` rather
-            // than as a permanent freeze.
-            //
-            // Test seam (issue #837 review #1): `test_inject_*_error_at_intervals`
-            // are non-empty only in regression tests. They simulate
-            // a sub-step failure without needing a real STF reject /
-            // missing pre-state to be set up, so the test exercises
-            // the catch+metric+continue path on the actual
-            // production code path.
+            // Application-layer failures are logged and counted, not returned.
             if (self.test_inject_validator_error_at_intervals.len > 0 and
                 std.mem.indexOfScalar(usize, self.test_inject_validator_error_at_intervals, interval) != null)
             {
@@ -1865,18 +1779,7 @@ pub const BeamNode = struct {
             }
 
             if (interval_in_slot == 2) {
-                // The aggregator path: this is the path that wedged
-                // `zeam_0` at `[s=139 i=2]` in #837 because
-                // `maybeAggregateOnInterval` kept failing with
-                // `UnknownSourceBlock` (an upstream STF reject left a
-                // hole in the canonical chain whose source root the
-                // aggregator tried to vote for). Log + continue so the
-                // tick advances; the next slot's aggregation attempt
-                // gets a fresh shot.
-                //
-                // Test seam (issue #837 review #1) mirrors the validator
-                // injection above: `test_inject_aggregator_error_at_intervals`
-                // is non-empty only in regression tests.
+                // Aggregation failure must not stall the interval cursor.
                 if (self.test_inject_aggregator_error_at_intervals.len > 0 and
                     std.mem.indexOfScalar(usize, self.test_inject_aggregator_error_at_intervals, interval) != null)
                 {
@@ -1890,12 +1793,7 @@ pub const BeamNode = struct {
                     };
                     if (maybe_aggregations) |aggregations| {
                         defer self.allocator.free(aggregations);
-                        // Per-element log-and-continue (review #4): every
-                        // aggregation gets a publish attempt and is
-                        // deinit'd exactly once whether publish
-                        // succeeded or not. Pre-fix this loop bailed on
-                        // the first failure, leaking already-cloned
-                        // SSZ proofs in the tail.
+                        // Try every aggregation; `publishProducedAggregations` owns deinit.
                         self.publishProducedAggregations(aggregations);
                     }
                 }
@@ -2127,29 +2025,7 @@ pub const BeamNode = struct {
         }
     }
 
-    /// Publish each produced aggregation independently, with per-element
-    /// log-and-continue semantics so a transient failure on one
-    /// aggregation does not cause the rest of the slot's aggregations
-    /// to be silently dropped.
-    ///
-    /// Issue #837 review #4 / leanSpec deviation D2: the prior
-    /// implementation bailed on the first publish failure and called
-    /// `deinit()` on the tail of the slice without attempting
-    /// publish, treating the slot's aggregations as all-or-nothing.
-    /// That coupled the loss of one aggregation (e.g. a stale
-    /// `UnknownSourceBlock` against a missing canonical-chain block)
-    /// to the loss of every aggregation that happened to be later in
-    /// the slice. After this change every aggregation gets a publish
-    /// attempt; per-failure metric increments under the
-    /// `publishProducedAggregations` site label let operators alarm
-    /// on the per-aggregation failure rate.
-    ///
-    /// Ownership invariant: every entry of `aggregations` is
-    /// `deinit`'d exactly once whether its publish succeeded or
-    /// failed. The caller still owns the backing slice (allocated
-    /// via `chain.aggregate`); the caller's `defer
-    /// self.allocator.free(aggregations)` is responsible for the
-    /// slice itself.
+    /// Publish every aggregation independently; deinit each entry exactly once.
     fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) void {
         for (aggregations) |*signed_aggregation| {
             self.publishAggregation(signed_aggregation.*) catch |err| {
@@ -3204,49 +3080,9 @@ test "Network: ConnectedPeers integration with selectPeer (slice a-3)" {
     try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
 }
 
-// =====================================================================
-// Issue #837 — onInterval tick decoupling regression tests
-// =====================================================================
-//
-// Background: devnet-4 incident on 2026-05-07 wedged `zeam_0`
-// (aggregator) at `[s=139 i=2]` for 70+ minutes after a single
-// upstream STF reject (`error.DuplicateAttestationData`) at slot 100.
-// Every aggregation interval (`interval_in_slot == 2`) thereafter
-// failed with `error.UnknownSourceBlock`, the failure bubbled out of
-// `BeamNode.onInterval` BEFORE the bottom-of-function
-// `self.last_interval = itime_intervals` assignment, and the next
-// wall-clock fire resumed from `self.last_interval + 1` — which was
-// the same failing interval. Glued forever.
-//
-// Fix: per-iteration commit of `self.last_interval` BEFORE every
-// sub-step plus log-and-continue on every error site downstream of
-// (and including) `chain.onInterval` (validator duties, gossip
-// publish, aggregator role). Errors there bump
-// `lean_node_interval_error_total{site=…}` instead of returning.
-//
-// Production callers leave `test_inject_*_error_at_intervals` empty
-// slices; the tests below set them so the production catch+metric+
-// continue path is exercised on actual failure-injection slots.
-// Without this seam the assertion that follows ("failed interval is
-// NOT replayed") would be vacuous: a fresh test fixture has no real
-// failure to inject because there are no aggregations to produce
-// against a missing canonical chain.
+// Issue #837 — onInterval tick decoupling regression tests.
 
-/// Test helper (issue #837 review #12) consolidating the boilerplate
-/// every per-test set up by hand:
-///
-///   1. arena allocator on top of `std.testing.allocator`
-///   2. `testing.NodeTestContext.init`
-///   3. `networks.Mock.init` against the loop
-///   4. heap-allocated `NodeNameRegistry`
-///   5. `validator_ids` storage that outlives the node
-///   6. `BeamNode.init`
-///
-/// `deinit()` tears it all back down in reverse order. Used by the
-/// regression tests below; older tests in this file still construct
-/// the boilerplate inline (kept that way to minimize the diff blast
-/// radius of this PR; review-only sweep can roll them onto
-/// `TestHarness` later).
+/// Shared setup for `BeamNode.onInterval` regression tests.
 const TestHarness = struct {
     arena_allocator: std.heap.ArenaAllocator,
     ctx: testing.NodeTestContext,
@@ -3298,9 +3134,6 @@ const TestHarness = struct {
     fn deinit(harness: *TestHarness) void {
         harness.node.deinit();
         harness.test_registry.deinit();
-        // `harness.test_registry` was created on the arena allocator;
-        // it does not need an explicit `destroy` call because the
-        // arena reaps it.
         harness.mock.deinit();
         harness.ctx.deinit();
         harness.arena_allocator.deinit();
@@ -3312,19 +3145,8 @@ test "Issue #837: BeamNode.onInterval advances last_interval despite validator/a
     try harness.init(std.testing.allocator);
     defer harness.deinit();
 
-    // Tick across several intervals from cold state. Even with the
-    // aggregator role enabled and the chain in `fc_initing` (no peers,
-    // no canonical head past genesis), every interval must advance
-    // `last_interval`. Pre-#837 this would wedge somewhere around the
-    // first `interval_in_slot == 2` if any sub-step bubbled an error.
     _ = harness.node.chain.setAggregator(true);
 
-    // Drive 12 intervals (~2.4 slots in beamdev). We assert the
-    // monotonic-advance invariant after each call: the cursor lands
-    // on the requested interval, never below it. With the post-#848
-    // commit-before-substeps order, the cursor must equal the
-    // requested interval exactly because the cursor write happens
-    // before any sub-step that could fail.
     var i: usize = 1;
     while (i <= 12) : (i += 1) {
         BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), @intCast(i)) catch {};
@@ -3333,15 +3155,6 @@ test "Issue #837: BeamNode.onInterval advances last_interval despite validator/a
 }
 
 test "Issue #837: validator-layer failure does NOT replay the failing interval" {
-    // Real regression test for review #1: the pre-fix bug satisfied
-    // "cursor monotonically non-decreases" because the cursor simply
-    // wedged at its old value, which is monotonically non-decreasing.
-    // The actual wedge invariant is "a sub-step failure does NOT
-    // cause the failing interval to be replayed on the next
-    // wall-clock fire". This test injects a validator-layer failure
-    // on interval 5, then drives interval 6 and asserts that the
-    // cursor lands at 6 — which is only true if interval 5 advanced
-    // the cursor despite the failure.
     var harness: TestHarness = undefined;
     try harness.init(std.testing.allocator);
     defer harness.deinit();
@@ -3349,37 +3162,18 @@ test "Issue #837: validator-layer failure does NOT replay the failing interval" 
     var fail_at = [_]usize{5};
     harness.node.test_inject_validator_error_at_intervals = &fail_at;
 
-    // Drive intervals 1–6. Interval 5 is forced to fail at the
-    // validator layer; the post-fix invariant is that the cursor
-    // still advances to 5, and interval 6 advances to 6.
+    // Interval 5 fails; interval 6 must not replay it.
     var i: usize = 1;
     while (i <= 6) : (i += 1) {
         BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), @intCast(i)) catch {};
-        // Cursor MUST equal the just-fired interval. The failure
-        // injection still hits the catch+metric+continue path, the
-        // cursor was committed at the top of the loop body BEFORE
-        // the failing sub-step ran.
         try std.testing.expectEqual(@as(isize, @intCast(i)), harness.node.last_interval);
     }
 
-    // The killer assertion: the validator-layer failure on interval
-    // 5 did NOT cause interval 5 to be replayed when we asked for
-    // interval 6. In the pre-fix design, the bottom-of-function
-    // commit was skipped by the early `return e`, so interval 6's
-    // call would have re-entered the loop with `start_interval = 5`
-    // and re-failed forever. Asserting `last_interval == 6` after
-    // the call to `onInterval(6)` proves the wedge cannot recur.
     try std.testing.expectEqual(@as(isize, 6), harness.node.last_interval);
 }
 
 test "Issue #837: aggregator-layer failure does NOT replay the failing interval" {
-    // Same shape as the validator-layer test above, but the failure
-    // is injected at the aggregator path — the actual #837 wedge
-    // site (`maybeAggregateOnInterval` failing with
-    // `UnknownSourceBlock` after an upstream STF reject left a hole
-    // in the canonical chain). Aggregation runs at
-    // `interval_in_slot == 2`, so we inject on interval 7 (slot 1,
-    // i_in_slot 2 with INTERVALS_PER_SLOT=5).
+    // Interval 7 is the aggregation interval in slot 1.
     var harness: TestHarness = undefined;
     try harness.init(std.testing.allocator);
     defer harness.deinit();
@@ -3389,52 +3183,26 @@ test "Issue #837: aggregator-layer failure does NOT replay the failing interval"
     var fail_at = [_]usize{7};
     harness.node.test_inject_aggregator_error_at_intervals = &fail_at;
 
-    // Drive intervals 1–8.
     var i: usize = 1;
     while (i <= 8) : (i += 1) {
         BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), @intCast(i)) catch {};
         try std.testing.expectEqual(@as(isize, @intCast(i)), harness.node.last_interval);
     }
 
-    // Killer assertion: aggregator failure on interval 7 (the actual
-    // wedge site of #837) did NOT prevent interval 8 from advancing
-    // the cursor to 8. Pre-fix this test would land at
-    // `last_interval == 6` and stay there forever — the symptom
-    // observed in the devnet-4 incident.
     try std.testing.expectEqual(@as(isize, 8), harness.node.last_interval);
 }
 
 test "Issue #837: last_interval commits per-iteration on a multi-interval onInterval call" {
-    // Pre-fix bookkeeping bug: `self.last_interval = itime_intervals`
-    // sat at the bottom of the function, so a multi-interval call
-    // (e.g. `start_interval=5, itime_intervals=10` after a wall-clock
-    // miss-fire) that hit a failure mid-sweep at interval 7 would
-    // leave `last_interval` at its pre-call value (`4`) — meaning the
-    // next call would re-execute intervals 5 and 6 even though they
-    // succeeded. Post-fix: `self.last_interval = current_interval` is
-    // set at the TOP of the loop body, so partial progress is
-    // preserved through any sub-step failure.
-    //
-    // This test verifies the per-iteration commit by driving a
-    // single multi-interval `onInterval(8)` call where the validator
-    // is forced to fail mid-sweep at interval 5. The cursor must
-    // still land at 8.
+    // One call spans intervals 1–8; failure at 5 must not lose later progress.
     var harness: TestHarness = undefined;
     try harness.init(std.testing.allocator);
     defer harness.deinit();
 
-    // Prime: cursor starts at -1 (set in `BeamNode.init`).
     try std.testing.expectEqual(@as(isize, -1), harness.node.last_interval);
 
     var fail_at = [_]usize{5};
     harness.node.test_inject_validator_error_at_intervals = &fail_at;
 
-    // Single multi-interval call covering intervals 1–8. With
-    // top-of-iteration commit and log-and-continue everywhere, the
-    // cursor must land at 8 even though interval 5 deliberately
-    // failed. Pre-fix this would have left the cursor at 4 (or
-    // whatever the pre-call value was) and silently re-run intervals
-    // 1–4 next time — exactly the wedge.
     BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), 8) catch {};
     try std.testing.expectEqual(@as(isize, 8), harness.node.last_interval);
 }
