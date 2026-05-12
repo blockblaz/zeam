@@ -5,16 +5,81 @@ const params = @import("@zeam/params");
 pub const INTERVALS_PER_SLOT = 5;
 pub const SECONDS_PER_INTERVAL_MS: isize = @divFloor(params.SECONDS_PER_SLOT * std.time.ms_per_s, INTERVALS_PER_SLOT);
 
-// Maximum number of slots in the future that an attestation is allowed to reference
-// This prevents accepting attestations that are too far ahead of the current slot
+// Future-slot tolerance for gossip attestations, measured in intervals:
+//
+//     data.slot * INTERVALS_PER_SLOT <= store.time + GOSSIP_DISPARITY_INTERVALS
+//
+// where store.time is in intervals. One interval is roughly 800 ms at
+// SECONDS_PER_SLOT=4 / INTERVALS_PER_SLOT=5.
+//
+// A whole-slot tolerance would let an adversary pre-publish next-slot
+// aggregates ahead of any honest validator (~800 ms head start at 4 s
+// slots); tightening to one interval bounds that head start to NTP drift.
+//
+// Block-included attestations skip this check entirely; they are trusted
+// under the block's own validation.
+pub const GOSSIP_DISPARITY_INTERVALS = 1;
+
+// Maximum number of slots in the future that a *block* is allowed to reference
+// for *immediate* acceptance. Anything beyond this is treated as a future block
+// and queued via `pending_blocks`. One slot of tolerance covers the normal race
+// between `onInterval` and a neighbouring node's gossip arriving slightly early.
+//
+// leanSpec note: this is a zeam-specific constant, not spec-defined. For blocks
+// no spec constant exists and we follow the Ethereum CL p2p-interface
+// convention of allowing future-slot blocks to be queued. Gossip attestations
+// use the stricter GOSSIP_DISPARITY_INTERVALS bound (leanSpec
+// forks/lstar/spec.py:1022) instead of this whole-slot tolerance — see
+// `validateAttestation` and `onGossipAggregatedAttestation`.
 pub const MAX_FUTURE_SLOT_TOLERANCE = 1;
+
+// Maximum number of slots in the future that a *block* may be queued for
+// later replay from `pending_blocks`. Issue #788: under mutex contention
+// (#786) the local `onInterval` can be delayed long enough that the forkchoice
+// clock lags wall-time by tens of slots; gossip blocks for those slots arrive
+// at the wall-clock time and would otherwise be rejected with `FutureSlot`,
+// causing the fork choice head to fall back to the latest finalized
+// checkpoint when no descendants exist in the protoArray. Buffering up to
+// `MAX_FUTURE_SLOT_QUEUE_TOLERANCE` slots ahead lets the queue absorb the
+// worst observed lag (~160 slots in the linked devnet-4 incident) so blocks
+// can be replayed once the clock catches up. Anything beyond this is almost
+// certainly an actually-malicious or buggy peer and is dropped.
+//
+// Tuning note: 256 is empirical, derived from devnet-4's worst lag. There is
+// no leanSpec analog — the spec doesn't define a future-block queue depth
+// (cf. `MAX_FUTURE_SLOT_TOLERANCE` above where a partial analog exists). This
+// value SHOULD be revisited if `zeam_lock_hold_seconds` reaches new highs
+// under devnet-N (N > 4) or if `lean_blocks_future_slot_dropped_total` shows
+// sustained drops on a healthy network. Don't ossify the magic number.
+pub const MAX_FUTURE_SLOT_QUEUE_TOLERANCE: u64 = 256;
+
+// Maximum number of blocks held in the `pending_blocks` future-block queue.
+// Bounded to prevent OOM from a malicious or buggy peer that gossips a wide
+// range of fake-future blocks. Sized to comfortably exceed the worst observed
+// catch-up window (#788) without giving an attacker meaningful memory
+// pressure: at ~2KB per `SignedBlock` envelope (varies with attestation
+// count) this caps the queue at ~2MB which is negligible vs the rest of
+// chain state. Older entries (lower-slot, lower-receive-time) are evicted
+// first when the cap is hit.
+//
+// leanSpec analog: `subspecs/sync/config.py::MAX_CACHED_BLOCKS` (also 1024;
+// same magnitude, same FIFO-eviction policy on overflow). Naming differs
+// because `pending_blocks` is zeam's pre-existing identifier for the
+// future-block queue and renaming it would touch every callsite without
+// behavioural benefit; flag the spec mapping here so future maintainers
+// can find the spec source when leanSpec test vectors land.
+pub const MAX_PENDING_BLOCKS: usize = 1024;
 
 // Maximum depth for recursive block fetching
 // When fetching parent blocks, we stop after this many levels to avoid infinite loops
 pub const MAX_BLOCK_FETCH_DEPTH = 512;
 
 // Maximum number of blocks to keep in the fetched blocks cache
-// This prevents unbounded memory growth from malicious peers sending orphaned blocks
+// This prevents unbounded memory growth from malicious peers sending orphaned blocks.
+//
+// leanSpec analog: `subspecs/sync/config.py::MAX_CACHED_BLOCKS` (this constant
+// is the direct Zig mirror of the spec name; see `MAX_PENDING_BLOCKS` for the
+// related future-block queue cap with a different scope).
 pub const MAX_CACHED_BLOCKS = 1024;
 
 // Periodic state pruning interval: prune non-canonical states every N slots
@@ -37,3 +102,18 @@ pub const RPC_REQUEST_TIMEOUT_SECONDS: i64 = 8;
 // a node stuck in fc_initing can recover without waiting for new peer connections.
 // 8 slots = 32 seconds at 4s/slot.
 pub const SYNC_STATUS_REFRESH_INTERVAL_SLOTS: u64 = 8;
+
+// Threshold (in slots) above which we prefer a `blocks_by_range` bulk sync over the
+// recursive head-by-root walk. When the peer's head is more than this many slots
+// ahead of ours, we issue a single ranged request to catch up efficiently rather
+// than chasing the parent chain one block at a time.
+pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 64;
+
+// Minimum number of recent slots that a blocksByRange responder MUST keep available.
+// Derived from leanSpec networking/config.py MIN_SLOTS_FOR_BLOCK_REQUESTS.
+// Requests whose start_slot falls before (head_slot - MIN_SLOTS_FOR_BLOCK_REQUESTS)
+// receive a RESOURCE_UNAVAILABLE error (code 3).
+pub const MIN_SLOTS_FOR_BLOCK_REQUESTS: u64 = 3600;
+
+// RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec).
+pub const RPC_ERR_RESOURCE_UNAVAILABLE: u32 = 3;

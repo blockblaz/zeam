@@ -94,6 +94,14 @@ pub const NodeOptions = struct {
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
     db_backend: database.Backend = .rocksdb,
+    chain_spec: ?[]const u8 = null,
+    /// Slice c-2b commit 3 of #803: route producer-side gossip
+    /// handlers through the chain-worker queue. Default `true` post
+    /// devnet-4 burn-in: the worker path is the supported prod path;
+    /// surfaced as `--chain-worker` on the `zeam node` CLI, with
+    /// `--chain-worker false` as the kill-switch for the legacy
+    /// synchronous path.
+    chain_worker_enabled: bool = true,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -192,17 +200,56 @@ pub const Node = struct {
         self.options = options;
         self.api_server_handle = null;
         self.metrics_server_handle = null;
-
-        // some base mainnet spec would be loaded to build this up
-        const chain_spec =
+        self.logger = options.logger_config.logger(.node);
+        // If path is specified load from it, otherwise use default settings
+        const chain_spec_owned = self.options.chain_spec != null;
+        const chain_spec = if (self.options.chain_spec) |path|
+            std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1024 * 1024)) catch |err| {
+                self.logger.err("failed to load chain spec at '{s}': {any}", .{ path, err });
+                return err;
+            }
+        else
             \\{"preset": "mainnet", "name": "devnet0", "fork_digest": "12345678"}
         ;
+
+        defer if (chain_spec_owned) allocator.free(chain_spec);
+
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
-        var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
+        // `parseFromSlice` allocates string fields inside the `Parsed` arena.
+        // The slice headers it returns alias arena memory; `chain_config` later
+        // owns these fields and `ChainSpec.deinit(allocator)` calls
+        // `allocator.free(self.name)` / `allocator.free(self.fork_digest)`. We
+        // must move both fields out of the arena onto the top-level allocator
+        // before dropping the arena, otherwise shutdown panics with
+        // "Invalid free" once `chain.deinit -> config.deinit` runs (see #831).
+        const parsed = try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options);
+        defer parsed.deinit();
+        var chain_options = parsed.value;
+        chain_options.name = try allocator.dupe(u8, chain_options.name.?);
+        errdefer if (chain_options.name) |n| allocator.free(n);
+        chain_options.fork_digest = try allocator.dupe(u8, chain_options.fork_digest.?);
+        errdefer if (chain_options.fork_digest) |d| allocator.free(d);
         chain_options.genesis_time = options.genesis_spec.genesis_time;
+
+        if (chain_spec_owned) {
+            if (chain_options.preset == null) {
+                self.logger.err("chain spec: 'preset' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.name == null or chain_options.name.?.len == 0) {
+                self.logger.err("chain spec: 'name' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.fork_digest == null or chain_options.fork_digest.?.len != 8) {
+                self.logger.err("chain spec: 'fork_digest' field must be 4 bytes (8 hex characters)", .{});
+                return error.InvalidChainSpec;
+            }
+        }
 
         // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
         chain_options.validator_attestation_pubkeys = options.genesis_spec.validator_attestation_pubkeys;
@@ -237,7 +284,6 @@ pub const Node = struct {
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
             .node_registry = options.node_registry,
-            .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.logger_config);
@@ -250,8 +296,6 @@ pub const Node = struct {
             options.db_backend,
         );
         errdefer db.deinit();
-
-        self.logger = options.logger_config.logger(.node);
 
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
@@ -295,6 +339,32 @@ pub const Node = struct {
                         self.logger.info("checkpoint sync completed successfully with a recent state at slot={d} as anchor", .{downloaded_state.slot});
                         self.anchor_state.deinit();
                         self.anchor_state.* = downloaded_state;
+                        // Fetch the real anchor block from the checkpoint provider and store
+                        // it in the DB so blocks_by_root can serve it with the correct
+                        // hash_tree_root.  Mirrors leanSpec fetch_finalized_anchor: compute
+                        // anchor_block_root + expected_state_root, then fetch + verify both
+                        // root and state_root pairing before persisting.
+                        //
+                        // Fail closed: if any hash computation fails we skip the block fetch
+                        // rather than passing null to downloadAndStoreCheckpointBlock and
+                        // silently skipping the pairing check.
+                        anchor_block_fetch: {
+                            var anchor_state_root: types.Root = undefined;
+                            zeam_utils.hashTreeRoot(types.BeamState, self.anchor_state.*, &anchor_state_root, allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamState) failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            const hdr = self.anchor_state.genStateBlockHeader(allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: genStateBlockHeader failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            var anchor_block_root: types.Root = undefined;
+                            zeam_utils.hashTreeRoot(types.BeamBlockHeader, hdr, &anchor_block_root, allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamBlockHeader) failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, anchor_state_root, &db, self.logger);
+                        }
                     } else {
                         self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
                         downloaded_state.deinit();
@@ -360,6 +430,7 @@ pub const Node = struct {
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
+            .chain_worker_enabled = options.chain_worker_enabled,
         });
         errdefer self.beam_node.deinit();
 
@@ -431,6 +502,14 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
+        // Start the Rust libp2p network BEFORE BeamNode: since #812,
+        // `BeamNode.run()` calls `gossip.subscribe(...)`, which enqueues
+        // `SwarmCommand::SubscribeGossip` on the per-network command channel.
+        // That channel only exists after `EthLibp2p.run()` returns from
+        // `wait_for_network_ready`. Reversing the order drops every subscribe
+        // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
+        // command already does network-first; this is the matching swap for
+        // the production node path.
         try self.network.run();
         try self.beam_node.run();
 
@@ -754,7 +833,9 @@ pub fn buildStartOptions(
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+    opts.chain_spec = node_cmd.@"chain-spec";
     opts.is_aggregator = node_cmd.@"is-aggregator";
+    opts.chain_worker_enabled = node_cmd.@"chain-worker";
 
     // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
     // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
@@ -930,6 +1011,132 @@ fn verifyCheckpointState(
         &state_block_header.state_root,
         &block_root,
     });
+}
+
+/// Path suffix that the checkpoint-sync state URL must end with.
+/// Used to derive the block URL (same base, different path tail).
+const FINALIZED_STATE_PATH = "/lean/v0/states/finalized";
+/// Path for the finalized block endpoint (leanSpec FINALIZED_BLOCK_ENDPOINT).
+const FINALIZED_BLOCK_PATH = "/lean/v0/blocks/finalized";
+
+/// Tries to fetch the real SignedBlock for the checkpoint anchor from the
+/// checkpoint provider and persist it to the DB.
+///
+/// The block URL is derived from the state URL by stripping the known
+/// `FINALIZED_STATE_PATH` suffix and appending `FINALIZED_BLOCK_PATH`.
+///
+/// On any failure the error is logged and the function returns without storing
+/// anything — a missing anchor block is non-fatal: blocks_by_root will return
+/// empty for this root until the real block arrives via reqresp or gossip.
+fn downloadAndStoreCheckpointBlock(
+    allocator: std.mem.Allocator,
+    state_url: []const u8,
+    expected_root: types.Root,
+    /// hash_tree_root(anchor_state) — required. Block's state_root is checked
+    /// against this for block/state pairing (leanSpec fetch_finalized_anchor).
+    expected_state_root: types.Root,
+    db: *database.Db,
+    logger: zeam_utils.ModuleLogger,
+) void {
+    // Derive block URL: strip the known state path suffix and append the block path.
+    // Using endsWith avoids ambiguous first-occurrence matches in hostname/query params.
+    const trimmed = std.mem.trimEnd(u8, state_url, "/");
+    const base_url = if (std.mem.endsWith(u8, trimmed, FINALIZED_STATE_PATH))
+        trimmed[0 .. trimmed.len - FINALIZED_STATE_PATH.len]
+    else {
+        logger.warn(
+            "checkpoint block fetch: state URL '{s}' does not end with '{s}', cannot derive block URL",
+            .{ state_url, FINALIZED_STATE_PATH },
+        );
+        return;
+    };
+    const block_url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, FINALIZED_BLOCK_PATH }) catch |err| {
+        logger.warn("checkpoint block fetch: failed to allocate block URL: {}", .{err});
+        return;
+    };
+    defer allocator.free(block_url);
+
+    logger.info("checkpoint block fetch: downloading anchor block from: {s}", .{block_url});
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = block_url },
+        .method = .GET,
+        .response_writer = &body_writer.writer,
+        // Spec: Accept: application/octet-stream for SSZ binary response.
+        .extra_headers = &.{.{ .name = "Accept", .value = "application/octet-stream" }},
+    }) catch |err| {
+        logger.warn("checkpoint block fetch: HTTP request failed: {}", .{err});
+        return;
+    };
+
+    if (result.status != .ok) {
+        logger.warn("checkpoint block fetch: HTTP {d} from {s}", .{ @intFromEnum(result.status), block_url });
+        return;
+    }
+
+    var ssz_data = body_writer.toArrayList();
+    defer ssz_data.deinit(allocator);
+
+    // Deserialize into arena so block fields don't need explicit cleanup.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var block: types.SignedBlock = undefined;
+    ssz.deserialize(types.SignedBlock, ssz_data.items, &block, arena.allocator()) catch |err| {
+        logger.warn("checkpoint block fetch: SSZ deserialize failed: {}", .{err});
+        return;
+    };
+
+    // Verify block root: hash_tree_root(BeamBlock) must equal expected_root.
+    // Fail closed: if hashing fails something is seriously wrong (hashTreeRoot is
+    // deterministic over well-typed values); drop rather than store unverified.
+    var computed_root: types.Root = undefined;
+    zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &computed_root, allocator) catch |err| {
+        logger.warn("checkpoint block fetch: hash verification failed: {}, discarding", .{err});
+        return;
+    };
+    if (!std.mem.eql(u8, &computed_root, &expected_root)) {
+        logger.warn("checkpoint block fetch: root mismatch — computed=0x{x} expected=0x{x}, discarding", .{ &computed_root, &expected_root });
+        return;
+    }
+
+    // Pairing check: block.state_root must equal hash_tree_root(anchor_state).
+    // Mirrors leanSpec fetch_finalized_anchor assertion. Detects server advancing
+    // finalization between the two requests (state then block).
+    if (!std.mem.eql(u8, &block.block.state_root, &expected_state_root)) {
+        logger.warn(
+            "checkpoint block fetch: anchor block/state mismatch — block.state_root=0x{x} hash_tree_root(state)=0x{x}; server may have advanced finalization, discarding",
+            .{ &block.block.state_root, &expected_state_root },
+        );
+        return;
+    }
+
+    // Store the original SSZ bytes directly — no re-serialise round-trip.
+    // The bytes already passed deserialise + hash_tree_root verification so they
+    // are valid; re-encoding would waste CPU and could diverge on non-canonical
+    // encodings (though hash_tree_root catches those too).
+    var batch = db.initWriteBatch() catch |err| {
+        logger.warn("checkpoint block fetch: write-batch init failed: {}", .{err});
+        return;
+    };
+    defer batch.deinit();
+    batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, ssz_data.items);
+    db.commit(&batch) catch |err| {
+        logger.warn("checkpoint block fetch: DB commit failed: {}", .{err});
+        return;
+    };
+
+    logger.info(
+        "checkpoint block fetch: stored real anchor block root=0x{x} slot={d} ({d} bytes)",
+        .{ &expected_root, block.block.slot, ssz_data.items.len },
+    );
 }
 
 /// Parses the nodes from a YAML configuration.

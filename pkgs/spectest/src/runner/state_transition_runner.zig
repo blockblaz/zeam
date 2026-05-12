@@ -66,13 +66,13 @@ pub fn TestCase(
 
         const Self = @This();
 
-        pub fn execute(allocator: std.mem.Allocator, dir: std.fs.Dir) RunnerError!void {
+        pub fn execute(allocator: std.mem.Allocator, dir: std.Io.Dir) RunnerError!void {
             var tc = try Self.init(allocator, dir);
             defer tc.deinit(allocator);
             try tc.run(allocator);
         }
 
-        pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir) RunnerError!Self {
+        pub fn init(allocator: std.mem.Allocator, dir: std.Io.Dir) RunnerError!Self {
             const payload = try loadFixturePayload(allocator, dir, rel_path);
             return Self{ .payload = payload };
         }
@@ -93,10 +93,10 @@ pub fn TestCase(
 
 fn loadFixturePayload(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     rel_path: []const u8,
 ) RunnerError![]u8 {
-    const payload = dir.readFileAlloc(allocator, rel_path, read_max_bytes) catch |err| switch (err) {
+    const payload = dir.readFileAlloc(std.testing.io, rel_path, allocator, std.Io.Limit.limited(read_max_bytes)) catch |err| switch (err) {
         error.FileTooBig => {
             std.debug.print("spectest: fixture {s} exceeds allowed size\n", .{rel_path});
             return RunnerError.IoFailure;
@@ -199,15 +199,28 @@ fn runCase(
     };
 
     if (blocks_array.items.len == 0 and expect_exception != null) {
-        if (skipExpectExceptionIfEnabled(ctx)) {
-            return FixtureError.SkippedFixture;
+        // Slots-only monotonicity fixtures (leanSpec PR #643:
+        // test_process_slots_*) ship `pre` + `expectException` with no
+        // blocks. The test is that `process_slots(state, state.slot)` (or
+        // any `target <= state.slot`) must be rejected. There's no explicit
+        // `targetSlot` in the JSON — the test name and the fixture shape
+        // imply target == pre.slot. zeam's `state.process_slots` asserts
+        // `slot > self.slot` and returns `InvalidPreState` on violation,
+        // which is what the spec calls `AssertionError` ("Target slot must
+        // be in the future").
+        var logger_config_slots = zeam_utils.getTestLoggerConfig();
+        defer logger_config_slots.deinit();
+        const logger_slots = logger_config_slots.logger(.state_transition);
+        const target_slot = pre_state.slot;
+        if (pre_state.process_slots(allocator, target_slot, logger_slots)) |_| {
+            std.debug.print(
+                "fixture {s} case {s}: expected {s} from process_slots(target={d}, state.slot={d}) but it succeeded\n",
+                .{ ctx.fixture_label, ctx.case_name, expect_exception.?, target_slot, pre_state.slot },
+            );
+            return FixtureError.FixtureMismatch;
+        } else |_| {
+            return;
         }
-
-        std.debug.print(
-            "fixture {s} case {s}: expectException present but no blocks supplied\n",
-            .{ ctx.fixture_label, ctx.case_name },
-        );
-        return FixtureError.FixtureMismatch;
     }
 
     const post_obj = switch (case_obj.get("post") orelse JsonValue{ .null = {} }) {
@@ -337,7 +350,7 @@ fn skipExpectExceptionIfEnabled(ctx: Context) bool {
     return true;
 }
 
-fn buildState(
+pub fn buildState(
     allocator: std.mem.Allocator,
     ctx: Context,
     value: JsonValue,
@@ -396,7 +409,7 @@ fn buildState(
     };
 }
 
-fn parseValidators(
+pub fn parseValidators(
     allocator: std.mem.Allocator,
     ctx: Context,
     pre_obj: std.json.ObjectMap,
@@ -448,12 +461,13 @@ fn parseValidators(
     return validators;
 }
 
-fn buildBlock(
+pub fn buildBlock(
     allocator: std.mem.Allocator,
     ctx: Context,
     index: usize,
     obj: std.json.ObjectMap,
 ) FixtureError!types.BeamBlock {
+    _ = index;
     const slot = try expect.expectU64Field(FixtureError, obj, &.{"slot"}, ctx, "slot");
     const proposer_index = try expect.expectU64Field(FixtureError, obj, &.{ "proposer_index", "proposerIndex" }, ctx, "proposer_index");
     const parent_root = try expect.expectBytesField(FixtureError, types.Root, obj, &.{ "parent_root", "parentRoot" }, ctx, "parent_root");
@@ -461,24 +475,104 @@ fn buildBlock(
 
     const body_obj = try expect.expectObject(FixtureError, obj, &.{"body"}, ctx, "body");
     const attestations_obj = try expect.expectObject(FixtureError, body_obj, &.{"attestations"}, ctx, "body.attestations");
+
+    var attestations = try types.AggregatedAttestations.init(allocator);
+    errdefer {
+        for (attestations.slice()) |*agg| agg.deinit();
+        attestations.deinit();
+    }
+
     if (attestations_obj.get("data")) |data_val| {
         const arr = try expect.expectArrayValue(FixtureError, data_val, ctx, "body.attestations.data");
-        if (arr.items.len != 0) {
-            std.debug.print(
-                "fixture {s} case {s}: attestations unsupported (block #{})\n",
-                .{ ctx.fixture_label, ctx.case_name, index },
-            );
-            return FixtureError.UnsupportedFixture;
+        for (arr.items) |agg_value| {
+            const agg_obj = try expect.expectObjectValue(FixtureError, agg_value, ctx, "body.attestations[].");
+            const bits_value = agg_obj.get("aggregationBits") orelse agg_obj.get("aggregation_bits") orelse {
+                std.debug.print(
+                    "fixture {s} case {s}: aggregated attestation missing aggregationBits\n",
+                    .{ ctx.fixture_label, ctx.case_name },
+                );
+                return FixtureError.InvalidFixture;
+            };
+            var aggregation_bits = try parseAggregationBits(allocator, ctx, bits_value);
+            errdefer aggregation_bits.deinit();
+
+            const data_obj = try expect.expectObject(FixtureError, agg_obj, &.{"data"}, ctx, "body.attestations[].data");
+            const att_data = try parseAttestationData(ctx, data_obj);
+
+            attestations.append(types.AggregatedAttestation{
+                .aggregation_bits = aggregation_bits,
+                .data = att_data,
+            }) catch {
+                std.debug.print(
+                    "fixture {s} case {s}: failed to append aggregated attestation\n",
+                    .{ ctx.fixture_label, ctx.case_name },
+                );
+                return FixtureError.InvalidFixture;
+            };
         }
     }
 
-    const attestations = try types.AggregatedAttestations.init(allocator);
     return types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,
         .parent_root = parent_root,
         .state_root = state_root,
         .body = .{ .attestations = attestations },
+    };
+}
+
+pub fn parseAggregationBits(
+    allocator: std.mem.Allocator,
+    ctx: Context,
+    value: JsonValue,
+) FixtureError!types.AggregationBits {
+    const bits_obj = try expect.expectObjectValue(FixtureError, value, ctx, "aggregationBits");
+    const data_val = bits_obj.get("data") orelse {
+        std.debug.print(
+            "fixture {s} case {s}: aggregationBits missing data\n",
+            .{ ctx.fixture_label, ctx.case_name },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    const arr = try expect.expectArrayValue(FixtureError, data_val, ctx, "aggregationBits.data");
+
+    var bits = types.AggregationBits.init(allocator) catch return FixtureError.InvalidFixture;
+    errdefer bits.deinit();
+
+    for (arr.items) |item| {
+        const flag = switch (item) {
+            .bool => |b| b,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}: aggregationBits entries must be bool\n",
+                    .{ ctx.fixture_label, ctx.case_name },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+        bits.append(flag) catch return FixtureError.InvalidFixture;
+    }
+    return bits;
+}
+
+pub fn parseAttestationData(ctx: Context, data_obj: std.json.ObjectMap) FixtureError!types.AttestationData {
+    const att_slot = try expect.expectU64Field(FixtureError, data_obj, &.{"slot"}, ctx, "data.slot");
+    const head_obj = try expect.expectObject(FixtureError, data_obj, &.{"head"}, ctx, "data.head");
+    const target_obj = try expect.expectObject(FixtureError, data_obj, &.{"target"}, ctx, "data.target");
+    const source_obj = try expect.expectObject(FixtureError, data_obj, &.{"source"}, ctx, "data.source");
+
+    const head_root = try expect.expectBytesField(FixtureError, types.Root, head_obj, &.{"root"}, ctx, "data.head.root");
+    const head_slot = try expect.expectU64Field(FixtureError, head_obj, &.{"slot"}, ctx, "data.head.slot");
+    const target_root = try expect.expectBytesField(FixtureError, types.Root, target_obj, &.{"root"}, ctx, "data.target.root");
+    const target_slot = try expect.expectU64Field(FixtureError, target_obj, &.{"slot"}, ctx, "data.target.slot");
+    const source_root = try expect.expectBytesField(FixtureError, types.Root, source_obj, &.{"root"}, ctx, "data.source.root");
+    const source_slot = try expect.expectU64Field(FixtureError, source_obj, &.{"slot"}, ctx, "data.source.slot");
+
+    return types.AttestationData{
+        .slot = att_slot,
+        .head = .{ .root = head_root, .slot = head_slot },
+        .target = .{ .root = target_root, .slot = target_slot },
+        .source = .{ .root = source_root, .slot = source_slot },
     };
 }
 
@@ -567,7 +661,7 @@ fn verifyPost(
     }
 }
 
-fn parseCheckpoint(
+pub fn parseCheckpoint(
     ctx: Context,
     parent: std.json.ObjectMap,
     field_name: []const u8,
@@ -585,7 +679,7 @@ fn parseCheckpoint(
     };
 }
 
-fn parseBlockHeader(
+pub fn parseBlockHeader(
     ctx: Context,
     obj: std.json.ObjectMap,
 ) FixtureError!types.BeamBlockHeader {

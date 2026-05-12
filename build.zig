@@ -351,6 +351,10 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("build_options", build_options_module);
     zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_spectests.addImport("@zeam/node", zeam_beam_node);
+    zeam_spectests.addImport("@zeam/xmss", zeam_xmss);
+    zeam_spectests.addImport("@zeam/network", zeam_network);
+    zeam_spectests.addImport("snappyz", snappyz);
+    zeam_spectests.addImport("snappyframesz", snappyframesz);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -441,6 +445,113 @@ pub fn build(b: *Builder) !void {
 
     const test_step = b.step("test", "Run zeam core tests");
 
+    // ---------------------------------------------------------------
+    // Single-node ingestion stress harness (issue #803 slice b).
+    //
+    // Run with `zig build stress` (or `zig build stress -Doptimize=Debug`).
+    // Configurable via env vars:
+    //   ZEAM_STRESS_DURATION_SECS  default 1800 (30 min, design-doc r3 merge gate)
+    //   ZEAM_STRESS_NUM_BLOCKS     default 6
+    //   ZEAM_STRESS_GOSSIP_THREADS default 3
+    //   ZEAM_STRESS_RPC_THREADS    default 4
+    //   ZEAM_STRESS_ATTN_THREADS   default 2
+    //   ZEAM_STRESS_BORROW_THREADS default 2
+    //   ZEAM_STRESS_CACHE_THREADS  default 1
+    //   ZEAM_STRESS_WATCHDOG_SECS  default 60
+    // ---------------------------------------------------------------
+    const stress_exe = b.addExecutable(.{
+        .name = "zeam-stress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkgs/node/src/stress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    stress_exe.root_module.addImport("xev", xev);
+    stress_exe.root_module.addImport("ssz", ssz);
+    stress_exe.root_module.addImport("@zeam/utils", zeam_utils);
+    stress_exe.root_module.addImport("@zeam/params", zeam_params);
+    stress_exe.root_module.addImport("@zeam/types", zeam_types);
+    stress_exe.root_module.addImport("@zeam/configs", zeam_configs);
+    stress_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    stress_exe.root_module.addImport("@zeam/network", zeam_network);
+    stress_exe.root_module.addImport("@zeam/database", zeam_database);
+    stress_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
+    stress_exe.root_module.addImport("@zeam/api", zeam_api);
+    stress_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    stress_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    stress_exe.root_module.addImport("@zeam/thread-pool", zeam_thread_pool);
+    addRustGlueLib(b, stress_exe, target, prover);
+    stress_exe.step.dependOn(&build_rust_lib_steps.step);
+    const run_stress = b.addRunArtifact(stress_exe);
+    if (b.args) |args| run_stress.addArgs(args);
+    const stress_step = b.step("stress", "Run single-node ingestion stress harness (issue #803 slice b)");
+    stress_step.dependOn(&run_stress.step);
+
+    // -----------------------------------------------------------------
+    // `stress-quick`: short-form stress harness wired into `zig build
+    // test`. The full 30-min run is operator-driven; this 30s run is
+    // what CI executes on every PR so the slice-(a)/(b) merge gate
+    // actually has automated enforcement, not just a PR-comment
+    // attestation. The quick run uses the same code paths as the full
+    // run and will fail CI on:
+    //   * any `MissingPreState` (states-map race),
+    //   * any unexpected `chain.onBlock` error in gossip-flood,
+    //   * any `recordFatal` from coherence checks (BlockCache,
+    //     borrow-reader, watchdog),
+    //   * worker error counters non-zero in the summary epilogue.
+    // 30s is long enough for several thousand ops on each worker
+    // without putting the test job over budget.
+    //
+    // Override knobs are intentionally NOT wired here — CI exercises
+    // the same defaults a developer sees with `zig build stress-quick`,
+    // which is the point.
+    const run_stress_quick = b.addRunArtifact(stress_exe);
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate, slice b)");
+    stress_quick_step.dependOn(&run_stress_quick.step);
+    test_step.dependOn(&run_stress_quick.step);
+
+    // -----------------------------------------------------------------
+    // `stress-saturation` and `stress-quick-saturation`: chain-worker
+    // queue saturation harness (slice c-2c commit 6 of #803).
+    //
+    // The full `stress-saturation` step is operator-driven (~30s
+    // default). The quick variant is wired into `zig build test` so
+    // CI catches:
+    //   * Producer-side accounting drift (attempts != ok+qfull+err).
+    //   * Backpressure regression (queue never fills — either the
+    //     producers are too slow or the queue capacity got bumped
+    //     without a corresponding bump to producer count).
+    //   * Worker-drain regression (queue fills but never drains —
+    //     classic worker-thread deadlock).
+    //   * Any unexpected `submitBlock` / `submitGossipAttestation`
+    //     error tag (today only `QueueClosed` and
+    //     `ChainWorkerDisabled` are non-`QueueFull`).
+    //
+    // Both steps reuse the same `stress_exe` artifact — the harness
+    // dispatches on `ZEAM_STRESS_MODE=saturation` set here.
+    const run_stress_saturation = b.addRunArtifact(stress_exe);
+    run_stress_saturation.setEnvironmentVariable("ZEAM_STRESS_MODE", "saturation");
+    if (b.args) |args| run_stress_saturation.addArgs(args);
+    const stress_saturation_step = b.step(
+        "stress-saturation",
+        "Run the chain-worker queue saturation harness (issue #803 slice c-2c)",
+    );
+    stress_saturation_step.dependOn(&run_stress_saturation.step);
+
+    const run_stress_quick_saturation = b.addRunArtifact(stress_exe);
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_MODE", "saturation");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "10");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    const stress_quick_saturation_step = b.step(
+        "stress-quick-saturation",
+        "Run a 10s chain-worker queue saturation harness (CI gate, slice c-2c)",
+    );
+    stress_quick_saturation_step.dependOn(&run_stress_quick_saturation.step);
+    test_step.dependOn(&run_stress_quick_saturation.step);
+
     // CLI integration tests (separate target) - always create this test target
     const cli_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -485,6 +596,21 @@ pub fn build(b: *Builder) !void {
     const run_types_test = b.addRunArtifact(types_tests);
     setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
+
+    // leanMetrics PR #35: lock the gauge↑scrape contract for
+    // `lean_gossip_mesh_peers` (and the append-only behaviour of the
+    // `registerScrapeRefresher` registry) in code so doc-only audits
+    // cannot regress silently — the same lesson as slice (b)
+    // (LockTimer → /metrics test) and slice c-2b
+    // (`lean_chain_state_refcount_distribution`).
+    const metrics_tests = b.addTest(.{
+        .root_module = zeam_metrics,
+    });
+    metrics_tests.test_runner = simple_test_runner;
+    metrics_tests.root_module.addImport("metrics", metrics);
+    const run_metrics_tests = b.addRunArtifact(metrics_tests);
+    setTestRunLabelFromCompile(b, run_metrics_tests, metrics_tests);
+    test_step.dependOn(&run_metrics_tests.step);
 
     const transition_tests = b.addTest(.{
         .root_module = zeam_state_transition,
@@ -613,6 +739,9 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
     spectests.root_module.addImport("@zeam/metrics", zeam_metrics);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    spectests.root_module.addImport("@zeam/network", zeam_network);
+    spectests.root_module.addImport("snappyz", snappyz);
+    spectests.root_module.addImport("snappyframesz", snappyframesz);
     spectests.root_module.addImport("ssz", ssz);
 
     manager_tests.step.dependOn(&build_rust_lib_steps.step);
@@ -656,6 +785,15 @@ pub fn build(b: *Builder) !void {
     const run_spectest_generate = b.addRunArtifact(spectest_generate_exe);
     const spectest_generate_step = b.step("spectest:generate", "Regenerate spectest fixtures");
     spectest_generate_step.dependOn(&run_spectest_generate.step);
+
+    // The test-binary compile reads pkgs/spectest/src/generated/index.zig
+    // (gitignored, regenerated by the generator step). Without this edge
+    // the compile and the generator race when zig fans out parallel build
+    // steps — the compile sometimes reads a stale or half-written index
+    // and fails with "file contents changed during update" or
+    // "FileNotFound". Pinning compile-after-generate makes
+    // `zig build spectest` idempotent across re-invocations.
+    spectests.step.dependOn(&run_spectest_generate.step);
 
     const run_spectests_after_generate = b.addRunArtifact(spectests);
     run_spectests_after_generate.step.dependOn(&run_spectest_generate.step);
