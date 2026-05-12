@@ -1,0 +1,4 @@
+# Raw profile artifacts and devnet logs — large + non-portable.
+# Only `docs/perf/devnet/baselines/*` is tracked.
+*
+!.gitignore
