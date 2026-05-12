@@ -866,6 +866,28 @@ pub fn build(b: *Builder) !void {
     const stf_bench_step = b.step("bench-stf", "Run STF benchmarks (ReleaseFast)");
     stf_bench_step.dependOn(&run_stf_bench.step);
     bench_step.dependOn(&run_stf_bench.step);
+
+    const aggregation_bench_exe = b.addExecutable(.{
+        .name = "bench-aggregation",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/aggregation_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+        }),
+    });
+    aggregation_bench_exe.root_module.addImport("zbench", zbench);
+    aggregation_bench_exe.root_module.addImport("@zeam/types", zeam_types);
+    aggregation_bench_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    aggregation_bench_exe.root_module.addImport("@zeam/params", zeam_params);
+    aggregation_bench_exe.root_module.addImport("ssz", ssz);
+    aggregation_bench_exe.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, aggregation_bench_exe, target, prover);
+    const install_aggregation_bench = b.addInstallArtifact(aggregation_bench_exe, .{});
+    const run_aggregation_bench = b.addRunArtifact(aggregation_bench_exe);
+    run_aggregation_bench.step.dependOn(&install_aggregation_bench.step);
+    const aggregation_bench_step = b.step("bench-aggregation", "Run aggregation benchmarks (ReleaseFast)");
+    aggregation_bench_step.dependOn(&run_aggregation_bench.step);
+    bench_step.dependOn(&run_aggregation_bench.step);
 }
 
 fn setSpectestArgsAndEnv(

@@ -8,3 +8,7 @@ Format: ISO date — target — one-line finding — link/path to evidence.
 2026-05-12 — xmss — 80%+ of CPU time inside hashsig_glue Rust FFI: dominated by p3_monty_31 Poseidon1 (KoalaBear, aarch64-NEON) across 10 rayon worker threads, with keccak::p1600 and leansig::tweak_hash_tree as secondary contributors; no allocator pressure observed (libsystem_malloc absent from hot path)
 
 2026-05-12 — stf — profile too sparse (19 samples, ~10ms total runtime) and symbols stripped (ReleaseFast); benchmark shows apply_transition (avg 102µs) faster than apply_raw_block (avg 151µs) because validateResult=false skips hash_tree_root in apply_transition, confirming hash_tree_root is the dominant STF cost when signature verification is excluded
+
+2026-05-12 — aggregation — proof_aggregate_only (8 signers, LOG_INV_RATE_PROD=2): avg 655ms/call; proof_aggregate_with_2_children (2×4-signer child proofs): avg 3.9s/call; profile shows 10 rayon worker threads dominating with ~43k samples each (vs 7k on main thread), symbols stripped in ReleaseFast so leaf frames appear as raw addresses — same pattern as xmss bench; the 6× slowdown for recursive aggregation vs raw aggregation reflects the additional ZK proof composition cost
+
+NOTE — dropped variants: extend_greedy_small and extend_greedy_large are infeasible without refactoring (the greedy logic is inlined inside computeAggregatedSignatures in block.zig:468, not a standalone function); compute_aggregated_signatures deferred (needs Validators + SignaturesMap fixture setup, out of single-task scope)
