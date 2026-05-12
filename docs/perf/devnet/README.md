@@ -13,9 +13,9 @@ design rationale. This README is the user-facing runbook.
 
 ## Prerequisites
 
-Recommended host: **GitHub Codespace, 4-core 16 GB Ubuntu 24.04**. Local Linux
-works too. macOS works via `samply` fallback but threading behaviour differs
-from production — prefer Codespace.
+Recommended host: **GitHub Codespace, 4-core 16 GB Ubuntu 24.04** (8-core/32GB
+faster). Local Linux works too. macOS works via `samply` fallback but threading
+behaviour differs from production — prefer Codespace.
 
 ```bash
 # One-time setup on Linux (codespace or other)
@@ -27,10 +27,10 @@ git clone --depth=1 https://github.com/brendangregg/FlameGraph /opt/FlameGraph
 echo 'export PATH=/opt/FlameGraph:$PATH' >> ~/.bashrc
 export PATH=/opt/FlameGraph:$PATH
 
-# Verify perf works without root; if denied, allow non-root sampling:
-perf record -F 1 -p $$ -o /tmp/x -- sleep 0.1 && echo "perf OK"
-# If the above fails:
+# Allow non-root perf sampling. NOTE: codespaces reset this to 4 on every
+# new SSH session — run this at the start of every shell that uses perf.
 sudo sysctl -w kernel.perf_event_paranoid=1
+perf record -F 1 -p $$ -o /tmp/x -- sleep 0.1 && echo "perf OK" && rm /tmp/x
 ```
 
 For the `samply` fallback (macOS):
@@ -38,6 +38,60 @@ For the `samply` fallback (macOS):
 ```bash
 cargo install samply
 ```
+
+### Codespace-specific gotchas (validated 2026-05-12)
+
+Working from a fresh GitHub Codespace surfaces a handful of friction points
+that aren't documented in lean-quickstart's own README:
+
+- **Default Zig is 0.15.1** (Ubuntu 24.04 + GitHub's default Zig). zeam needs
+  **0.16.0**. Install manually:
+
+  ```bash
+  curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+      | tar -xJ -C ~/ && mv ~/zig-linux-x86_64-0.16.0 ~/zig-0.16
+  export PATH=$HOME/zig-0.16:$PATH
+  zig version   # → 0.16.0
+  ```
+
+- **`cargo` may exist but not be on `$PATH`.** Codespace's stock image puts
+  `cargo` at `~/.cargo/bin/cargo`, but doesn't source `~/.cargo/env` for
+  non-interactive SSH sessions. Add it explicitly:
+
+  ```bash
+  export PATH=$HOME/.cargo/bin:$PATH
+  cargo --version
+  ```
+
+  Without this, `zig build` fails with `error: failed to spawn and capture
+  stdio from cargo: FileNotFound`.
+
+- **`kernel.perf_event_paranoid` resets to 4 on every SSH session.** Codespace
+  policy. Run `sudo sysctl -w kernel.perf_event_paranoid=1` at the start of
+  any shell that will invoke `capture.sh`. (The script's preflight test for
+  perf availability catches this and falls back to `samply` if it can't be
+  set.)
+
+- **Git remote may be configured to single-branch fetch.** If
+  `git fetch origin perf-devnet-profile` fails with "couldn't find remote
+  ref", widen the refspec:
+
+  ```bash
+  git config --add remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+  git fetch origin
+  ```
+
+- **`/workspaces/zeam` might not be zeam.** Some codespaces mount this name
+  for a different repo (e.g. lean-quickstart). Check `git remote -v` before
+  acting; the actual zeam clone may be at `/workspaces/zeam-build/` or
+  similar. The runbook assumes you `cd` to the real zeam working tree before
+  every command.
+
+- **Linux smoke-test target needs CPU work.** The `sleep N` target referenced
+  in `scripts/devnet-profile/README.md` and earlier macOS smoke tests
+  produces zero CPU samples under `perf record --call-graph dwarf` (it's all
+  `nanosleep` syscall time). For a Linux smoke test of `capture.sh`, use a
+  CPU-busy target like `yes >/dev/null &` instead.
 
 Also required: `git submodule update --init lean-quickstart` from the zeam repo root.
 
