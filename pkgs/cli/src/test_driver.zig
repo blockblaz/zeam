@@ -3,6 +3,9 @@
 /// Implements:
 ///   POST /lean/v0/test_driver/fork_choice/init
 ///   POST /lean/v0/test_driver/fork_choice/step
+///   POST /lean/v0/test_driver/fork_choice/snapshot
+///   POST /lean/v0/test_driver/state_transition/run
+///   POST /lean/v0/test_driver/verify_signatures/run
 ///
 /// Logic mirrors pkgs/spectest/src/runner/fork_choice_runner.zig but adapted
 /// for persistent per-request state and HTTP responses.
@@ -55,6 +58,10 @@ pub const ForkChoiceDriverState = struct {
         }
         self.allocated_states.deinit(self.allocator);
         self.state_map.deinit(self.allocator);
+        var label_keys = self.label_map.keyIterator();
+        while (label_keys.next()) |key| {
+            self.allocator.free(key.*);
+        }
         self.label_map.deinit(self.allocator);
         for (self.block_attestations.items) |entry| {
             self.allocator.free(entry.participants);
@@ -63,6 +70,7 @@ pub const ForkChoiceDriverState = struct {
         // anchor_state_ptr is NOT in allocated_states; free separately
         self.anchor_state_ptr.deinit();
         self.allocator.destroy(self.anchor_state_ptr);
+        self.chain_config.genesis.deinit(self.allocator);
         self.chain_config.deinit(self.allocator);
     }
 };
@@ -420,10 +428,9 @@ pub fn initForkChoiceDriver(
     const anchor_state_value = body_obj.get("anchorState") orelse return error.MissingField;
     const anchor_block_value = body_obj.get("anchorBlock") orelse return error.MissingField;
 
-    // Parse into temporaries (arena memory is fine; we copy what we need)
+    // Parse into a temporary, then clone into stable driver-owned storage.
     var anchor_state_temp = try buildStateFromJson(driver_allocator, anchor_state_value);
-    // Don't defer deinit here — will be moved to heap below
-    errdefer anchor_state_temp.deinit();
+    defer anchor_state_temp.deinit();
 
     var anchor_block = try buildBlockFromJson(driver_allocator, anchor_block_value);
     defer anchor_block.deinit();
@@ -436,40 +443,19 @@ pub fn initForkChoiceDriver(
         return error.AnchorMismatch;
     }
 
-    // Build chain config (uses driver_allocator for pubkey slices)
+    // Build chain config (uses driver_allocator for pubkey slices).
+    // ChainConfig.deinit currently owns ChainSpec only; this driver owns the
+    // GenesisSpec pubkey slices it installs and frees them in ForkChoiceDriverState.deinit.
     var chain_config = try buildChainConfig(driver_allocator, &anchor_state_temp);
-    errdefer chain_config.deinit(driver_allocator);
-
-    // Move anchor state to a stable heap address
-    const anchor_state_ptr = try driver_allocator.create(types.BeamState);
-    anchor_state_ptr.* = anchor_state_temp;
-    // anchor_state_temp is now "moved" — clear its errdefer by disabling it
-    // (we rely on anchor_state_ptr's errdefer from here on)
     errdefer {
-        anchor_state_ptr.deinit();
-        driver_allocator.destroy(anchor_state_ptr);
+        chain_config.genesis.deinit(driver_allocator);
+        chain_config.deinit(driver_allocator);
     }
-    // Prevent double-deinit: clear fields so the stack copy's deinit is a no-op.
-    // We set anchor_state_temp to a zeroed-out state so its errdefer (if somehow triggered)
-    // won't double-free. Actually the errdefer above fires on the *ptr; the local temp's
-    // errdefer was already set before the move. We just need to neutralise it.
-    // The cleanest approach: after successful move, null out the moved-from
-    // local so its deinit is safe. We'll just let Zig's errdefer chain handle it.
-    // Since anchor_state_temp.deinit() would free its internal lists and we've done a
-    // bitwise copy, calling deinit on both would double-free. To prevent this, we
-    // reassign anchor_state_temp to a fresh empty state:
-    anchor_state_temp = types.BeamState{
-        .config = .{ .genesis_time = 0 },
-        .slot = 0,
-        .latest_block_header = std.mem.zeroes(types.BeamBlockHeader),
-        .latest_justified = std.mem.zeroes(types.Checkpoint),
-        .latest_finalized = std.mem.zeroes(types.Checkpoint),
-        .historical_block_hashes = try types.HistoricalBlockHashes.init(driver_allocator),
-        .justified_slots = try types.JustifiedSlots.init(driver_allocator),
-        .validators = try types.Validators.init(driver_allocator),
-        .justifications_roots = try types.JustificationRoots.init(driver_allocator),
-        .justifications_validators = try types.JustificationValidators.init(driver_allocator),
-    };
+
+    const anchor_state_ptr = try driver_allocator.create(types.BeamState);
+    errdefer driver_allocator.destroy(anchor_state_ptr);
+    try types.sszClone(driver_allocator, types.BeamState, anchor_state_temp, anchor_state_ptr);
+    errdefer anchor_state_ptr.deinit();
 
     // Compute anchor block root for state_map
     var anchor_block_root: types.Root = undefined;
@@ -493,8 +479,14 @@ pub fn initForkChoiceDriver(
     errdefer allocated_states.deinit(driver_allocator);
 
     var label_map = LabelMap.empty;
-    errdefer label_map.deinit(driver_allocator);
-    try label_map.put(driver_allocator, "genesis", anchor_block_root);
+    errdefer {
+        var label_keys = label_map.keyIterator();
+        while (label_keys.next()) |key| {
+            driver_allocator.free(key.*);
+        }
+        label_map.deinit(driver_allocator);
+    }
+    try label_map.put(driver_allocator, try driver_allocator.dupe(u8, "genesis"), anchor_block_root);
 
     const block_attestations = BlockAttestationList.empty;
     // (deinit is a no-op when empty)
@@ -543,6 +535,68 @@ fn clearBlockAttestations(allocator: Allocator, list: *BlockAttestationList) voi
         allocator.free(entry.participants);
     }
     list.clearRetainingCapacity();
+}
+
+fn putLabel(driver: *ForkChoiceDriverState, label: []const u8, root: types.Root) !void {
+    if (driver.label_map.getEntry(label)) |entry| {
+        entry.value_ptr.* = root;
+        return;
+    }
+    const owned_label = try driver.allocator.dupe(u8, label);
+    errdefer driver.allocator.free(owned_label);
+    try driver.label_map.put(driver.allocator, owned_label, root);
+}
+
+fn parseNonNegativeU64(value: JsonValue) !u64 {
+    return switch (value) {
+        .integer => |i| if (i < 0) error.InvalidField else @as(u64, @intCast(i)),
+        .float => |f| if (f < 0) error.InvalidField else @as(u64, @intFromFloat(f)),
+        else => error.InvalidField,
+    };
+}
+
+fn validateAttestationDataForGossip(driver: *ForkChoiceDriverState, data: types.AttestationData) !void {
+    const source_node = driver.fork_choice.getProtoNode(data.source.root) orelse return error.UnknownSourceBlock;
+    const target_node = driver.fork_choice.getProtoNode(data.target.root) orelse return error.UnknownTargetBlock;
+    const head_node = driver.fork_choice.getProtoNode(data.head.root) orelse return error.UnknownHeadBlock;
+
+    if (data.source.slot > data.target.slot) return error.SourceCheckpointExceedsTarget;
+    if (data.head.slot < data.target.slot) return error.HeadOlderThanTarget;
+    if (source_node.slot != data.source.slot) return error.SourceCheckpointSlotMismatch;
+    if (target_node.slot != data.target.slot) return error.TargetCheckpointSlotMismatch;
+    if (head_node.slot != data.head.slot) return error.HeadCheckpointSlotMismatch;
+
+    const time_intervals = driver.fork_choice.fcStore.slot_clock.time.load(.monotonic);
+    const attestation_start_interval = data.slot * node_constants.INTERVALS_PER_SLOT;
+    if (attestation_start_interval > time_intervals + node_constants.GOSSIP_DISPARITY_INTERVALS) {
+        return error.AttestationTooFarInFuture;
+    }
+}
+
+pub fn isProtocolError(err: anyerror) bool {
+    return switch (err) {
+        error.MissingField,
+        error.InvalidField,
+        error.HashFailed,
+        error.InvalidState,
+        error.AnchorMismatch,
+        => true,
+        else => false,
+    };
+}
+
+fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
+    try w.writeByte('"');
+    for (value) |c| switch (c) {
+        '\\' => try w.writeAll("\\\\"),
+        '"' => try w.writeAll("\\\""),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0...8, 0x0b, 0x0c, 0x0e...0x1f => try w.print("\\u{x:0>4}", .{c}),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('"');
 }
 
 fn processBlockStep(
@@ -653,7 +707,7 @@ fn processBlockStep(
     if (block_wrapper_obj) |wo| {
         if (wo.get("blockRootLabel")) |label_value| {
             const label = try parseStringValue(label_value);
-            try driver.label_map.put(driver.allocator, label, block_root);
+            try putLabel(driver, label, block_root);
         }
     }
 }
@@ -668,20 +722,12 @@ fn processTickStep(
     const anchor_genesis_time = driver.fork_choice.anchorState.config.genesis_time;
 
     if (step_obj.get("time")) |tv| {
-        const time_value = switch (tv) {
-            .integer => |i| @as(u64, @intCast(i)),
-            .float => |f| @as(u64, @intFromFloat(f)),
-            else => return error.InvalidField,
-        };
+        const time_value = try parseNonNegativeU64(tv);
         if (time_value < anchor_genesis_time) return; // tick before genesis is a no-op
         const target_intervals = timeToIntervals(anchor_genesis_time, time_value);
         try advanceForkchoiceIntervals(driver, target_intervals, false);
     } else if (step_obj.get("interval")) |iv| {
-        const target_interval = switch (iv) {
-            .integer => |i| @as(u64, @intCast(i)),
-            .float => |f| @as(u64, @intFromFloat(f)),
-            else => return error.InvalidField,
-        };
+        const target_interval = try parseNonNegativeU64(iv);
         try advanceForkchoiceIntervals(driver, target_interval, false);
     } else {
         return error.MissingField; // neither time nor interval
@@ -724,6 +770,9 @@ fn processAttestationStep(
     const validator_id = try parseU64Field(att_obj, &.{ "validatorId", "validator_id" });
     const data_obj = try parseObjectField(att_obj, &.{"data"});
     const att_data = try parseAttestationData(data_obj);
+    const num_validators = driver.fork_choice.anchorState.validators.constSlice().len;
+    if (validator_id >= num_validators) return error.UnknownValidator;
+    try validateAttestationDataForGossip(driver, att_data);
 
     const att = types.Attestation{
         .validator_id = @intCast(validator_id),
@@ -747,6 +796,7 @@ fn processGossipAggregatedAttestationStep(
 
     const data_obj = try parseObjectField(att_obj, &.{"data"});
     const att_data = try parseAttestationData(data_obj);
+    try validateAttestationDataForGossip(driver, att_data);
 
     const proof_obj = try parseObjectField(att_obj, &.{"proof"});
     const participants_obj = try parseObjectField(proof_obj, &.{"participants"});
@@ -788,7 +838,7 @@ fn processGossipAggregatedAttestationStep(
             .validator_id = @intCast(vi),
             .data = att_data,
         };
-        driver.fork_choice.onAttestation(att, false) catch {};
+        driver.fork_choice.onAttestation(att, false) catch |err| return err;
     }
 
     _ = driver.fork_choice.updateHead() catch {};
@@ -818,11 +868,13 @@ pub fn stepForkChoiceDriver(
 
     if (std.mem.eql(u8, step_type, "block")) {
         processBlockStep(driver, step_obj) catch |err| {
+            if (isProtocolError(err) or err == error.OutOfMemory) return err;
             accepted = false;
             error_str = @errorName(err);
         };
     } else if (std.mem.eql(u8, step_type, "tick")) {
         processTickStep(driver, step_obj) catch |err| {
+            if (isProtocolError(err) or err == error.OutOfMemory) return err;
             accepted = false;
             error_str = @errorName(err);
         };
@@ -830,6 +882,7 @@ pub fn stepForkChoiceDriver(
         // Single-validator gossip attestation: {"validatorId": N, "data": {...}}
         // Mirrors ForkChoiceStep::Attestation in leanSpec.
         processAttestationStep(driver, step_obj) catch |err| {
+            if (isProtocolError(err) or err == error.OutOfMemory) return err;
             accepted = false;
             error_str = @errorName(err);
         };
@@ -837,6 +890,7 @@ pub fn stepForkChoiceDriver(
         // Aggregated attestation gossip: {"data": {...}, "proof": {"participants": ..., "proof_data": ...}}
         // Mirrors ForkChoiceStep::GossipAggregatedAttestation.
         processGossipAggregatedAttestationStep(driver, step_obj) catch |err| {
+            if (isProtocolError(err) or err == error.OutOfMemory) return err;
             accepted = false;
             error_str = @errorName(err);
         };
@@ -845,9 +899,9 @@ pub fn stepForkChoiceDriver(
         // `checks` from the JSON step itself and validates against our snapshot.
         // No `valid` field on checks steps so accepted value is not asserted.
     } else {
-        // Unknown step type: return accepted=true (no-op) so the test can continue.
-        // The hive simulator only asserts accepted when the step has a `valid` field.
-        std.debug.print("test_driver: unhandled step type '{s}' — treating as no-op\n", .{step_type});
+        accepted = false;
+        error_str = "UnknownStepType";
+        std.debug.print("test_driver: unhandled step type '{s}'\n", .{step_type});
     }
 
     _ = valid; // used only for local validation logic, not HTTP response
@@ -873,7 +927,9 @@ fn buildStepResponseJson(
 
     try w.print("{{\"accepted\":{s},", .{if (accepted) "true" else "false"});
     if (error_msg) |msg| {
-        try w.print("\"error\":\"{s}\",", .{msg});
+        try w.writeAll("\"error\":");
+        try writeJsonString(w, msg);
+        try w.writeByte(',');
     } else {
         try w.writeAll("\"error\":null,");
     }
@@ -895,7 +951,13 @@ fn buildStepResponseJson(
 
 /// Build a simple error JSON for init failure. Caller must free with allocator.
 pub fn buildInitErrorJson(error_msg: []const u8, allocator: Allocator) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{error_msg});
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
+    try w.writeAll("{\"error\":");
+    try writeJsonString(w, error_msg);
+    try w.writeByte('}');
+    return allocator.dupe(u8, writer_alloc.writer.buffered());
 }
 
 /// Build a snapshot JSON from the current driver state. Caller must free.
@@ -995,10 +1057,9 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
             .{ last_slot, last_block_header_slot, &last_block_header_state_root, historical_count },
         );
     } else {
-        try w.print(
-            "{{\"succeeded\":false,\"error\":\"{s}\",\"post\":null}}",
-            .{transition_error orelse "Unknown"},
-        );
+        try w.writeAll("{\"succeeded\":false,\"error\":");
+        try writeJsonString(w, transition_error orelse "Unknown");
+        try w.writeAll(",\"post\":null}");
     }
 
     return allocator.dupe(u8, writer_alloc.writer.buffered());
@@ -1006,31 +1067,24 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
 
 /// POST /lean/v0/test_driver/verify_signatures/run
 /// Verifies block signatures against an anchor state.
-/// For zeam, signature verification is always accepted (XMSS keys require separate setup).
-/// Returns {"succeeded": true/false, "error": null/string}
+/// XMSS signature verification is not wired into the HTTP test driver yet.
 pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
-    // Parse to confirm valid JSON but signature verification is not yet implemented
-    // in the test driver — return succeeded:true to avoid blocking the test suite.
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
-    const parsed = std.json.parseFromSlice(std.json.Value, aa, body_bytes, .{ .ignore_unknown_fields = true }) catch |err| {
-        return buildSimpleResult(allocator, false, @errorName(err));
-    };
-    _ = parsed;
-
-    // TODO: implement XMSS signature verification for test driver
-    // For now return succeeded:true — verify_signatures tests may still check logic
-    // but won't fail on missing implementation.
-    return buildSimpleResult(allocator, true, null);
+    _ = body_bytes;
+    return buildSimpleResult(allocator, false, "NotImplemented");
 }
 
 fn buildSimpleResult(allocator: Allocator, succeeded: bool, err_name: ?[]const u8) ![]u8 {
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
+    try w.print("{{\"succeeded\":{s},\"error\":", .{boolStr(succeeded)});
     if (err_name) |e| {
-        return std.fmt.allocPrint(allocator, "{{\"succeeded\":{s},\"error\":\"{s}\"}}", .{ boolStr(succeeded), e });
+        try writeJsonString(w, e);
+    } else {
+        try w.writeAll("null");
     }
-    return std.fmt.allocPrint(allocator, "{{\"succeeded\":{s},\"error\":null}}", .{boolStr(succeeded)});
+    try w.writeByte('}');
+    return allocator.dupe(u8, writer_alloc.writer.buffered());
 }
 
 fn boolStr(b: bool) []const u8 {

@@ -788,7 +788,10 @@ pub const ApiServer = struct {
             ) catch {};
             return;
         };
-        // Keep mutex locked for entire step to serialise access
+        // Single-driver Hive mode: serialize the full state transition under the
+        // mutex so concurrent /step requests cannot mutate the same fork-choice
+        // state. Hive drives one test at a time; this is intentionally not a
+        // concurrent multi-client test-driver.
         defer self.test_driver_mutex.unlock();
 
         const response_json = test_driver.stepForkChoiceDriver(
@@ -797,7 +800,9 @@ pub const ApiServer = struct {
             allocator,
         ) catch |err| {
             self.logger.warn("test driver step error: {}", .{err});
-            _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            const status: std.http.Status = if (test_driver.isProtocolError(err)) .bad_request else .internal_server_error;
+            const body = if (status == .bad_request) "Bad Request: invalid test-driver step\n" else "Internal Server Error\n";
+            _ = request.respond(body, .{ .status = status }) catch {};
             return;
         };
         defer allocator.free(response_json);
@@ -878,6 +883,7 @@ pub const ApiServer = struct {
         defer allocator.free(response_json);
 
         _ = request.respond(response_json, .{
+            .status = .not_implemented,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             },
