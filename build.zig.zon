@@ -41,8 +41,8 @@
             .hash = "zig_snappy-0.0.5-bDFzXlh4AADPRkDi2swDMAf8shH39Fc1g5oYRAhFQfTt",
         },
         .snappyframesz = .{
-            .url = "git+https://github.com/blockblaz/snappyframesz#df262c69ca24f072dd71b26c70972649458b6659",
-            .hash = "snappyframesz-0.0.2-COCLy-AQBAAvfJT4M4AK1AqYfMzhvdbsQhsfAJPGTgpc",
+            .url = "git+https://github.com/blockblaz/snappyframesz#e95759d9ca8442ad3a41ccbdf66362a0dd3694fe",
+            .hash = "snappyframesz-0.0.2-COCLy-4XBAAHgQL4JpwB1KwvqFqZCItwCZTrM4gr_QPY",
         },
         .multiaddr = .{
             .url = "git+https://github.com/zen-eth/multiaddr-zig#568b5dd7c125973994222a34bc05679ab2f7b545",

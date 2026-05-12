@@ -9,13 +9,13 @@ pub const Fork = struct {
     symbol: []const u8,
 };
 
-pub const devnet = Fork{
-    .name = "Devnet",
-    .path = "devnet",
-    .symbol = "forks.devnet",
+pub const lstar = Fork{
+    .name = "Lstar",
+    .path = "lstar",
+    .symbol = "forks.lstar",
 };
 
-pub const all = [_]Fork{devnet};
+pub const all = [_]Fork{lstar};
 
 pub fn findByPath(path: []const u8) ?Fork {
     inline for (all) |fork| {

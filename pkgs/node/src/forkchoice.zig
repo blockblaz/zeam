@@ -19,6 +19,23 @@ const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
+/// Maximum number of distinct AttestationData entries a single block may
+/// include, matching leanSpec's chain.config.MAX_ATTESTATIONS_DATA.
+pub const MAX_ATTESTATIONS_DATA: usize = 16;
+
+fn validateAttestationDataLimits(
+    allocator: Allocator,
+    aggregated_attestations: []const types.AggregatedAttestation,
+) ForkChoiceError!void {
+    var seen = std.AutoHashMap(types.AttestationData, void).init(allocator);
+    defer seen.deinit();
+    for (aggregated_attestations) |agg_att| {
+        const gop = seen.getOrPut(agg_att.data) catch return ForkChoiceError.InvalidForkchoiceBlock;
+        if (gop.found_existing) return ForkChoiceError.DuplicateAttestationData;
+    }
+    if (seen.count() > MAX_ATTESTATIONS_DATA) return ForkChoiceError.TooManyAttestationData;
+}
+
 const ProtoBlock = types.ProtoBlock;
 pub const ProtoNode = struct {
     // Fields from ProtoBlock
@@ -500,7 +517,7 @@ pub const ForkChoice = struct {
         return true;
     }
 
-    fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
+    pub fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
         const finalized_slot = self.fcStore.latest_finalized.slot;
         const finalized_root = self.fcStore.latest_finalized.root;
 
@@ -1378,14 +1395,21 @@ pub const ForkChoice = struct {
                     .attestation_data = attestation_data,
                 };
 
-                // also clear out our latest new non included attestation if this is even later than that
-                const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
-                if (attestation_slot > attestation_tracker_latest_new_slot) {
-                    attestation_tracker.latestNew = attestation_tracker.latestKnown;
-                }
+                // leanSpec PR #680 keeps the gossip ("new") and on-chain
+                // ("known") pools strictly separate: `update_safe_target`
+                // operates on the new pool only, while head selection uses
+                // the known pool. Mirroring `latestKnown → latestNew` here
+                // would smuggle on-chain weight back into the safe-target
+                // computation and break the
+                // `test_safe_target_ignores_known_pool_at_interval_3`
+                // contract from the spec test vectors.
             }
         } else {
-            if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic)) {
+            // leanSpec allows attestations up to 1 slot in the future:
+            //   assert data.slot <= current_slot + Slot(1)
+            // In production, chain.validateAttestationData enforces the stricter gossip
+            // check (data.slot <= current_slot) upstream.
+            if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic) + 1) {
                 return ForkChoiceError.InvalidFutureAttestation;
             }
             // just update latest new attested head of the validator
@@ -1646,16 +1670,27 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
-                return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.latest_finalized.slot) {
+            // Block admission only requires a known parent and a slot above
+            // the finalized boundary; STF and signature verification are the
+            // gating layers.
+            if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
-            const is_finalized_descendant = self.isFinalizedDescendant(parent_root);
-            if (is_finalized_descendant != true) {
-                return ForkChoiceError.NotFinalizedDesendant;
-            }
+            // Per leanSpec store.process_block: a block may include at most
+            // MAX_ATTESTATIONS_DATA (16) distinct AttestationData entries, and
+            // each distinct entry must appear exactly once. Enforce this before
+            // registering the block in protoArray so rejected blocks leave no
+            // residue in fork choice state.
+            try validateAttestationDataLimits(self.allocator, block.body.attestations.constSlice());
+
+            // onBlock is a pure store operation aligned with leanSpec's
+            // store.on_block: any block whose parent is in protoArray is stored,
+            // and head selection naturally ignores forks that do not descend
+            // from the finalized root (get_head walks best descendants from
+            // latest_justified). The gossip-level DoS defense against forks
+            // branching off pre-finalization ancestors lives in
+            // chain.validateBlock, not here.
 
             const justified = state.latest_justified;
             const finalized = state.latest_finalized;
@@ -1989,6 +2024,15 @@ pub const ForkChoice = struct {
         return self.protoArray.nodes.items[idx];
     }
 
+    /// Get a ProtoNode's index in the underlying nodes array. Callers use
+    /// this to measure how many nodes precede a given block (e.g. to gate
+    /// proto-array rebase on a grace-window threshold).
+    pub fn getProtoNodeIndex(self: *Self, blockRoot: types.Root) ?usize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.protoArray.indices.get(blockRoot);
+    }
+
     /// Get the current number of nodes in the forkchoice tree
     pub fn getNodeCount(self: *Self) usize {
         self.mutex.lockShared();
@@ -2000,11 +2044,9 @@ pub const ForkChoice = struct {
 pub const ForkChoiceError = error{
     NotImplemented,
     UnknownParent,
-    FutureSlot,
     InvalidFutureAttestation,
     InvalidOnChainAttestation,
     PreFinalizedSlot,
-    NotFinalizedDesendant,
     InvalidAttestation,
     InvalidDeltas,
     InvalidJustifiedRoot,
@@ -2016,6 +2058,8 @@ pub const ForkChoiceError = error{
     InvalidCanonicalTraversal,
     InvalidForkchoiceBlock,
     InvalidSafeTargetCompute,
+    DuplicateAttestationData,
+    TooManyAttestationData,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
@@ -2063,11 +2107,8 @@ test "forkchoice block tree" {
         const block = signed_block.block;
         try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
-        // shouldn't accept a future slot
-        const current_slot = block.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
-
-        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        // onBlock only requires a known parent and a non-pre-finalized slot.
+        try fork_choice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));

@@ -17,6 +17,7 @@ pub const Signature = hashsig.Signature;
 pub const PublicKey = hashsig.PublicKey;
 pub const HashSigError = hashsig.HashSigError;
 pub const verifySsz = hashsig.verifySsz;
+pub const verifySszTest = hashsig.verifySszTest;
 pub const HashSigKeyPair = hashsig.HashSigKeyPair;
 pub const HashSigSignature = hashsig.HashSigSignature;
 pub const HashSigPublicKey = hashsig.HashSigPublicKey;

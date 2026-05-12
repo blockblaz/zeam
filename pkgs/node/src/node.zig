@@ -90,6 +90,10 @@ pub const BeamNode = struct {
     batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
     batch_pending_parent_roots_lock: zeam_utils.SyncMutex = .{},
 
+    /// Test-only failure injection for `onInterval` catch-and-continue paths.
+    test_inject_validator_error_at_intervals: []const usize = &.{},
+    test_inject_aggregator_error_at_intervals: []const usize = &.{},
+
     const Self = @This();
 
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
@@ -166,6 +170,8 @@ pub const BeamNode = struct {
             .validator = validator,
             .nodeId = opts.nodeId,
             .last_interval = -1,
+            .test_inject_validator_error_at_intervals = &.{},
+            .test_inject_aggregator_error_at_intervals = &.{},
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
@@ -349,34 +355,6 @@ pub const BeamNode = struct {
                     }
                     return;
                 },
-                // Block arrived too early for local clock - cache and retry later.
-                error.FutureSlot => {
-                    if (data.* == .block) {
-                        const signed_block = data.block;
-                        // Reuse the root we computed before taking the lock (issue #786).
-                        const block_root = precomputed_block_root;
-                        if (self.cacheFutureBlock(block_root, signed_block)) |_| {
-                            self.logger.debug(
-                                "cached future gossip block 0x{s} at slot {d}",
-                                .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                            );
-                        } else |cache_err| {
-                            if (cache_err == CacheBlockError.PreFinalized) {
-                                self.logger.info(
-                                    "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
-                                    .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                                );
-                                _ = self.network.pruneCachedBlocks(block_root, null);
-                            } else {
-                                self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
-                                    std.fmt.bytesToHex(block_root, .lower)[0..],
-                                    cache_err,
-                                });
-                            }
-                        }
-                    }
-                    return;
-                },
                 // Attestation/aggregation validation failed due to missing head/source/target block -
                 // downgrade to debug when the missing block is already being fetched.
                 error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
@@ -542,12 +520,6 @@ pub const BeamNode = struct {
                         self.logger.debug(
                             "Cached block 0x{x} still missing parent, keeping in cache",
                             .{&descendant_root},
-                        );
-                    } else if (err == error.FutureSlot) {
-                        // Block is still in the future, keep it cached
-                        self.logger.debug(
-                            "Cached block 0x{s} still in future slot, keeping in cache",
-                            .{std.fmt.bytesToHex(descendant_root, .lower)[0..]},
                         );
                     } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                         // This block is now before finalized (finalization advanced while it was cached).
@@ -1685,32 +1657,17 @@ pub const BeamNode = struct {
             const interval: usize = @intCast(current_interval);
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
+            // Commit per interval before sub-steps so later errors cannot replay it.
+            self.last_interval = current_interval;
+
             {
-                // Slice (a-3): no outer mutex. `chain.onInterval` /
-                // `chain.processPendingBlocks` take their own per-resource
-                // locks (forkchoice RwLock, pending_blocks_lock,
-                // states_lock, events_lock) and `sweepTimedOutRequests` /
-                // `processReadyCachedBlocks` go through
-                // network/block_cache helpers.
+                // No outer mutex: each sub-system owns its locks.
 
                 self.chain.onInterval(interval) catch |e| {
-                    self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
-                    // no point going further if chain is not ticked properly
-                    return e;
+                    self.logger.err("error ticking chain to time(intervals)={d} err={any} (continuing tick)", .{ interval, e });
+                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "chain.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                    continue;
                 };
-
-                // Replay blocks that were queued waiting for the forkchoice clock to advance,
-                // then fetch any attestation head roots that were missing during replay.
-                const pending_missing_roots = self.chain.processPendingBlocks();
-                defer self.allocator.free(pending_missing_roots);
-                if (pending_missing_roots.len > 0) {
-                    self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
-                        self.logger.warn(
-                            "failed to fetch {d} missing block(s) from pending blocks: {any}",
-                            .{ pending_missing_roots.len, err },
-                        );
-                    };
-                }
 
                 // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
                 self.sweepTimedOutRequests();
@@ -1718,35 +1675,42 @@ pub const BeamNode = struct {
                 self.processReadyCachedBlocks(slot);
             }
 
-            if (self.validator) |*validator| {
+            // Application-layer failures are logged and counted, not returned.
+            if (self.test_inject_validator_error_at_intervals.len > 0 and
+                std.mem.indexOfScalar(usize, self.test_inject_validator_error_at_intervals, interval) != null)
+            {
+                self.logger.err("error ticking validator to time(intervals)={d} err=error.TestInjected (continuing tick)", .{interval});
+                zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+            } else if (self.validator) |*validator| {
                 // we also tick validator per interval in case it would
                 // need to sync its future duties when its an independent validator
-                var validator_output = validator.onInterval(interval) catch |e| {
-                    self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
-                    return e;
+                var maybe_validator_output = validator.onInterval(interval) catch |e| blk: {
+                    self.logger.err("error ticking validator to time(intervals)={d} err={any} (continuing tick)", .{ interval, e });
+                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                    break :blk null;
                 };
 
-                if (validator_output) |*output| {
+                if (maybe_validator_output) |*output| {
                     defer output.deinit();
                     for (output.gossip_messages.items) |gossip_msg| {
                         // Process based on message type
                         switch (gossip_msg) {
                             .block => |signed_block| {
                                 self.publishBlock(signed_block) catch |e| {
-                                    self.logger.err("error publishing block from validator: err={any}", .{e});
-                                    return e;
+                                    self.logger.err("error publishing block from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishBlock" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
                                 };
                             },
                             .attestation => |signed_attestation| {
                                 self.publishAttestation(signed_attestation) catch |e| {
-                                    self.logger.err("error publishing attestation from validator: err={any}", .{e});
-                                    return e;
+                                    self.logger.err("error publishing attestation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAttestation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
                                 };
                             },
                             .aggregation => |signed_aggregation| {
                                 self.publishAggregation(signed_aggregation) catch |e| {
-                                    self.logger.err("error publishing aggregation from validator: err={any}", .{e});
-                                    return e;
+                                    self.logger.err("error publishing aggregation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAggregation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
                                 };
                             },
                         }
@@ -1768,20 +1732,28 @@ pub const BeamNode = struct {
             }
 
             if (interval_in_slot == 2) {
-                if (self.chain.maybeAggregateOnInterval(interval) catch |e| {
-                    self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
-                    return e;
-                }) |aggregations| {
-                    defer self.allocator.free(aggregations);
-                    self.publishProducedAggregations(aggregations) catch |e| {
-                        self.logger.err("error producing/publishing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
-                        return e;
+                const agg_timer = zeam_metrics.zeam_node_aggregation_interval_tick_seconds.start();
+                defer _ = agg_timer.observe();
+                // Aggregation failure must not stall the interval cursor.
+                if (self.test_inject_aggregator_error_at_intervals.len > 0 and
+                    std.mem.indexOfScalar(usize, self.test_inject_aggregator_error_at_intervals, interval) != null)
+                {
+                    self.logger.err("error producing aggregations at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, error.TestInjected });
+                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "maybeAggregateOnInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                } else {
+                    const maybe_aggregations = self.chain.maybeAggregateOnInterval(interval) catch |e| blk: {
+                        self.logger.err("error producing aggregations at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "maybeAggregateOnInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                        break :blk null;
                     };
+                    if (maybe_aggregations) |aggregations| {
+                        defer self.allocator.free(aggregations);
+                        // Try every aggregation; `publishProducedAggregations` owns deinit.
+                        self.publishProducedAggregations(aggregations);
+                    }
                 }
             }
         }
-
-        self.last_interval = itime_intervals;
     }
 
     /// Re-send our status to every connected peer.
@@ -2008,19 +1980,25 @@ pub const BeamNode = struct {
         }
     }
 
-    fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) !void {
-        for (aggregations, 0..) |_, i| {
-            self.publishAggregation(aggregations[i]) catch |err| {
-                for (aggregations[i..]) |*a| a.deinit();
-                return err;
+    /// Publish every aggregation independently; deinit each entry exactly once.
+    fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) void {
+        for (aggregations) |*signed_aggregation| {
+            self.publishAggregation(signed_aggregation.*) catch |err| {
+                self.logger.err(
+                    "error publishing aggregation at slot={d}: {any} (continuing within slot)",
+                    .{ signed_aggregation.data.slot, err },
+                );
+                zeam_metrics.metrics.lean_node_interval_error_total.incr(
+                    .{ .site = "publishProducedAggregations" },
+                ) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
             };
-            aggregations[i].deinit();
+            signed_aggregation.deinit();
         }
     }
 
     pub fn run(self: *Self) !void {
         // Catch up fork choice time to current interval before processing any requests.
-        // This prevents FutureSlot errors when receiving blocks via RPC immediately after starting.
+        // Keeps validator duties and aggregation timing aligned with the local clock.
         const current_interval = self.clock.current_interval;
         if (current_interval > 0) {
             try self.chain.forkChoice.onInterval(@intCast(current_interval), false);
@@ -3055,4 +3033,131 @@ test "Network: ConnectedPeers integration with selectPeer (slice a-3)" {
 
     try std.testing.expect(node.network.disconnectPeer("peer-aaa"));
     try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
+}
+
+// Issue #837 — onInterval tick decoupling regression tests.
+
+/// Shared setup for `BeamNode.onInterval` regression tests.
+const TestHarness = struct {
+    arena_allocator: std.heap.ArenaAllocator,
+    ctx: testing.NodeTestContext,
+    mock: networks.Mock,
+    test_registry: *NodeNameRegistry,
+    validator_ids: [1]usize,
+    node: BeamNode,
+
+    fn init(harness: *TestHarness, parent_allocator: std.mem.Allocator) !void {
+        harness.arena_allocator = std.heap.ArenaAllocator.init(parent_allocator);
+        errdefer harness.arena_allocator.deinit();
+        const allocator = harness.arena_allocator.allocator();
+
+        harness.ctx = try testing.NodeTestContext.init(allocator, .{});
+        errdefer harness.ctx.deinit();
+
+        harness.mock = try networks.Mock.init(
+            allocator,
+            harness.ctx.loopPtr(),
+            harness.ctx.loggerConfig().logger(.mock),
+            null,
+        );
+        errdefer harness.mock.deinit();
+        const backend = harness.mock.getNetworkInterface();
+
+        const chain_config = harness.ctx.takeChainConfig();
+        const anchor_state = harness.ctx.takeAnchorState();
+
+        harness.test_registry = try allocator.create(NodeNameRegistry);
+        errdefer allocator.destroy(harness.test_registry);
+        harness.test_registry.* = NodeNameRegistry.init(allocator);
+        errdefer harness.test_registry.deinit();
+
+        harness.validator_ids = .{0};
+        try harness.node.init(allocator, .{
+            .config = chain_config,
+            .anchorState = anchor_state,
+            .backend = backend,
+            .clock = harness.ctx.clockPtr(),
+            .validator_ids = &harness.validator_ids,
+            .key_manager = &harness.ctx.key_manager,
+            .nodeId = 0,
+            .db = harness.ctx.dbInstance(),
+            .logger_config = harness.ctx.loggerConfig(),
+            .node_registry = harness.test_registry,
+        });
+    }
+
+    fn deinit(harness: *TestHarness) void {
+        harness.node.deinit();
+        harness.test_registry.deinit();
+        harness.mock.deinit();
+        harness.ctx.deinit();
+        harness.arena_allocator.deinit();
+    }
+};
+
+test "Issue #837: BeamNode.onInterval advances last_interval despite validator/aggregator errors" {
+    var harness: TestHarness = undefined;
+    try harness.init(std.testing.allocator);
+    defer harness.deinit();
+
+    _ = harness.node.chain.setAggregator(true);
+
+    var i: usize = 1;
+    while (i <= 12) : (i += 1) {
+        BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), @intCast(i)) catch {};
+        try std.testing.expectEqual(@as(isize, @intCast(i)), harness.node.last_interval);
+    }
+}
+
+test "Issue #837: validator-layer failure does NOT replay the failing interval" {
+    var harness: TestHarness = undefined;
+    try harness.init(std.testing.allocator);
+    defer harness.deinit();
+
+    var fail_at = [_]usize{5};
+    harness.node.test_inject_validator_error_at_intervals = &fail_at;
+
+    // Interval 5 fails; interval 6 must not replay it.
+    var i: usize = 1;
+    while (i <= 6) : (i += 1) {
+        BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), @intCast(i)) catch {};
+        try std.testing.expectEqual(@as(isize, @intCast(i)), harness.node.last_interval);
+    }
+
+    try std.testing.expectEqual(@as(isize, 6), harness.node.last_interval);
+}
+
+test "Issue #837: aggregator-layer failure does NOT replay the failing interval" {
+    // Interval 7 is the aggregation interval in slot 1.
+    var harness: TestHarness = undefined;
+    try harness.init(std.testing.allocator);
+    defer harness.deinit();
+
+    _ = harness.node.chain.setAggregator(true);
+
+    var fail_at = [_]usize{7};
+    harness.node.test_inject_aggregator_error_at_intervals = &fail_at;
+
+    var i: usize = 1;
+    while (i <= 8) : (i += 1) {
+        BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), @intCast(i)) catch {};
+        try std.testing.expectEqual(@as(isize, @intCast(i)), harness.node.last_interval);
+    }
+
+    try std.testing.expectEqual(@as(isize, 8), harness.node.last_interval);
+}
+
+test "Issue #837: last_interval commits per-iteration on a multi-interval onInterval call" {
+    // One call spans intervals 1–8; failure at 5 must not lose later progress.
+    var harness: TestHarness = undefined;
+    try harness.init(std.testing.allocator);
+    defer harness.deinit();
+
+    try std.testing.expectEqual(@as(isize, -1), harness.node.last_interval);
+
+    var fail_at = [_]usize{5};
+    harness.node.test_inject_validator_error_at_intervals = &fail_at;
+
+    BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), 8) catch {};
+    try std.testing.expectEqual(@as(isize, 8), harness.node.last_interval);
 }
