@@ -158,15 +158,20 @@ const ZeamRequest = struct {
         return ZeamRequest{ .allocator = allocator };
     }
 
+    /// Full Prometheus scrape can exceed 8KiB; keep this comfortably above the
+    /// current exposition size so tests do not truncate mid-body (CI was
+    /// missing `zeam_node_*` histograms while still finding `zeam_chain_*`).
+    const metrics_response_max_bytes: usize = 2 * 1024 * 1024;
+
     /// Make a request to the /metrics endpoint and return the response
     /// Note: Metrics are served on the separate metrics port (default: 9668)
     fn getMetrics(self: ZeamRequest) ![]u8 {
-        return self.makeRequestToPort("/metrics", constants.DEFAULT_METRICS_PORT);
+        return self.makeRequestToPort("/metrics", constants.DEFAULT_METRICS_PORT, metrics_response_max_bytes);
     }
 
     /// Make a request to the /lean/v0/health endpoint and return the response
     fn getHealth(self: ZeamRequest) ![]u8 {
-        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT);
+        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT, 256 * 1024);
     }
 
     /// Parsed HTTP response returned by the aggregator helpers. Use `std.http.Client`
@@ -240,7 +245,7 @@ const ZeamRequest = struct {
     /// Make a request to the plain GET endpoints (metrics, health). These still
     /// use a raw TCP writer because the metrics/health callers predate the
     /// aggregator work and aren't in scope here.
-    fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16) ![]u8 {
+    fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16, max_response_bytes: usize) ![]u8 {
         const io = std.testing.io;
         const address = try net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, port);
         var connection = try address.connect(io, .{ .mode = .stream });
@@ -257,23 +262,28 @@ const ZeamRequest = struct {
         try conn_writer.interface.writeAll(request);
         try conn_writer.interface.flush();
 
-        return try self.readFullResponse(&connection);
+        return try self.readFullResponse(&connection, max_response_bytes);
     }
 
-    fn readFullResponse(self: ZeamRequest, connection: *net.Stream) ![]u8 {
+    fn readFullResponse(self: ZeamRequest, connection: *net.Stream, max_response_bytes: usize) ![]u8 {
         const io = std.testing.io;
-        var response_buffer: [8192]u8 = undefined;
-        var read_buf: [8192]u8 = undefined;
-        var stream_reader = connection.reader(io, &read_buf);
-        var total_bytes: usize = 0;
-        while (total_bytes < response_buffer.len) {
-            const bytes_read = stream_reader.interface.readSliceShort(response_buffer[total_bytes..]) catch |err| switch (err) {
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(self.allocator);
+        // `connection.reader` uses `reader_scratch` internally; `readSliceShort` must read
+        // into a disjoint buffer or Zig detects illegal @memcpy aliasing (Debug panic on CI).
+        var reader_scratch: [8192]u8 = undefined;
+        var chunk: [8192]u8 = undefined;
+        var stream_reader = connection.reader(io, &reader_scratch);
+        while (list.items.len < max_response_bytes) {
+            const remaining = max_response_bytes - list.items.len;
+            const chunk_cap = @min(chunk.len, remaining);
+            const bytes_read = stream_reader.interface.readSliceShort(chunk[0..chunk_cap]) catch |err| switch (err) {
                 error.ReadFailed => if (stream_reader.err) |e| (if (e == error.ConnectionResetByPeer) break else return e) else return err,
             };
             if (bytes_read == 0) break;
-            total_bytes += bytes_read;
+            try list.appendSlice(self.allocator, chunk[0..bytes_read]);
         }
-        return try self.allocator.dupe(u8, response_buffer[0..total_bytes]);
+        return try list.toOwnedSlice(self.allocator);
     }
 
     /// Free a response returned by getMetrics() / getHealth() / aggregator helpers
