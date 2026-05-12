@@ -262,7 +262,13 @@ const ZeamRequest = struct {
 
     fn readFullResponse(self: ZeamRequest, connection: *net.Stream) ![]u8 {
         const io = std.testing.io;
-        var response_buffer: [8192]u8 = undefined;
+        // 128 KB — large enough for all Prometheus metrics output even as new
+        // histograms are added. The 8 KB stack buffer was insufficient once
+        // the metrics endpoint exceeded that size (e.g. after PR #864 added
+        // zeam_node_aggregation_interval_tick_seconds near the end of output).
+        const buffer_size = 131072;
+        const response_buffer = try self.allocator.alloc(u8, buffer_size);
+        defer self.allocator.free(response_buffer);
         var read_buf: [8192]u8 = undefined;
         var stream_reader = connection.reader(io, &read_buf);
         var total_bytes: usize = 0;
