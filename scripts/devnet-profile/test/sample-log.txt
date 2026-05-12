@@ -1,6 +1,6 @@
-May-12 10:20:30.001 [INFO] (default) some unrelated info line
-May-12 10:20:30.123 [WARN] (default) slot_probe over budget: chain.onBlock took 950000000ns (budget 800000000ns)
-May-12 10:20:34.567 [WARN] (default) slot_probe over budget: fc.aggregate took 1100000000ns (budget 800000000ns)
-May-12 10:20:35.099 [WARN] (default) slot_probe over budget: fc.acceptNewAttestations took 410000000ns (budget 400000000ns)
-May-12 10:20:36.000 [DEBUG] (default) noise that should be skipped
-May-12 10:20:36.500 [WARN] (default) slot_probe over budget: chain.onGossip took 800000001ns (budget 800000000ns)
+warning: some unrelated info line that doesn't match
+warning: slot_probe over budget: chain.onBlock took 950000000ns (budget 800000000ns)
+warning: slot_probe over budget: fc.aggregate took 1100000000ns (budget 800000000ns)
+warning: slot_probe over budget: fc.acceptNewAttestations took 410000000ns (budget 400000000ns)
+debug: noise that should be skipped (debug level doesn't match the warn-filter pattern anyway)
+warning: slot_probe over budget: chain.onGossip took 800000001ns (budget 800000000ns)

@@ -104,7 +104,7 @@ grep "slot_probe over budget" "$LOG" \
     > docs/perf/devnet/baselines/$(date +%F)-slot_probe.tsv
 ```
 
-The TSV has columns: `timestamp`, `probe_name`, `elapsed_ns`, `budget_ns`,
+The TSV has columns: `line_no`, `probe_name`, `elapsed_ns`, `budget_ns`,
 `over_pct`. Header row always present.
 
 Quick check: counts per probe.
@@ -124,8 +124,11 @@ the bench finding of ~411ms gossip-only / ~3.9s recursive vs 800ms budget).
    <https://profiler.firefox.com/>).
 2. Look for:
    - **Forbidden symbols on the libxev TID**: `apply_raw_block`,
-     `apply_transition`, `verifySsz`, `aggregate`, `hashTreeRoot`. (Find
-     libxev's TID in the zeam_0 startup log: `grep "libxev" stderr.log`.)
+     `apply_transition`, `verifySsz`, `aggregate`, `hashTreeRoot`.
+     (Identify the libxev/event-loop thread from the profiler — `samply`
+     shows thread names in the UI; for `perf`, use
+     `perf report -i perf.data --sort=pid,comm,dso,sym` to find the
+     event-loop thread by name.)
    - **Top lock-related callers**: `pthread_mutex_lock`, `__psynch_cvwait`,
      `_pthread_cond_wait` — and what functions called them.
    - **Unexpected hot paths**: anything not in the bench-aggregation profile.

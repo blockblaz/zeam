@@ -1,5 +1,5 @@
-timestamp	probe_name	elapsed_ns	budget_ns	over_pct
-May-12 10:20:30.123	chain.onBlock	950000000	800000000	18
-May-12 10:20:34.567	fc.aggregate	1100000000	800000000	37
-May-12 10:20:35.099	fc.acceptNewAttestations	410000000	400000000	2
-May-12 10:20:36.500	chain.onGossip	800000001	800000000	0
+line_no	probe_name	elapsed_ns	budget_ns	over_pct
+2	chain.onBlock	950000000	800000000	18
+3	fc.aggregate	1100000000	800000000	37
+4	fc.acceptNewAttestations	410000000	400000000	2
+6	chain.onGossip	800000001	800000000	0

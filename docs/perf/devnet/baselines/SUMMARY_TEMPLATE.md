@@ -61,9 +61,10 @@ Findings: <2-4 sentences>.
 ## 3. IO-thread invariant
 
 `#803` invariant: the libxev main thread runs *only* the event router —
-no STF, no XMSS verify, no aggregation. To check, identify the libxev TID
-in the zeam_0 log (search for `libxev main thread tid=`) and look in
-`flamegraph.svg` for that TID. The forbidden symbol set:
+no STF, no XMSS verify, no aggregation. To check, identify the libxev
+thread from the profiler (samply shows thread names; for `perf`, use
+`perf report -i perf.data --sort=pid,comm,dso,sym`) and look in
+`flamegraph.svg` for that thread's samples. The forbidden symbol set:
 
 - `apply_raw_block` / `apply_transition`
 - `verifySsz` (XMSS verify)

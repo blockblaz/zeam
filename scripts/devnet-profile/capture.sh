@@ -93,7 +93,11 @@ case "$SAMPLER" in
         SAMPLY_PID=$!
         sleep "$DURATION" && kill -INT "$SAMPLY_PID" 2>/dev/null &
         wait "$SAMPLY_PID" 2>/dev/null || true
-        echo "samply.json: $(du -h "$OUT_DIR/samply.json" | cut -f1)"
+        if [[ -f "$OUT_DIR/samply.json" ]]; then
+            echo "samply.json: $(du -h "$OUT_DIR/samply.json" | cut -f1)"
+        else
+            echo "warning: samply.json not found — samply may have errored before write" >&2
+        fi
         echo "view at: https://profiler.firefox.com/ (upload samply.json)"
         ;;
 esac
