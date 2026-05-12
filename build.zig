@@ -841,6 +841,31 @@ pub fn build(b: *Builder) !void {
     const xmss_bench_step = b.step("bench-xmss", "Run XMSS benchmarks (ReleaseFast)");
     xmss_bench_step.dependOn(&run_xmss_bench.step);
     bench_step.dependOn(&run_xmss_bench.step);
+
+    const stf_bench_exe = b.addExecutable(.{
+        .name = "bench-stf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/stf_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+        }),
+    });
+    stf_bench_exe.root_module.addImport("zbench", zbench);
+    stf_bench_exe.root_module.addImport("@zeam/types", zeam_types);
+    stf_bench_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    stf_bench_exe.root_module.addImport("@zeam/utils", zeam_utils);
+    stf_bench_exe.root_module.addImport("@zeam/params", zeam_params);
+    stf_bench_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    stf_bench_exe.root_module.addImport("zeam_spectests", zeam_spectests);
+    stf_bench_exe.root_module.addImport("ssz", ssz);
+    stf_bench_exe.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, stf_bench_exe, target, prover);
+    const install_stf_bench = b.addInstallArtifact(stf_bench_exe, .{});
+    const run_stf_bench = b.addRunArtifact(stf_bench_exe);
+    run_stf_bench.step.dependOn(&install_stf_bench.step);
+    const stf_bench_step = b.step("bench-stf", "Run STF benchmarks (ReleaseFast)");
+    stf_bench_step.dependOn(&run_stf_bench.step);
+    bench_step.dependOn(&run_stf_bench.step);
 }
 
 fn setSpectestArgsAndEnv(

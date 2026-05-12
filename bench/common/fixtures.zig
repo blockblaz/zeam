@@ -2,17 +2,21 @@ const std = @import("std");
 const spectest = @import("zeam_spectests");
 const types = @import("@zeam/types");
 
+const read_max_bytes: usize = 16 * 1024 * 1024; // 16 MiB upper bound per fixture file.
+
 /// Load a leanSpec state-transition fixture JSON and return parsed `pre`
 /// state + first `block` for STF benches. Caller owns deinit on both.
 ///
-/// Path must be relative to `fixtures_root` (typically the repo's
-/// `leanSpec/tests/...` directory once the submodule is initialised).
+/// `rel_path` must be relative to the process working directory (repo root
+/// when run via `zig build bench-stf`).
 pub fn loadStateTransitionCase(
     allocator: std.mem.Allocator,
-    fixtures_root: std.fs.Dir,
     rel_path: []const u8,
 ) !struct { pre: types.BeamState, block: types.BeamBlock } {
-    const payload = try spectest.fixtures.loadFixturePayload(allocator, fixtures_root, rel_path);
+    // Use std.Io.Dir (Zig 0.16+) — std.fs.Dir no longer exists.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const payload = try cwd.readFileAlloc(io, rel_path, allocator, .limited(read_max_bytes));
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .ignore_unknown_fields = true });
