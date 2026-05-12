@@ -157,6 +157,8 @@ pub fn build(b: *Builder) !void {
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
     // Absolute path to test-keys for pre-generated validator keys
     build_options.addOption([]const u8, "test_keys_path", b.pathFromRoot("test-keys/hash-sig-keys"));
+    const enable_slot_probes = b.option(bool, "slot-probes", "Enable in-process slot-budget probes in chain.zig and forkchoice.zig (default: false)") orelse false;
+    build_options.addOption(bool, "slot_probes", enable_slot_probes);
     const build_options_module = build_options.createModule();
 
     // add zeam-utils
@@ -175,6 +177,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
+    zeam_utils.addImport("@zeam/params", zeam_params);
 
     // add zeam-metrics (core metrics definitions)
     const zeam_metrics = b.addModule("@zeam/metrics", .{
@@ -1061,6 +1064,7 @@ fn build_zkvm_targets(
         });
         zeam_utils.addImport("ssz", ssz);
         zeam_utils.addImport("build_options", build_options_module);
+        zeam_utils.addImport("@zeam/params", zeam_params);
         // add zeam-metrics (core metrics definitions for ZKVM)
         const zeam_metrics = b.addModule("@zeam/metrics", .{
             .target = target,
