@@ -269,16 +269,19 @@ const ZeamRequest = struct {
         const io = std.testing.io;
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(self.allocator);
-        var read_buf: [8192]u8 = undefined;
-        var stream_reader = connection.reader(io, &read_buf);
+        // `connection.reader` uses `reader_scratch` internally; `readSliceShort` must read
+        // into a disjoint buffer or Zig detects illegal @memcpy aliasing (Debug panic on CI).
+        var reader_scratch: [8192]u8 = undefined;
+        var chunk: [8192]u8 = undefined;
+        var stream_reader = connection.reader(io, &reader_scratch);
         while (list.items.len < max_response_bytes) {
             const remaining = max_response_bytes - list.items.len;
-            const chunk_cap = @min(read_buf.len, remaining);
-            const bytes_read = stream_reader.interface.readSliceShort(read_buf[0..chunk_cap]) catch |err| switch (err) {
+            const chunk_cap = @min(chunk.len, remaining);
+            const bytes_read = stream_reader.interface.readSliceShort(chunk[0..chunk_cap]) catch |err| switch (err) {
                 error.ReadFailed => if (stream_reader.err) |e| (if (e == error.ConnectionResetByPeer) break else return e) else return err,
             };
             if (bytes_read == 0) break;
-            try list.appendSlice(self.allocator, read_buf[0..bytes_read]);
+            try list.appendSlice(self.allocator, chunk[0..bytes_read]);
         }
         return try list.toOwnedSlice(self.allocator);
     }
