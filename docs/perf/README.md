@@ -8,7 +8,7 @@ See `docs/superpowers/specs/2026-05-12-perf-profile-bench-design.md` for design.
 ## Running benches
 
 ```sh
-zig build bench                   # all four targets
+zig build bench                   # all targets (smoke + xmss + stf + aggregation + forkchoice-ssz)
 zig build bench-xmss              # single target
 ```
 

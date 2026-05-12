@@ -1,8 +1,8 @@
 benchmark          runs     total time     time/run (avg ± σ)    (min ... max)                p75        p99        p995      
 -------------------------------------------------------------------------------------------------------------------------------
-fc_onBlock         50       4.104ms        82.082us ± 35.14us    (27.542us ... 259.167us)     90.667us   259.167us  259.167us  
-fc_onAttestation   500      49.186ms       98.373us ± 83.479us   (74.417us ... 1.728ms)       94.5us     296.25us   337.875us  
-ssz_block_encode   1000     42.288ms       42.288us ± 48.119us   (27.791us ... 1.172ms)       40.625us   155.25us   350.833us  
-ssz_block_decode   1000     1.202ms        1.202us ± 691ns       (959ns ... 14.458us)         1.375us    1.459us    1.917us    
-ssz_state_encode   200      5.183ms        25.917us ± 28.698us   (16.25us ... 396.833us)      23.834us   100us      396.833us  
-ssz_state_decode   200      2.103ms        10.515us ± 4.975us    (8.042us ... 44.625us)       10.25us    42.834us   44.625us   
+fc_onBlock         50       3.614ms        72.296us ± 25.594us   (29us ... 202.042us)         77.291us   202.042us  202.042us  
+fc_onAttestation   500      52.864ms       105.728us ± 202.453us (69.459us ... 4.513ms)       94.833us   345.916us  468.25us   
+ssz_block_encode   1000     34.209ms       34.209us ± 12.47us    (23us ... 206.709us)         36.958us   86.708us   115.792us  
+ssz_block_decode   1000     1.391ms        1.391us ± 462ns       (1.291us ... 15.958us)       1.375us    1.459us    1.459us    
+ssz_state_encode   200      5.29ms         26.452us ± 12.865us   (16.042us ... 109.417us)     26.833us   85.458us   109.417us  
+ssz_state_decode   200      2.036ms        10.182us ± 8.213us    (7.791us ... 103.709us)      9.083us    57.583us   103.709us  

@@ -35,6 +35,9 @@ const RealProbe = struct {
         const now_ns = time.monotonicTimestampNs();
         const diff = now_ns - self.start_ns;
         const elapsed: u64 = if (diff > 0) @intCast(diff) else 0;
+        // Design originally had a `std.log.debug` always-emit line here for log
+        // scraping. Removed: per-call formatting cost is non-trivial in hot paths
+        // and we have no scraper today. Re-add if/when a scraper materialises.
         if (elapsed > self.budget_ns) {
             std.log.warn(
                 "slot_probe over budget: {s} took {d}ns (budget {d}ns)",

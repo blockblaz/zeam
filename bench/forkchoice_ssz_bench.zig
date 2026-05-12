@@ -168,6 +168,7 @@ pub fn main(init: std.process.Init) !void {
             .max_attestations_data = 16,
         },
     };
+    defer g_chain_config.?.genesis.deinit(allocator);
 
     // Transfer genesis state ownership to g_anchor_state.
     g_anchor_state = mock_chain.genesis_state;
