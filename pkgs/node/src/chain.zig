@@ -2361,27 +2361,11 @@ pub const BeamChain = struct {
             }
 
             // Each unique AttestationData must appear at most once per block.
-            //
-            // Issue #837 ask #5: log the duplicate's distinguishing
-            // fields (slot + checkpoint roots) so the next reproduction
-            // has enough on-the-wire context to diagnose without
-            // pulling block bytes from a peer. Two `AttestationData`
-            // values are equal iff every field (slot, head, target,
-            // source) matches; logging the slot + checkpoint roots
-            // tells operators which validators voted on the same
-            // checkpoint pair.
-            //
-            // The format string is intentionally split across logical
-            // chunks (block-level / data / head / target / source) so
-            // it stays diff-friendly and operators can grep individual
-            // fields. `blockroot=` / `checkpoint_root=` mirror the
-            // naming used elsewhere in this file (e.g. line ~1867's
-            // gossip log).
             {
-                var att_data_set = std.AutoHashMap(types.AttestationData, usize).init(self.allocator);
-                defer att_data_set.deinit();
+                var att_data_map = std.AutoHashMap(types.AttestationData, usize).init(self.allocator);
+                defer att_data_map.deinit();
                 for (aggregated_attestations, 0..) |agg_att, idx| {
-                    const result = try att_data_set.getOrPut(agg_att.data);
+                    const result = try att_data_map.getOrPut(agg_att.data);
                     if (result.found_existing) {
                         const first_idx = result.value_ptr.*;
                         self.logger.err(
@@ -2409,10 +2393,10 @@ pub const BeamChain = struct {
                     }
                     result.value_ptr.* = idx;
                 }
-                if (att_data_set.count() > self.config.spec.max_attestations_data) {
+                if (att_data_map.count() > self.config.spec.max_attestations_data) {
                     self.logger.err(
                         "block contains {d} distinct AttestationData entries (max {d}) for block root=0x{x}",
-                        .{ att_data_set.count(), self.config.spec.max_attestations_data, &freshFcBlock.blockRoot },
+                        .{ att_data_map.count(), self.config.spec.max_attestations_data, &freshFcBlock.blockRoot },
                     );
                     return BlockProcessingError.TooManyAttestationData;
                 }
