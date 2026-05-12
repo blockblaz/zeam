@@ -191,6 +191,12 @@ pub fn build(b: *Builder) !void {
     });
     const zeam_thread_pool = thread_pool_dep.module("thread-pool");
 
+    // zBench — Zig benchmarking library. Used by `zig build bench[-name]`.
+    const zbench = b.dependency("zbench", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zbench");
+
     // add zeam-xmss
     const zeam_xmss = b.addModule("@zeam/xmss", .{
         .root_source_file = b.path("pkgs/xmss/src/lib.zig"),
@@ -790,6 +796,32 @@ pub fn build(b: *Builder) !void {
 
     const spectest_run_step = b.step("spectest:run", "Run previously generated spectests");
     spectest_run_step.dependOn(&run_spectests.step);
+
+    // -----------------------------------------------------------------
+    // Bench targets (perf-profile-bench, see docs/superpowers/specs/
+    // 2026-05-12-perf-profile-bench-design.md). All bench binaries are
+    // forced to ReleaseFast regardless of -Doptimize=... — Debug
+    // numbers are noise for perf work.
+    // -----------------------------------------------------------------
+    const bench_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+    const bench_step = b.step("bench", "Run all benchmarks (ReleaseFast)");
+
+    const smoke_bench_exe = b.addExecutable(.{
+        .name = "bench-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/smoke_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+        }),
+    });
+    smoke_bench_exe.root_module.addImport("zbench", zbench);
+    const install_smoke_bench = b.addInstallArtifact(smoke_bench_exe, .{});
+    const run_smoke_bench = b.addRunArtifact(smoke_bench_exe);
+    run_smoke_bench.step.dependOn(&install_smoke_bench.step);
+
+    const smoke_bench_step = b.step("bench-smoke", "Run smoke benchmark (validates zbench wiring)");
+    smoke_bench_step.dependOn(&run_smoke_bench.step);
+    bench_step.dependOn(&run_smoke_bench.step);
 }
 
 fn setSpectestArgsAndEnv(
