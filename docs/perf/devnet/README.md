@@ -141,13 +141,49 @@ This:
 2. Pre-flights: ≥ 2 GB free in `docs/perf/devnet/raw/`.
 3. Tests `perf record` permissions; falls back to `samply --save-only` if
    `perf_event_paranoid` blocks non-root.
-4. Records for 1800 seconds (30 min) at 997 Hz with DWARF call-graph unwind
-   (depth 16 KB for the deep Plonky3 stacks).
+4. Records for 1800 seconds (30 min) at 997 Hz with frame-pointer-based
+   call-graph unwind (Zig ReleaseFast retains frame pointers; tiny
+   perf.data, fast post-processing).
 5. On Linux + FlameGraph scripts available: also generates `flamegraph.svg`.
 
 Expected output dir contents:
-- `perf.data` (300-500 MB, gitignored) **OR** `samply.json` (50-200 MB, gitignored)
+- `perf.data` (~50-200 MB on 8-core × 30 min, gitignored) **OR**
+  `samply.json` (50-200 MB, gitignored)
 - `flamegraph.svg` (~1-5 MB, **commit** if interesting — see Step 5)
+
+### When to switch to DWARF call-graph
+
+If the resulting flamegraph has obvious "[unknown]" frames or stops at a
+non-leaf Rust FFI symbol (e.g. inside `hashsig_glue`), the frame-pointer
+chain broke somewhere — typically a Rust dependency built with
+`-Cforce-frame-pointers=no` somewhere down the chain. Fall back to DWARF:
+
+```bash
+CAPTURE_CALL_GRAPH=dwarf,8192 scripts/devnet-profile/capture.sh \
+    "zeam.*zeam_0" 1800 docs/perf/devnet/raw/$(date +%F)/
+```
+
+DWARF mode captures the user stack on every sample, so perf.data balloons
+~10× larger and `perf script` symbol resolution takes proportionally longer.
+**Do not use `dwarf,16384` on multi-core hosts** — observed 2.4 GB perf.data
+on an 8-core × 20s capture (validated 2026-05-12 on codespace).
+
+### Caveat: avoid `zig build stress-quick` as a profile target
+
+`stress-quick` (and `stress`) auto-delete their `.zig-cache/o/.../zeam-stress`
+binary on exit, which breaks post-capture symbol resolution — `addr2line`
+later can't read the binary that produced the recorded PCs. If you want to
+profile zeam-stress, **copy the binary out of `.zig-cache/` first** and run
+the copy:
+
+```bash
+zig build install -Dslot-probes=true -Doptimize=ReleaseFast   # populates zig-out/bin/
+cp zig-out/bin/zeam-stress /tmp/zeam-stress-profile           # OR rebuild stress as install artifact
+/tmp/zeam-stress-profile &                                    # ← attach perf to THIS one
+```
+
+For the real workflow (full devnet), this caveat doesn't apply — the
+`lean-quickstart` binary mode uses `zig-out/bin/zeam` which is stable.
 
 ## Step 4: Extract slot probes
 

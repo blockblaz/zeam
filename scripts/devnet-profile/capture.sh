@@ -68,9 +68,21 @@ fi
 echo "sampler: $SAMPLER, duration: ${DURATION}s, output: $OUT_DIR"
 
 # 4. Record
+#
+# Call-graph mode notes:
+#   - `fp` (default): frame-pointer-based unwind. Tiny perf.data (~10× smaller
+#     than dwarf), fast. Zig ReleaseFast retains frame pointers, so this
+#     works for zeam. Default for that reason.
+#   - `dwarf,8192`: captures 8KB user stack per sample. Use when frame
+#     pointers are missing (e.g., Rust dep with `-Cforce-frame-pointers=no`).
+#     The earlier `dwarf,16384` default produced 2.4 GB perf.data for a 20s
+#     8-core run — unworkable on a codespace. Half-size also produces deep
+#     enough stacks for Plonky3 (depth observed: ~30 frames, ~6 KB).
+#   - Override via env: `CAPTURE_CALL_GRAPH=dwarf,8192 capture.sh ...`
+CALL_GRAPH="${CAPTURE_CALL_GRAPH:-fp}"
 case "$SAMPLER" in
     perf)
-        perf record -F 997 --call-graph dwarf,16384 -p "$PID" \
+        perf record -F 997 --call-graph "$CALL_GRAPH" -p "$PID" \
             -o "$OUT_DIR/perf.data" -- sleep "$DURATION"
         echo "perf.data: $(du -h "$OUT_DIR/perf.data" | cut -f1)"
 
