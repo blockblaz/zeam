@@ -221,6 +221,21 @@ pub const Db = union(Backend) {
         };
     }
 
+    /// Returns the raw SSZ bytes for a block without deserialising, or null if
+    /// not found.  Caller must free the returned slice with `allocator.free`.
+    /// Prefer this over `loadBlock` when only the serialised bytes are needed
+    /// (e.g. serving blocks_by_root) to avoid an unnecessary SSZ round-trip.
+    pub fn loadBlockBytes(
+        self: *Db,
+        comptime cn: ColumnNamespace,
+        block_root: types.Root,
+        allocator: std.mem.Allocator,
+    ) ?[]u8 {
+        return switch (self.*) {
+            inline else => |*impl| impl.loadBlockBytes(cn, block_root, allocator),
+        };
+    }
+
     pub fn saveState(self: *Db, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) void {
         switch (self.*) {
             inline else => |*impl| impl.saveState(cn, state_root, state),

@@ -345,6 +345,30 @@ pub const BeamChain = struct {
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
         try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
+
+        // Check whether the anchor block is already in the DB.
+        // NodeRunner.downloadAndStoreCheckpointBlock fetches the real block from the
+        // checkpoint provider before BeamChain.init is called, so the common path here
+        // is the non-null branch (block already present).
+        //
+        // Memory note: loadBlock returns an owned SignedBlock by value.  The non-null
+        // branch must call deinit to release the heap-allocated attestation lists;
+        // previously this branch dropped the value silently, leaking on every warm-start.
+        if (chain.db.loadBlock(database.DbBlocksNamespace, fork_choice.head.blockRoot)) |loaded| {
+            var owned = loaded;
+            owned.deinit();
+        } else {
+            // Anchor block not in DB.  NodeRunner tries to fetch it from the checkpoint
+            // provider during startup; if that fetch failed (provider doesn't expose
+            // /lean/v0/blocks/finalized, or timed out) we log and continue.
+            // blocks_by_root returns empty for this root until the real block arrives
+            // via reqresp or gossip from a peer.
+            logger_config.logger(.chain).warn(
+                "anchor block root=0x{x} slot={d} not in DB — blocks_by_root will return empty for this root until real block is received",
+                .{ &fork_choice.head.blockRoot, opts.anchorState.slot },
+            );
+        }
+
         return chain;
     }
 
@@ -3238,8 +3262,15 @@ pub const BeamChain = struct {
                 return null;
             },
             .no_peers => {
-                self.logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
-                return null;
+                // Aggregate even with no peers: local fork-choice benefits from aggregated
+                // attestation weight, and aggregates will propagate once peers connect.
+                // Consistent with proposer and attester which also proceed through .no_peers.
+                //
+                // No double-counting: aggregate() maps per-AttestationData key, replacing
+                // raw attestations with their aggregate. Fork-choice counts each
+                // AttestationData key once regardless of whether the raw or aggregated
+                // form arrived first.
+                self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
                 self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
@@ -3443,6 +3474,13 @@ pub const BeamChain = struct {
             .tier5_held = true,
             .timer = t_ev,
         };
+    }
+
+    /// Load a block from the DB and return its raw SSZ bytes, or null if not found.
+    /// Uses `Db.loadBlockBytes` to avoid a deserialise+reserialise round-trip.
+    /// Caller must free the returned slice with `allocator.free`.
+    pub fn loadBlockSsz(self: *Self, root: types.Root, allocator: Allocator) ?[]u8 {
+        return self.db.loadBlockBytes(database.DbBlocksNamespace, root, allocator);
     }
 
     /// Get the latest justified checkpoint.
