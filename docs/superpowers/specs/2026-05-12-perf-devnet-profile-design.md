@@ -216,13 +216,9 @@ Sections:
 8. **Write summary** — copy the template at the end of the README into `docs/perf/devnet/baselines/<date>-<sha>-summary.md` and fill in. Template covers the four questions (probes / queue / IO invariant / locks) with prose + tables.
 9. **Commit** — `flamegraph.svg`, `slot_probe.tsv`, `summary.md` to `docs/perf/devnet/baselines/`. Do NOT commit `perf.data` or raw logs — `raw/.gitignore` covers them.
 
-### D. `lean_chain_worker_queue_depth` metric
+### D. `lean_chain_queue_depth` metric — verified already shipped
 
-If `grep -n "lean_chain_worker_queue_depth" pkgs/metrics/` returns nothing during implementation:
-
-In `pkgs/metrics/src/lib.zig`, add the histogram type alongside the existing chain-worker metrics. In `pkgs/node/src/chain_worker.zig`, find the queue submission path (`sendBlock` / `submitGossipAttestation` etc.) and call `metrics.lean_chain_worker_queue_depth.record(@floatFromInt(self.queue.len))` on each submission.
-
-If the metric already exists, skip this work.
+Initial design assumed we might need to add this metric. **Verified during plan-writing**: `pkgs/metrics/src/lib.zig:177` already exports `lean_chain_queue_depth: LeanChainQueueDepthGauge` with `queue=block|attestation` labels, and `pkgs/node/src/chain_worker.zig:567,584` (`sendBlock`/`sendAttestation`) already call `.set(...)` on each enqueue. Also present: `lean_chain_queue_dropped_total` (queue-full counter) and `lean_chain_worker_loop_iters_total` (watchdog liveness). Section D in this design is therefore a **no-op** — the implementation plan skips it.
 
 ### E. Codespace prerequisites (documented, not automated)
 
