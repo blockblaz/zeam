@@ -822,6 +822,25 @@ pub fn build(b: *Builder) !void {
     const smoke_bench_step = b.step("bench-smoke", "Run smoke benchmark (validates zbench wiring)");
     smoke_bench_step.dependOn(&run_smoke_bench.step);
     bench_step.dependOn(&run_smoke_bench.step);
+
+    const xmss_bench_exe = b.addExecutable(.{
+        .name = "bench-xmss",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/xmss_bench.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+        }),
+    });
+    xmss_bench_exe.root_module.addImport("zbench", zbench);
+    xmss_bench_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    xmss_bench_exe.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, xmss_bench_exe, target, prover);
+    const install_xmss_bench = b.addInstallArtifact(xmss_bench_exe, .{});
+    const run_xmss_bench = b.addRunArtifact(xmss_bench_exe);
+    run_xmss_bench.step.dependOn(&install_xmss_bench.step);
+    const xmss_bench_step = b.step("bench-xmss", "Run XMSS benchmarks (ReleaseFast)");
+    xmss_bench_step.dependOn(&run_xmss_bench.step);
+    bench_step.dependOn(&run_xmss_bench.step);
 }
 
 fn setSpectestArgsAndEnv(
