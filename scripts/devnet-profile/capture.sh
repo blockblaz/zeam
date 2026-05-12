@@ -88,10 +88,22 @@ case "$SAMPLER" in
 
         if command -v stackcollapse-perf.pl >/dev/null && command -v flamegraph.pl >/dev/null; then
             echo "generating flamegraph..."
-            perf script -i "$OUT_DIR/perf.data" \
+            # Guard the pipeline: perf script emits warnings about kernel
+            # symbols (codespace's restricted kallsyms) which `set -euo
+            # pipefail` would treat as fatal otherwise. We only care that
+            # the SVG ended up non-empty.
+            set +e
+            perf script -i "$OUT_DIR/perf.data" 2>/dev/null \
                 | stackcollapse-perf.pl \
-                | flamegraph.pl > "$OUT_DIR/flamegraph.svg"
-            echo "flamegraph.svg: $(du -h "$OUT_DIR/flamegraph.svg" | cut -f1)"
+                | flamegraph.pl > "$OUT_DIR/flamegraph.svg" 2>/dev/null
+            set -e
+            if [[ -s "$OUT_DIR/flamegraph.svg" ]]; then
+                echo "flamegraph.svg: $(du -h "$OUT_DIR/flamegraph.svg" | cut -f1)"
+            else
+                echo "warning: flamegraph generation produced an empty SVG"
+                echo "  retry manually: perf script -i $OUT_DIR/perf.data | stackcollapse-perf.pl | flamegraph.pl > $OUT_DIR/flamegraph.svg"
+                rm -f "$OUT_DIR/flamegraph.svg"
+            fi
         else
             echo "warning: FlameGraph scripts not on PATH; perf.data is saved but flamegraph.svg not generated"
             echo "  install: git clone https://github.com/brendangregg/FlameGraph && export PATH=\$PWD/FlameGraph:\$PATH"
