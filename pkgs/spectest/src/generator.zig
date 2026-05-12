@@ -288,7 +288,13 @@ fn makeHeaderWithPrefix(allocator: Allocator, prefix: []const u8, kind: FixtureK
     try writer.writeAll("const test_allocator = std.testing.allocator;\n");
     try writer.writeAll("const fixture_root_candidate = \"leanSpec/fixtures\";\n\n");
     try writer.writeAll("const ResolveError = error{\n    FixturesNotFound,\n};\n\n");
-    try writer.writeAll("fn resolveFixturesRoot(allocator: std.mem.Allocator) ResolveError![]u8 {\n");
+    // realPathFileAlloc in zig 0.16 returns `[:0]u8` — a null-terminated
+    // slice. Preserve the sentinel through this helper's return type so the
+    // caller's `allocator.free(...)` sees the same length the allocator
+    // sized; demoting to a plain `[]u8` drops the sentinel byte from the
+    // slice length and crashes the DebugAllocator with
+    // "Allocation size N bytes does not match free size N-1".
+    try writer.writeAll("fn resolveFixturesRoot(allocator: std.mem.Allocator) ResolveError![:0]u8 {\n");
     try writer.writeAll("    const cwd = std.Io.Dir.cwd();\n");
     try writer.writeAll("    const resolved = cwd.realPathFileAlloc(std.testing.io, fixture_root_candidate, allocator) catch {\n");
     try writer.writeAll("        std.debug.print(\n");
@@ -367,7 +373,6 @@ fn writeTestCase(
     try writer.writeAll("    configureSkipBehaviour();\n");
     try writer.writeAll("    const fixtures_path = resolveFixturesRoot(test_allocator) catch |err| switch (err) {\n");
     try writer.writeAll("        ResolveError.FixturesNotFound => return error.SkipZigTest,\n");
-    try writer.writeAll("        else => return err,\n");
     try writer.writeAll("    };\n");
     try writer.writeAll("    defer test_allocator.free(fixtures_path);\n");
     try writer.writeAll("    var fixtures_dir = std.Io.Dir.openDirAbsolute(std.testing.io, fixtures_path, .{}) catch |err| {\n");
@@ -708,6 +713,9 @@ fn writeEmptyIndex(
     try writer.writeAll("    pub const fixture_count: usize = 0;\n");
     try writer.writeAll("};\n\n");
     try writer.writeAll("pub const fork_choice = struct {\n");
+    try writer.writeAll("    pub const fixture_count: usize = 0;\n");
+    try writer.writeAll("};\n\n");
+    try writer.writeAll("pub const ssz = struct {\n");
     try writer.writeAll("    pub const fixture_count: usize = 0;\n");
     try writer.writeAll("};\n\n");
     try writer.writeAll("pub const fixture_count: usize = 0;\n");

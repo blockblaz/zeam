@@ -327,8 +327,13 @@ pub const BeamChain = struct {
             .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
-            .pending_blocks = .empty,
             .thread_pool = opts.thread_pool,
+            // pending_blocks is the future-slot queue (issue #788). It's an
+            // unmanaged ArrayList, so default-init to `.empty`; the lock
+            // below guards mutation. Required field — without it the
+            // struct literal fails to compile under the merged main
+            // pending-blocks plumbing.
+            .pending_blocks = .empty,
             // Per-resource locks default-initialised. RwLock and Mutex have
             // no special init; init() runs single-threaded so no acquire
             // here.
@@ -1723,13 +1728,7 @@ pub const BeamChain = struct {
             }
         };
 
-        // 4. Advance fork choice to this block's slot so the block is not rejected as FutureSlot
-        // PS: this isn't required because forkchoice is already ticked before validator's oninterval is called
-        // which then leads to block production call
-        //
-        // try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
-
-        // 5. Add the block to directly forkchoice as this proposer will next need to construct its vote
+        // 4. Add the block directly to forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
         //   them in the forkchoice
         _ = try self.forkChoice.onBlock(block, post_state, .{
@@ -2039,9 +2038,6 @@ pub const BeamChain = struct {
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
-                        // we will not catch and enqueue block for FutureSlot error because this error here means
-                        // that the block's slot is 2 ahead of the local because we have tolerance of 1 in case of
-                        // clock skew or race between oninterval and block arrival
                         self.logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                             block.slot,
                             &block_root,
@@ -2854,9 +2850,10 @@ pub const BeamChain = struct {
             pruned_count,
         });
 
-        // 5 Rebase forkchouce
-        if (pruneForkchoice)
+        // 5 Rebase forkchoice on finalization advance.
+        if (pruneForkchoice) {
             try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
+        }
 
         // TODO:
         // 6. Remove orphaned blocks from database and cleanup unfinalized indices of there are any
@@ -2926,11 +2923,16 @@ pub const BeamChain = struct {
     /// flooding the node with invalid blocks.
     ///
     /// Validations performed:
-    /// 1. Future slot check: block.slot must not be too far in the future
-    /// 2. Pre-finalized slot check: block.slot must be >= finalized_slot
-    /// 3. Proposer index bounds check: proposer_index must be < validator_count
-    /// 4. Parent existence check: parent_root must be known
-    /// 5. Slot ordering check: block.slot must be > parent.slot
+    /// 1. Pre-finalized slot check: block.slot must be >= finalized_slot
+    /// 2. Proposer index bounds check: proposer_index must be < validator_count
+    /// 3. Parent existence check: parent_root must be known
+    /// 4. Slot ordering check: block.slot must be > parent.slot
+    /// 5. Finalized-descendant check: parent chain must reach the finalized
+    ///    checkpoint (DoS defense — forks off pre-finalization ancestors are
+    ///    rejected here so they never enter the fork choice store).
+    ///
+    /// Block admission is gated by parent / signature / STF; the slot is only
+    /// checked relative to the finalized boundary and to the parent block.
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
         _ = is_from_gossip;
 
@@ -3009,7 +3011,7 @@ pub const BeamChain = struct {
             return BlockValidationError.PreFinalizedSlot;
         }
 
-        // 3. Proposer index bounds check - sanity check against registry limit
+        // 2. Proposer index bounds check - sanity check against registry limit
         // This is a fast pre-check; actual proposer validity is verified during signature verification
         // We use VALIDATOR_REGISTRY_LIMIT as the upper bound since the validator set can grow beyond genesis
         if (block.proposer_index >= params.VALIDATOR_REGISTRY_LIMIT) {
@@ -3020,14 +3022,14 @@ pub const BeamChain = struct {
             return BlockValidationError.InvalidProposerIndex;
         }
 
-        // 4. Parent existence check
+        // 3. Parent existence check
         const parent_block = self.forkChoice.getBlock(block.parent_root);
         if (parent_block == null) {
             // Log decision moved to node.zig where we can check if parent is already being fetched
             return BlockValidationError.UnknownParentBlock;
         }
 
-        // 5. Slot ordering check - block slot must be greater than parent slot
+        // 4. Slot ordering check - block slot must be greater than parent slot
         if (block.slot <= parent_block.?.slot) {
             self.logger.debug("block validation failed: slot {d} <= parent slot {d}", .{
                 block.slot,
@@ -3035,15 +3037,31 @@ pub const BeamChain = struct {
             });
             return BlockValidationError.SlotNotAfterParent;
         }
+
+        // 5. Finalized-descendant check - reject forks that branch off from
+        // pre-finalization ancestors. This is the gossip-level DoS defense that
+        // prevents malicious peers from flooding the fork choice store with
+        // blocks whose parent chain cannot reach the finalized checkpoint.
+        // forkchoice.onBlock is intentionally permissive here (matching
+        // leanSpec store.on_block semantics), so the check must live at this
+        // attack surface.
+        if (!self.forkChoice.isFinalizedDescendant(block.parent_root)) {
+            self.logger.debug("block validation failed: parent 0x{x} does not descend from finalized root", .{
+                &block.parent_root,
+            });
+            return BlockValidationError.NotFinalizedDescendant;
+        }
     }
 
     /// Validate incoming attestation before processing.
     ///
-    /// is_from_block: true if attestation came from a block, false if from network gossip
+    /// The time check applies only to the gossip path: admit a vote iff
+    /// `data.slot * INTERVALS_PER_SLOT <= store.time + GOSSIP_DISPARITY_INTERVALS`.
+    /// The bound is in intervals, not slots: a whole-slot margin would let an
+    /// adversary pre-publish next-slot aggregates ahead of any honest validator.
     ///
-    /// Per leanSpec:
-    /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
-    /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
+    /// Block-included attestations skip the time check; they are trusted under
+    /// the block's own validation. `is_from_block` is retained as a log marker.
     pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
@@ -3071,7 +3089,6 @@ pub const BeamChain = struct {
             });
             return AttestationValidationError.UnknownHeadBlock;
         };
-        _ = head_block; // Will be used in future validations
 
         // 2. Validate slot relationships
         if (source_block.slot > target_block.slot) {
@@ -3089,6 +3106,15 @@ pub const BeamChain = struct {
                 data.target.slot,
             });
             return AttestationValidationError.SourceCheckpointExceedsTarget;
+        }
+
+        //    This corresponds to leanSpec's: assert data.head.slot >= data.target.slot
+        if (data.head.slot < data.target.slot) {
+            self.logger.debug("attestation validation failed: head slot {d} < target slot {d}", .{
+                data.head.slot,
+                data.target.slot,
+            });
+            return AttestationValidationError.HeadOlderThanTarget;
         }
 
         // 3. Validate checkpoint slots match block slots
@@ -3109,24 +3135,34 @@ pub const BeamChain = struct {
             return AttestationValidationError.TargetCheckpointSlotMismatch;
         }
 
-        // 4. Validate attestation is not too far in the future
-        //
-        //    Gossip attestations must be for current or past slots only. Validators attest
-        //    in interval 1 of the current slot, so they cannot attest for future slots.
-        //    Block attestations can be more lenient since the block itself was validated.
-        const current_slot = self.forkChoice.getCurrentSlot();
-        const max_allowed_slot = if (is_from_block)
-            current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE // Block attestations: allow +1
-        else
-            current_slot; // Gossip attestations: no future slots allowed
-
-        if (data.slot > max_allowed_slot) {
-            self.logger.debug("attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
-                data.slot,
-                max_allowed_slot,
-                is_from_block,
+        //    This corresponds to leanSpec's: assert head_block.slot == attestation.head.slot
+        if (head_block.slot != data.head.slot) {
+            self.logger.debug("attestation validation failed: head block slot {d} != head checkpoint slot {d}", .{
+                head_block.slot,
+                data.head.slot,
             });
-            return AttestationValidationError.AttestationTooFarInFuture;
+            return AttestationValidationError.HeadCheckpointSlotMismatch;
+        }
+
+        // 4. Validate gossip attestation is not too far in the future.
+        //
+        //    Bound is in intervals, not slots, and only applies to the gossip
+        //    path. Block-included attestations are trusted under the block's
+        //    own validation (matching leanSpec on_block, which doesn't run
+        //    validate_attestation on block-body attestations at all).
+        if (!is_from_block) {
+            const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+            const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
+            const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
+            if (attestation_start_interval > max_allowed_interval) {
+                self.logger.debug("attestation validation failed: gossip attestation start interval {d} > max allowed interval {d} (slot={d}, time={d})", .{
+                    attestation_start_interval,
+                    max_allowed_interval,
+                    data.slot,
+                    current_time,
+                });
+                return AttestationValidationError.AttestationTooFarInFuture;
+            }
         }
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
@@ -3162,7 +3198,6 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        // Validate the attestation data first (same rules as individual gossip attestations)
         try self.validateAttestationData(signedAggregation.data, false);
 
         try self.verifyAggregatedAttestation(signedAggregation);
@@ -3594,6 +3629,8 @@ const AttestationValidationError = error{
     SourceCheckpointExceedsTarget,
     SourceCheckpointSlotMismatch,
     TargetCheckpointSlotMismatch,
+    HeadCheckpointSlotMismatch,
+    HeadOlderThanTarget,
     AttestationTooFarInFuture,
 };
 pub const BlockValidationError = error{
@@ -3613,6 +3650,8 @@ pub const BlockValidationError = error{
     InvalidProposerIndex,
     /// Block slot is not greater than parent slot
     SlotNotAfterParent,
+    /// Block's parent chain does not descend from the finalized checkpoint
+    NotFinalizedDescendant,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
@@ -4131,12 +4170,17 @@ test "attestation validation - comprehensive" {
         try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
-    // Test 9: Attestation too far in future (for gossip)
+    // Test 9: Attestation too far in future (gossip path)
+    //
+    // Setup ended at time = 2 * INTERVALS_PER_SLOT = 10 (slot 2, interval 0).
+    // Gossip bound: data.slot * INTERVALS_PER_SLOT <= time + GOSSIP_DISPARITY_INTERVALS
+    //               → max admitted slot here is ⌊(10 + 1) / 5⌋ = 2.
+    // slot 4 → start interval 20, well beyond 11. Rejected.
     {
         const future_attestation: types.SignedAttestation = .{
             .validator_id = 0,
             .message = .{
-                .slot = 3, // Future slot (current is 2)
+                .slot = 4,
                 .head = types.Checkpoint{
                     .root = mock_chain.blockRoots[2],
                     .slot = 2,
@@ -4158,10 +4202,21 @@ test "attestation validation - comprehensive" {
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
-test "attestation validation - gossip vs block future slot handling" {
-    // Test that gossip and block attestations have different future slot tolerances
-    // Gossip: must be <= current_slot
-    // Block: can be <= current_slot + 1
+test "attestation validation - gossip future-slot bound" {
+    // Gossip path is interval-grained:
+    //
+    //   data.slot * INTERVALS_PER_SLOT <= time + GOSSIP_DISPARITY_INTERVALS
+    //
+    // Block-included attestations skip the time check entirely.
+    //
+    // Scenario:
+    //   - Setup leaves the chain at slot 1, time = 5 (slot 1, interval 0).
+    //   - A slot-2 vote at time = 5: gossip rejects (10 > 5 + 1 = 6).
+    //   - Tick to time = 9 (slot 1, interval 4 — disparity boundary):
+    //     gossip accepts (10 <= 9 + 1 = 10).
+    //   - A slot-3 vote at time = 9: gossip rejects (15 > 9 + 1 = 10).
+    //   - Block-included path admits the slot-3 vote at every tick.
+
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -4203,13 +4258,12 @@ test "attestation validation - gossip vs block future slot handling" {
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
-    // Add one block (slot 1)
+    // Add one block (slot 1). Forkchoice ticks to time = INTERVALS_PER_SLOT (slot 1, interval 0).
     const block = mock_chain.blocks[1];
     try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
     const missing_roots = try beam_chain.onBlock(block, .{});
     allocator.free(missing_roots);
 
-    // Current time is at slot 1, create attestation for slot 2 (next slot)
     const next_slot_attestation: types.SignedAttestation = .{
         .validator_id = 0,
         .message = .{
@@ -4230,17 +4284,27 @@ test "attestation validation - gossip vs block future slot handling" {
         .signature = ZERO_SIGBYTES,
     };
 
-    // Gossip attestations: should FAIL for next slot (current + 1)
-    // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(next_slot_attestation.message, false));
+    // At time = 5 the gossip path rejects a slot-2 vote (3 intervals shy of boundary).
+    try std.testing.expectError(
+        error.AttestationTooFarInFuture,
+        beam_chain.validateAttestationData(next_slot_attestation.message, false),
+    );
 
-    // Block attestations: should PASS for next slot (current + 1)
-    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
+    // Block-included attestations skip the time check.
     try beam_chain.validateAttestationData(next_slot_attestation.message, true);
+
+    // Tick to the gossip disparity boundary: time = 2 * INTERVALS_PER_SLOT - GOSSIP_DISPARITY_INTERVALS = 9.
+    const boundary_time = 2 * constants.INTERVALS_PER_SLOT - constants.GOSSIP_DISPARITY_INTERVALS;
+    try beam_chain.forkChoice.onInterval(boundary_time, false);
+
+    // At the boundary the gossip path admits the same vote.
+    try beam_chain.validateAttestationData(next_slot_attestation.message, false);
+
+    // A slot-3 vote stays beyond the boundary on the gossip path but still admitted on the block path.
     const too_far_attestation: types.SignedAttestation = .{
         .validator_id = 0,
         .message = .{
-            .slot = 3, // Too far in future
+            .slot = 3,
             .head = types.Checkpoint{
                 .root = mock_chain.blockRoots[1],
                 .slot = 1,
@@ -4256,9 +4320,8 @@ test "attestation validation - gossip vs block future slot handling" {
         },
         .signature = ZERO_SIGBYTES,
     };
-    // Both should fail for slot 3 when current is slot 1
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, true));
+    try beam_chain.validateAttestationData(too_far_attestation.message, true);
 }
 
 // ----------------------------------------------------------------------
@@ -4986,15 +5049,6 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
 }
-
-// =====================================================================
-// Slice (a-2) primitive tests — these exercise BorrowedState and the
-// BlockCache helper against real BeamState / SignedBlock values produced
-// by `stf.genMockChain`. The corresponding API-level tests in
-// `pkgs/node/src/locking.zig` cover the FailingAllocator / OOM paths,
-// double-deinit, and tier-5 depth counter without needing a mock chain.
-// =====================================================================
-
 test "BorrowedState: cloneAndRelease success path against real BeamState" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();

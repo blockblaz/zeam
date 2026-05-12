@@ -318,7 +318,7 @@ jobs:
 
     - name: Generate LeanSpec fixtures
       working-directory: leanSpec
-      run: uv run fill --clean --fork=devnet -n auto
+      run: uv run fill --clean --fork=Lstar -n auto
     
     - name: Generate spec fixtures
       run: zig build spectest:generate --summary all
