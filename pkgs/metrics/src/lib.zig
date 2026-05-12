@@ -118,6 +118,9 @@ const Metrics = struct {
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
     // Fork-choice tick interval duration: actual elapsed time between forkchoice tickIntervalUnlocked calls
     zeam_fork_choice_tick_interval_duration_seconds: ForkChoiceTickIntervalDurationHistogram,
+    /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
+    /// plus `publishProducedAggregations` when the aggregator produces gossip aggregates.
+    zeam_node_aggregation_interval_tick_seconds: AggregationIntervalTickHistogram,
     // BeamNode mutex contention metrics (issue #786)
     // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
     // Hold time = how long the callsite kept the mutex locked.
@@ -302,6 +305,8 @@ const Metrics = struct {
     const CompactAttestationsTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 });
     const TickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
     const ForkChoiceTickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
+    /// Aggregation tick (interval-in-slot 2): spans sub-ms through multi-second stalls.
+    const AggregationIntervalTickHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
     const CompactAttestationsInputCounter = metrics_lib.Counter(u64);
     const CompactAttestationsOutputCounter = metrics_lib.Counter(u64);
     // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
@@ -503,6 +508,12 @@ fn observeForkChoiceTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeAggregationIntervalTick(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.AggregationIntervalTickHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observePendingBlocksDrainIters(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.PendingBlocksDrainItersHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -601,6 +612,10 @@ pub var zeam_fork_choice_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeForkChoiceTickIntervalDuration,
 };
+pub var zeam_node_aggregation_interval_tick_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeAggregationIntervalTick,
+};
 pub var lean_pending_blocks_drain_iters: Histogram = .{
     .context = null,
     .observe = &observePendingBlocksDrainIters,
@@ -693,6 +708,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("zeam_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
+        .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
         // BeamNode mutex contention metrics (issue #786)
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
         .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
@@ -752,6 +768,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
     lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
+    zeam_node_aggregation_interval_tick_seconds.context = @ptrCast(&metrics.zeam_node_aggregation_interval_tick_seconds);
     lean_pending_blocks_drain_iters.context = @ptrCast(&metrics.lean_pending_blocks_drain_iters);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);

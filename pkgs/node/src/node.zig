@@ -1732,6 +1732,8 @@ pub const BeamNode = struct {
             }
 
             if (interval_in_slot == 2) {
+                const agg_timer = zeam_metrics.zeam_node_aggregation_interval_tick_seconds.start();
+                defer _ = agg_timer.observe();
                 // Aggregation failure must not stall the interval cursor.
                 if (self.test_inject_aggregator_error_at_intervals.len > 0 and
                     std.mem.indexOfScalar(usize, self.test_inject_aggregator_error_at_intervals, interval) != null)
