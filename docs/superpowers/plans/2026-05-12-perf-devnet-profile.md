@@ -234,8 +234,9 @@ echo "target pid: $PID ($(ps -p "$PID" -o comm= 2>/dev/null || echo unknown))"
 
 mkdir -p "$OUT_DIR"
 
-# 2. Disk-space pre-check (perf.data can be 300-500 MB for 30 min @ 997 Hz)
-free_mb=$(df -BM "$OUT_DIR" 2>/dev/null | awk 'NR==2 {gsub("M",""); print $4}')
+# 2. Disk-space pre-check (perf.data can be 300-500 MB for 30 min @ 997 Hz).
+# `|| true` because macOS df returns exit 64 on `-BM` and would trip `set -e`.
+free_mb=$(df -BM "$OUT_DIR" 2>/dev/null | awk 'NR==2 {gsub("M",""); print $4}') || true
 if [[ -z "$free_mb" ]]; then
     # macOS df doesn't support -BM; fall back to -m
     free_mb=$(df -m "$OUT_DIR" | awk 'NR==2 {print $4}')
@@ -281,8 +282,15 @@ case "$SAMPLER" in
         fi
         ;;
     samply)
+        # samply attach mode: `--pid` cannot be combined with trailing `-- cmd`,
+        # and on macOS `-d` is ignored in attach mode (samply runs until SIGINT).
+        # We launch samply in background, then SIGINT it after $DURATION
+        # to trigger a clean shutdown that writes the output file.
         samply record --save-only --pid "$PID" \
-            -o "$OUT_DIR/samply.json" -- sleep "$DURATION"
+            -d "$DURATION" -o "$OUT_DIR/samply.json" &
+        SAMPLY_PID=$!
+        sleep "$DURATION" && kill -INT "$SAMPLY_PID" 2>/dev/null &
+        wait "$SAMPLY_PID" 2>/dev/null || true
         echo "samply.json: $(du -h "$OUT_DIR/samply.json" | cut -f1)"
         echo "view at: https://profiler.firefox.com/ (upload samply.json)"
         ;;
