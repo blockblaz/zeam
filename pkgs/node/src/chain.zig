@@ -1439,6 +1439,8 @@ pub const BeamChain = struct {
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize) !void {
+        const _probe = zeam_utils.slot_probe.Probe.begin("chain.onInterval", zeam_utils.slot_probe.INTERVAL_BUDGET_NS);
+        defer _probe.end();
         // see if the node has a proposal this slot to properly tick
         // forkchoice head
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
@@ -1535,6 +1537,8 @@ pub const BeamChain = struct {
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
+        const _probe = zeam_utils.slot_probe.Probe.begin("chain.produceBlock", zeam_utils.slot_probe.INTERVAL_BUDGET_NS);
+        defer _probe.end();
         // Block building total time timer
         const block_building_timer = zeam_metrics.lean_block_building_time_seconds.start();
         errdefer {
@@ -1873,6 +1877,8 @@ pub const BeamChain = struct {
         sender_peer_id: []const u8,
         precomputed_block_root: ?types.Root,
     ) !GossipProcessingResult {
+        const _probe = zeam_utils.slot_probe.Probe.begin("chain.onGossip", zeam_utils.slot_probe.INTERVAL_BUDGET_NS);
+        defer _probe.end();
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.block;
@@ -2197,6 +2203,8 @@ pub const BeamChain = struct {
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
+        const _probe = zeam_utils.slot_probe.Probe.begin("chain.onBlock", zeam_utils.slot_probe.INTERVAL_BUDGET_NS);
+        defer _probe.end();
         const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
 
         const block = signedBlock.block;
