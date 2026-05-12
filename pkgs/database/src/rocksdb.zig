@@ -532,6 +532,26 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             );
         }
 
+        /// Returns raw SSZ bytes for a block without deserialising.
+        /// Caller must free the returned slice with `allocator.free`.
+        pub fn loadBlockBytes(
+            self: *Self,
+            comptime cn: ColumnNamespace,
+            block_root: types.Root,
+            allocator: std.mem.Allocator,
+        ) ?[]u8 {
+            const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
+                self.logger.err("failed to format block key for loadBlockBytes: {any}", .{err});
+                return null;
+            };
+            defer self.allocator.free(key);
+
+            const maybe_data = self.get(cn, key) catch return null;
+            const data = maybe_data orelse return null;
+            defer data.deinit();
+            return allocator.dupe(u8, data.data) catch null;
+        }
+
         /// Save a state to the database
         pub fn saveState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) void {
             const key = interface.formatStateKey(self.allocator, &state_root) catch |err| {

@@ -345,6 +345,30 @@ pub const BeamChain = struct {
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
         try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
+
+        // Check whether the anchor block is already in the DB.
+        // NodeRunner.downloadAndStoreCheckpointBlock fetches the real block from the
+        // checkpoint provider before BeamChain.init is called, so the common path here
+        // is the non-null branch (block already present).
+        //
+        // Memory note: loadBlock returns an owned SignedBlock by value.  The non-null
+        // branch must call deinit to release the heap-allocated attestation lists;
+        // previously this branch dropped the value silently, leaking on every warm-start.
+        if (chain.db.loadBlock(database.DbBlocksNamespace, fork_choice.head.blockRoot)) |loaded| {
+            var owned = loaded;
+            owned.deinit();
+        } else {
+            // Anchor block not in DB.  NodeRunner tries to fetch it from the checkpoint
+            // provider during startup; if that fetch failed (provider doesn't expose
+            // /lean/v0/blocks/finalized, or timed out) we log and continue.
+            // blocks_by_root returns empty for this root until the real block arrives
+            // via reqresp or gossip from a peer.
+            logger_config.logger(.chain).warn(
+                "anchor block root=0x{x} slot={d} not in DB — blocks_by_root will return empty for this root until real block is received",
+                .{ &fork_choice.head.blockRoot, opts.anchorState.slot },
+            );
+        }
+
         return chain;
     }
 
@@ -2377,22 +2401,41 @@ pub const BeamChain = struct {
 
             // Each unique AttestationData must appear at most once per block.
             {
-                var att_data_set = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
-                defer att_data_set.deinit();
-                for (aggregated_attestations) |agg_att| {
-                    const result = try att_data_set.getOrPut(agg_att.data);
+                var att_data_map = std.AutoHashMap(types.AttestationData, usize).init(self.allocator);
+                defer att_data_map.deinit();
+                for (aggregated_attestations, 0..) |agg_att, idx| {
+                    const result = try att_data_map.getOrPut(agg_att.data);
                     if (result.found_existing) {
+                        const first_idx = result.value_ptr.*;
                         self.logger.err(
-                            "block contains duplicate AttestationData entries for block root=0x{x}",
-                            .{&freshFcBlock.blockRoot},
+                            "duplicate AttestationData rejected: blockroot=0x{x} slot={d} proposer={d}" ++
+                                " duplicate_indices=[{d},{d}] data.slot={d}" ++
+                                " data.head.blockroot=0x{x}@{d}" ++
+                                " data.target.checkpoint_root=0x{x}@{d}" ++
+                                " data.source.checkpoint_root=0x{x}@{d}",
+                            .{
+                                &freshFcBlock.blockRoot,
+                                block.slot,
+                                block.proposer_index,
+                                first_idx,
+                                idx,
+                                agg_att.data.slot,
+                                &agg_att.data.head.root,
+                                agg_att.data.head.slot,
+                                &agg_att.data.target.root,
+                                agg_att.data.target.slot,
+                                &agg_att.data.source.root,
+                                agg_att.data.source.slot,
+                            },
                         );
                         return BlockProcessingError.DuplicateAttestationData;
                     }
+                    result.value_ptr.* = idx;
                 }
-                if (att_data_set.count() > self.config.spec.max_attestations_data) {
+                if (att_data_map.count() > self.config.spec.max_attestations_data) {
                     self.logger.err(
                         "block contains {d} distinct AttestationData entries (max {d}) for block root=0x{x}",
-                        .{ att_data_set.count(), self.config.spec.max_attestations_data, &freshFcBlock.blockRoot },
+                        .{ att_data_map.count(), self.config.spec.max_attestations_data, &freshFcBlock.blockRoot },
                     );
                     return BlockProcessingError.TooManyAttestationData;
                 }
@@ -3234,8 +3277,15 @@ pub const BeamChain = struct {
                 return null;
             },
             .no_peers => {
-                self.logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
-                return null;
+                // Aggregate even with no peers: local fork-choice benefits from aggregated
+                // attestation weight, and aggregates will propagate once peers connect.
+                // Consistent with proposer and attester which also proceed through .no_peers.
+                //
+                // No double-counting: aggregate() maps per-AttestationData key, replacing
+                // raw attestations with their aggregate. Fork-choice counts each
+                // AttestationData key once regardless of whether the raw or aggregated
+                // form arrived first.
+                self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
                 self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
@@ -3439,6 +3489,13 @@ pub const BeamChain = struct {
             .tier5_held = true,
             .timer = t_ev,
         };
+    }
+
+    /// Load a block from the DB and return its raw SSZ bytes, or null if not found.
+    /// Uses `Db.loadBlockBytes` to avoid a deserialise+reserialise round-trip.
+    /// Caller must free the returned slice with `allocator.free`.
+    pub fn loadBlockSsz(self: *Self, root: types.Root, allocator: Allocator) ?[]u8 {
+        return self.db.loadBlockBytes(database.DbBlocksNamespace, root, allocator);
     }
 
     /// Get the latest justified checkpoint.
