@@ -871,8 +871,6 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn acceptNewAttestationsUnlocked(self: *Self) !ProtoBlock {
-        const _probe = zeam_utils.slot_probe.Probe.begin("fc.acceptNewAttestations", zeam_utils.slot_probe.HALF_INTERVAL_BUDGET_NS);
-        defer _probe.end();
         // Capture counts outside lock scope for metrics update
         var known_payloads_count: usize = 0;
         var new_payloads_count: usize = 0;
@@ -1442,8 +1440,6 @@ pub const ForkChoice = struct {
     /// Extends aggregation with child proofs from new/known payloads
     /// via two-pass greedy selection. Replaces new_payloads with fresh results.
     fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
-        const _probe = zeam_utils.slot_probe.Probe.begin("fc.aggregate", zeam_utils.slot_probe.INTERVAL_BUDGET_NS);
-        defer _probe.end();
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
         const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
         defer _ = agg_timer.observe();

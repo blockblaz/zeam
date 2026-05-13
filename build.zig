@@ -157,8 +157,6 @@ pub fn build(b: *Builder) !void {
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
     // Absolute path to test-keys for pre-generated validator keys
     build_options.addOption([]const u8, "test_keys_path", b.pathFromRoot("test-keys/hash-sig-keys"));
-    const enable_slot_probes = b.option(bool, "slot-probes", "Enable in-process slot-budget probes in chain.zig and forkchoice.zig (default: false)") orelse false;
-    build_options.addOption(bool, "slot_probes", enable_slot_probes);
     const build_options_module = build_options.createModule();
 
     // add zeam-utils
