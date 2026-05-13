@@ -2448,7 +2448,7 @@ pub const BeamChain = struct {
                 var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
                 defer participant_indices.deinit(self.allocator);
 
-                if (validator_indices.items.len != participant_indices.items.len) {
+                if (validator_indices.items.len != participant_indices.items.len or !std.mem.eql(usize, validator_indices.items, participant_indices.items)) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.logger.err(
                         "attestation signature mismatch index={d} validators={d} participants={d}",

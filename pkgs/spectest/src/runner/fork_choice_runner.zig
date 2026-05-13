@@ -781,18 +781,16 @@ fn processBlockStep(
         };
         defer proof_template.deinit();
 
-        const bits_len = aggregated_attestation.aggregation_bits.len();
-        for (0..bits_len) |i| {
-            if (aggregated_attestation.aggregation_bits.get(i) catch false) {
-                types.aggregationBitsSet(&proof_template.participants, i, true) catch |err| {
-                    std.debug.print(
-                        "fixture {s} case {s}{f}: failed to set aggregation bit ({s})\n",
-                        .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-                    );
-                    return FixtureError.InvalidFixture;
-                };
-            }
-        }
+        var cloned_bits: types.AggregationBits = undefined;
+        types.sszClone(ctx.allocator, types.AggregationBits, aggregated_attestation.aggregation_bits, &cloned_bits) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to clone aggregation bits ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        proof_template.participants.deinit();
+        proof_template.participants = cloned_bits;
 
         var validator_ids = ctx.allocator.alloc(types.ValidatorIndex, indices.items.len) catch |err| {
             std.debug.print(
@@ -1045,19 +1043,17 @@ fn processGossipAggregatedAttestationStep(
     };
     defer proof.deinit();
 
-    // Copy participant bits into proof.
-    const bits_len = aggregation_bits.len();
-    for (0..bits_len) |i| {
-        if (aggregation_bits.get(i) catch false) {
-            types.aggregationBitsSet(&proof.participants, i, true) catch |err| {
-                std.debug.print(
-                    "fixture {s} case {s}{f}: failed to set aggregation bit ({s})\n",
-                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-                );
-                return FixtureError.InvalidFixture;
-            };
-        }
-    }
+    // Clone participant bits into proof.
+    var cloned_bits: types.AggregationBits = undefined;
+    types.sszClone(ctx.allocator, types.AggregationBits, aggregation_bits, &cloned_bits) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to clone aggregation bits ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    proof.participants.deinit();
+    proof.participants = cloned_bits;
 
     ctx.fork_choice.storeAggregatedPayload(&attestation_data, proof, false) catch |err| {
         std.debug.print(

@@ -307,13 +307,9 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             errdefer proof.deinit();
 
             // Clone participants for the attestation entry
-            var att_bits = try types.AggregationBits.init(allocator);
+            var att_bits: types.AggregationBits = undefined;
+            try types.sszClone(allocator, types.AggregationBits, proof.participants, &att_bits);
             errdefer att_bits.deinit();
-            for (0..proof.participants.len()) |i| {
-                if (proof.participants.get(i) catch false) {
-                    try types.aggregationBitsSet(&att_bits, i, true);
-                }
-            }
 
             try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
             try agg_signatures.append(proof);

@@ -1071,12 +1071,12 @@ pub const ForkChoice = struct {
                     try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
                     errdefer cloned_proof.deinit();
 
-                    var att_bits = try types.AggregationBits.init(self.allocator);
+                    var att_bits: types.AggregationBits = undefined;
+                    try types.sszClone(self.allocator, types.AggregationBits, cloned_proof.participants, &att_bits);
                     errdefer att_bits.deinit();
 
                     for (0..cloned_proof.participants.len()) |i| {
                         if (cloned_proof.participants.get(i) catch false) {
-                            try types.aggregationBitsSet(&att_bits, i, true);
                             if (i >= covered.capacity()) {
                                 try covered.resize(i + 1, false);
                             }
@@ -1117,13 +1117,9 @@ pub const ForkChoice = struct {
             }
 
             for (agg_attestations.constSlice()) |agg_att| {
-                var cloned_bits = try types.AggregationBits.init(self.allocator);
+                var cloned_bits: types.AggregationBits = undefined;
+                try types.sszClone(self.allocator, types.AggregationBits, agg_att.aggregation_bits, &cloned_bits);
                 errdefer cloned_bits.deinit();
-                for (0..agg_att.aggregation_bits.len()) |i| {
-                    if (agg_att.aggregation_bits.get(i) catch false) {
-                        try types.aggregationBitsSet(&cloned_bits, i, true);
-                    }
-                }
                 try candidate_atts.append(.{ .aggregation_bits = cloned_bits, .data = agg_att.data });
             }
 
