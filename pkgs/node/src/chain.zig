@@ -2302,6 +2302,16 @@ pub const BeamChain = struct {
             &finalized.root,
         });
 
+        if (slot > 0) {
+            if (self.forkChoice.formatAggregationCoverageReport(self.allocator, slot - 1) catch |err| blk: {
+                self.logger.warn("failed to format attestation aggregate coverage for slot={d}: {any}", .{ slot - 1, err });
+                break :blk null;
+            }) |coverage_report| {
+                defer self.allocator.free(coverage_report);
+                self.logger.info("{s}", .{coverage_report});
+            }
+        }
+
         // Build tree visualization (thread-safe snapshot)
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();

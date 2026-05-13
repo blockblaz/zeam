@@ -318,6 +318,10 @@ pub const ForkChoice = struct {
     // Aggregated signature proofs that are known and contribute to fork choice weights.
     // Used for recursive signature aggregation when building blocks.
     latest_known_aggregated_payloads: AggregatedPayloadsMap,
+    // Aggregated signature proofs observed in the most recently processed block slot.
+    // This is observability-only; fork choice uses latest_known_aggregated_payloads.
+    latest_block_aggregated_payloads: AggregatedPayloadsMap,
+    latest_block_aggregated_payloads_slot: ?types.Slot,
     // Mutex to protect concurrent access to signature/payload maps
     signatures_mutex: zeam_utils.SyncMutex,
     // Tracks whether FC has observed a real justified checkpoint via block processing.
@@ -379,6 +383,7 @@ pub const ForkChoice = struct {
         const attestation_signatures = SignaturesMap.init(allocator);
         const latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator);
         const latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator);
+        const latest_block_aggregated_payloads = AggregatedPayloadsMap.init(allocator);
 
         var fc = Self{
             .allocator = allocator,
@@ -395,6 +400,8 @@ pub const ForkChoice = struct {
             .attestation_signatures = attestation_signatures,
             .latest_new_aggregated_payloads = latest_new_aggregated_payloads,
             .latest_known_aggregated_payloads = latest_known_aggregated_payloads,
+            .latest_block_aggregated_payloads = latest_block_aggregated_payloads,
+            .latest_block_aggregated_payloads_slot = null,
             .signatures_mutex = .{},
             // Genesis (slot == 0) is immediately ready; checkpoint-sync / DB-restore anchors
             // (slot > 0) start in `initing` and become `ready` once the first real justified
@@ -491,24 +498,9 @@ pub const ForkChoice = struct {
         defer self.signatures_mutex.unlock();
         self.attestation_signatures.deinit();
 
-        // Deinit each list in the aggregated payloads maps
-        var it_known = self.latest_known_aggregated_payloads.iterator();
-        while (it_known.next()) |entry| {
-            for (entry.value_ptr.items) |*stored| {
-                stored.proof.deinit();
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.latest_known_aggregated_payloads.deinit();
-
-        var it_new = self.latest_new_aggregated_payloads.iterator();
-        while (it_new.next()) |entry| {
-            for (entry.value_ptr.items) |*stored| {
-                stored.proof.deinit();
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.latest_new_aggregated_payloads.deinit();
+        deinitAggregatedPayloadsMap(self.allocator, &self.latest_known_aggregated_payloads);
+        deinitAggregatedPayloadsMap(self.allocator, &self.latest_new_aggregated_payloads);
+        deinitAggregatedPayloadsMap(self.allocator, &self.latest_block_aggregated_payloads);
     }
 
     fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
@@ -1452,7 +1444,103 @@ pub const ForkChoice = struct {
                 .slot = attestation_data.slot,
                 .proof = cloned_proof,
             });
+
+            if (is_from_block) {
+                if (self.latest_block_aggregated_payloads_slot == null or self.latest_block_aggregated_payloads_slot.? != attestation_data.slot) {
+                    deinitAggregatedPayloadsMap(self.allocator, &self.latest_block_aggregated_payloads);
+                    self.latest_block_aggregated_payloads = AggregatedPayloadsMap.init(self.allocator);
+                    self.latest_block_aggregated_payloads_slot = attestation_data.slot;
+                }
+
+                var block_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &block_proof);
+                errdefer block_proof.deinit();
+
+                const block_gop = try self.latest_block_aggregated_payloads.getOrPut(attestation_data.*);
+                if (!block_gop.found_existing) {
+                    block_gop.value_ptr.* = .empty;
+                }
+                try block_gop.value_ptr.append(self.allocator, .{
+                    .slot = attestation_data.slot,
+                    .proof = block_proof,
+                });
+            }
         }
+    }
+
+    pub fn formatAggregationCoverageReport(self: *Self, allocator: Allocator, slot: types.Slot) !?[]u8 {
+        const validator_count: usize = @intCast(self.config.genesis.numValidators());
+        if (validator_count == 0) return null;
+
+        const committee_count_u32 = self.config.spec.attestation_committee_count;
+        if (committee_count_u32 == 0) return null;
+        const committee_count: usize = @intCast(committee_count_u32);
+
+        const new_seen = try allocator.alloc(bool, validator_count);
+        defer allocator.free(new_seen);
+        const block_seen = try allocator.alloc(bool, validator_count);
+        defer allocator.free(block_seen);
+        const combined_seen = try allocator.alloc(bool, validator_count);
+        defer allocator.free(combined_seen);
+        @memset(new_seen, false);
+        @memset(block_seen, false);
+        @memset(combined_seen, false);
+
+        const new_has_subnet = try allocator.alloc(bool, committee_count);
+        defer allocator.free(new_has_subnet);
+        const block_has_subnet = try allocator.alloc(bool, committee_count);
+        defer allocator.free(block_has_subnet);
+        const combined_has_subnet = try allocator.alloc(bool, committee_count);
+        defer allocator.free(combined_has_subnet);
+        @memset(new_has_subnet, false);
+        @memset(block_has_subnet, false);
+        @memset(combined_has_subnet, false);
+
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
+        collectCoverageFromPayloads(
+            &self.latest_new_aggregated_payloads,
+            slot,
+            committee_count_u32,
+            new_seen,
+            combined_seen,
+            new_has_subnet,
+            combined_has_subnet,
+        );
+        collectCoverageFromPayloads(
+            &self.latest_block_aggregated_payloads,
+            slot,
+            committee_count_u32,
+            block_seen,
+            combined_seen,
+            block_has_subnet,
+            combined_has_subnet,
+        );
+
+        var has_any = false;
+        for (combined_has_subnet) |has_subnet| {
+            if (has_subnet) {
+                has_any = true;
+                break;
+            }
+        }
+        if (!has_any) return null;
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "attestation aggregate coverage: ");
+        try appendCoverageSection(allocator, &out, "new", new_seen, new_has_subnet, validator_count, committee_count_u32);
+        try out.appendSlice(allocator, " | ");
+        try appendCoverageSection(allocator, &out, "block", block_seen, block_has_subnet, validator_count, committee_count_u32);
+        try out.appendSlice(allocator, " | ");
+        try appendCoverageSection(allocator, &out, "combined", combined_seen, combined_has_subnet, validator_count, committee_count_u32);
+
+        const network_covered = countSeen(combined_seen);
+        const network_pct = coveragePct(network_covered, validator_count);
+        try appendFmt(allocator, &out, " | network={d}/{d}({d:.2}%)", .{ network_covered, validator_count, network_pct });
+
+        return try out.toOwnedSlice(allocator);
     }
 
     /// Aggregate attestation signatures using recursive child proofs.
@@ -2433,6 +2521,8 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads_slot = null,
         .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
         .last_node_tick_time_ms = null,
@@ -2442,6 +2532,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     defer fork_choice.attestation_signatures.deinit();
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_block_aggregated_payloads);
 
     // ========================================
     // TEST getCanonicalAncestorAtDepth
@@ -2723,6 +2814,105 @@ fn deinitAggregatedPayloadsMap(allocator: Allocator, map: *AggregatedPayloadsMap
     map.deinit();
 }
 
+fn collectCoverageFromPayloads(
+    map: *AggregatedPayloadsMap,
+    slot: types.Slot,
+    committee_count: types.SubnetId,
+    seen: []bool,
+    combined_seen: []bool,
+    has_subnet: []bool,
+    combined_has_subnet: []bool,
+) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.slot != slot) continue;
+        for (entry.value_ptr.items) |*stored| {
+            if (stored.slot != slot) continue;
+            for (0..stored.proof.participants.len()) |validator_index| {
+                if (validator_index >= seen.len) continue;
+                if (!(stored.proof.participants.get(validator_index) catch false)) continue;
+
+                const subnet_id = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+                const subnet_index: usize = @intCast(subnet_id);
+                if (subnet_index >= has_subnet.len) continue;
+
+                seen[validator_index] = true;
+                combined_seen[validator_index] = true;
+                has_subnet[subnet_index] = true;
+                combined_has_subnet[subnet_index] = true;
+            }
+        }
+    }
+}
+
+fn appendCoverageSection(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    label: []const u8,
+    seen: []const bool,
+    has_subnet: []const bool,
+    validator_count: usize,
+    committee_count: types.SubnetId,
+) !void {
+    try appendFmt(allocator, out, "{s}=", .{label});
+
+    var wrote_any = false;
+    for (has_subnet, 0..) |has, subnet_index| {
+        if (!has) continue;
+        if (wrote_any) try out.appendSlice(allocator, ",");
+
+        const coverage = countSubnetSeen(seen, @intCast(subnet_index), committee_count);
+        const total = countSubnetValidators(validator_count, @intCast(subnet_index), committee_count);
+        try appendFmt(allocator, out, "subnet{d}={d}/{d}({d:.2}%)", .{
+            subnet_index,
+            coverage,
+            total,
+            coveragePct(coverage, total),
+        });
+        wrote_any = true;
+    }
+
+    if (!wrote_any) try out.appendSlice(allocator, "none");
+}
+
+fn appendFmt(allocator: Allocator, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn countSeen(seen: []const bool) usize {
+    var count: usize = 0;
+    for (seen) |is_seen| {
+        if (is_seen) count += 1;
+    }
+    return count;
+}
+
+fn countSubnetSeen(seen: []const bool, subnet_id: types.SubnetId, committee_count: types.SubnetId) usize {
+    var count: usize = 0;
+    for (seen, 0..) |is_seen, validator_index| {
+        if (!is_seen) continue;
+        const validator_subnet = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+        if (validator_subnet == subnet_id) count += 1;
+    }
+    return count;
+}
+
+fn countSubnetValidators(validator_count: usize, subnet_id: types.SubnetId, committee_count: types.SubnetId) usize {
+    var count: usize = 0;
+    for (0..validator_count) |validator_index| {
+        const validator_subnet = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+        if (validator_subnet == subnet_id) count += 1;
+    }
+    return count;
+}
+
+fn coveragePct(covered: usize, total: usize) f64 {
+    if (total == 0) return 0;
+    return (@as(f64, @floatFromInt(covered)) * 100.0) / @as(f64, @floatFromInt(total));
+}
+
 // Helper to build the comprehensive test tree with 9 nodes (A-I)
 // Returns ForkChoice and spec_name. Caller must manage mock_chain lifecycle separately.
 //
@@ -2788,6 +2978,8 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads_slot = null,
         .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
         .last_node_tick_time_ms = null,
@@ -2826,8 +3018,9 @@ const RebaseTestContext = struct {
         errdefer test_data.fork_choice.attestations.deinit();
         errdefer test_data.fork_choice.deltas.deinit(test_data.fork_choice.allocator);
         errdefer test_data.fork_choice.attestation_signatures.deinit();
-        errdefer test_data.fork_choice.latest_known_aggregated_payloads.deinit();
-        errdefer test_data.fork_choice.latest_new_aggregated_payloads.deinit();
+        errdefer deinitAggregatedPayloadsMap(allocator, &test_data.fork_choice.latest_known_aggregated_payloads);
+        errdefer deinitAggregatedPayloadsMap(allocator, &test_data.fork_choice.latest_new_aggregated_payloads);
+        errdefer deinitAggregatedPayloadsMap(allocator, &test_data.fork_choice.latest_block_aggregated_payloads);
 
         return .{
             .mock_chain = mock_chain,
@@ -2845,24 +3038,9 @@ const RebaseTestContext = struct {
         self.fork_choice.attestations.deinit();
         self.fork_choice.deltas.deinit(self.allocator);
         self.fork_choice.attestation_signatures.deinit();
-        // Deinit each list in latest_known_aggregated_payloads
-        var it_known = self.fork_choice.latest_known_aggregated_payloads.iterator();
-        while (it_known.next()) |entry| {
-            for (entry.value_ptr.items) |*stored| {
-                stored.proof.deinit();
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.fork_choice.latest_known_aggregated_payloads.deinit();
-        // Deinit each list in latest_new_aggregated_payloads
-        var it_new = self.fork_choice.latest_new_aggregated_payloads.iterator();
-        while (it_new.next()) |entry| {
-            for (entry.value_ptr.items) |*stored| {
-                stored.proof.deinit();
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.fork_choice.latest_new_aggregated_payloads.deinit();
+        deinitAggregatedPayloadsMap(self.allocator, &self.fork_choice.latest_known_aggregated_payloads);
+        deinitAggregatedPayloadsMap(self.allocator, &self.fork_choice.latest_new_aggregated_payloads);
+        deinitAggregatedPayloadsMap(self.allocator, &self.fork_choice.latest_block_aggregated_payloads);
         self.allocator.free(self.spec_name);
         self.allocator.free(self.fork_digest);
 
@@ -3774,6 +3952,8 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads_slot = null,
         .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
         .last_node_tick_time_ms = null,
@@ -3785,6 +3965,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     defer fork_choice.attestation_signatures.deinit();
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_block_aggregated_payloads);
 
     // Setup attestations for all validators
     // Distribute across C and D
