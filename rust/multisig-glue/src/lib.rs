@@ -1,4 +1,5 @@
 use leansig_wrapper::{XmssPublicKey, XmssSignature};
+use rayon::prelude::*;
 use rec_aggregation::{
     init_aggregation_bytecode, xmss_aggregate as rec_xmss_aggregate, xmss_verify_aggregation,
     AggregatedXMSS,
@@ -237,6 +238,110 @@ pub unsafe extern "C" fn xmss_verify_aggregated(
     }
 
     xmss_verify_aggregation(pub_keys, &agg_sig, message_hash, slot).is_ok()
+}
+
+/// Verify multiple aggregated signatures on the configured rayon pool.
+/// Returns true only if every task is valid.
+///
+/// # Safety
+/// - `public_key_offsets` and `public_key_counts` must contain `num_tasks` elements.
+/// - `public_keys` must contain all task public-key pointers flattened together.
+/// - `message_hashes` must contain `num_tasks * 32` bytes.
+/// - `agg_sig_ptrs`, `agg_sig_lens`, and `slots` must contain `num_tasks` elements.
+#[no_mangle]
+pub unsafe extern "C" fn xmss_verify_aggregated_batch(
+    public_key_offsets: *const usize,
+    public_key_counts: *const usize,
+    num_tasks: usize,
+    public_keys: *const *const PublicKey,
+    message_hashes: *const u8,
+    agg_sig_ptrs: *const *const u8,
+    agg_sig_lens: *const usize,
+    slots: *const u32,
+) -> bool {
+    if num_tasks == 0 {
+        return true;
+    }
+    if public_key_offsets.is_null()
+        || public_key_counts.is_null()
+        || public_keys.is_null()
+        || message_hashes.is_null()
+        || agg_sig_ptrs.is_null()
+        || agg_sig_lens.is_null()
+        || slots.is_null()
+    {
+        return false;
+    }
+
+    let offsets = slice::from_raw_parts(public_key_offsets, num_tasks);
+    let counts = slice::from_raw_parts(public_key_counts, num_tasks);
+    let total_keys = match offsets
+        .iter()
+        .zip(counts.iter())
+        .map(|(offset, count)| offset.checked_add(*count))
+        .collect::<Option<Vec<usize>>>()
+    {
+        Some(ends) => ends.into_iter().max().unwrap_or(0),
+        None => return false,
+    };
+    let key_ptrs = slice::from_raw_parts(public_keys, total_keys);
+    let hashes = slice::from_raw_parts(message_hashes, num_tasks * 32);
+    let sig_ptrs = slice::from_raw_parts(agg_sig_ptrs, num_tasks);
+    let sig_lens = slice::from_raw_parts(agg_sig_lens, num_tasks);
+    let task_slots = slice::from_raw_parts(slots, num_tasks);
+
+    struct VerifyTask {
+        public_keys: Vec<usize>,
+        message_hash: [u8; 32],
+        sig_ptr: usize,
+        sig_len: usize,
+        slot: u32,
+    }
+
+    let mut tasks: Vec<VerifyTask> = Vec::with_capacity(num_tasks);
+    for i in 0..num_tasks {
+        let start = offsets[i];
+        let end = match start.checked_add(counts[i]) {
+            Some(end) if end <= key_ptrs.len() => end,
+            _ => return false,
+        };
+        let message_hash: [u8; 32] = match hashes[i * 32..(i + 1) * 32].try_into() {
+            Ok(hash) => hash,
+            Err(_) => return false,
+        };
+        if sig_ptrs[i].is_null() || sig_lens[i] == 0 {
+            return false;
+        }
+        tasks.push(VerifyTask {
+            public_keys: key_ptrs[start..end]
+                .iter()
+                .map(|ptr| *ptr as usize)
+                .collect(),
+            message_hash,
+            sig_ptr: sig_ptrs[i] as usize,
+            sig_len: sig_lens[i],
+            slot: task_slots[i],
+        });
+    }
+
+    tasks.par_iter().all(|task| {
+        let sig_bytes = slice::from_raw_parts(task.sig_ptr as *const u8, task.sig_len);
+        let agg_sig = match AggregatedXMSS::deserialize(sig_bytes) {
+            Some(sig) => sig,
+            None => return false,
+        };
+
+        let mut pub_keys: Vec<XmssPublicKey> = Vec::with_capacity(task.public_keys.len());
+        for &pk_ptr in &task.public_keys {
+            let pk_ptr = pk_ptr as *const PublicKey;
+            if pk_ptr.is_null() {
+                return false;
+            }
+            pub_keys.push((*pk_ptr).inner.clone());
+        }
+
+        xmss_verify_aggregation(pub_keys, &agg_sig, &task.message_hash, task.slot).is_ok()
+    })
 }
 
 /// Serialize an AggregatedXMSS to bytes (postcard + lz4).

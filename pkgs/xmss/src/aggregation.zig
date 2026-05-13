@@ -49,6 +49,17 @@ extern fn xmss_verify_aggregated(
     slot: u32,
 ) callconv(.c) bool;
 
+extern fn xmss_verify_aggregated_batch(
+    public_key_offsets: [*]const usize,
+    public_key_counts: [*]const usize,
+    num_tasks: usize,
+    public_keys: [*]const *const hashsig.HashSigPublicKey,
+    message_hashes: [*]const u8,
+    agg_sig_ptrs: [*]const [*]const u8,
+    agg_sig_lens: [*]const usize,
+    slots: [*]const u32,
+) callconv(.c) bool;
+
 extern fn xmss_free_aggregate_signature(agg_sig: *AggregatedXMSS) callconv(.c) void;
 
 // Serialization FFI functions
@@ -197,6 +208,64 @@ pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, m
         epoch,
     );
 
+    if (!result) return AggregationError.InvalidAggregateSignature;
+}
+
+pub const AggregatedPayloadVerifyBatch = struct {
+    public_keys: []*const hashsig.HashSigPublicKey,
+    message_hash: [32]u8,
+    epoch: u32,
+    agg_sig: *const ByteListMiB,
+};
+
+pub fn verifyAggregatedPayloadBatch(allocator: std.mem.Allocator, tasks: []const AggregatedPayloadVerifyBatch) !void {
+    if (tasks.len == 0) return;
+
+    try setupVerifier();
+
+    var total_keys: usize = 0;
+    for (tasks) |task| total_keys += task.public_keys.len;
+
+    const offsets = try allocator.alloc(usize, tasks.len);
+    defer allocator.free(offsets);
+    const counts = try allocator.alloc(usize, tasks.len);
+    defer allocator.free(counts);
+    const all_public_keys = try allocator.alloc(*const hashsig.HashSigPublicKey, total_keys);
+    defer allocator.free(all_public_keys);
+    const message_hashes = try allocator.alloc(u8, tasks.len * 32);
+    defer allocator.free(message_hashes);
+    const sig_ptrs = try allocator.alloc([*]const u8, tasks.len);
+    defer allocator.free(sig_ptrs);
+    const sig_lens = try allocator.alloc(usize, tasks.len);
+    defer allocator.free(sig_lens);
+    const slots = try allocator.alloc(u32, tasks.len);
+    defer allocator.free(slots);
+
+    var key_offset: usize = 0;
+    for (tasks, 0..) |task, i| {
+        offsets[i] = key_offset;
+        counts[i] = task.public_keys.len;
+        for (task.public_keys, 0..) |public_key, j| {
+            all_public_keys[key_offset + j] = public_key;
+        }
+        key_offset += task.public_keys.len;
+        @memcpy(message_hashes[i * 32 .. (i + 1) * 32], &task.message_hash);
+        const sig_bytes = task.agg_sig.constSlice();
+        sig_ptrs[i] = sig_bytes.ptr;
+        sig_lens[i] = sig_bytes.len;
+        slots[i] = task.epoch;
+    }
+
+    const result = xmss_verify_aggregated_batch(
+        offsets.ptr,
+        counts.ptr,
+        tasks.len,
+        all_public_keys.ptr,
+        message_hashes.ptr,
+        sig_ptrs.ptr,
+        sig_lens.ptr,
+        slots.ptr,
+    );
     if (!result) return AggregationError.InvalidAggregateSignature;
 }
 

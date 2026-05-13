@@ -10,6 +10,8 @@ pub const setupProver = aggregate.setupProver;
 pub const setupVerifier = aggregate.setupVerifier;
 pub const aggregateSignatures = aggregate.aggregateSignatures;
 pub const verifyAggregatedPayload = aggregate.verifyAggregatedPayload;
+pub const verifyAggregatedPayloadBatch = aggregate.verifyAggregatedPayloadBatch;
+pub const AggregatedPayloadVerifyBatch = aggregate.AggregatedPayloadVerifyBatch;
 pub const aggregate_module = aggregate;
 
 const hashsig = @import("hashsig.zig");
