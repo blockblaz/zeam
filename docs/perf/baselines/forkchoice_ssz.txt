@@ -1,8 +1,0 @@
-benchmark          runs     total time     time/run (avg ± σ)    (min ... max)                p75        p99        p995      
--------------------------------------------------------------------------------------------------------------------------------
-fc_onBlock         50       3.614ms        72.296us ± 25.594us   (29us ... 202.042us)         77.291us   202.042us  202.042us  
-fc_onAttestation   500      52.864ms       105.728us ± 202.453us (69.459us ... 4.513ms)       94.833us   345.916us  468.25us   
-ssz_block_encode   1000     34.209ms       34.209us ± 12.47us    (23us ... 206.709us)         36.958us   86.708us   115.792us  
-ssz_block_decode   1000     1.391ms        1.391us ± 462ns       (1.291us ... 15.958us)       1.375us    1.459us    1.459us    
-ssz_state_encode   200      5.29ms         26.452us ± 12.865us   (16.042us ... 109.417us)     26.833us   85.458us   109.417us  
-ssz_state_decode   200      2.036ms        10.182us ± 8.213us    (7.791us ... 103.709us)      9.083us    57.583us   103.709us  

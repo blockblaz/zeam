@@ -1,9 +1,8 @@
 # Performance — bench + profile
 
-Bench targets live in `bench/`. Profile artifacts (gitignored except `notes.md`)
-land here under `profiles/`. Committed baselines live under `baselines/`.
-
-See `docs/superpowers/specs/2026-05-12-perf-profile-bench-design.md` for design.
+Bench targets live in `bench/`. Profile artifacts (`.samply.json`,
+`.perf.data`, `.svg`) are gitignored globally — keep them locally or
+ship them to object storage; don't commit.
 
 ## Running benches
 
@@ -12,31 +11,34 @@ zig build bench                   # all targets (smoke + xmss + stf + aggregatio
 zig build bench-xmss              # single target
 ```
 
-## Profiling
+To track regressions, keep your previous run's output around and compare:
+
+```sh
+zig build bench-aggregation 2>/dev/null > /tmp/agg-before.txt
+# ... make changes ...
+zig build bench-aggregation 2>/dev/null > /tmp/agg-after.txt
+diff /tmp/agg-before.txt /tmp/agg-after.txt
+```
+
+There is no committed baseline file and no automated regression gate (by
+design — bench numbers are machine-specific and would noise-diff on every
+PR). Headline numbers worth preserving belong in PR descriptions or
+commit messages.
+
+## Profiling a bench binary
 
 ```sh
 scripts/profile.sh xmss           # samply (macOS) / perf (linux)
 ```
 
-Open `docs/perf/profiles/<target>.samply.json` in Firefox Profiler
-(`https://profiler.firefox.com/`) or view the perf SVG in a browser.
+Output goes to a local `docs/perf/profiles/<name>.samply.json` (or
+`.perf.data` + `.svg` on Linux). Open the JSON at
+<https://profiler.firefox.com/> or view the SVG in a browser.
 
 Required tools:
 - **macOS:** `cargo install samply` (one-time).
 - **Linux:** `perf` (linux-tools package). For flamegraph SVG output:
   `git clone https://github.com/brendangregg/FlameGraph` and add the scripts to PATH.
-
-## Refreshing a baseline
-
-```sh
-zig build bench-<name> 2>/dev/null > docs/perf/baselines/<name>.txt
-git diff docs/perf/baselines/<name>.txt    # eyeball the change
-git add docs/perf/baselines/<name>.txt
-git commit -m "bench: refresh <name> baseline (<reason>)"
-```
-
-The git diff is the regression detector. There is no automated regression gate
-(by design — see spec § Non-goals).
 
 ## Production profiling — continuous low-rate capture
 

@@ -1,4 +1,0 @@
-# Profile artifacts are local-only; only notes.md is tracked.
-*.samply.json
-*.perf.data
-*.svg
