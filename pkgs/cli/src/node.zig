@@ -406,6 +406,14 @@ pub const Node = struct {
         });
         errdefer self.thread_pool.deinit();
 
+        // Limit the rayon thread pool used by the XMSS aggregate prover so that
+        // it doesn’t consume all CPU cores. Reserve 3 threads for libxev,
+        // the chain worker, and the rust-libp2p network thread (issue #873).
+        // Must be called before setupProver/setupVerifier since rayon’s global
+        // pool is initialized lazily on first use.
+        const rayon_threads = cpu_count -| 3; // saturating sub — 0 means rayon default
+        xmss.setRayonThreads(if (rayon_threads > 0) rayon_threads else 1);
+
         // Pre-warm the XMSS verifier on the main thread before any worker can
         // call `verifyAggregatedPayload`. The Rust-side verifier setup is
         // documented as idempotent but is not hardened against first-time-init

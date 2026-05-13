@@ -18,6 +18,10 @@ pub const AggregatedXMSS = opaque {};
 extern fn xmss_setup_prover() callconv(.c) c_int;
 /// Returns 0 on success, -1 on failure.
 extern fn xmss_setup_verifier() callconv(.c) c_int;
+/// Configure the global rayon thread pool. Must be called before xmss_setup_prover.
+/// num_threads=0 means use rayon default (one per logical CPU).
+/// Returns 0 always (errors from an already-initialized pool are silently ignored).
+extern fn xmss_set_rayon_threads(num_threads: usize) callconv(.c) c_int;
 
 extern fn xmss_aggregate(
     // Raw XMSS signatures
@@ -58,6 +62,16 @@ extern fn xmss_aggregate_signature_from_bytes(
     bytes: [*]const u8,
     bytes_len: usize,
 ) callconv(.c) ?*AggregatedXMSS;
+
+/// Configure the global rayon thread pool used by the XMSS aggregate prover.
+/// Must be called before `setupProver` and before any aggregation work begins.
+/// `num_threads = 0` means "use rayon's default" (one thread per logical CPU).
+/// Typical usage: pass `cpu_count - 3` to reserve cores for libxev, the chain
+/// worker, and the rust-libp2p network thread (see issue #873).
+/// Silently no-ops if the pool is already initialized.
+pub fn setRayonThreads(num_threads: usize) void {
+    _ = xmss_set_rayon_threads(num_threads);
+}
 
 /// Initialize the XMSS prover (idempotent — only runs once).
 /// Returns error.ProverSetupFailed when the prover bytecode file is missing or the

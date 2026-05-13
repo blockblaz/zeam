@@ -302,3 +302,27 @@ pub unsafe extern "C" fn xmss_free_aggregate_signature(agg_sig: *mut AggregatedX
         drop(Box::from_raw(agg_sig));
     }
 }
+
+/// Configure the global rayon thread pool used by the XMSS aggregate prover.
+///
+/// Must be called **before** `xmss_setup_prover` and before any aggregation work
+/// begins. The rayon global pool can only be configured once; subsequent calls
+/// are silently ignored (rayon returns `ThreadPoolBuildError` which we discard).
+///
+/// `num_threads = 0` means "use rayon's default" (one thread per logical CPU).
+/// Typical caller: set to `cpu_count - 3` to reserve cores for libxev, the
+/// chain worker, and the rust-libp2p network thread (issue #873 comment).
+///
+/// Returns 0 on success or if the pool was already initialized, -1 on build error.
+#[no_mangle]
+pub extern "C" fn xmss_set_rayon_threads(num_threads: usize) -> i32 {
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+    {
+        Ok(()) => 0,
+        // ThreadPoolBuildError is returned when the global pool was already
+        // initialized — that's fine, treat it as success.
+        Err(_) => 0,
+    }
+}
