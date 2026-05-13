@@ -554,3 +554,63 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
         }
     }
 }
+
+// Test-scheme verify path. Always compiled, regardless of the test-config
+// feature flag. Used by zeam's spec-test runner against leanSpec fixtures
+// generated with leanEnv=test (LOG_LIFETIME=8, DIMENSION=4, ~424-byte signatures).
+mod test_scheme {
+    use leansig::serialization::Serializable;
+    use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::{
+        PubKeyAbortingTargetSumLifetime8Dim46Base8 as TestPublicKey,
+        SchemeAbortingTargetSumLifetime8Dim46Base8 as TestScheme,
+        SigAbortingTargetSumLifetime8Dim46Base8 as TestSignature,
+    };
+    use leansig::signature::SignatureScheme;
+    use leansig::MESSAGE_LENGTH;
+    use std::slice;
+
+    /// Verify a leanSpec test-scheme XMSS signature.
+    ///
+    /// Returns 1 if valid, 0 if invalid, -1 on parse / pointer error.
+    ///
+    /// # Safety
+    /// All pointers must be valid for the supplied lengths.
+    #[no_mangle]
+    pub unsafe extern "C" fn hashsig_test_verify_ssz(
+        pubkey_bytes: *const u8,
+        pubkey_len: usize,
+        message: *const u8,
+        epoch: u32,
+        signature_bytes: *const u8,
+        signature_len: usize,
+    ) -> i32 {
+        if pubkey_bytes.is_null() || message.is_null() || signature_bytes.is_null() {
+            return -1;
+        }
+        unsafe {
+            let pk_data = slice::from_raw_parts(pubkey_bytes, pubkey_len);
+            let sig_data = slice::from_raw_parts(signature_bytes, signature_len);
+            let msg_data = slice::from_raw_parts(message, MESSAGE_LENGTH);
+
+            let message_array: &[u8; MESSAGE_LENGTH] = match msg_data.try_into() {
+                Ok(arr) => arr,
+                Err(_) => return -1,
+            };
+
+            let pk: TestPublicKey = match TestPublicKey::from_bytes(pk_data) {
+                Ok(pk) => pk,
+                Err(_) => return -1,
+            };
+            let sig: TestSignature = match TestSignature::from_bytes(sig_data) {
+                Ok(sig) => sig,
+                Err(_) => return -1,
+            };
+
+            if TestScheme::verify(&pk, epoch, message_array, &sig) {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}

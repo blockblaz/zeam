@@ -106,6 +106,18 @@ extern fn hashsig_verify_ssz(
     signature_len: usize,
 ) callconv(.c) i32;
 
+/// Verify XMSS signature against the leanSpec test scheme (LOG_LIFETIME=8,
+/// DIMENSION=4). Used by spec-test fixtures whose `leanEnv=test` produces
+/// ~424-byte signatures that the production scheme cannot parse.
+extern fn hashsig_test_verify_ssz(
+    pubkey_bytes: [*]const u8,
+    pubkey_len: usize,
+    message: [*]const u8,
+    epoch: u32,
+    signature_bytes: [*]const u8,
+    signature_len: usize,
+) callconv(.c) i32;
+
 pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory };
 
 /// Verify signature using SSZ-encoded bytes
@@ -120,6 +132,35 @@ pub fn verifySsz(
     }
 
     const result = hashsig_verify_ssz(
+        pubkey_bytes.ptr,
+        pubkey_bytes.len,
+        message.ptr,
+        epoch,
+        signature_bytes.ptr,
+        signature_bytes.len,
+    );
+
+    switch (result) {
+        1 => {},
+        0 => return HashSigError.VerificationFailed,
+        -1 => return HashSigError.InvalidSignature,
+        else => return HashSigError.VerificationFailed,
+    }
+}
+
+/// Verify signature against the leanSpec test scheme. Mirrors verifySsz but
+/// dispatches to the test-config FFI symbol. Used by spec-test fixtures.
+pub fn verifySszTest(
+    pubkey_bytes: []const u8,
+    message: []const u8,
+    epoch: u32,
+    signature_bytes: []const u8,
+) HashSigError!void {
+    if (message.len != 32) {
+        return HashSigError.InvalidMessageLength;
+    }
+
+    const result = hashsig_test_verify_ssz(
         pubkey_bytes.ptr,
         pubkey_bytes.len,
         message.ptr,

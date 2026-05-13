@@ -5,19 +5,32 @@ const params = @import("@zeam/params");
 pub const INTERVALS_PER_SLOT = 5;
 pub const SECONDS_PER_INTERVAL_MS: isize = @divFloor(params.SECONDS_PER_SLOT * std.time.ms_per_s, INTERVALS_PER_SLOT);
 
-// Maximum number of slots in the future that an attestation/block is allowed to
-// reference for *immediate* acceptance. Anything beyond this is treated as a
-// future block (queued via `pending_blocks`) or, for attestations, rejected.
-// One slot of tolerance covers the normal race between `onInterval` and a
-// neighbouring node's gossip arriving slightly early.
+// Future-slot tolerance for gossip attestations, measured in intervals:
 //
-// leanSpec note: this is a zeam-specific constant, not spec-defined. leanSpec
-// uses GOSSIP_DISPARITY_INTERVALS = 1 (~800ms) for *attestations*
-// (forks/lstar/spec.py:1022) with an explicit anti-pre-publish argument; for
-// blocks no spec constant exists and we follow the Ethereum CL p2p-interface
-// convention of allowing future-slot blocks to be queued. 4 s vs 800 ms is
-// wider than the attestation analog but matches existing zeam behaviour from
-// before #788 (#788 preserves rather than introduces this value).
+//     data.slot * INTERVALS_PER_SLOT <= store.time + GOSSIP_DISPARITY_INTERVALS
+//
+// where store.time is in intervals. One interval is roughly 800 ms at
+// SECONDS_PER_SLOT=4 / INTERVALS_PER_SLOT=5.
+//
+// A whole-slot tolerance would let an adversary pre-publish next-slot
+// aggregates ahead of any honest validator (~800 ms head start at 4 s
+// slots); tightening to one interval bounds that head start to NTP drift.
+//
+// Block-included attestations skip this check entirely; they are trusted
+// under the block's own validation.
+pub const GOSSIP_DISPARITY_INTERVALS = 1;
+
+// Maximum number of slots in the future that a *block* is allowed to reference
+// for *immediate* acceptance. Anything beyond this is treated as a future block
+// and queued via `pending_blocks`. One slot of tolerance covers the normal race
+// between `onInterval` and a neighbouring node's gossip arriving slightly early.
+//
+// leanSpec note: this is a zeam-specific constant, not spec-defined. For blocks
+// no spec constant exists and we follow the Ethereum CL p2p-interface
+// convention of allowing future-slot blocks to be queued. Gossip attestations
+// use the stricter GOSSIP_DISPARITY_INTERVALS bound (leanSpec
+// forks/lstar/spec.py:1022) instead of this whole-slot tolerance — see
+// `validateAttestation` and `onGossipAggregatedAttestation`.
 pub const MAX_FUTURE_SLOT_TOLERANCE = 1;
 
 // Maximum number of slots in the future that a *block* may be queued for
