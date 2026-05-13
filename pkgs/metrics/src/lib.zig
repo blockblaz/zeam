@@ -176,7 +176,7 @@ const Metrics = struct {
     lean_pending_blocks_replayed_total: LeanPendingBlocksReplayedCounter,
     lean_blocks_future_slot_dropped_total: LeanBlocksFutureSlotDroppedCounter,
     // Chain-worker queue + loop metrics (slice c-1 of #803).
-    //   * `_dropped_total{queue="block"|"attestation"}` — producer
+    //   * `_dropped_total{queue="block"|"attestation"|"aggregated_attestation"}` — producer
     //     `trySend` rejections when the queue was full.
     //   * `_depth{queue="..."}` — outstanding accepted work, incremented
     //     on successful sends and decremented after worker processing; for
@@ -748,8 +748,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_blocks_replayed_total = try Metrics.LeanPendingBlocksReplayedCounter.init(allocator, io, "lean_pending_blocks_replayed_total", .{ .help = "Total number of replays from pending_blocks, by terminal result (issue #788)." }, .{}),
         .lean_blocks_future_slot_dropped_total = Metrics.LeanBlocksFutureSlotDroppedCounter.init("lean_blocks_future_slot_dropped_total", .{ .help = "Total number of gossip blocks hard-rejected as FutureSlot beyond the queueable window (issue #788)." }, .{}),
         // Chain-worker queue + loop metrics (slice c-1 of #803).
-        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
-        .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed, labeled by queue (block|attestation)." }, .{}),
+        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
+        .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed or explicitly discarded during shutdown, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.

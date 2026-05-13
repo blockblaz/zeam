@@ -25,15 +25,14 @@
 //!     never blocks on a full queue. Two consumer APIs: blocking
 //!     `recv` (used by tests + any single-queue consumer) and
 //!     non-blocking `tryRecv` (used by the chain-worker loop, which
-//!     multiplexes two queues).
-//!   * `ChainWorker` — owns the thread, two queues (block-FIFO,
-//!     attestation-LIFO per the design doc §"Bounded queue,
-//!     backpressure, and starvation"), stop flag, and a shared
+//!     multiplexes the worker queues).
+//!   * `ChainWorker` — owns the thread, queues for block, raw
+//!     attestation, and aggregated-attestation work, stop flag, and a shared
 //!     `wake_cond` so the worker wakes regardless of which queue a
 //!     producer pushed into. Producers MUST send via
 //!     `sendBlock`/`sendAttestation` so the wake signal is emitted.
 //!     Shutdown is signalled out-of-band: `stop()` flips `stop_flag`,
-//!     closes both queues, and signals `wake_cond`; the loop drains
+//!     closes all queues, and signals `wake_cond`; the loop drains
 //!     remaining messages (calling `Message.deinit` so producer-
 //!     allocated heap is not leaked) and returns. There is
 //!     deliberately no `Message.shutdown` variant — the queues
@@ -205,7 +204,7 @@ pub const Message = union(enum) {
 /// tail (newest first). The design doc §"Bounded queue, backpressure"
 /// requires gossip blocks FIFO (ordering matters for safety) and gossip
 /// attestations LIFO (freshness > ordering). Slashings will be FIFO too
-/// when c-2 routes them; for c-1 we only ship the two queues we need
+/// when c-2 routes them; for c-1 we only shipped the queues we needed
 /// immediately.
 ///
 /// Shutdown semantics: `close()` sets `closed = true` and broadcasts
@@ -310,7 +309,7 @@ pub fn BoundedQueue(comptime T: type) type {
         /// Used by tests in c-1 and by any single-queue consumer.
         /// The chain-worker loop in c-1 (`ChainWorker.runLoop`) does
         /// NOT use this on the hot path because the worker draining
-        /// two queues must wake when EITHER queue has work — see
+        /// multiple queues must wake when any queue has work — see
         /// `tryRecv` + the worker's shared condvar in `ChainWorker`.
         pub fn recv(self: *Self) ?T {
             const item = self.inner.getOneUncancelable(self.io) catch |err| switch (err) {
@@ -322,7 +321,7 @@ pub fn BoundedQueue(comptime T: type) type {
 
         /// Single-consumer non-blocking recv. Returns `null` when the
         /// queue is empty (whether closed or not). Used by the
-        /// chain-worker loop, which multiplexes two queues and uses a
+        /// chain-worker loop, which multiplexes the worker queues and uses a
         /// shared condvar at the worker level for wakeup.
         pub fn tryRecv(self: *Self) ?T {
             var buf: [1]T = undefined;
@@ -339,7 +338,7 @@ pub fn BoundedQueue(comptime T: type) type {
             self.inner.close(self.io);
         }
 
-        /// Snapshot of the current depth (`sent_total - recv_total`).
+        /// Snapshot of the current pending depth (`sent_total - recv_total`).
         /// Race-free for the metric's purposes — a brief stale read
         /// is acceptable since Prometheus gauges are sampled values.
         ///
@@ -351,7 +350,7 @@ pub fn BoundedQueue(comptime T: type) type {
         /// `ChainWorker.runLoop`, this is fine: the worker re-runs
         /// its drain loop on the next iteration and will pick up any
         /// item that was in flight.
-        pub fn depth(self: *Self) usize {
+        pub fn pendingDepth(self: *Self) usize {
             const sent_n = self.sent_total.load(.monotonic);
             const recv_n = self.recv_total.load(.monotonic);
             return @intCast(sent_n -| recv_n);
@@ -366,12 +365,15 @@ pub fn BoundedQueue(comptime T: type) type {
         }
 
         /// Snapshot of messages accepted by producers that have not yet
-        /// completed worker-side handling. Unlike `depth()`, this does not
+        /// completed worker-side handling. Unlike `pendingDepth()`, this does not
         /// decrement when the worker merely pops an item; it decrements only
         /// after dispatch (or shutdown discard) finishes.
         pub fn outstandingDepth(self: *Self) usize {
             const sent_n = self.sent_total.load(.monotonic);
             const processed_n = self.processed_total.load(.monotonic);
+            // These are separate monotonic loads, so a scrape can observe a
+            // transiently newer processed count than sent count. Saturating
+            // subtraction makes that race an acceptable brief under-report.
             return @intCast(sent_n -| processed_n);
         }
     };
@@ -429,7 +431,11 @@ pub const Handlers = struct {
 
 /// Default capacities. Generous enough that a 30s gossip burst on
 /// devnet4 (~3 attestations/slot × 32 validators × 8 slots ≈ 800) does
-/// not saturate. Tuned by the slice c-2 stress harness.
+/// not saturate. Tuned by the slice c-2 stress harness. Aggregated
+/// attestations get a separate 512-message burst budget: under current
+/// devnet load they arrive below raw-attestation volume, and the worker
+/// drains one raw + one aggregated item per loop so neither class can
+/// indefinitely starve the other.
 pub const DEFAULT_BLOCK_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_ATTESTATION_QUEUE_CAPACITY: usize = 1024;
 pub const DEFAULT_AGGREGATED_ATTESTATION_QUEUE_CAPACITY: usize = 512;
@@ -451,7 +457,7 @@ pub const ChainWorker = struct {
     const Self = @This();
 
     allocator: Allocator,
-    /// Backing storage for the two queues — allocated in `init`,
+    /// Backing storage for the worker queues — allocated in `init`,
     /// freed in `deinit`. Owned by ChainWorker; the queues hold
     /// non-owning references via `std.Io.Queue.init(buf)`.
     block_queue_buf: []Message,
@@ -477,8 +483,8 @@ pub const ChainWorker = struct {
     /// queue state.
     loop_iters: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Shared wake mechanism. The worker drains both queues each
-    /// iteration; when both are empty it parks here. Producers signal
+    /// Shared wake mechanism. The worker drains all queues each
+    /// iteration; when all are empty it parks here. Producers signal
     /// after every successful enqueue so the worker wakes regardless
     /// of which queue received the work. The mutex is only held long
     /// enough to wait/signal.
@@ -487,17 +493,16 @@ pub const ChainWorker = struct {
     ///
     /// `wake_mutex` and the per-queue mutexes ARE composed in one
     /// place: the worker's lost-wakeup re-check in `runLoop` holds
-    /// `wake_mutex` while calling `block_queue.depth()` and
-    /// `attestation_queue.depth()` (which take their own internal
-    /// mutexes). The composition is safe under the rule
+    /// `wake_mutex` while calling each queue's `pendingDepth()` (which
+    /// takes its own internal mutex). The composition is safe under the rule
     ///
     ///   ORDER: wake_mutex → queue_mutex (never reverse)
     ///
-    /// Producers respect this trivially: `sendBlock`/`sendAttestation`
-    /// take queue_mutex (inside trySend) FIRST and release it BEFORE
-    /// taking wake_mutex (inside `wake()`). The worker is the only
+    /// Producers respect this trivially: send wrappers take queue_mutex
+    /// (inside trySend) FIRST and release it BEFORE taking wake_mutex
+    /// (inside `wake()`). The worker is the only
     /// thread that holds wake_mutex while reaching for a queue
-    /// mutex, and only via `depth()` (read-only, immediately
+    /// mutex, and only via `pendingDepth()` (read-only, immediately
     /// released).
     ///
     /// Future contributors who add new wake-mutex-protected paths
@@ -592,8 +597,7 @@ pub const ChainWorker = struct {
     /// queue without blocking. Producers must use these wrappers
     /// rather than calling `block_queue.trySend` directly so the
     /// worker's shared wake-condvar is signalled — otherwise the
-    /// worker can park on an empty block queue while attestations
-    /// pile up (and vice versa).
+    /// worker can park while queued work piles up.
     pub fn sendBlock(self: *Self, msg: Message) BlockQueue.TrySendError!void {
         self.block_queue.trySend(msg) catch |err| {
             if (err == error.QueueFull) {
@@ -656,7 +660,7 @@ pub const ChainWorker = struct {
 
     /// Wake the worker if it's parked. Safe to call from any
     /// producer; idempotent under spurious wakeups (the loop
-    /// re-checks both queues each iteration).
+    /// re-checks all queues each iteration).
     pub fn wake(self: *Self) void {
         const io = self.io;
         self.wake_mutex.lockUncancelable(io);
@@ -682,7 +686,7 @@ pub const ChainWorker = struct {
     ///      and both reached `t.join()` (UB on the second).
     ///   2. Set `stop_flag` so the loop's drain-then-park guard
     ///      observes it.
-    ///   3. Close both queues so any blocked standalone `recv`
+    ///   3. Close all queues so any blocked standalone `recv`
     ///      returns null. The worker loop itself is woken via
     ///      the shared `wake_cond` in step 4; the queues' own
     ///      condvars are not what it parks on.
@@ -715,14 +719,16 @@ pub const ChainWorker = struct {
         self.thread = null;
     }
 
-    /// Worker thread main loop. Each iteration drains the block queue
-    /// first (FIFO, safety-ordered) then the attestation queue (LIFO,
-    /// freshness-ordered) per the design doc. When BOTH queues are
-    /// empty, the worker parks on the shared `wake_cond`, which any
-    /// producer signals via `sendBlock` / `sendAttestation`, and `stop`
-    /// signals after closing the queues.
+    /// Worker thread main loop. Each iteration attempts one block, one
+    /// raw-attestation, and one aggregated-attestation dispatch before
+    /// parking. That keeps block work highest priority while preventing a
+    /// hot raw-attestation queue from indefinitely starving aggregated
+    /// attestations. When all queues are empty, the worker parks on the
+    /// shared `wake_cond`, which any producer signals via `sendBlock` /
+    /// `sendAttestation` / `sendAggregatedAttestation`, and `stop` signals
+    /// after closing the queues.
     ///
-    /// Exit condition: `stop_flag == true` AND both queues are
+    /// Exit condition: `stop_flag == true` AND all queues are
     /// drained. On exit, any messages still in the queues are popped
     /// and freed via `Message.deinit` so producer-allocated heap is
     /// not leaked when shutdown races a partial enqueue burst.
@@ -733,30 +739,36 @@ pub const ChainWorker = struct {
             _ = self.loop_iters.fetchAdd(1, .monotonic);
             zeam_metrics.metrics.lean_chain_worker_loop_iters_total.incr();
 
-            // Drain block queue first (highest priority). `tryRecv`
-            // never blocks; we keep draining until empty.
+            var dispatched_any = false;
+
+            // Block queue stays first (highest priority), but each loop also
+            // gives raw and aggregated attestations one dispatch opportunity.
             if (self.block_queue.tryRecv()) |msg| {
                 self.dispatch(msg);
                 self.block_queue.markProcessed();
                 self.recordBlockQueueDepth();
-                continue;
+                dispatched_any = true;
             }
 
-            // Then attestation queue.
+            // Raw attestations and aggregated attestations are intentionally
+            // separate metrics labels/queues. The consensus path does not
+            // require FIFO ordering between these gossip topics, and handling
+            // one of each per loop avoids starvation under sustained load.
             if (self.attestation_queue.tryRecv()) |msg| {
                 self.dispatch(msg);
                 self.attestation_queue.markProcessed();
                 self.recordAttestationQueueDepth();
-                continue;
+                dispatched_any = true;
             }
 
-            // Then aggregated attestation queue.
             if (self.aggregated_attestation_queue.tryRecv()) |msg| {
                 self.dispatch(msg);
                 self.aggregated_attestation_queue.markProcessed();
                 self.recordAggregatedAttestationQueueDepth();
-                continue;
+                dispatched_any = true;
             }
+
+            if (dispatched_any) continue;
 
             // All queues empty this round. Check stop condition
             // BEFORE parking: if stop was requested while we were
@@ -767,9 +779,8 @@ pub const ChainWorker = struct {
                 break;
             }
 
-            // Park on the shared wake-cond. Any producer that calls
-            // sendBlock / sendAttestation will signal it, as will
-            // `stop()`. We re-check both queues + the stop flag on
+            // Park on the shared wake-cond. Any producer send wrapper will
+            // signal it, as will `stop()`. We re-check all queues + the stop flag on
             // wake so a spurious wakeup is harmless.
             self.wake_mutex.lockUncancelable(io);
             // Re-check under the wake mutex to avoid the lost-wakeup
@@ -777,9 +788,9 @@ pub const ChainWorker = struct {
             // last drain and our park here would have signalled an
             // unparked worker; without this re-check we'd sleep
             // forever even though there is work pending.
-            if (self.block_queue.depth() == 0 and
-                self.attestation_queue.depth() == 0 and
-                self.aggregated_attestation_queue.depth() == 0 and
+            if (self.block_queue.pendingDepth() == 0 and
+                self.attestation_queue.pendingDepth() == 0 and
+                self.aggregated_attestation_queue.pendingDepth() == 0 and
                 !self.stop_flag.load(.acquire))
             {
                 self.wake_cond.waitUncancelable(io, &self.wake_mutex);
@@ -789,7 +800,7 @@ pub const ChainWorker = struct {
         self.logger.info("chain-worker: loop stopped", .{});
     }
 
-    /// Pop and free every remaining message in both queues without
+    /// Pop and free every remaining message in all queues without
     /// running their handler logic. Called from `runLoop` once the
     /// stop flag is observed; ensures producer-allocated heap is not
     /// leaked when stop races a partial enqueue burst.
@@ -902,7 +913,7 @@ test "BoundedQueue: trySend / recv preserves FIFO order" {
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 2 } });
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 3 } });
 
-    try testing.expectEqual(@as(usize, 3), q.depth());
+    try testing.expectEqual(@as(usize, 3), q.pendingDepth());
 
     const m1 = q.recv() orelse return error.UnexpectedNull;
     try testing.expectEqual(@as(types.Slot, 1), m1.process_pending_blocks.current_slot);
@@ -911,12 +922,12 @@ test "BoundedQueue: trySend / recv preserves FIFO order" {
     const m3 = q.recv() orelse return error.UnexpectedNull;
     try testing.expectEqual(@as(types.Slot, 3), m3.process_pending_blocks.current_slot);
 
-    try testing.expectEqual(@as(usize, 0), q.depth());
+    try testing.expectEqual(@as(usize, 0), q.pendingDepth());
     q.close();
     try testing.expect(q.recv() == null);
 }
 
-// Note: c-1 dropped LIFO mode — both queues are FIFO until c-2
+// Note: c-1 dropped LIFO mode — worker queues are FIFO until c-2
 // swaps the attestation queue for a 1024cores intrusive MPSC node
 // queue (per @GrapeBaBa's review). The previous LIFO test is
 // removed; the FIFO test above covers the only ordering surface
@@ -1025,17 +1036,17 @@ test "BoundedQueue: ring wraparound — head walks past capacity-1 with items li
     var round: usize = 0;
     while (round < 16) : (round += 1) {
         // Fill to capacity.
-        while (q.depth() < cap) {
+        while (q.pendingDepth() < cap) {
             try q.trySend(.{ .process_pending_blocks = .{ .current_slot = @intCast(next_send) } });
             next_send += 1;
         }
-        try testing.expectEqual(cap, q.depth());
+        try testing.expectEqual(cap, q.pendingDepth());
 
         // Drain all-but-one. The remaining item sits at
         // (head + len - 1) % cap which, as head walks the ring,
         // exercises every slot of `items[]`.
         var keep: usize = 0;
-        while (q.depth() > 1) {
+        while (q.pendingDepth() > 1) {
             const m = q.recv() orelse return error.UnexpectedNull;
             try testing.expectEqual(
                 @as(types.Slot, @intCast(next_recv)),
@@ -1044,14 +1055,14 @@ test "BoundedQueue: ring wraparound — head walks past capacity-1 with items li
             next_recv += 1;
             keep += 1;
         }
-        try testing.expectEqual(@as(usize, 1), q.depth());
+        try testing.expectEqual(@as(usize, 1), q.pendingDepth());
         try testing.expect(keep == cap - 1);
     }
 
     // Final drain. Every value popped must still match the FIFO
     // sequence — if any wraparound mishandling silently re-ordered
     // the ring, this assertion fires.
-    while (q.depth() > 0) {
+    while (q.pendingDepth() > 0) {
         const m = q.recv() orelse return error.UnexpectedNull;
         try testing.expectEqual(
             @as(types.Slot, @intCast(next_recv)),
@@ -1109,7 +1120,7 @@ test "BoundedQueue: multi-producer trySend race — counters are exact" {
                 _ = queue.recv() orelse return;
             }
             // Final drain.
-            while (queue.depth() > 0) {
+            while (queue.pendingDepth() > 0) {
                 _ = queue.recv();
             }
         }
@@ -1166,7 +1177,7 @@ test "ChainWorker: start, send a message, stop() drains and joins cleanly" {
 
 test "ChainWorker: start without explicit Shutdown — stop() unblocks recv()" {
     // Verifies the close()-path of stop(): the worker is parked on
-    // `recv()` inside `runLoop`; `stop()` closes both queues, recv
+    // `recv()` inside `runLoop`; `stop()` closes all queues, recv
     // returns null, the loop exits, the join completes.
     var logger_config = zeam_utils.getTestLoggerConfig();
     var w = try ChainWorker.init(testing.allocator, .{
@@ -1471,6 +1482,7 @@ test "ChainWorker: metrics — sendBlock/sendAttestation/runLoop bump lean_chain
         // hit QueueFull and bump lean_chain_queue_dropped_total.
         .block_queue_capacity = 1,
         .attestation_queue_capacity = 1,
+        .aggregated_attestation_queue_capacity = 1,
     });
     defer w.deinit();
 
@@ -1492,7 +1504,14 @@ test "ChainWorker: metrics — sendBlock/sendAttestation/runLoop bump lean_chain
         w.sendAttestation(.{ .process_pending_blocks = .{ .current_slot = 4 } }),
     );
 
-    // 4) Start the worker briefly so runLoop runs at least once and
+    // 4) Same shape on the aggregated-attestation queue.
+    try w.sendAggregatedAttestation(.{ .process_pending_blocks = .{ .current_slot = 5 } });
+    try testing.expectError(
+        error.QueueFull,
+        w.sendAggregatedAttestation(.{ .process_pending_blocks = .{ .current_slot = 6 } }),
+    );
+
+    // 5) Start the worker briefly so runLoop runs at least once and
     //    bumps lean_chain_worker_loop_iters_total.
     try w.start();
     while (w.loop_iters.load(.monotonic) < 1) {
@@ -1500,7 +1519,7 @@ test "ChainWorker: metrics — sendBlock/sendAttestation/runLoop bump lean_chain
     }
     w.stop();
 
-    // 5) Scrape /metrics via writeMetrics and assert each metric +
+    // 6) Scrape /metrics via writeMetrics and assert each metric +
     //    label is in the rendered body.
     var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
     defer alloc_writer.deinit();
@@ -1513,6 +1532,7 @@ test "ChainWorker: metrics — sendBlock/sendAttestation/runLoop bump lean_chain
 
     try testing.expect(std.mem.indexOf(u8, body, "queue=\"block\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "queue=\"attestation\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "queue=\"aggregated_attestation\"") != null);
 }
 
 test "ChainWorker.stop: idempotent under concurrent callers (no double-join UB)" {

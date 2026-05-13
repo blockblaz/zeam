@@ -593,8 +593,8 @@ pub const BeamChain = struct {
         try w.sendAttestation(.{ .on_gossip_attestation = gossip });
     }
 
-    /// Route a gossip aggregated-attestation through the dedicated
-    /// aggregated-attestation worker queue.
+    /// Route a gossip aggregated-attestation through the worker's
+    /// aggregated-attestation queue so backlog/drop metrics stay labelable.
     pub fn submitGossipAggregatedAttestation(
         self: *Self,
         agg: types.SignedAggregatedAttestation,
