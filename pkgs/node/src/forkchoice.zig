@@ -1075,6 +1075,9 @@ pub const ForkChoice = struct {
                     try types.sszClone(self.allocator, types.AggregationBits, cloned_proof.participants, &att_bits);
                     errdefer att_bits.deinit();
 
+                    // `att_bits` is a full SSZ clone of `participants` (preserves bitlist length on the wire).
+                    // `covered` is only a greedy coverage bitmap keyed by participant indices; it is not
+                    // compared to `att_bits` or used for SSZ equality checks.
                     for (0..cloned_proof.participants.len()) |i| {
                         if (cloned_proof.participants.get(i) catch false) {
                             if (i >= covered.capacity()) {
@@ -1117,13 +1120,9 @@ pub const ForkChoice = struct {
             }
 
             for (agg_attestations.constSlice()) |agg_att| {
-                var cloned_bits = try types.AggregationBits.init(self.allocator);
+                var cloned_bits: types.AggregationBits = undefined;
+                try types.sszClone(self.allocator, types.AggregationBits, agg_att.aggregation_bits, &cloned_bits);
                 errdefer cloned_bits.deinit();
-                for (0..agg_att.aggregation_bits.len()) |i| {
-                    if (agg_att.aggregation_bits.get(i) catch false) {
-                        try types.aggregationBitsSet(&cloned_bits, i, true);
-                    }
-                }
                 try candidate_atts.append(.{ .aggregation_bits = cloned_bits, .data = agg_att.data });
             }
 

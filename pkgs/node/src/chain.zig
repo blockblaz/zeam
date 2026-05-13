@@ -2442,17 +2442,17 @@ pub const BeamChain = struct {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
 
-                // Get participant indices from the signature proof, length already validated
                 const signature_proof = &signature_groups[index];
 
-                var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
-                defer participant_indices.deinit(self.allocator);
-
-                if (validator_indices.items.len != participant_indices.items.len) {
+                var agg_bits_htr: [32]u8 = undefined;
+                var participants_htr: [32]u8 = undefined;
+                try zeam_utils.hashTreeRoot(types.AggregationBits, aggregated_attestation.aggregation_bits, &agg_bits_htr, self.allocator);
+                try zeam_utils.hashTreeRoot(types.AggregationBits, signature_proof.participants, &participants_htr, self.allocator);
+                if (!std.mem.eql(u8, &agg_bits_htr, &participants_htr)) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.logger.err(
-                        "attestation signature mismatch index={d} validators={d} participants={d}",
-                        .{ index, validator_indices.items.len, participant_indices.items.len },
+                        "attestation aggregation_bits mismatch signature proof participants index={d} (hash_tree_root differs)",
+                        .{index},
                     );
                     continue;
                 }

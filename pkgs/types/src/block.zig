@@ -633,18 +633,18 @@ pub const AggregatedAttestationsResult = struct {
             if (!has_gossip and selected_children.items.len == 1) {
                 const child = &selected_children.items[0];
 
-                var att_bits_val: attestation.AggregationBits = undefined;
-                try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits_val);
-                var att_bits: ?attestation.AggregationBits = att_bits_val;
-                defer if (att_bits) |*ab| ab.deinit();
+                var att_bits: attestation.AggregationBits = undefined;
+                try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits);
+                var att_bits_owned: bool = true;
+                errdefer if (att_bits_owned) att_bits.deinit();
 
                 // Clone the child proof for the result (original will be freed by deferred cleanup)
                 var cloned_child: aggregation.AggregatedSignatureProof = undefined;
                 try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, child.*, &cloned_child);
                 errdefer cloned_child.deinit();
 
-                try self.attestations.append(.{ .aggregation_bits = att_bits.?, .data = data });
-                att_bits = null; // ownership transferred to self.attestations
+                try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
+                att_bits_owned = false;
                 try self.attestation_signatures.append(cloned_child);
                 continue;
             }
@@ -711,13 +711,13 @@ pub const AggregatedAttestationsResult = struct {
             if (xmss_participants) |*gp| gp.deinit();
             xmss_participants = null;
 
-            var att_bits_val: attestation.AggregationBits = undefined;
-            try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits_val);
-            var att_bits: ?attestation.AggregationBits = att_bits_val;
-            defer if (att_bits) |*ab| ab.deinit();
+            var att_bits: attestation.AggregationBits = undefined;
+            try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
+            var att_bits_owned: bool = true;
+            errdefer if (att_bits_owned) att_bits.deinit();
 
-            try self.attestations.append(.{ .aggregation_bits = att_bits.?, .data = data });
-            att_bits = null; // ownership transferred to self.attestations
+            try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
+            att_bits_owned = false;
             try self.attestation_signatures.append(proof);
         }
     }
@@ -1400,4 +1400,36 @@ test "encode decode signed block with non-empty attestation signatures" {
     try std.testing.expect(decoded.signature.attestation_signatures.len() == 1);
     const decoded_group = try decoded.signature.attestation_signatures.get(0);
     try std.testing.expect(decoded_group.participants.len() == 2);
+}
+
+test "compactSingleProof preserves participants bitlist length and HTR" {
+    const allocator = std.testing.allocator;
+
+    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    defer proof.deinit();
+
+    try attestation.aggregationBitsSet(&proof.participants, 0, true);
+    try attestation.aggregationBitsSet(&proof.participants, 2, true);
+    try attestation.aggregationBitsEnsureLength(&proof.participants, 8);
+    try std.testing.expectEqual(@as(usize, 8), proof.participants.len());
+
+    const att_data = attestation.AttestationData{
+        .slot = 1,
+        .head = .{ .root = ZERO_HASH, .slot = 0 },
+        .target = .{ .root = ZERO_HASH, .slot = 0 },
+        .source = .{ .root = ZERO_HASH, .slot = 0 },
+    };
+
+    var compacted = try compactSingleProof(allocator, att_data, &proof);
+    defer compacted.attestation.deinit();
+    defer compacted.signature.deinit();
+
+    try std.testing.expectEqual(proof.participants.len(), compacted.attestation.aggregation_bits.len());
+    try std.testing.expectEqual(compacted.signature.participants.len(), compacted.attestation.aggregation_bits.len());
+
+    var want_root: [32]u8 = undefined;
+    var got_root: [32]u8 = undefined;
+    try zeam_utils.hashTreeRoot(attestation.AggregationBits, proof.participants, &want_root, allocator);
+    try zeam_utils.hashTreeRoot(attestation.AggregationBits, compacted.attestation.aggregation_bits, &got_root, allocator);
+    try std.testing.expectEqualSlices(u8, &want_root, &got_root);
 }
