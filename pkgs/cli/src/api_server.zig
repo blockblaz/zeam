@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_driver = @import("test_driver.zig");
 const api = @import("@zeam/api");
 const net = std.Io.net;
 const constants = @import("constants.zig");
@@ -160,6 +161,66 @@ fn routeConnection(io: std.Io, connection: net.Stream, allocator: std.mem.Alloca
                 ctx.logger.warn("failed to handle aggregator admin request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/test_driver/fork_choice/init")) {
+            if (request.head.method == .POST) {
+                ctx.handleTestDriverForkChoiceInit(&request, request_allocator) catch |err| {
+                    ctx.logger.warn("test driver fork_choice/init failed: {}", .{err});
+                    _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+                };
+            } else {
+                _ = request.respond("Method Not Allowed\n", .{
+                    .status = .method_not_allowed,
+                    .extra_headers = &.{.{ .name = "allow", .value = "POST" }},
+                }) catch {};
+            }
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/test_driver/fork_choice/step")) {
+            if (request.head.method == .POST) {
+                ctx.handleTestDriverForkChoiceStep(&request, request_allocator) catch |err| {
+                    ctx.logger.warn("test driver fork_choice/step failed: {}", .{err});
+                    _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+                };
+            } else {
+                _ = request.respond("Method Not Allowed\n", .{
+                    .status = .method_not_allowed,
+                    .extra_headers = &.{.{ .name = "allow", .value = "POST" }},
+                }) catch {};
+            }
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/test_driver/fork_choice/snapshot")) {
+            if (request.head.method == .GET) {
+                ctx.handleTestDriverForkChoiceSnapshot(&request, request_allocator) catch |err| {
+                    ctx.logger.warn("test driver fork_choice/snapshot failed: {}", .{err});
+                    _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+                };
+            } else {
+                _ = request.respond("Method Not Allowed\n", .{
+                    .status = .method_not_allowed,
+                    .extra_headers = &.{.{ .name = "allow", .value = "GET" }},
+                }) catch {};
+            }
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/test_driver/state_transition/run")) {
+            if (request.head.method == .POST) {
+                ctx.handleTestDriverStateTransitionRun(&request, request_allocator) catch |err| {
+                    ctx.logger.warn("test driver state_transition/run failed: {}", .{err});
+                    _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+                };
+            } else {
+                _ = request.respond("Method Not Allowed\n", .{
+                    .status = .method_not_allowed,
+                    .extra_headers = &.{.{ .name = "allow", .value = "POST" }},
+                }) catch {};
+            }
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/test_driver/verify_signatures/run")) {
+            if (request.head.method == .POST) {
+                ctx.handleTestDriverVerifySignaturesRun(&request, request_allocator) catch |err| {
+                    ctx.logger.warn("test driver verify_signatures/run failed: {}", .{err});
+                    _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+                };
+            } else {
+                _ = request.respond("Method Not Allowed\n", .{
+                    .status = .method_not_allowed,
+                    .extra_headers = &.{.{ .name = "allow", .value = "POST" }},
+                }) catch {};
+            }
         } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
             const chain = ctx.getChain() orelse {
                 _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
@@ -195,6 +256,8 @@ pub const ApiServer = struct {
     rate_limiter: RateLimiter,
     sse_mutex: utils_lib.SyncMutex = .{},
     graph_mutex: utils_lib.SyncMutex = .{},
+    test_driver_mutex: utils_lib.SyncMutex = .{},
+    test_driver_state: ?*test_driver.ForkChoiceDriverState = null,
     thread: std.Thread,
 
     const Self = @This();
@@ -205,6 +268,10 @@ pub const ApiServer = struct {
         if (self.stopped.swap(true, .seq_cst)) return;
         self.thread.join();
         self.rate_limiter.deinit();
+        if (self.test_driver_state) |s| {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
         self.allocator.destroy(self);
     }
 
@@ -604,6 +671,223 @@ pub const ApiServer = struct {
         };
         event_broadcaster.removeGlobalConnection(stream);
         ctx.releaseSSE();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test driver handlers
+    // -----------------------------------------------------------------------
+
+    fn readLargeBody(
+        _: *const Self,
+        request: *std.http.Server.Request,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        const content_length = request.head.content_length orelse {
+            _ = request.respond("Bad Request: content-length required\n", .{ .status = .bad_request }) catch {};
+            return error.BadRequest;
+        };
+        if (content_length == 0) {
+            _ = request.respond("Bad Request: missing body\n", .{ .status = .bad_request }) catch {};
+            return error.BadRequest;
+        }
+        if (content_length > test_driver.read_max_bytes) {
+            _ = request.respond("Payload Too Large\n", .{ .status = .payload_too_large }) catch {};
+            return error.PayloadTooLarge;
+        }
+        var http_buf: [4096]u8 = undefined;
+        const reader = request.readerExpectContinue(&http_buf) catch {
+            _ = request.respond("Bad Request: could not read body\n", .{ .status = .bad_request }) catch {};
+            return error.BadRequest;
+        };
+        const len: usize = @intCast(content_length);
+        const body_bytes = try allocator.alloc(u8, len);
+        errdefer allocator.free(body_bytes);
+        var read_total: usize = 0;
+        while (read_total < len) {
+            const n = reader.readSliceShort(body_bytes[read_total..]) catch {
+                _ = request.respond("Bad Request: body read failed\n", .{ .status = .bad_request }) catch {};
+                return error.BadRequest;
+            };
+            if (n == 0) break;
+            read_total += n;
+        }
+        if (read_total != len) {
+            _ = request.respond("Bad Request: short body\n", .{ .status = .bad_request }) catch {};
+            return error.BadRequest;
+        }
+        return body_bytes;
+    }
+
+    fn handleTestDriverForkChoiceInit(
+        self: *Self,
+        request: *std.http.Server.Request,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const body_bytes = try self.readLargeBody(request, allocator);
+        defer allocator.free(body_bytes);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body_bytes, .{}) catch {
+            _ = request.respond("Bad Request: invalid JSON\n", .{ .status = .bad_request }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+
+        const new_state = test_driver.initForkChoiceDriver(
+            self.allocator,
+            self.logger,
+            parsed.value,
+        ) catch |err| {
+            const error_json = test_driver.buildInitErrorJson(@errorName(err), allocator) catch "{}";
+            defer if (error_json.ptr != "{}".ptr) allocator.free(error_json);
+            _ = request.respond(error_json, .{
+                .status = .bad_request,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+                },
+            }) catch {};
+            return;
+        };
+
+        // Replace old state under lock
+        self.test_driver_mutex.lock();
+        if (self.test_driver_state) |old| {
+            old.deinit();
+            self.allocator.destroy(old);
+        }
+        self.test_driver_state = new_state;
+        self.test_driver_mutex.unlock();
+
+        _ = request.respond("", .{ .status = .no_content }) catch {};
+    }
+
+    fn handleTestDriverForkChoiceStep(
+        self: *Self,
+        request: *std.http.Server.Request,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const body_bytes = try self.readLargeBody(request, allocator);
+        defer allocator.free(body_bytes);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body_bytes, .{}) catch {
+            _ = request.respond("Bad Request: invalid JSON\n", .{ .status = .bad_request }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+
+        self.test_driver_mutex.lock();
+        const driver = self.test_driver_state orelse {
+            self.test_driver_mutex.unlock();
+            _ = request.respond(
+                "{\"accepted\":false,\"error\":\"NoInitState\",\"snapshot\":null}",
+                .{
+                    .status = .bad_request,
+                    .extra_headers = &.{
+                        .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+                    },
+                },
+            ) catch {};
+            return;
+        };
+        // Single-driver Hive mode: serialize the full state transition under the
+        // mutex so concurrent /step requests cannot mutate the same fork-choice
+        // state. Hive drives one test at a time; this is intentionally not a
+        // concurrent multi-client test-driver.
+        defer self.test_driver_mutex.unlock();
+
+        const response_json = test_driver.stepForkChoiceDriver(
+            driver,
+            parsed.value,
+            allocator,
+        ) catch |err| {
+            self.logger.warn("test driver step error: {}", .{err});
+            const status: std.http.Status = if (test_driver.isProtocolError(err)) .bad_request else .internal_server_error;
+            const body = if (status == .bad_request) "Bad Request: invalid test-driver step\n" else "Internal Server Error\n";
+            _ = request.respond(body, .{ .status = status }) catch {};
+            return;
+        };
+        defer allocator.free(response_json);
+
+        _ = request.respond(response_json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch {};
+    }
+
+    fn handleTestDriverForkChoiceSnapshot(
+        self: *Self,
+        request: *std.http.Server.Request,
+        allocator: std.mem.Allocator,
+    ) !void {
+        self.test_driver_mutex.lock();
+        const driver = self.test_driver_state orelse {
+            self.test_driver_mutex.unlock();
+            _ = request.respond("Service Unavailable: not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+        defer self.test_driver_mutex.unlock();
+
+        const snap_json = test_driver.buildSnapshotJson(driver, allocator) catch |err| {
+            self.logger.warn("test driver snapshot error: {}", .{err});
+            _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+        defer allocator.free(snap_json);
+
+        _ = request.respond(snap_json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch {};
+    }
+
+    /// POST /lean/v0/test_driver/state_transition/run
+    /// Runs a state transition on the given pre-state + blocks and returns post summary.
+    fn handleTestDriverStateTransitionRun(
+        self: *Self,
+        request: *std.http.Server.Request,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const body_bytes = try self.readLargeBody(request, allocator);
+        defer allocator.free(body_bytes);
+
+        const response_json = test_driver.runStateTransition(allocator, body_bytes) catch |err| {
+            self.logger.warn("test driver state_transition/run error: {}", .{err});
+            _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+        defer allocator.free(response_json);
+
+        _ = request.respond(response_json, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch {};
+    }
+
+    /// POST /lean/v0/test_driver/verify_signatures/run
+    /// Verifies block signatures against an anchor state.
+    fn handleTestDriverVerifySignaturesRun(
+        self: *Self,
+        request: *std.http.Server.Request,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const body_bytes = try self.readLargeBody(request, allocator);
+        defer allocator.free(body_bytes);
+
+        const response_json = test_driver.runVerifySignatures(allocator, body_bytes) catch |err| {
+            self.logger.warn("test driver verify_signatures/run error: {}", .{err});
+            _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+        defer allocator.free(response_json);
+
+        _ = request.respond(response_json, .{
+            .status = .not_implemented,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch {};
     }
 
     fn tryAcquireSSE(self: *Self) bool {

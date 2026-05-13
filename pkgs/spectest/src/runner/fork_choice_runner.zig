@@ -1410,6 +1410,88 @@ fn applyChecks(
             continue;
         }
 
+        if (std.mem.eql(u8, key, "justifiedCheckpoint")) {
+            const cp_obj = switch (value) {
+                .object => |m| m,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint must be object\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            if (cp_obj.get("slot")) |sv| {
+                const expected = try expectU64Value(sv, fixture_path, case_name, step_index, "justifiedCheckpoint.slot");
+                const actual = ctx.fork_choice.fcStore.latest_justified.slot;
+                if (actual != expected) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint.slot mismatch got {d} expected {d}\n",
+                        .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            if (cp_obj.get("root")) |rv| {
+                const expected = try expectRootValue(rv, fixture_path, case_name, step_index, "justifiedCheckpoint.root");
+                if (!std.mem.eql(u8, &ctx.fork_choice.fcStore.latest_justified.root, &expected)) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint.root mismatch\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "finalizedCheckpoint")) {
+            const cp_obj = switch (value) {
+                .object => |m| m,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint must be object\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            if (cp_obj.get("slot")) |sv| {
+                const expected = try expectU64Value(sv, fixture_path, case_name, step_index, "finalizedCheckpoint.slot");
+                const actual = ctx.fork_choice.fcStore.latest_finalized.slot;
+                if (actual != expected) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint.slot mismatch got {d} expected {d}\n",
+                        .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            if (cp_obj.get("root")) |rv| {
+                const expected = try expectRootValue(rv, fixture_path, case_name, step_index, "finalizedCheckpoint.root");
+                if (!std.mem.eql(u8, &ctx.fork_choice.fcStore.latest_finalized.root, &expected)) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint.root mismatch\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "safeTarget")) {
+            const expected = try expectRootValue(value, fixture_path, case_name, step_index, "safeTarget");
+            if (!std.mem.eql(u8, &ctx.fork_choice.safeTarget.blockRoot, &expected)) {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: safeTarget mismatch\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.FixtureMismatch;
+            }
+            continue;
+        }
+
         if (std.mem.eql(u8, key, "safeTargetSlot")) {
             const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
             if (ctx.fork_choice.safeTarget.slot != expected) {
