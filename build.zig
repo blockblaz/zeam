@@ -864,29 +864,32 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Every Rust glue crate is routed through the `zeam-glue` staticlib shim;
     // feature flags control which per-prover rlibs get linked in. See the
     // comment on `addRustGlueLib` and blockblaz/zeam#773.
-    // Use `rustup run nightly cargo` instead of `cargo +nightly`: on some macOS CI
-    // runners another `cargo` (e.g. Homebrew) appears earlier on PATH than rustup's
-    // shim, and that binary rejects `+nightly` with "unexpected argument '+nightly'".
+    // `cargo +nightly` requires rustup's Cargo shim (not Homebrew's standalone Cargo).
+    // CI prepends `$HOME/.cargo/bin` on macOS before rust-cache / zig build (see ci.yml).
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "rustup",                "run",              "nightly",                 "cargo",     "-C", path,
-            "-Z",                    "unstable-options", "build",                   "--release", "-p", "zeam-glue",
-            "--no-default-features", "--features",       "libp2p,hashsig,multisig",
+            "cargo",                   "+nightly",         "-C",                    path,
+            "-Z",                      "unstable-options", "build",                 "--release",
+            "-p",                      "zeam-glue",        "--no-default-features", "--features",
+            "libp2p,hashsig,multisig",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "rustup",    "run",                   "nightly",    "cargo",                         "-C",            path,
-            "-Z",        "unstable-options",      "build",      "--profile",                     "risc0-release", "-p",
-            "zeam-glue", "--no-default-features", "--features", "libp2p,hashsig,multisig,risc0",
+            "cargo",         "+nightly",                      "-C",        path,
+            "-Z",            "unstable-options",              "build",     "--profile",
+            "risc0-release", "-p",                            "zeam-glue", "--no-default-features",
+            "--features",    "libp2p,hashsig,multisig,risc0",
         }),
         .openvm => b.addSystemCommand(&.{
-            "rustup",    "run",                   "nightly",    "cargo",                          "-C",             path,
-            "-Z",        "unstable-options",      "build",      "--profile",                      "openvm-release", "-p",
-            "zeam-glue", "--no-default-features", "--features", "libp2p,hashsig,multisig,openvm",
+            "cargo",          "+nightly",                       "-C",        path,
+            "-Z",             "unstable-options",               "build",     "--profile",
+            "openvm-release", "-p",                             "zeam-glue", "--no-default-features",
+            "--features",     "libp2p,hashsig,multisig,openvm",
         }),
         .all => b.addSystemCommand(&.{
-            "rustup",                "run",              "nightly",                              "cargo",     "-C", path,
-            "-Z",                    "unstable-options", "build",                                "--release", "-p", "zeam-glue",
-            "--no-default-features", "--features",       "libp2p,hashsig,multisig,risc0,openvm",
+            "cargo",                                "+nightly",         "-C",                    path,
+            "-Z",                                   "unstable-options", "build",                 "--release",
+            "-p",                                   "zeam-glue",        "--no-default-features", "--features",
+            "libp2p,hashsig,multisig,risc0,openvm",
         }),
     };
 
