@@ -261,6 +261,7 @@ pub fn BoundedQueue(comptime T: type) type {
         dropped_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         sent_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         recv_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        processed_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
         pub const TrySendError = error{ QueueFull, QueueClosed };
 
@@ -354,6 +355,24 @@ pub fn BoundedQueue(comptime T: type) type {
             const sent_n = self.sent_total.load(.monotonic);
             const recv_n = self.recv_total.load(.monotonic);
             return @intCast(sent_n -| recv_n);
+        }
+
+        /// Mark one popped message as fully processed (or explicitly
+        /// discarded during shutdown). Used for the Prometheus queue-depth
+        /// gauge, whose operator-facing meaning is "accepted by a producer
+        /// but not yet finished by the worker".
+        pub fn markProcessed(self: *Self) void {
+            _ = self.processed_total.fetchAdd(1, .monotonic);
+        }
+
+        /// Snapshot of messages accepted by producers that have not yet
+        /// completed worker-side handling. Unlike `depth()`, this does not
+        /// decrement when the worker merely pops an item; it decrements only
+        /// after dispatch (or shutdown discard) finishes.
+        pub fn outstandingDepth(self: *Self) usize {
+            const sent_n = self.sent_total.load(.monotonic);
+            const processed_n = self.processed_total.load(.monotonic);
+            return @intCast(sent_n -| processed_n);
         }
     };
 }
@@ -571,10 +590,7 @@ pub const ChainWorker = struct {
             }
             return err;
         };
-        zeam_metrics.metrics.lean_chain_queue_depth.set(
-            .{ .queue = "block" },
-            self.block_queue.depth(),
-        ) catch {};
+        self.recordBlockQueueDepth();
         self.wake();
     }
 
@@ -588,11 +604,22 @@ pub const ChainWorker = struct {
             }
             return err;
         };
+        self.recordAttestationQueueDepth();
+        self.wake();
+    }
+
+    fn recordBlockQueueDepth(self: *Self) void {
+        zeam_metrics.metrics.lean_chain_queue_depth.set(
+            .{ .queue = "block" },
+            self.block_queue.outstandingDepth(),
+        ) catch {};
+    }
+
+    fn recordAttestationQueueDepth(self: *Self) void {
         zeam_metrics.metrics.lean_chain_queue_depth.set(
             .{ .queue = "attestation" },
-            self.attestation_queue.depth(),
+            self.attestation_queue.outstandingDepth(),
         ) catch {};
-        self.wake();
     }
 
     /// Wake the worker if it's parked. Safe to call from any
@@ -677,12 +704,16 @@ pub const ChainWorker = struct {
             // never blocks; we keep draining until empty.
             if (self.block_queue.tryRecv()) |msg| {
                 self.dispatch(msg);
+                self.block_queue.markProcessed();
+                self.recordBlockQueueDepth();
                 continue;
             }
 
             // Then attestation queue.
             if (self.attestation_queue.tryRecv()) |msg| {
                 self.dispatch(msg);
+                self.attestation_queue.markProcessed();
+                self.recordAttestationQueueDepth();
                 continue;
             }
 
@@ -725,11 +756,15 @@ pub const ChainWorker = struct {
         while (self.block_queue.tryRecv()) |popped| {
             var m = popped;
             m.deinit();
+            self.block_queue.markProcessed();
+            self.recordBlockQueueDepth();
             freed += 1;
         }
         while (self.attestation_queue.tryRecv()) |popped| {
             var m = popped;
             m.deinit();
+            self.attestation_queue.markProcessed();
+            self.recordAttestationQueueDepth();
             freed += 1;
         }
         if (freed > 0) {
