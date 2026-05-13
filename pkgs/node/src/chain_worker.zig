@@ -379,6 +379,7 @@ pub fn BoundedQueue(comptime T: type) type {
 
 pub const BlockQueue = BoundedQueue(Message);
 pub const AttestationQueue = BoundedQueue(Message);
+pub const AggregatedAttestationQueue = BoundedQueue(Message);
 
 /// Per-variant dispatch vtable.
 ///
@@ -431,6 +432,7 @@ pub const Handlers = struct {
 /// not saturate. Tuned by the slice c-2 stress harness.
 pub const DEFAULT_BLOCK_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_ATTESTATION_QUEUE_CAPACITY: usize = 1024;
+pub const DEFAULT_AGGREGATED_ATTESTATION_QUEUE_CAPACITY: usize = 512;
 
 /// Owns the chain-worker thread, the bounded queues, and a stop flag.
 ///
@@ -454,8 +456,10 @@ pub const ChainWorker = struct {
     /// non-owning references via `std.Io.Queue.init(buf)`.
     block_queue_buf: []Message,
     attestation_queue_buf: []Message,
+    aggregated_attestation_queue_buf: []Message,
     block_queue: BlockQueue,
     attestation_queue: AttestationQueue,
+    aggregated_attestation_queue: AggregatedAttestationQueue,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Single-shot guard so concurrent `stop()` callers don't both
     /// reach `t.join()` (which is UB on the second caller — the
@@ -526,6 +530,7 @@ pub const ChainWorker = struct {
     pub const InitOpts = struct {
         block_queue_capacity: usize = DEFAULT_BLOCK_QUEUE_CAPACITY,
         attestation_queue_capacity: usize = DEFAULT_ATTESTATION_QUEUE_CAPACITY,
+        aggregated_attestation_queue_capacity: usize = DEFAULT_AGGREGATED_ATTESTATION_QUEUE_CAPACITY,
         logger: zeam_utils.ModuleLogger,
         /// Optional dispatch vtable; see `ChainWorker.handlers`.
         handlers: ?Handlers = null,
@@ -547,6 +552,8 @@ pub const ChainWorker = struct {
         errdefer allocator.free(block_buf);
         const att_buf = try allocator.alloc(Message, opts.attestation_queue_capacity);
         errdefer allocator.free(att_buf);
+        const agg_att_buf = try allocator.alloc(Message, opts.aggregated_attestation_queue_capacity);
+        errdefer allocator.free(agg_att_buf);
 
         return .{
             .allocator = allocator,
@@ -554,8 +561,10 @@ pub const ChainWorker = struct {
             .io = io,
             .block_queue_buf = block_buf,
             .attestation_queue_buf = att_buf,
+            .aggregated_attestation_queue_buf = agg_att_buf,
             .block_queue = BlockQueue.init(block_buf, io),
             .attestation_queue = AttestationQueue.init(att_buf, io),
+            .aggregated_attestation_queue = AggregatedAttestationQueue.init(agg_att_buf, io),
             .logger = opts.logger,
             .handlers = opts.handlers,
         };
@@ -570,8 +579,10 @@ pub const ChainWorker = struct {
         }
         self.block_queue.deinit();
         self.attestation_queue.deinit();
+        self.aggregated_attestation_queue.deinit();
         self.allocator.free(self.block_queue_buf);
         self.allocator.free(self.attestation_queue_buf);
+        self.allocator.free(self.aggregated_attestation_queue_buf);
         self.threaded.deinit();
         self.allocator.destroy(self.threaded);
     }
@@ -619,6 +630,27 @@ pub const ChainWorker = struct {
         zeam_metrics.metrics.lean_chain_queue_depth.set(
             .{ .queue = "attestation" },
             self.attestation_queue.outstandingDepth(),
+        ) catch {};
+    }
+
+    /// Send an aggregated-attestation-flavored message and wake the worker.
+    /// Same wakeup contract as `sendBlock`. Bumps the metrics family
+    /// with `queue="aggregated_attestation"`.
+    pub fn sendAggregatedAttestation(self: *Self, msg: Message) AggregatedAttestationQueue.TrySendError!void {
+        self.aggregated_attestation_queue.trySend(msg) catch |err| {
+            if (err == error.QueueFull) {
+                zeam_metrics.metrics.lean_chain_queue_dropped_total.incr(.{ .queue = "aggregated_attestation" }) catch {};
+            }
+            return err;
+        };
+        self.recordAggregatedAttestationQueueDepth();
+        self.wake();
+    }
+
+    fn recordAggregatedAttestationQueueDepth(self: *Self) void {
+        zeam_metrics.metrics.lean_chain_queue_depth.set(
+            .{ .queue = "aggregated_attestation" },
+            self.aggregated_attestation_queue.outstandingDepth(),
         ) catch {};
     }
 
@@ -675,6 +707,7 @@ pub const ChainWorker = struct {
         self.stop_flag.store(true, .release);
         self.block_queue.close();
         self.attestation_queue.close();
+        self.aggregated_attestation_queue.close();
         self.wake();
         if (self.thread) |t| {
             t.join();
@@ -717,7 +750,15 @@ pub const ChainWorker = struct {
                 continue;
             }
 
-            // Both queues empty this round. Check stop condition
+            // Then aggregated attestation queue.
+            if (self.aggregated_attestation_queue.tryRecv()) |msg| {
+                self.dispatch(msg);
+                self.aggregated_attestation_queue.markProcessed();
+                self.recordAggregatedAttestationQueueDepth();
+                continue;
+            }
+
+            // All queues empty this round. Check stop condition
             // BEFORE parking: if stop was requested while we were
             // draining, drain anything that arrived after the last
             // probe and exit.
@@ -738,6 +779,7 @@ pub const ChainWorker = struct {
             // forever even though there is work pending.
             if (self.block_queue.depth() == 0 and
                 self.attestation_queue.depth() == 0 and
+                self.aggregated_attestation_queue.depth() == 0 and
                 !self.stop_flag.load(.acquire))
             {
                 self.wake_cond.waitUncancelable(io, &self.wake_mutex);
@@ -765,6 +807,13 @@ pub const ChainWorker = struct {
             m.deinit();
             self.attestation_queue.markProcessed();
             self.recordAttestationQueueDepth();
+            freed += 1;
+        }
+        while (self.aggregated_attestation_queue.tryRecv()) |popped| {
+            var m = popped;
+            m.deinit();
+            self.aggregated_attestation_queue.markProcessed();
+            self.recordAggregatedAttestationQueueDepth();
             freed += 1;
         }
         if (freed > 0) {
