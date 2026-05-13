@@ -398,7 +398,8 @@ pub const Node = struct {
         const cpu_count = std.Thread.getCpuCount() catch 2;
         const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
         const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
-        const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+        const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
+        const worker_count = @min(zig_worker_budget, @as(usize, ThreadPool.max_thread_count));
         self.thread_pool = try ThreadPool.init(.{
             .allocator = allocator,
             .io = std.Io.Threaded.global_single_threaded.io(),
@@ -406,13 +407,16 @@ pub const Node = struct {
         });
         errdefer self.thread_pool.deinit();
 
-        // Limit the rayon thread pool used by the XMSS aggregate prover so that
-        // it doesn’t consume all CPU cores. Reserve 3 threads for libxev,
-        // the chain worker, and the rust-libp2p network thread (issue #873).
+        // Coordinate the Zig worker pool and the rayon pool used by the XMSS
+        // aggregate prover from the same post-system-thread budget so they do
+        // not independently claim every remaining CPU. Prefer the Zig pool for
+        // the extra worker on odd counts since aggregate verification enters
+        // rayon from Zig workers. Both pools still keep a minimum of one worker
+        // so tiny/cgroup-limited systems remain functional.
         // Must be called before setupProver/setupVerifier since rayon’s global
         // pool is initialized lazily on first use.
-        const rayon_threads = cpu_count -| 3; // saturating sub — 0 means rayon default
-        xmss.setRayonThreads(if (rayon_threads > 0) rayon_threads else 1);
+        const rayon_threads = @max(@as(usize, 1), desired_workers -| worker_count);
+        xmss.setRayonThreads(rayon_threads);
 
         // Pre-warm the XMSS verifier on the main thread before any worker can
         // call `verifyAggregatedPayload`. The Rust-side verifier setup is
