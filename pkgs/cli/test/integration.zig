@@ -262,18 +262,21 @@ const ZeamRequest = struct {
 
     fn readFullResponse(self: ZeamRequest, connection: *net.Stream) ![]u8 {
         const io = std.testing.io;
-        var response_buffer: [8192]u8 = undefined;
         var read_buf: [8192]u8 = undefined;
         var stream_reader = connection.reader(io, &read_buf);
-        var total_bytes: usize = 0;
-        while (total_bytes < response_buffer.len) {
-            const bytes_read = stream_reader.interface.readSliceShort(response_buffer[total_bytes..]) catch |err| switch (err) {
+        var response = std.ArrayList(u8).empty;
+        errdefer response.deinit(self.allocator);
+
+        var response_buffer: [8192]u8 = undefined;
+        while (true) {
+            const bytes_read = stream_reader.interface.readSliceShort(&response_buffer) catch |err| switch (err) {
                 error.ReadFailed => if (stream_reader.err) |e| (if (e == error.ConnectionResetByPeer) break else return e) else return err,
             };
             if (bytes_read == 0) break;
-            total_bytes += bytes_read;
+            try response.appendSlice(self.allocator, response_buffer[0..bytes_read]);
         }
-        return try self.allocator.dupe(u8, response_buffer[0..total_bytes]);
+
+        return try response.toOwnedSlice(self.allocator);
     }
 
     /// Free a response returned by getMetrics() / getHealth() / aggregator helpers

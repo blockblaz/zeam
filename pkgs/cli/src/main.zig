@@ -493,6 +493,7 @@ fn mainInner(init: std.process.Init) !void {
             var network1: *networks.EthLibp2p = undefined;
             var network2: *networks.EthLibp2p = undefined;
             var network3: *networks.EthLibp2p = undefined;
+            var mock_network_impl: ?*networks.Mock = null;
             // Initialize to empty slices to avoid undefined behavior in defer when mock_network=true
             var listen_addresses1: []Multiaddr = &.{};
             var listen_addresses2: []Multiaddr = &.{};
@@ -530,6 +531,7 @@ fn mainInner(init: std.process.Init) !void {
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
                 network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network), shared_registry);
+                mock_network_impl = network;
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
                 backend3 = network.getNetworkInterface();
@@ -783,6 +785,22 @@ fn mainInner(init: std.process.Init) !void {
 
             // Register delayed runner callback with clock
             try clock.subscribeOnSlot(delayed_cb);
+
+            if (mock_network_impl) |network| {
+                const MockGossipDrain = struct {
+                    fn onInterval(ptr: *anyopaque, _: isize) !void {
+                        const mock: *networks.Mock = @ptrCast(@alignCast(ptr));
+                        try mock.drainPendingPublishes();
+                    }
+                };
+
+                const drain_cb = try allocator.create(node_lib.utils.OnIntervalCbWrapper);
+                drain_cb.* = .{
+                    .ptr = network,
+                    .onIntervalCb = MockGossipDrain.onInterval,
+                };
+                try clock.subscribeOnSlot(drain_cb);
+            }
 
             try clock.run();
         },
