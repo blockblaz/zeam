@@ -593,13 +593,14 @@ pub const BeamChain = struct {
         try w.sendAttestation(.{ .on_gossip_attestation = gossip });
     }
 
-    /// Route a gossip aggregated-attestation through the worker queue.
+    /// Route a gossip aggregated-attestation through the worker's
+    /// aggregated-attestation queue so backlog/drop metrics stay labelable.
     pub fn submitGossipAggregatedAttestation(
         self: *Self,
         agg: types.SignedAggregatedAttestation,
     ) SubmitError!void {
         const w = self.chain_worker orelse return error.ChainWorkerDisabled;
-        try w.sendAttestation(.{ .on_gossip_aggregated_attestation = agg });
+        try w.sendAggregatedAttestation(.{ .on_gossip_aggregated_attestation = agg });
     }
 
     /// Route a `processPendingBlocks` tick through the worker queue.
@@ -2447,7 +2448,7 @@ pub const BeamChain = struct {
                 var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
                 defer participant_indices.deinit(self.allocator);
 
-                if (validator_indices.items.len != participant_indices.items.len) {
+                if (validator_indices.items.len != participant_indices.items.len or !std.mem.eql(usize, validator_indices.items, participant_indices.items)) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.logger.err(
                         "attestation signature mismatch index={d} validators={d} participants={d}",

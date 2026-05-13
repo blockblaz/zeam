@@ -633,22 +633,16 @@ pub const AggregatedAttestationsResult = struct {
             if (!has_gossip and selected_children.items.len == 1) {
                 const child = &selected_children.items[0];
 
-                // Create attestation bits from the child's participants
-                var att_bits: ?attestation.AggregationBits = try attestation.AggregationBits.init(allocator);
-                defer if (att_bits) |*ab| ab.deinit();
-                for (0..child.participants.len()) |i| {
-                    if (child.participants.get(i) catch false) {
-                        try attestation.aggregationBitsSet(&att_bits.?, i, true);
-                    }
-                }
+                var att_bits: attestation.AggregationBits = undefined;
+                try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits);
+                errdefer att_bits.deinit(); // ownership is for self.attestations
 
                 // Clone the child proof for the result (original will be freed by deferred cleanup)
                 var cloned_child: aggregation.AggregatedSignatureProof = undefined;
                 try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, child.*, &cloned_child);
                 errdefer cloned_child.deinit();
 
-                try self.attestations.append(.{ .aggregation_bits = att_bits.?, .data = data });
-                att_bits = null; // ownership transferred to self.attestations
+                try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
                 try self.attestation_signatures.append(cloned_child);
                 continue;
             }
@@ -715,17 +709,11 @@ pub const AggregatedAttestationsResult = struct {
             if (xmss_participants) |*gp| gp.deinit();
             xmss_participants = null;
 
-            // Create attestation from the proof's merged participants
-            var att_bits: ?attestation.AggregationBits = try attestation.AggregationBits.init(allocator);
-            defer if (att_bits) |*ab| ab.deinit();
-            for (0..proof.participants.len()) |i| {
-                if (proof.participants.get(i) catch false) {
-                    try attestation.aggregationBitsSet(&att_bits.?, i, true);
-                }
-            }
+            var att_bits: attestation.AggregationBits = undefined;
+            try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
+            errdefer att_bits.deinit(); // ownership is for self.attestations
 
-            try self.attestations.append(.{ .aggregation_bits = att_bits.?, .data = data });
-            att_bits = null; // ownership transferred to self.attestations
+            try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
             try self.attestation_signatures.append(proof);
         }
     }
@@ -859,13 +847,9 @@ fn compactSingleProof(
     try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, sig.*, &cloned_proof);
     errdefer cloned_proof.deinit();
 
-    var att_bits = try attestation.AggregationBits.init(allocator);
+    var att_bits: attestation.AggregationBits = undefined;
+    try utils.sszClone(allocator, attestation.AggregationBits, cloned_proof.participants, &att_bits);
     errdefer att_bits.deinit();
-    for (0..cloned_proof.participants.len()) |i| {
-        if (cloned_proof.participants.get(i) catch false) {
-            try attestation.aggregationBitsSet(&att_bits, i, true);
-        }
-    }
 
     return .{
         .attestation = .{ .aggregation_bits = att_bits, .data = att_data },
@@ -911,13 +895,9 @@ fn compactMultiProofWithPrep(
         &proof,
     );
 
-    var att_bits = try attestation.AggregationBits.init(allocator);
+    var att_bits: attestation.AggregationBits = undefined;
+    try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
     errdefer att_bits.deinit();
-    for (0..proof.participants.len()) |i| {
-        if (proof.participants.get(i) catch false) {
-            try attestation.aggregationBitsSet(&att_bits, i, true);
-        }
-    }
 
     return .{
         .attestation = .{ .aggregation_bits = att_bits, .data = att_data },
@@ -1416,4 +1396,72 @@ test "encode decode signed block with non-empty attestation signatures" {
     try std.testing.expect(decoded.signature.attestation_signatures.len() == 1);
     const decoded_group = try decoded.signature.attestation_signatures.get(0);
     try std.testing.expect(decoded_group.participants.len() == 2);
+}
+
+// Regression: an AggregatedSignatureProof whose `participants` bitlist
+// has trailing zero bits (i.e., len() > highest_set_bit + 1) must still
+// produce an `aggregation_bits` that is byte-for-byte identical to
+// `participants`. Rebuilding `aggregation_bits` by re-setting only the
+// TRUE indices would shrink it to highest_set_bit + 1, changing its SSZ
+// encoding and causing other clients (e.g. ethlambda) to reject the
+// block with a ParticipantsMismatch error.
+test "compactSingleProof: aggregation_bits matches participants when participants has trailing zeros" {
+    const allocator = std.testing.allocator;
+
+    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    defer proof.deinit();
+
+    // Force participants.len() == 6 with bits set only at {0, 2}.
+    // aggregationBitsSet(.., 5, false) extends to length 6 and leaves bit 5 clear.
+    try attestation.aggregationBitsSet(&proof.participants, 5, false);
+    try attestation.aggregationBitsSet(&proof.participants, 0, true);
+    try attestation.aggregationBitsSet(&proof.participants, 2, true);
+
+    try std.testing.expectEqual(@as(usize, 6), proof.participants.len());
+
+    const att_data = attestation.AttestationData{
+        .slot = 1,
+        .head = .{ .root = ZERO_HASH, .slot = 0 },
+        .target = .{ .root = ZERO_HASH, .slot = 0 },
+        .source = .{ .root = ZERO_HASH, .slot = 0 },
+    };
+
+    var result = try compactSingleProof(allocator, att_data, &proof);
+    defer {
+        result.attestation.deinit();
+        result.signature.deinit();
+    }
+
+    try std.testing.expectEqual(
+        result.signature.participants.len(),
+        result.attestation.aggregation_bits.len(),
+    );
+    for (0..result.signature.participants.len()) |i| {
+        try std.testing.expectEqual(
+            try result.signature.participants.get(i),
+            try result.attestation.aggregation_bits.get(i),
+        );
+    }
+
+    // SSZ-encoded forms must also be identical so cross-client strict
+    // equality checks pass.
+    var participants_bytes: std.ArrayList(u8) = .empty;
+    defer participants_bytes.deinit(allocator);
+    try ssz.serialize(
+        attestation.AggregationBits,
+        result.signature.participants,
+        &participants_bytes,
+        allocator,
+    );
+
+    var bits_bytes: std.ArrayList(u8) = .empty;
+    defer bits_bytes.deinit(allocator);
+    try ssz.serialize(
+        attestation.AggregationBits,
+        result.attestation.aggregation_bits,
+        &bits_bytes,
+        allocator,
+    );
+
+    try std.testing.expectEqualSlices(u8, participants_bytes.items, bits_bytes.items);
 }
