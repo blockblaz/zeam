@@ -869,28 +869,24 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // shim, and that binary rejects `+nightly` with "unexpected argument '+nightly'".
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "rustup", "run", "nightly", "cargo", "-C", path,
-            "-Z",     "unstable-options", "build", "--release",
-            "-p",     "zeam-glue", "--no-default-features", "--features",
-            "libp2p,hashsig,multisig",
+            "rustup",                "run",              "nightly",                 "cargo",     "-C", path,
+            "-Z",                    "unstable-options", "build",                   "--release", "-p", "zeam-glue",
+            "--no-default-features", "--features",       "libp2p,hashsig,multisig",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "rustup", "run", "nightly", "cargo", "-C", path,
-            "-Z",     "unstable-options", "build", "--profile",
-            "risc0-release", "-p", "zeam-glue", "--no-default-features",
-            "--features", "libp2p,hashsig,multisig,risc0",
+            "rustup",    "run",                   "nightly",    "cargo",                         "-C",            path,
+            "-Z",        "unstable-options",      "build",      "--profile",                     "risc0-release", "-p",
+            "zeam-glue", "--no-default-features", "--features", "libp2p,hashsig,multisig,risc0",
         }),
         .openvm => b.addSystemCommand(&.{
-            "rustup", "run", "nightly", "cargo", "-C", path,
-            "-Z",     "unstable-options", "build", "--profile",
-            "openvm-release", "-p", "zeam-glue", "--no-default-features",
-            "--features", "libp2p,hashsig,multisig,openvm",
+            "rustup",    "run",                   "nightly",    "cargo",                          "-C",             path,
+            "-Z",        "unstable-options",      "build",      "--profile",                      "openvm-release", "-p",
+            "zeam-glue", "--no-default-features", "--features", "libp2p,hashsig,multisig,openvm",
         }),
         .all => b.addSystemCommand(&.{
-            "rustup", "run", "nightly", "cargo", "-C", path,
-            "-Z",     "unstable-options", "build", "--release",
-            "-p",     "zeam-glue", "--no-default-features", "--features",
-            "libp2p,hashsig,multisig,risc0,openvm",
+            "rustup",                "run",              "nightly",                              "cargo",     "-C", path,
+            "-Z",                    "unstable-options", "build",                                "--release", "-p", "zeam-glue",
+            "--no-default-features", "--features",       "libp2p,hashsig,multisig,risc0,openvm",
         }),
     };
 
