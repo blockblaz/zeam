@@ -87,6 +87,7 @@ cmd_attach() {
     [[ $# -ge 1 ]] || usage
     local pattern="$1"
     local out_dir="${2:-/var/lib/zeam-perf}"
+    out_dir="${out_dir%/}"
 
     local freq_hz="${PROFILE_FREQ_HZ:-19}"
     local chunk_bytes="${PROFILE_CHUNK_BYTES:-200M}"
