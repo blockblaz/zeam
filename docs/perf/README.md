@@ -28,12 +28,12 @@ commit messages.
 ## Profiling a bench binary
 
 ```sh
-scripts/profile.sh xmss           # samply (macOS) / perf (linux)
+scripts/profile.sh bench xmss       # samply (macOS) / perf (Linux)
 ```
 
-Output goes to a local `docs/perf/profiles/<name>.samply.json` (or
-`.perf.data` + `.svg` on Linux). Open the JSON at
-<https://profiler.firefox.com/> or view the SVG in a browser.
+Output goes to `docs/perf/profiles/<name>.samply.json` (or `.perf.data` +
+`.svg` on Linux). Open the JSON at <https://profiler.firefox.com/> or view
+the SVG in a browser.
 
 Required tools:
 - **macOS:** `cargo install samply` (one-time).
@@ -53,10 +53,10 @@ wall-clock to existing Prometheus metrics (`lean_committee_signatures_aggregatio
 
 ```sh
 # Linux production node (run under systemd for always-on capture)
-scripts/profile-continuous.sh "zeam.*node" /var/lib/zeam-perf/
+scripts/profile.sh attach "zeam.*node" /var/lib/zeam-perf/
 
 # macOS local validation
-scripts/profile-continuous.sh "zeam.*node_id zeam_0" ./perf-out/
+scripts/profile.sh attach "zeam.*node_id zeam_0" ./perf-out/
 ```
 
 Defaults: 19Hz sampling, frame-pointer call graphs, 200MB chunk rotation
@@ -85,7 +85,7 @@ When Prometheus shows a slow event at wall-clock T:
 3. Slice:
 
 ```sh
-scripts/profile-slice.sh /var/lib/zeam-perf/perf.data.20260513120000 12.3 14.5 slow-slot.svg
+scripts/profile.sh slice /var/lib/zeam-perf/perf.data.20260513120000 12.3 14.5 slow-slot.svg
 ```
 
 For samply (macOS), upload the JSON to <https://profiler.firefox.com/>
