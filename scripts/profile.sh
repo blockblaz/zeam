@@ -50,7 +50,11 @@ cmd_bench() {
                 || { echo "samply not found — install with: cargo install samply" >&2; exit 1; }
             local out="docs/perf/profiles/${name}.samply.json"
             echo "Profiling ${bin} with samply → ${out}"
-            samply record -o "$out" -- "$bin" "$@"
+            # --save-only: write the JSON and exit. Without it, samply opens
+            # a local web UI and blocks until the user closes the browser
+            # tab, which breaks any non-interactive use. Load the JSON at
+            # https://profiler.firefox.com/ or via `samply load <file>`.
+            samply record --save-only -o "$out" -- "$bin" "$@"
             ;;
         Linux)
             command -v perf >/dev/null 2>&1 \
@@ -176,6 +180,24 @@ cmd_slice() {
     [[ $# -ge 1 ]] || usage
     local chunk="$1"; shift
     [[ -r "$chunk" ]] || { echo "error: cannot read $chunk" >&2; exit 1; }
+
+    # samply (macOS) JSON chunks are self-contained — slicing happens
+    # interactively in the Firefox Profiler UI, not via a CLI tool.
+    case "$chunk" in
+        *.json|*.samply.json)
+            cat >&2 <<'EOF'
+error: this subcommand only handles Linux perf.data chunks.
+       samply JSON is self-contained — slice it interactively by uploading
+       to https://profiler.firefox.com/ and using the timeline range tool.
+EOF
+            exit 1
+            ;;
+    esac
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        echo "error: 'slice' requires Linux perf + FlameGraph (not available on $(uname -s))" >&2
+        echo "       use https://profiler.firefox.com/ on a samply JSON chunk instead" >&2
+        exit 1
+    fi
 
     local time_filter=""
     local out
