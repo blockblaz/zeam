@@ -116,6 +116,13 @@ const Metrics = struct {
     zeam_compact_attestations_output_total: CompactAttestationsOutputCounter,
     // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
+    /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run` (issues #863, #867).
+    /// Large values imply completion backlog (gossip / reqresp / bridge) before the next tick.
+    zeam_xev_clock_until_done_drain_seconds: XevClockUntilDoneDrainHistogram,
+    /// Count of clock-loop `run(.until_done)` drains taking ≥500ms wall time.
+    zeam_xev_clock_until_done_slow_ge_500ms_total: ZeamXevClockUntilDoneSlowGe500msCounter,
+    /// Count of clock-loop `run(.until_done)` drains taking ≥1s wall time.
+    zeam_xev_clock_until_done_slow_ge_1s_total: ZeamXevClockUntilDoneSlowGe1sCounter,
     // Fork-choice tick interval duration: actual elapsed time between forkchoice tickIntervalUnlocked calls
     zeam_fork_choice_tick_interval_duration_seconds: ForkChoiceTickIntervalDurationHistogram,
     /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
@@ -304,6 +311,12 @@ const Metrics = struct {
     // compactAttestations metric types
     const CompactAttestationsTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 });
     const TickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
+    /// Buckets from sub-ms through multi-second xev drains observed on loaded devnets (#863).
+    const XevClockUntilDoneDrainHistogram = metrics_lib.Histogram(f32, &[_]f32{
+        0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60,
+    });
+    const ZeamXevClockUntilDoneSlowGe500msCounter = metrics_lib.Counter(u64);
+    const ZeamXevClockUntilDoneSlowGe1sCounter = metrics_lib.Counter(u64);
     const ForkChoiceTickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
     /// Aggregation tick (interval-in-slot 2): spans sub-ms through multi-second stalls.
     const AggregationIntervalTickHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
@@ -502,6 +515,12 @@ fn observeTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeXevClockUntilDoneDrain(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.XevClockUntilDoneDrainHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeForkChoiceTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.ForkChoiceTickIntervalDurationHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -608,6 +627,10 @@ pub var lean_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeTickIntervalDuration,
 };
+pub var zeam_xev_clock_until_done_drain_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeXevClockUntilDoneDrain,
+};
 pub var zeam_fork_choice_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeForkChoiceTickIntervalDuration,
@@ -707,6 +730,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("zeam_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
         .zeam_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("zeam_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
+        .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
+        .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
+        .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
         // BeamNode mutex contention metrics (issue #786)
@@ -767,6 +793,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_attestations_production_time_seconds.context = @ptrCast(&metrics.lean_attestations_production_time_seconds);
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
     lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
+    zeam_xev_clock_until_done_drain_seconds.context = @ptrCast(&metrics.zeam_xev_clock_until_done_drain_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
     zeam_node_aggregation_interval_tick_seconds.context = @ptrCast(&metrics.zeam_node_aggregation_interval_tick_seconds);
     lean_pending_blocks_drain_iters.context = @ptrCast(&metrics.lean_pending_blocks_drain_iters);
@@ -1127,4 +1154,25 @@ test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in 
     for (fetch_outcomes) |lbl| {
         try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
     }
+}
+
+// Issues #863 / #867: clock-loop xev drain observability must stay in the
+// Prometheus scrape output (histogram + slow-drain counters).
+test "issues #863/#867: xev until_done drain metrics appear in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    zeam_xev_clock_until_done_drain_seconds.record(0.012);
+    metrics.zeam_xev_clock_until_done_slow_ge_500ms_total.incr();
+    metrics.zeam_xev_clock_until_done_slow_ge_1s_total.incr();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_drain_seconds") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_500ms_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_1s_total") != null);
 }
