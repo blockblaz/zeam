@@ -104,9 +104,10 @@ pub const BeamNode = struct {
         errdefer if (network_init_cleanup) network.deinit();
 
         const chain = try allocator.create(chainFactory.BeamChain);
-        errdefer allocator.destroy(chain);
-
-        chain.* = try chainFactory.BeamChain.init(
+        // `BeamChain.init` failure: only the empty `*BeamChain` allocation exists — destroy
+        // it without `deinit`. On success, a single errdefer runs `deinit` then `destroy`
+        // (two errdefers would double-destroy this pointer if init failed after `chain.*` was written).
+        chain.* = chainFactory.BeamChain.init(
             allocator,
             chainFactory.ChainOpts{
                 .config = opts.config,
@@ -119,7 +120,10 @@ pub const BeamNode = struct {
                 .thread_pool = opts.thread_pool,
             },
             network.connected_peers,
-        );
+        ) catch |init_err| {
+            allocator.destroy(chain);
+            return init_err;
+        };
         errdefer {
             chain.deinit();
             allocator.destroy(chain);
@@ -129,9 +133,8 @@ pub const BeamNode = struct {
         // the chain is at its final heap address (allocator.create +
         // assignment-via-deref above), because the worker stores
         // `chain` as its handler ctx and that pointer must remain
-        // stable for the worker's entire lifetime. `chain.deinit()`
-        // (above errdefer + the deinit method) tears the worker
-        // down before any chain state it might touch.
+        // stable for the worker's entire lifetime. `chain.deinit()` (via the errdefer
+        // above) tears the worker down before any chain state it might touch.
         if (opts.chain_worker_enabled) {
             try chain.startChainWorker();
         }
