@@ -751,27 +751,27 @@ pub fn buildStartOptions(
     node_cmd: NodeCommand,
     opts: *NodeOptions,
 ) !void {
-    try utils_lib.checkDIRExists(node_cmd.custom_genesis);
+    try utils_lib.checkDIRExists(node_cmd.@"custom-genesis");
 
-    const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/config.yaml" });
+    const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.@"custom-genesis", "/config.yaml" });
     defer allocator.free(config_filepath);
-    const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/nodes.yaml" });
+    const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.@"custom-genesis", "/nodes.yaml" });
     defer allocator.free(bootnodes_filepath);
     const validators_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{
-        if (std.mem.eql(u8, node_cmd.validator_config, "genesis_bootnode"))
+        if (std.mem.eql(u8, node_cmd.@"validator-config", "genesis_bootnode"))
             //
-            node_cmd.custom_genesis
+            node_cmd.@"custom-genesis"
         else
-            node_cmd.validator_config,
+            node_cmd.@"validator-config",
         "/annotated_validators.yaml",
     });
     defer allocator.free(validators_filepath);
     const validator_config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{
-        if (std.mem.eql(u8, node_cmd.validator_config, "genesis_bootnode"))
+        if (std.mem.eql(u8, node_cmd.@"validator-config", "genesis_bootnode"))
             //
-            node_cmd.custom_genesis
+            node_cmd.@"custom-genesis"
         else
-            node_cmd.validator_config,
+            node_cmd.@"validator-config",
         "/validator-config.yaml",
     });
     defer allocator.free(validator_config_filepath);
@@ -799,7 +799,7 @@ pub fn buildStartOptions(
     if (bootnodes.len == 0) {
         return error.InvalidNodesConfig;
     }
-    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, node_cmd.override_genesis_time);
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, node_cmd.@"override-genesis-time");
 
     const validator_assignments = try validatorAssignmentsFromYAML(allocator, opts.node_key, parsed_validators);
     errdefer {
@@ -816,7 +816,7 @@ pub fn buildStartOptions(
     const node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
 
     const hash_sig_key_dir = try std.mem.concat(allocator, u8, &[_][]const u8{
-        node_cmd.custom_genesis,
+        node_cmd.@"custom-genesis",
         "/",
         node_cmd.@"sig-keys-dir",
     });
@@ -1758,20 +1758,20 @@ test "populateNodeNameRegistry" {
 test "checkpoint-sync-url parameter is optional" {
     // Verify that the NodeCommand struct has checkpoint-sync-url as optional
     const node_cmd = NodeCommand{
-        .custom_genesis = "test",
+        .@"custom-genesis" = "test",
         .@"node-id" = "test",
-        .validator_config = "test",
-        .override_genesis_time = null,
+        .@"validator-config" = "test",
+        .@"override-genesis-time" = null,
         .@"checkpoint-sync-url" = null, // Should compile and work with null
     };
 
     try std.testing.expect(node_cmd.@"checkpoint-sync-url" == null);
 
     const node_cmd_with_url = NodeCommand{
-        .custom_genesis = "test",
+        .@"custom-genesis" = "test",
         .@"node-id" = "test",
-        .validator_config = "test",
-        .override_genesis_time = null,
+        .@"validator-config" = "test",
+        .@"override-genesis-time" = null,
         .@"checkpoint-sync-url" = "http://localhost:5052/lean/v0/states/finalized",
     };
 
