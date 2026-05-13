@@ -255,6 +255,14 @@ pub const BeamChain = struct {
     root_to_slot_lock: zeam_utils.SyncMutex = .{},
     events_lock: zeam_utils.SyncMutex = .{},
 
+    /// Dedicated Io.Threaded for the aggregate FFI worker (issue #873).
+    /// `concurrent_limit = .limited(1)` enforces at most one in-flight
+    /// aggregate task; a second submit returns `error.ConcurrencyUnavailable`.
+    aggregate_io: *std.Io.Threaded,
+
+    /// Long-lived group hosting submitted aggregate tasks.
+    aggregate_group: std.Io.Group = .init,
+
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -307,6 +315,16 @@ pub const BeamChain = struct {
         errdefer anchor_rc.release();
         try states.put(fork_choice.head.blockRoot, anchor_rc);
 
+        // Issue #873: dedicated Io.Threaded for aggregate FFI worker.
+        // concurrent_limit = .limited(1) ensures at most one in-flight aggregate task.
+        const agg_io = try allocator.create(std.Io.Threaded);
+        errdefer allocator.destroy(agg_io);
+        agg_io.* = std.Io.Threaded.init(allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(1),
+        });
+        errdefer agg_io.deinit();
+
         var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
@@ -346,6 +364,9 @@ pub const BeamChain = struct {
             // at its final heap location), so the worker's ctx pointer
             // remains stable for its entire lifetime.
             .chain_worker = null,
+            // aggregate_io: dedicated Io.Threaded for aggregate FFI worker (issue #873).
+            .aggregate_io = agg_io,
+            .aggregate_group = .init,
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
@@ -643,6 +664,10 @@ pub const BeamChain = struct {
         // never called.)
         self.stopChainStateRefcountObserver();
 
+        // Issue #873: wait for any in-flight aggregate worker before
+        // tearing down chain state it references.
+        self.aggregate_group.cancel(self.aggregate_io.io());
+
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
         // `stop()` is idempotent and joins the worker thread; after
@@ -654,6 +679,11 @@ pub const BeamChain = struct {
             self.allocator.destroy(w);
             self.chain_worker = null;
         }
+
+        // Issue #873: tear down aggregate worker pool after chain_worker
+        // is stopped and aggregate_group is cancelled.
+        self.aggregate_io.deinit();
+        self.allocator.destroy(self.aggregate_io);
 
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
@@ -3301,26 +3331,28 @@ pub const BeamChain = struct {
         return self.forkChoice.aggregate(snapshot);
     }
 
-    pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
+    /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
+    /// Returns within microseconds; the worker calls `publishProducedAggregations`
+    /// itself. If the previous aggregate is still in-flight, the submit is
+    /// skipped and the skip metric is incremented.
+    pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) return null;
+        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_aggregator" }) catch {};
+            return;
+        }
 
         const sync_status = self.getSyncStatus();
         switch (sync_status) {
             .synced => {},
             .fc_initing => {
                 self.logger.warn("skipping aggregation production for slot={d}: forkchoice initializing", .{slot});
-                return null;
+                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                return;
             },
             .no_peers => {
                 // Aggregate even with no peers: local fork-choice benefits from aggregated
                 // attestation weight, and aggregates will propagate once peers connect.
-                // Consistent with proposer and attester which also proceed through .no_peers.
-                //
-                // No double-counting: aggregate() maps per-AttestationData key, replacing
-                // raw attestations with their aggregate. Fork-choice counts each
-                // AttestationData key once regardless of whether the raw or aggregated
-                // form arrived first.
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
@@ -3330,21 +3362,58 @@ pub const BeamChain = struct {
                     info.finalized_slot,
                     info.max_peer_finalized_slot,
                 });
-                return null;
+                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                return;
             },
         }
 
-        const aggregations = self.aggregate() catch |err| {
-            self.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
-            return null;
+        // Snapshot state on the caller's thread (fast path).
+        const head_root = self.forkChoice.getHead().blockRoot;
+        var borrow = self.statesGet(head_root) orelse {
+            self.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "missing_state" }) catch {};
+            return;
+        };
+        defer borrow.assertReleasedOrPanic();
+        const snapshot = borrow.cloneAndRelease(self.allocator) catch |err| {
+            self.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
+            return;
         };
 
-        if (aggregations.len == 0) {
-            self.allocator.free(aggregations);
-            return null;
+        // Submit to the dedicated aggregate worker. concurrent_limit=1
+        // ensures at most one in-flight task.
+        self.aggregate_group.concurrent(self.aggregate_io.io(), aggregateImpl, .{ self, node, snapshot, slot }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                self.logger.info("skipping aggregation for slot={d}: previous aggregate still in-flight", .{slot});
+                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
+                // Free the snapshot we just cloned — the worker won't run.
+                snapshot.deinit();
+                self.allocator.destroy(snapshot);
+                return;
+            },
+        };
+    }
+
+    /// Worker body for the aggregate FFI (runs on `aggregate_io` thread).
+    /// Owns `snapshot` and frees it on exit.
+    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, slot: usize) void {
+        const worker_timer = zeam_metrics.zeam_aggregate_worker_duration_seconds.start();
+        defer _ = worker_timer.observe();
+
+        defer {
+            snapshot.deinit();
+            chain.allocator.destroy(snapshot);
         }
 
-        return aggregations;
+        const aggregations = chain.forkChoice.aggregate(snapshot) catch |err| {
+            chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
+            return;
+        };
+        defer chain.allocator.free(aggregations);
+
+        if (aggregations.len == 0) return;
+
+        node.publishProducedAggregations(aggregations);
     }
 
     pub fn getStatus(self: *Self) types.Status {
