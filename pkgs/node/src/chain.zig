@@ -593,13 +593,14 @@ pub const BeamChain = struct {
         try w.sendAttestation(.{ .on_gossip_attestation = gossip });
     }
 
-    /// Route a gossip aggregated-attestation through the worker queue.
+    /// Route a gossip aggregated-attestation through the worker's
+    /// aggregated-attestation queue so backlog/drop metrics stay labelable.
     pub fn submitGossipAggregatedAttestation(
         self: *Self,
         agg: types.SignedAggregatedAttestation,
     ) SubmitError!void {
         const w = self.chain_worker orelse return error.ChainWorkerDisabled;
-        try w.sendAttestation(.{ .on_gossip_aggregated_attestation = agg });
+        try w.sendAggregatedAttestation(.{ .on_gossip_aggregated_attestation = agg });
     }
 
     /// Route a `processPendingBlocks` tick through the worker queue.

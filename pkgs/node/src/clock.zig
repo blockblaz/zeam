@@ -118,7 +118,16 @@ pub const Clock = struct {
     pub fn run(self: *Self) !void {
         while (true) {
             self.tickInterval();
+            const drain_timer = zeam_metrics.zeam_xev_clock_until_done_drain_seconds.start();
             try self.events.run(.until_done);
+            const drain_s = drain_timer.observe();
+            if (drain_s >= 0.5) {
+                zeam_metrics.metrics.zeam_xev_clock_until_done_slow_ge_500ms_total.incr();
+            }
+            if (drain_s >= 1.0) {
+                zeam_metrics.metrics.zeam_xev_clock_until_done_slow_ge_1s_total.incr();
+                self.logger.warn("xev until_done drain took {d:.3}s (slot driver backlog; see #863)", .{drain_s});
+            }
         }
     }
 
