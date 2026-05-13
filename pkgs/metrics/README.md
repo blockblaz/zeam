@@ -72,6 +72,28 @@ All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. T
 - **Labels**: None
 - **Sample Collection Event**: On every block processed by the chain
 
+### Event loop health (issues #863, #867)
+
+These series help correlate **long `[clock]` `slot_interval` gaps** with wall time spent inside **`xev.Loop.run(.until_done)`** in `Clock.run` (completion backlog: gossip, reqresp, rust-bridge, etc.). They do **not** replace `zeam_chain_onblock_duration_seconds` for attributing slow **`onBlock`** — use both on the same timeline.
+
+#### `zeam_xev_clock_until_done_drain_seconds` (Histogram)
+- **Description**: Wall time for one `run(.until_done)` drain in the clock driver.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60
+- **Labels**: None
+- **Sample Collection Event**: After each clock-loop `run(.until_done)` completes
+
+#### `zeam_xev_clock_until_done_slow_ge_500ms_total` (Counter)
+- **Description**: Number of clock-loop drains taking ≥0.5s wall time.
+- **Type**: Counter
+- **Sample Collection Event**: When a drain completes at ≥0.5s
+
+#### `zeam_xev_clock_until_done_slow_ge_1s_total` (Counter)
+- **Description**: Number of clock-loop drains taking ≥1s wall time (same path also emits a `[clock]` **warn** log).
+- **Type**: Counter
+- **Sample Collection Event**: When a drain completes at ≥1s
+
 ### Fork Choice Metrics
 
 #### `lean_head_slot` (Gauge)
