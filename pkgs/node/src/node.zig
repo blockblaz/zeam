@@ -104,9 +104,10 @@ pub const BeamNode = struct {
         errdefer if (network_init_cleanup) network.deinit();
 
         const chain = try allocator.create(chainFactory.BeamChain);
-        errdefer allocator.destroy(chain);
-
-        chain.* = try chainFactory.BeamChain.init(
+        // `BeamChain.init` failure: only the empty `*BeamChain` allocation exists — destroy
+        // it without `deinit`. On success, a single errdefer runs `deinit` then `destroy`
+        // (two errdefers would double-destroy this pointer if init failed after `chain.*` was written).
+        chain.* = chainFactory.BeamChain.init(
             allocator,
             chainFactory.ChainOpts{
                 .config = opts.config,
@@ -119,7 +120,10 @@ pub const BeamNode = struct {
                 .thread_pool = opts.thread_pool,
             },
             network.connected_peers,
-        );
+        ) catch |init_err| {
+            allocator.destroy(chain);
+            return init_err;
+        };
         errdefer {
             chain.deinit();
             allocator.destroy(chain);
@@ -129,9 +133,8 @@ pub const BeamNode = struct {
         // the chain is at its final heap address (allocator.create +
         // assignment-via-deref above), because the worker stores
         // `chain` as its handler ctx and that pointer must remain
-        // stable for the worker's entire lifetime. `chain.deinit()`
-        // (above errdefer + the deinit method) tears the worker
-        // down before any chain state it might touch.
+        // stable for the worker's entire lifetime. `chain.deinit()` (via the errdefer
+        // above) tears the worker down before any chain state it might touch.
         if (opts.chain_worker_enabled) {
             try chain.startChainWorker();
         }
@@ -1734,23 +1737,16 @@ pub const BeamNode = struct {
             if (interval_in_slot == 2) {
                 const agg_timer = zeam_metrics.zeam_node_aggregation_interval_tick_seconds.start();
                 defer _ = agg_timer.observe();
-                // Aggregation failure must not stall the interval cursor.
+                // Issue #873: aggregate work is submitted to a dedicated Io.Threaded
+                // worker. submitAggregateOnInterval returns within microseconds;
+                // the worker calls publishProducedAggregations itself.
                 if (self.test_inject_aggregator_error_at_intervals.len > 0 and
                     std.mem.indexOfScalar(usize, self.test_inject_aggregator_error_at_intervals, interval) != null)
                 {
                     self.logger.err("error producing aggregations at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, error.TestInjected });
                     zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "maybeAggregateOnInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
                 } else {
-                    const maybe_aggregations = self.chain.maybeAggregateOnInterval(interval) catch |e| blk: {
-                        self.logger.err("error producing aggregations at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
-                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "maybeAggregateOnInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                        break :blk null;
-                    };
-                    if (maybe_aggregations) |aggregations| {
-                        defer self.allocator.free(aggregations);
-                        // Try every aggregation; `publishProducedAggregations` owns deinit.
-                        self.publishProducedAggregations(aggregations);
-                    }
+                    self.chain.submitAggregateOnInterval(self, interval);
                 }
             }
         }
@@ -1981,7 +1977,7 @@ pub const BeamNode = struct {
     }
 
     /// Publish every aggregation independently; deinit each entry exactly once.
-    fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) void {
+    pub fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) void {
         for (aggregations) |*signed_aggregation| {
             self.publishAggregation(signed_aggregation.*) catch |err| {
                 self.logger.err(
