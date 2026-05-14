@@ -241,9 +241,10 @@ pub const BeamChain = struct {
     ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
     ///      pool construction; without that pre-warm, concurrent first-time
     ///      verifies could race the Rust-side initialization.
-    ///   3. `xmss.PublicKeyCache` is documented NOT thread-safe. Workers must
-    ///      not call its `getOrPut` directly. The current parallel paths
-    ///      respect this: cache access is confined to a serial pre-phase.
+    ///   3. `xmss.PublicKeyCache` is lock-free as of P1 of #863
+    ///      (per-slot atomic CAS); concurrent `getOrPut` calls are
+    ///      safe. The pre-PR-#884 serial-pre-phase constraint no
+    ///      longer applies.
     ///
     /// New consumers of `thread_pool` should preserve all three invariants.
     thread_pool: ?*ThreadPool = null,
@@ -374,7 +375,10 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
-            .public_key_cache = xmss.PublicKeyCache.init(allocator),
+            // Sized to the genesis validator count. Lock-free per-slot
+            // cache (P1 of #863) — see `xmss.PublicKeyCache` doc for the
+            // CAS protocol and validator-set-growth caveats.
+            .public_key_cache = try xmss.PublicKeyCache.init(allocator, @intCast(opts.config.genesis.numValidators())),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .thread_pool = opts.thread_pool,
             // pending_blocks is the future-slot queue (issue #788). It's an
@@ -2336,26 +2340,17 @@ pub const BeamChain = struct {
             // parallelize per-attestation verification across CPU workers.
             //
             // The XMSS pubkey cache is documented NOT thread-safe; today the
-            // parallel path only consumes the cache from a serial pre-phase.
-            // Slice (a-2) wraps the cache calls in `pubkey_cache_lock`. Tier-5
-            // sibling rule: `root_to_slot_lock` (5b) and `events_lock` (5c)
-            // must NOT be held at this point.
-            {
-                var t_pk = LockTimer.start("pubkey_cache", "onBlock.verifySignatures");
-                locking.assertNoTier5SiblingHeld("onBlock.verifySignatures");
-                self.pubkey_cache_lock.lock();
-                locking.enterTier5();
-                t_pk.acquired();
-                defer {
-                    self.pubkey_cache_lock.unlock();
-                    locking.leaveTier5();
-                    t_pk.released();
-                }
-                if (self.thread_pool) |pool| {
-                    try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
-                } else {
-                    try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
-                }
+            // The XMSS pubkey cache is lock-free as of P1 of #863
+            // (`xmss.PublicKeyCache` uses per-slot atomic CAS). No
+            // `pubkey_cache_lock` acquisition needed here — readers
+            // and the STF's own population path race on the slot's
+            // atomic and the loser frees its handle. The previous
+            // mutex around this block was the dominant contributor
+            // to the ~78ms mean lock hold reported in #863.
+            if (self.thread_pool) |pool| {
+                try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
+            } else {
+                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
             }
             step_watch.lap("verify_signatures");
 
@@ -3320,18 +3315,9 @@ pub const BeamChain = struct {
             defer borrow.deinit();
             const validators = borrow.state.validators.constSlice();
 
-            // pubkey_cache lookup needs the lock; tier-5 sibling rule says
-            // root_to_slot_lock and events_lock must NOT be held here.
-            var t_pk = LockTimer.start("pubkey_cache", "verifyAggregatedAttestation");
-            locking.assertNoTier5SiblingHeld("verifyAggregatedAttestation");
-            self.pubkey_cache_lock.lock();
-            locking.enterTier5();
-            t_pk.acquired();
-            defer {
-                self.pubkey_cache_lock.unlock();
-                locking.leaveTier5();
-                t_pk.released();
-            }
+            // pubkey_cache is lock-free as of P1 of #863 — no
+            // mutex acquisition needed. See `xmss.PublicKeyCache`
+            // for the per-slot CAS protocol.
 
             for (validator_indices.items) |validator_index| {
                 if (validator_index >= validators.len) {
