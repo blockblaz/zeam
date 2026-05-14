@@ -1188,22 +1188,16 @@ pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
         }
     }
 
-    // ----- Evaluate result against expectException -----
-    if (expect_exception != null) {
-        // We expected a failure
-        if (any_failure) {
-            return buildSimpleResult(allocator, true, null);
-        } else {
-            return buildSimpleResult(allocator, false, "ExpectedExceptionButSignaturesValid");
-        }
-    } else {
-        // We did NOT expect failure
-        if (any_failure) {
-            return buildSimpleResult(allocator, false, failure_reason orelse "SignatureVerificationFailed");
-        } else {
-            return buildSimpleResult(allocator, true, null);
-        }
-    }
+    // Report the truth about whether signatures verified.
+    // The simulator owns the comparison against `expectException` — it asserts
+    // `response.succeeded == expect_exception.is_none()`, so the driver must
+    // report verification outcome, NOT test outcome.
+    _ = expect_exception;
+    return buildSimpleResult(
+        allocator,
+        !any_failure,
+        if (any_failure) (failure_reason orelse "SignatureVerificationFailed") else null,
+    );
 }
 
 /// Verify each body-attestation aggregated signature for the HTTP test driver.

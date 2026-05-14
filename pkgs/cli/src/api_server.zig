@@ -883,7 +883,6 @@ pub const ApiServer = struct {
         defer allocator.free(response_json);
 
         _ = request.respond(response_json, .{
-            .status = .not_implemented,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             },
