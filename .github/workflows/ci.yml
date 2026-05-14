@@ -105,6 +105,13 @@ jobs:
         toolchain: nightly
         cache: false
 
+    - name: Prefer rustup shims on PATH (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        command -v cargo
+        cargo +nightly --version
+
     - name: Cache Zig packages
       uses: actions/cache@v4
       with:
@@ -178,6 +185,13 @@ jobs:
         toolchain: nightly
         components: clippy, rustfmt
         cache: false
+
+    - name: Prefer rustup shims on PATH (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        command -v cargo
+        cargo +nightly --version
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -260,6 +274,13 @@ jobs:
       with:
         toolchain: nightly
         cache: false
+
+    - name: Prefer rustup shims on PATH (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        command -v cargo
+        cargo +nightly --version
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -362,6 +383,13 @@ jobs:
       with:
         toolchain: nightly
         cache: false
+
+    - name: Prefer rustup shims on PATH (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        command -v cargo
+        cargo +nightly --version
 
     - name: Cache Zig packages
       uses: actions/cache@v4
