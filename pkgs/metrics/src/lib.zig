@@ -52,10 +52,11 @@ const Metrics = struct {
     //       sub-step buckets sum to roughly the total).
     zeam_chain_onblock_step_duration_seconds: ChainOnblockStepHistogram,
     // Slot-driver stall watchdog (#863): a dedicated thread samples the
-    // libxev tick clock every WATCHDOG_PROBE_MS; if `last_tick_time_ms`
-    // falls more than WATCHDOG_THRESHOLD_MS behind wall clock it logs
-    // an ERROR and bumps these counters. The histogram captures the
-    // distribution of stall durations across firings.
+    // libxev tick clock every WATCHDOG_PROBE_MS via `Clock.lastTickMs()`
+    // (atomic acquire load); if the value falls more than
+    // WATCHDOG_THRESHOLD_MS behind wall clock it logs an ERROR and
+    // bumps these counters. The histogram captures the distribution of
+    // stall durations across firings.
     zeam_slot_driver_stall_fired_total: ZeamSlotDriverStallFiredCounter,
     zeam_slot_driver_stall_seconds: ZeamSlotDriverStallSecondsHistogram,
     lean_head_slot: LeanHeadSlotGauge,

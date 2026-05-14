@@ -1,6 +1,6 @@
 //! Slot-driver stall watchdog (#863).
 //!
-//! Spawns a background OS thread that probes `Clock.last_tick_time_ms` at
+//! Spawns a background OS thread that probes `Clock.lastTickMs()` at
 //! a fixed interval. When the gap between wall clock and the last tick
 //! exceeds `WATCHDOG_THRESHOLD_MS`, the watchdog:
 //!
@@ -92,32 +92,46 @@ pub const SlotDriverWatchdog = struct {
     /// `pkgs/node/src/stress.zig::sleepSecs` and use libc nanosleep
     /// directly so this watchdog stays cross-target without a libxev
     /// timer (which would itself depend on the loop we are watching).
-    fn sleepMs(ms: u64) void {
+    ///
+    /// Re-issues `nanosleep` on EINTR so a stray signal (e.g. a
+    /// future SIGUSR1-based stack-dump probe) cannot shorten the
+    /// probe interval. Aborts immediately when `stop_flag` is set
+    /// so shutdown isn't blocked by an in-flight long sleep.
+    fn sleepMs(self: *const SlotDriverWatchdog, ms: u64) void {
         const total_ns: u128 = @as(u128, ms) * @as(u128, std.time.ns_per_ms);
         var ts: std.c.timespec = .{
             .sec = @intCast(@divFloor(total_ns, std.time.ns_per_s)),
             .nsec = @intCast(@mod(total_ns, std.time.ns_per_s)),
         };
-        _ = std.c.nanosleep(&ts, &ts);
+        var rem: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+        while (true) {
+            const rc = std.c.nanosleep(&ts, &rem);
+            if (rc == 0) return;
+            if (self.stop_flag.load(.acquire)) return;
+            // EINTR: continue with remainder. Other errnos are
+            // diagnostic-fatal to instrumentation only; bail.
+            const e = std.posix.errno(rc);
+            if (e != .INTR) return;
+            ts = rem;
+        }
     }
 
     fn runLoop(self: *SlotDriverWatchdog) void {
-        var last_observed_tick_ms: ?isize = null;
+        var last_observed_tick_ms: ?i64 = null;
         var firing_for_current_stall = false;
 
         while (!self.stop_flag.load(.acquire)) {
-            sleepMs(self.probe_ms);
+            self.sleepMs(self.probe_ms);
             if (self.stop_flag.load(.acquire)) break;
 
-            // `last_tick_time_ms` is mutated unsynchronised on the libxev
-            // thread. We accept torn reads on 32-bit platforms — the worst
-            // case is a transient spurious "stall" log, which is harmless
-            // for diagnostic instrumentation.
-            const last_tick_opt = self.clock.last_tick_time_ms;
-            const last_tick = last_tick_opt orelse continue;
+            // Atomic acquire load via the public `lastTickMs` accessor.
+            // Pairs with the release store in `Clock.tickInterval`, so
+            // there is no torn read even on 32-bit hosts where i64 is
+            // not naturally word-sized.
+            const last_tick = self.clock.lastTickMs() orelse continue;
 
-            const now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
-            const delta_ms: isize = now_ms - last_tick;
+            const now_ms: i64 = @intCast(zeam_utils.unixTimestampMillis());
+            const delta_ms: i64 = now_ms - last_tick;
             if (delta_ms < 0) continue; // clock skew — skip probe
 
             // Reset the per-stall firing latch when the slot driver has
