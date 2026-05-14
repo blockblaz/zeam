@@ -1164,6 +1164,16 @@ pub const BeamNode = struct {
             .blocks_by_root => |request| {
                 const roots = request.roots.constSlice();
 
+                // Reject over-limit requests per spec (INVALID_REQUEST, code 1).
+                if (roots.len > params.MAX_REQUEST_BLOCKS) {
+                    self.logger.warn(
+                        "node-{d}:: blocks_by_root: requested {d} roots exceeds MAX_REQUEST_BLOCKS={d}, sending INVALID_REQUEST",
+                        .{ self.nodeId, roots.len, params.MAX_REQUEST_BLOCKS },
+                    );
+                    try responder.sendError(constants.RPC_ERR_INVALID_REQUEST, "too many roots requested");
+                    return;
+                }
+
                 self.logger.debug(
                     "node-{d}:: Handling blocks_by_root request for {d} roots",
                     .{ self.nodeId, roots.len },
@@ -1192,12 +1202,30 @@ pub const BeamNode = struct {
             .blocks_by_range => |request| {
                 const start_slot = request.start_slot;
                 const requested_count = request.count;
-                // Cap count at MAX_REQUEST_BLOCKS to bound work per request
-                const count = @min(requested_count, params.MAX_REQUEST_BLOCKS);
+
+                // Reject invalid counts per spec (INVALID_REQUEST, code 1).
+                if (requested_count == 0) {
+                    self.logger.warn(
+                        "node-{d}:: blocks_by_range: count=0 is invalid, sending INVALID_REQUEST",
+                        .{self.nodeId},
+                    );
+                    try responder.sendError(constants.RPC_ERR_INVALID_REQUEST, "count must not be zero");
+                    return;
+                }
+                if (requested_count > params.MAX_REQUEST_BLOCKS) {
+                    self.logger.warn(
+                        "node-{d}:: blocks_by_range: count={d} exceeds MAX_REQUEST_BLOCKS={d}, sending INVALID_REQUEST",
+                        .{ self.nodeId, requested_count, params.MAX_REQUEST_BLOCKS },
+                    );
+                    try responder.sendError(constants.RPC_ERR_INVALID_REQUEST, "count exceeds MAX_REQUEST_BLOCKS");
+                    return;
+                }
+
+                const count = requested_count;
 
                 self.logger.debug(
-                    "node-{d}:: Handling blocks_by_range request start_slot={d} count={d} (capped from {d})",
-                    .{ self.nodeId, start_slot, count, requested_count },
+                    "node-{d}:: Handling blocks_by_range request start_slot={d} count={d}",
+                    .{ self.nodeId, start_slot, count },
                 );
 
                 // Enforce MIN_SLOTS_FOR_BLOCK_REQUESTS history window.
