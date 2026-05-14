@@ -1424,7 +1424,8 @@ pub const ForkChoice = struct {
     ) !void {
         var cloned_proof: types.AggregatedSignatureProof = undefined;
         try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
-        errdefer cloned_proof.deinit();
+        var cloned_proof_owned = true;
+        errdefer if (cloned_proof_owned) cloned_proof.deinit();
 
         {
             self.signatures_mutex.lock();
@@ -1444,6 +1445,7 @@ pub const ForkChoice = struct {
                 .slot = attestation_data.slot,
                 .proof = cloned_proof,
             });
+            cloned_proof_owned = false;
 
             if (is_from_block) {
                 if (self.latest_block_aggregated_payloads_slot == null or self.latest_block_aggregated_payloads_slot.? != attestation_data.slot) {
@@ -1454,7 +1456,8 @@ pub const ForkChoice = struct {
 
                 var block_proof: types.AggregatedSignatureProof = undefined;
                 try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &block_proof);
-                errdefer block_proof.deinit();
+                var block_proof_owned = true;
+                errdefer if (block_proof_owned) block_proof.deinit();
 
                 const block_gop = try self.latest_block_aggregated_payloads.getOrPut(attestation_data.*);
                 if (!block_gop.found_existing) {
@@ -1464,6 +1467,7 @@ pub const ForkChoice = struct {
                     .slot = attestation_data.slot,
                     .proof = block_proof,
                 });
+                block_proof_owned = false;
             }
         }
     }
