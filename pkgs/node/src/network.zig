@@ -255,6 +255,18 @@ pub const Network = struct {
         return self.connected_peers.setLatestStatus(peer_id, status);
     }
 
+    pub fn getPeerLatestStatus(self: *Self, peer_id: []const u8) ?types.Status {
+        var guard = self.connected_peers.iterateLocked();
+        defer guard.deinit();
+
+        while (guard.iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, peer_id)) {
+                return entry.value_ptr.latest_status;
+            }
+        }
+        return null;
+    }
+
     pub fn connectPeer(self: *Self, peer_id: []const u8) !void {
         try self.connected_peers.connect(peer_id);
     }
