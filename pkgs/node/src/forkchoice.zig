@@ -322,6 +322,9 @@ pub const ForkChoice = struct {
     // This is observability-only; fork choice uses latest_known_aggregated_payloads.
     latest_block_aggregated_payloads: AggregatedPayloadsMap,
     latest_block_aggregated_payloads_slot: ?types.Slot,
+    /// Coverage of latest_new_aggregated_payloads captured just before the last
+    /// acceptNewAttestationsUnlocked merge.  Used to report "prev_new" in printSlot.
+    saved_pre_merge_new_coverage: ?SavedPreMergeCoverage = null,
     // Mutex to protect concurrent access to signature/payload maps
     signatures_mutex: zeam_utils.SyncMutex,
     // Tracks whether FC has observed a real justified checkpoint via block processing.
@@ -346,6 +349,21 @@ pub const ForkChoice = struct {
 
         pub fn deinit(self: Snapshot, allocator: Allocator) void {
             allocator.free(self.nodes);
+        }
+    };
+
+    /// Per-validator / per-subnet coverage captured from `latest_new_aggregated_payloads`
+    /// immediately before an `acceptNewAttestationsUnlocked` merge.
+    pub const SavedPreMergeCoverage = struct {
+        slot: types.Slot,
+        /// Per-validator presence (len == numValidators).
+        seen: []bool,
+        /// Per-subnet presence (len == attestation_committee_count).
+        has_subnet: []bool,
+
+        pub fn deinit(self: *SavedPreMergeCoverage, allocator: Allocator) void {
+            allocator.free(self.seen);
+            allocator.free(self.has_subnet);
         }
     };
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
@@ -501,6 +519,7 @@ pub const ForkChoice = struct {
         deinitAggregatedPayloadsMap(self.allocator, &self.latest_known_aggregated_payloads);
         deinitAggregatedPayloadsMap(self.allocator, &self.latest_new_aggregated_payloads);
         deinitAggregatedPayloadsMap(self.allocator, &self.latest_block_aggregated_payloads);
+        if (self.saved_pre_merge_new_coverage) |*cov| cov.deinit(self.allocator);
     }
 
     fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
@@ -890,6 +909,52 @@ pub const ForkChoice = struct {
             defer self.signatures_mutex.unlock();
 
             if (self.latest_new_aggregated_payloads.count() > 0) {
+                // Capture coverage of new payloads BEFORE merging them into known.
+                // Saved as `saved_pre_merge_new_coverage` and used by
+                // formatAggregationCoverageReport as the "prev_new" section.
+                const vc: usize = @intCast(self.config.genesis.numValidators());
+                const cc_u32 = self.config.spec.attestation_committee_count;
+                if (vc > 0 and cc_u32 > 0) {
+                    const cc: usize = @intCast(cc_u32);
+                    // Determine slot from the first entry key.
+                    var payload_slot: types.Slot = 0;
+                    {
+                        var it_s = self.latest_new_aggregated_payloads.iterator();
+                        if (it_s.next()) |first| payload_slot = first.key_ptr.slot;
+                    }
+                    const new_seen = try self.allocator.alloc(bool, vc);
+                    var coverage_saved = false;
+                    errdefer if (!coverage_saved) self.allocator.free(new_seen);
+                    const new_has_subnet = try self.allocator.alloc(bool, cc);
+                    errdefer if (!coverage_saved) self.allocator.free(new_has_subnet);
+                    const dummy_combined_seen = try self.allocator.alloc(bool, vc);
+                    defer self.allocator.free(dummy_combined_seen);
+                    const dummy_combined_has = try self.allocator.alloc(bool, cc);
+                    defer self.allocator.free(dummy_combined_has);
+                    @memset(new_seen, false);
+                    @memset(new_has_subnet, false);
+                    @memset(dummy_combined_seen, false);
+                    @memset(dummy_combined_has, false);
+
+                    collectCoverageFromPayloads(
+                        &self.latest_new_aggregated_payloads,
+                        payload_slot,
+                        cc_u32,
+                        new_seen,
+                        dummy_combined_seen,
+                        new_has_subnet,
+                        dummy_combined_has,
+                    );
+
+                    if (self.saved_pre_merge_new_coverage) |*old| old.deinit(self.allocator);
+                    self.saved_pre_merge_new_coverage = .{
+                        .slot = payload_slot,
+                        .seen = new_seen,
+                        .has_subnet = new_has_subnet,
+                    };
+                    coverage_saved = true;
+                }
+
                 var it = self.latest_new_aggregated_payloads.iterator();
                 while (it.next()) |entry| {
                     const att_data = entry.key_ptr.*;
@@ -1472,6 +1537,17 @@ pub const ForkChoice = struct {
         }
     }
 
+    /// Format the full per-slot attestation aggregate coverage report.
+    ///
+    /// Sections:
+    ///   prev_new  – coverage saved just before the last acceptNewAttestationsUnlocked merge
+    ///               (represents the previous slot's new payloads that were accepted)
+    ///   late      – current latest_new_aggregated_payloads for `slot`
+    ///               (payloads that arrived after the last merge — late arrivals)
+    ///   block     – payloads observed in the most-recently processed block
+    ///   combined  – union of all three
+    ///   diff      – validator-coverage delta between block and prev_new
+    ///   network   – combined / total validators
     pub fn formatAggregationCoverageReport(self: *Self, allocator: Allocator, slot: types.Slot) !?[]u8 {
         const validator_count: usize = @intCast(self.config.genesis.numValidators());
         if (validator_count == 0) return null;
@@ -1480,38 +1556,65 @@ pub const ForkChoice = struct {
         if (committee_count_u32 == 0) return null;
         const committee_count: usize = @intCast(committee_count_u32);
 
-        const new_seen = try allocator.alloc(bool, validator_count);
-        defer allocator.free(new_seen);
+        // Work buffers for each section.
+        const prev_new_seen = try allocator.alloc(bool, validator_count);
+        defer allocator.free(prev_new_seen);
+        const prev_new_has_subnet = try allocator.alloc(bool, committee_count);
+        defer allocator.free(prev_new_has_subnet);
+        const late_seen = try allocator.alloc(bool, validator_count);
+        defer allocator.free(late_seen);
+        const late_has_subnet = try allocator.alloc(bool, committee_count);
+        defer allocator.free(late_has_subnet);
         const block_seen = try allocator.alloc(bool, validator_count);
         defer allocator.free(block_seen);
-        const combined_seen = try allocator.alloc(bool, validator_count);
-        defer allocator.free(combined_seen);
-        @memset(new_seen, false);
-        @memset(block_seen, false);
-        @memset(combined_seen, false);
-
-        const new_has_subnet = try allocator.alloc(bool, committee_count);
-        defer allocator.free(new_has_subnet);
         const block_has_subnet = try allocator.alloc(bool, committee_count);
         defer allocator.free(block_has_subnet);
+        const combined_seen = try allocator.alloc(bool, validator_count);
+        defer allocator.free(combined_seen);
         const combined_has_subnet = try allocator.alloc(bool, committee_count);
         defer allocator.free(combined_has_subnet);
-        @memset(new_has_subnet, false);
+
+        @memset(prev_new_seen, false);
+        @memset(prev_new_has_subnet, false);
+        @memset(late_seen, false);
+        @memset(late_has_subnet, false);
+        @memset(block_seen, false);
         @memset(block_has_subnet, false);
+        @memset(combined_seen, false);
         @memset(combined_has_subnet, false);
 
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
+        // Fill prev_new from the coverage saved before the last merge (if slot matches).
+        if (self.saved_pre_merge_new_coverage) |*cov| {
+            if (cov.slot == slot) {
+                const vlen = @min(cov.seen.len, validator_count);
+                @memcpy(prev_new_seen[0..vlen], cov.seen[0..vlen]);
+                const slen = @min(cov.has_subnet.len, committee_count);
+                @memcpy(prev_new_has_subnet[0..slen], cov.has_subnet[0..slen]);
+                // Fold into combined.
+                for (prev_new_seen, 0..) |pn, i| if (pn) {
+                    combined_seen[i] = true;
+                };
+                for (prev_new_has_subnet, 0..) |pn, i| if (pn) {
+                    combined_has_subnet[i] = true;
+                };
+            }
+        }
+
+        // Fill late from current latest_new_aggregated_payloads (late arrivals after last merge).
         collectCoverageFromPayloads(
             &self.latest_new_aggregated_payloads,
             slot,
             committee_count_u32,
-            new_seen,
+            late_seen,
             combined_seen,
-            new_has_subnet,
+            late_has_subnet,
             combined_has_subnet,
         );
+
+        // Fill block from latest_block_aggregated_payloads.
         collectCoverageFromPayloads(
             &self.latest_block_aggregated_payloads,
             slot,
@@ -1522,19 +1625,30 @@ pub const ForkChoice = struct {
             combined_has_subnet,
         );
 
+        // Only emit a report if we have data in at least one section.
         var has_any = false;
-        for (combined_has_subnet) |has_subnet| {
-            if (has_subnet) {
+        for (combined_has_subnet) |h| {
+            if (h) {
                 has_any = true;
                 break;
             }
         }
         if (!has_any) return null;
 
+        // Diff: validators in block but not in prev_new, and vice-versa.
+        var block_not_prev_new: usize = 0;
+        var prev_new_not_block: usize = 0;
+        for (block_seen, prev_new_seen) |b, pn| {
+            if (b and !pn) block_not_prev_new += 1;
+            if (pn and !b) prev_new_not_block += 1;
+        }
+
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         try out.appendSlice(allocator, "attestation aggregate coverage: ");
-        try appendCoverageSection(allocator, &out, "new", new_seen, new_has_subnet, validator_count, committee_count_u32);
+        try appendCoverageSection(allocator, &out, "prev_new", prev_new_seen, prev_new_has_subnet, validator_count, committee_count_u32);
+        try out.appendSlice(allocator, " | ");
+        try appendCoverageSection(allocator, &out, "late", late_seen, late_has_subnet, validator_count, committee_count_u32);
         try out.appendSlice(allocator, " | ");
         try appendCoverageSection(allocator, &out, "block", block_seen, block_has_subnet, validator_count, committee_count_u32);
         try out.appendSlice(allocator, " | ");
@@ -1543,8 +1657,65 @@ pub const ForkChoice = struct {
         const network_covered = countSeen(combined_seen);
         const network_pct = coveragePct(network_covered, validator_count);
         try appendFmt(allocator, &out, " | network={d}/{d}({d:.2}%)", .{ network_covered, validator_count, network_pct });
+        try appendFmt(allocator, &out, " | diff(block-prev_new)=+{d}/-{d}", .{ block_not_prev_new, prev_new_not_block });
 
         return try out.toOwnedSlice(allocator);
+    }
+
+    /// Log subnet-wise coverage of the current new payloads before starting aggregation.
+    /// Called from aggregateImpl just before fork-choice aggregation runs.
+    pub fn logNewPayloadsCoverageForAggregation(self: *Self, slot: types.Slot) void {
+        const validator_count: usize = @intCast(self.config.genesis.numValidators());
+        if (validator_count == 0) return;
+        const committee_count_u32 = self.config.spec.attestation_committee_count;
+        if (committee_count_u32 == 0) return;
+        const committee_count: usize = @intCast(committee_count_u32);
+
+        const new_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(new_seen);
+        const new_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
+        defer self.allocator.free(new_has_subnet);
+        const dummy_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(dummy_seen);
+        const dummy_has = self.allocator.alloc(bool, committee_count) catch return;
+        defer self.allocator.free(dummy_has);
+
+        @memset(new_seen, false);
+        @memset(new_has_subnet, false);
+        @memset(dummy_seen, false);
+        @memset(dummy_has, false);
+
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
+        collectCoverageFromPayloads(
+            &self.latest_new_aggregated_payloads,
+            slot,
+            committee_count_u32,
+            new_seen,
+            dummy_seen,
+            new_has_subnet,
+            dummy_has,
+        );
+
+        var has_any = false;
+        for (new_has_subnet) |h| {
+            if (h) {
+                has_any = true;
+                break;
+            }
+        }
+
+        if (!has_any) {
+            self.logger.info("agg start slot={d}: new payloads coverage=none", .{slot});
+            return;
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        appendFmt(self.allocator, &out, "agg start slot={d}: ", .{slot}) catch return;
+        appendCoverageSection(self.allocator, &out, "new", new_seen, new_has_subnet, validator_count, committee_count_u32) catch return;
+        self.logger.info("{s}", .{out.items});
     }
 
     /// Aggregate attestation signatures using recursive child proofs.
@@ -2537,6 +2708,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_block_aggregated_payloads);
+    defer if (fork_choice.saved_pre_merge_new_coverage) |*cov| cov.deinit(allocator);
 
     // ========================================
     // TEST getCanonicalAncestorAtDepth
@@ -3045,6 +3217,7 @@ const RebaseTestContext = struct {
         deinitAggregatedPayloadsMap(self.allocator, &self.fork_choice.latest_known_aggregated_payloads);
         deinitAggregatedPayloadsMap(self.allocator, &self.fork_choice.latest_new_aggregated_payloads);
         deinitAggregatedPayloadsMap(self.allocator, &self.fork_choice.latest_block_aggregated_payloads);
+        if (self.fork_choice.saved_pre_merge_new_coverage) |*cov| cov.deinit(self.allocator);
         self.allocator.free(self.spec_name);
         self.allocator.free(self.fork_digest);
 
@@ -3970,6 +4143,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
     defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_block_aggregated_payloads);
+    defer if (fork_choice.saved_pre_merge_new_coverage) |*cov| cov.deinit(allocator);
 
     // Setup attestations for all validators
     // Distribute across C and D

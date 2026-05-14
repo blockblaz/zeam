@@ -3945,6 +3945,9 @@ pub const BeamChain = struct {
             chain.allocator.destroy(snapshot);
         }
 
+        // Log subnet-wise coverage of current new payloads before starting aggregation.
+        chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
+
         const aggregations = chain.forkChoice.aggregate(snapshot) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return;
