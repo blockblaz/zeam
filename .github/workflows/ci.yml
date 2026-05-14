@@ -53,6 +53,7 @@ jobs:
       with:
         toolchain: stable
         components: clippy, rustfmt
+        cache: false
 
     - name: Verify installation
       run: |
@@ -102,6 +103,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -175,6 +177,7 @@ jobs:
       with:
         toolchain: nightly
         components: clippy, rustfmt
+        cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -256,6 +259,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -357,6 +361,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -430,6 +435,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
