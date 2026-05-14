@@ -19,6 +19,7 @@ const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
+const SlotDriverWatchdog = node_lib.SlotDriverWatchdog;
 const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
@@ -153,6 +154,9 @@ pub const Node = struct {
     anchor_state: *types.BeamState,
     /// Shared worker pool for CPU-bound chain work (attestation signature verification).
     thread_pool: *ThreadPool,
+    /// Background watchdog that monitors libxev slot-driver liveness (#863).
+    /// `null` until `run()` spawns it; `stop()` joins it.
+    slot_driver_watchdog: ?SlotDriverWatchdog = null,
 
     const Self = @This();
 
@@ -494,6 +498,9 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.slot_driver_watchdog) |*wd| {
+            wd.stop();
+        }
         if (self.api_server_handle) |handle| {
             handle.stop();
         }
@@ -575,6 +582,22 @@ pub const Node = struct {
         self.logger.info("  Listening on QUIC port: {?d}", .{quic_port});
         self.logger.info("  ENR: {s}", .{encoded_txt});
         self.logger.info("────────────────────────────────────────────────────────", .{});
+
+        // Spawn the slot-driver stall watchdog (#863) so multi-second
+        // libxev stalls surface in the log + metrics even if the main
+        // loop is stuck inside one completion or syscall. Failure to
+        // spawn is non-fatal — log and continue without it.
+        self.slot_driver_watchdog = SlotDriverWatchdog.init(
+            &self.clock,
+            self.options.logger_config.logger(.clock),
+            .{},
+        );
+        if (self.slot_driver_watchdog) |*wd| {
+            wd.start() catch |err| {
+                self.logger.warn("failed to start slot-driver watchdog: {any}", .{err});
+                self.slot_driver_watchdog = null;
+            };
+        }
 
         try self.clock.run();
     }
