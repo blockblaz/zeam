@@ -144,17 +144,72 @@ pub const Clock = struct {
     }
 
     pub fn run(self: *Self) !void {
+        // Issue #863 P4: bound each xev drain pass to ONE io_uring CQE
+        // batch via `.once` rather than `.until_done`.
+        //
+        // The pre-#863 shape called `events.run(.until_done)` per pass,
+        // which loops until `loop.active == 0`. Under sustained gossip
+        // pressure (especially on a 4-subnet aggregator that sees 4×
+        // attestation traffic, with ~74% of those attestations referring
+        // to head blocks the node hadn't imported yet — see the issue
+        // for the full trace), every callback enqueues additional work
+        // (chain submits, peer-event broadcasts, RPC retries) so the
+        // active-completion count never reaches zero and `tickInterval`
+        // doesn't run again until the storm subsides. Devnet-4 saw
+        // multi-second slot-driver stalls and ~96 finalized vs ~196 head
+        // delta on the aggregator as a direct consequence.
+        //
+        // `.once` blocks until at least one completion is ready, drains
+        // whatever the kernel has queued in that batch (up to 128 CQEs
+        // per the io_uring backend), and returns. The next-interval
+        // timer is itself a completion, so under no-flood conditions
+        // we still wake every ~800ms and call `tickInterval` exactly
+        // once per interval — the steady-state behaviour is unchanged.
+        // Under flood the loop returns to the body of this function
+        // after each batch; we re-tick `tickInterval` only when wall
+        // clock has actually crossed the next interval boundary so
+        // the per-tick log line and `lean_tick_interval_duration_seconds`
+        // histogram retain their interval-cadence semantics (and don't
+        // get spammed at the CQE-batch rate).
+        //
+        // The existing `zeam_xev_clock_until_done_drain_seconds`
+        // histogram is repurposed: each pass is now bounded by one
+        // batch, so values are expected to drop sharply (sub-ms median
+        // under steady load). The two slow-drain counters
+        // (>=500ms / >=1s) now flag pathologically large single CQE
+        // batches rather than unbounded drain queues — still a useful
+        // signal but rarely fires now. `zeam_xev_clock_drain_passes_total`
+        // is the new pass-rate liveness counter.
+
+        // Bootstrap: register the first interval timer so `.once` has
+        // something to wait on. Subscribers must have called
+        // `subscribeOnSlot` before `run`; if none did, `.once` would
+        // block forever (which is the same observable behaviour the
+        // pre-P4 `.until_done` loop produced — the busy-while exited
+        // each pass with `loop.active == 0`).
+        self.tickInterval();
         while (true) {
-            self.tickInterval();
             const drain_timer = zeam_metrics.zeam_xev_clock_until_done_drain_seconds.start();
-            try self.events.run(.until_done);
+            try self.events.run(.once);
+            zeam_metrics.metrics.zeam_xev_clock_drain_passes_total.incr();
             const drain_s = drain_timer.observe();
             if (drain_s >= 0.5) {
                 zeam_metrics.metrics.zeam_xev_clock_until_done_slow_ge_500ms_total.incr();
             }
             if (drain_s >= 1.0) {
                 zeam_metrics.metrics.zeam_xev_clock_until_done_slow_ge_1s_total.incr();
-                self.logger.warn("xev until_done drain took {d:.3}s (slot driver backlog; see #863)", .{drain_s});
+                self.logger.warn("xev .once drain batch took {d:.3}s (slot driver backlog; see #863)", .{drain_s});
+            }
+
+            // Only re-tick when wall clock has crossed the next
+            // interval boundary. The boundary check mirrors the one
+            // inside `tickInterval` itself (`current_interval_time_ms +
+            // SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS`),
+            // kept synchronised so a future change to either side
+            // doesn't silently drift them apart.
+            const time_now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
+            if (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS) {
+                self.tickInterval();
             }
         }
     }
