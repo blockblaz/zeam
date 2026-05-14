@@ -543,11 +543,16 @@ pub fn build(b: *Builder) !void {
 
     const run_stress_quick_saturation = b.addRunArtifact(stress_exe);
     run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_MODE", "saturation");
-    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "10");
-    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    // macOS CI runners are often noisy; attestation submits can keep up with the
+    // default producer count so the attn queue never hits QueueFull (FATAL in
+    // stress.zig). Extra attn producers + a slightly longer window make the
+    // gate reliable without changing the operator stress-saturation defaults.
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "15");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "25");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_SAT_ATTN_PRODUCERS", "16");
     const stress_quick_saturation_step = b.step(
         "stress-quick-saturation",
-        "Run a 10s chain-worker queue saturation harness (CI gate, slice c-2c)",
+        "Run a 15s chain-worker queue saturation harness (CI gate, slice c-2c)",
     );
     stress_quick_saturation_step.dependOn(&run_stress_quick_saturation.step);
     test_step.dependOn(&run_stress_quick_saturation.step);
@@ -859,6 +864,8 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Every Rust glue crate is routed through the `zeam-glue` staticlib shim;
     // feature flags control which per-prover rlibs get linked in. See the
     // comment on `addRustGlueLib` and blockblaz/zeam#773.
+    // `cargo +nightly` requires rustup's Cargo shim (not Homebrew's standalone Cargo).
+    // CI prepends `$HOME/.cargo/bin` on macOS before rust-cache / zig build (see ci.yml).
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
             "cargo",                   "+nightly",         "-C",                    path,

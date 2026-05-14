@@ -412,7 +412,7 @@ pub const Node = struct {
         // races between concurrent callers; doing it once here removes that
         // race regardless of the Rust implementation.
         xmss.setupVerifier() catch |err| {
-            self.thread_pool.deinit();
+            // Do not call `thread_pool.deinit()` here — `errdefer` below already tears it down.
             return err;
         };
 
