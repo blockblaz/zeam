@@ -2146,6 +2146,29 @@ pub const BeamChain = struct {
                     sender_node_name,
                 });
 
+                // Issue #863 P2: sync-aware gating. While the chain is
+                // syncing (no_peers / fc_initing / behind_peers) gossip
+                // attestation processing is a strict net loss — head/
+                // source/target lookups will overwhelmingly miss against
+                // a forkchoice that hasn't caught up yet, each miss
+                // would derive a missing-root and enqueue a
+                // `BlocksByRoot` fetch, and the fetch would bottom out
+                // (the head we'd be chasing is the same head our peers
+                // are chasing — we recover via `BlocksByRange` and
+                // gossip block import, NOT per-attestation point
+                // lookups). The pre-fix path turned this into a
+                // self-reinforcing storm on aggregators.
+                //
+                // Block gossip is intentionally NOT gated — it's the
+                // primary recovery vector during sync.
+                switch (self.getSyncStatus()) {
+                    .synced => {},
+                    .no_peers, .fc_initing, .behind_peers => {
+                        zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "attestation", .reason = "syncing" }) catch {};
+                        return .{};
+                    },
+                }
+
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestationData(signed_attestation.message.message, false) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
@@ -2163,6 +2186,17 @@ pub const BeamChain = struct {
                             errdefer roots.deinit(self.allocator);
                             try roots.append(self.allocator, missing_root);
                             return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
+                        },
+                        error.AttestationTooFarInFuture => {
+                            // Issue #863 P3: see `validateAttestationData`'s
+                            // hoisted future-slot check. We bump the
+                            // dedicated counter rather than letting this
+                            // fall into the generic warn-and-drop branch
+                            // so dashboards can attribute the drop rate
+                            // to flood symptoms vs. genuinely malformed
+                            // attestations.
+                            zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "attestation", .reason = "future_slot" }) catch {};
+                            return .{};
                         },
                         else => {
                             self.logger.warn("gossip attestation validation failed: {any}", .{err});
@@ -2227,6 +2261,19 @@ pub const BeamChain = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
+                // Issue #863 P2: same sync-aware gating as the raw
+                // attestation arm. Aggregations are 4× heavier per
+                // message (XMSS aggregate verify) so gating them while
+                // syncing is even more critical. See the rationale
+                // comment in the `.attestation` arm.
+                switch (self.getSyncStatus()) {
+                    .synced => {},
+                    .no_peers, .fc_initing, .behind_peers => {
+                        zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "syncing" }) catch {};
+                        return .{};
+                    },
+                }
+
                 // Validate attestation data before processing (same rules as individual gossip attestations)
                 self.validateAttestationData(signed_aggregation.data, false) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
@@ -2244,6 +2291,10 @@ pub const BeamChain = struct {
                             errdefer roots.deinit(self.allocator);
                             try roots.append(self.allocator, missing_root);
                             return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
+                        },
+                        error.AttestationTooFarInFuture => {
+                            zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "future_slot" }) catch {};
+                            return .{};
                         },
                         else => {
                             self.logger.warn("gossip aggregation validation failed: {any}", .{err});
@@ -3135,6 +3186,39 @@ pub const BeamChain = struct {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
 
+        // Issue #863 P3 part 1: future-slot drop is hoisted to BEFORE the
+        // proto-node lookups. Pre-fix order ran the lookups first, so an
+        // attestation for `current_slot + 100` referencing future blocks
+        // bottomed out at `UnknownHeadBlock` and the caller dutifully
+        // enqueued a `BlocksByRoot` for that future head — which always
+        // 404'd because the block didn't exist anywhere. Multiplied by
+        // 4× subnet fan-out on aggregators this was a fetch-storm
+        // amplifier and a primary contributor to the slot-driver
+        // starvation in #863. Rejecting the attestation here means we
+        // never derive a missing root for it and the fetch is simply
+        // never enqueued.
+        //
+        // Bound is intervals-based (`GOSSIP_DISPARITY_INTERVALS`, =1) so
+        // we still accept the very first interval of the next slot —
+        // attestations clients legitimately publish at the slot
+        // boundary tick — without bumping the disparity tolerance. The
+        // bound only applies to gossip; block-included attestations are
+        // trusted under the block's own validation.
+        if (!is_from_block) {
+            const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+            const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
+            const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
+            if (attestation_start_interval > max_allowed_interval) {
+                self.logger.debug("attestation validation failed: gossip attestation start interval {d} > max allowed interval {d} (slot={d}, time={d})", .{
+                    attestation_start_interval,
+                    max_allowed_interval,
+                    data.slot,
+                    current_time,
+                });
+                return AttestationValidationError.AttestationTooFarInFuture;
+            }
+        }
+
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
         const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
             self.logger.debug("Attestation validation failed: unknown source block root=0x{x}", .{
@@ -3213,26 +3297,9 @@ pub const BeamChain = struct {
             return AttestationValidationError.HeadCheckpointSlotMismatch;
         }
 
-        // 4. Validate gossip attestation is not too far in the future.
-        //
-        //    Bound is in intervals, not slots, and only applies to the gossip
-        //    path. Block-included attestations are trusted under the block's
-        //    own validation (matching leanSpec on_block, which doesn't run
-        //    validate_attestation on block-body attestations at all).
-        if (!is_from_block) {
-            const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
-            const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
-            const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
-            if (attestation_start_interval > max_allowed_interval) {
-                self.logger.debug("attestation validation failed: gossip attestation start interval {d} > max allowed interval {d} (slot={d}, time={d})", .{
-                    attestation_start_interval,
-                    max_allowed_interval,
-                    data.slot,
-                    current_time,
-                });
-                return AttestationValidationError.AttestationTooFarInFuture;
-            }
-        }
+        // (Future-slot bound check is hoisted above the proto-node
+        // lookups — see the issue-#863 P3 comment at the top of this
+        // function.)
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
             data.source.slot,
