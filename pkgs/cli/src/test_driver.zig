@@ -1134,7 +1134,9 @@ pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
     var failure_reason: ?[]const u8 = null;
 
     if (proposer_sig_hex) |hex| proposer: {
-        const proposer_sig_bytes = parseHexBytesAlloc(aa, hex) catch {
+        // Use a stack buffer — SIGSIZE (2536 bytes) is a known compile-time constant.
+        var sig_buf: [types.SIGSIZE]u8 = undefined;
+        const proposer_sig_bytes = parseHexBytes(&sig_buf, hex) catch {
             any_failure = true;
             failure_reason = "InvalidProposerSignatureHex";
             break :proposer;
@@ -1349,7 +1351,19 @@ fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.Aggre
     };
 }
 
+/// Parse a hex-encoded byte string (with 0x prefix) into a caller-supplied buffer.
+/// Returns a slice of the filled portion of `buf`. No heap allocation.
+fn parseHexBytes(buf: []u8, hex: []const u8) ![]u8 {
+    const body = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
+    if (body.len % 2 != 0) return error.InvalidField;
+    const byte_len = body.len / 2;
+    if (byte_len > buf.len) return error.BufferTooSmall;
+    _ = std.fmt.hexToBytes(buf[0..byte_len], body) catch return error.InvalidField;
+    return buf[0..byte_len];
+}
+
 /// Parse a hex-encoded byte string (with 0x prefix) into allocated bytes.
+/// Use only when the output size is not known at comptime (e.g. variable-length proofs).
 fn parseHexBytesAlloc(allocator: Allocator, hex: []const u8) ![]u8 {
     const body = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
     if (body.len % 2 != 0) return error.InvalidField;
