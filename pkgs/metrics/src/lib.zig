@@ -311,6 +311,30 @@ const Metrics = struct {
     // ~1.25 Hz at 4s slots) is a quick liveness signal independent of
     // the existing `lean_tick_interval_duration_seconds` histogram.
     zeam_xev_clock_drain_passes_total: ZeamXevClockDrainPassesCounter,
+    // leanSpec parity (`subspecs/sync/service.py`): gossip attestations
+    // and aggregations whose referenced source/target/head block isn't
+    // yet imported, or whose slot is still in the future, are buffered
+    // for replay after the next successful `onBlock` import (see
+    // `_replay_pending_attestations` in the spec; mirrored as
+    // `replayPendingAttestations` in `chain.zig`).
+    //
+    //   * `lean_pending_attestations_buffered_total{kind, reason}` —
+    //     cumulative entries pushed into the pending-attestation buffer.
+    //     `kind={attestation,aggregation}`, `reason={unknown_block,future_slot}`.
+    //   * `lean_pending_attestations_evicted_total{kind}` — entries
+    //     dropped via FIFO eviction at MAX_PENDING_ATTESTATIONS (1024,
+    //     spec value).
+    //   * `lean_pending_attestations_replay_total{kind, outcome}` —
+    //     replay attempts. `outcome={accepted,buffered,dropped}`:
+    //     `accepted` = validate+verify succeeded after replay,
+    //     `buffered` = still missing block (re-enqueued), `dropped` =
+    //     permanent failure (signature, malformed, etc).
+    //   * `lean_pending_attestations_size{kind}` — instantaneous buffer
+    //     depth, refreshed after every enqueue/replay drain.
+    lean_pending_attestations_buffered_total: LeanPendingAttsBufferedCounter,
+    lean_pending_attestations_evicted_total: LeanPendingAttsEvictedCounter,
+    lean_pending_attestations_replay_total: LeanPendingAttsReplayCounter,
+    lean_pending_attestations_size: LeanPendingAttsSizeGauge,
     // Per-site errors swallowed by `BeamNode.onInterval`; sustained non-zero
     // rates mean the node is ticking but a duty/publish layer is failing.
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
@@ -449,6 +473,10 @@ const Metrics = struct {
     const ZeamGossipAttsDroppedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
     const ZeamBlocksByRootInflightGauge = metrics_lib.Gauge(u64);
     const ZeamXevClockDrainPassesCounter = metrics_lib.Counter(u64);
+    const LeanPendingAttsBufferedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
+    const LeanPendingAttsEvictedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8 });
+    const LeanPendingAttsReplayCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, outcome: []const u8 });
+    const LeanPendingAttsSizeGauge = metrics_lib.GaugeVec(u64, struct { kind: []const u8 });
     // Issue #837 — see `lean_node_interval_error_total` field doc.
     const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
@@ -882,9 +910,15 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_gossip_atts_dropped_total = try Metrics.ZeamGossipAttsDroppedCounter.init(allocator, io, "zeam_gossip_atts_dropped_total", .{ .help = "Total number of gossip attestations/aggregations dropped on the libxev main thread before chain-worker dispatch. Labeled by kind={attestation,aggregation} and reason={syncing,future_slot,worker_validation_failed}. zeam-specific. See blockblaz/zeam#863." }, .{}),
         .zeam_blocks_by_root_inflight = Metrics.ZeamBlocksByRootInflightGauge.init("zeam_blocks_by_root_inflight", .{ .help = "Instantaneous count of outbound `BlocksByRoot` RPCs that have been dispatched but not yet finalized via `finalizePendingRequest`. Capped at MAX_CONCURRENT_BLOCKS_BY_ROOT (8) to bound per-flood dispatch fan-out. zeam-specific. See blockblaz/zeam#863." }, .{}),
         .zeam_xev_clock_drain_passes_total = Metrics.ZeamXevClockDrainPassesCounter.init("zeam_xev_clock_drain_passes_total", .{ .help = "Cumulative passes through `Clock.run`'s libxev drain (one io_uring CQE batch per pass via `events.run(.once)`). Compare scrape deltas against the expected ~1.25 Hz at 4s slots / 5 intervals to detect slot-driver wedges independent of `lean_tick_interval_duration_seconds`. See blockblaz/zeam#863." }, .{}),
+        .lean_pending_attestations_buffered_total = try Metrics.LeanPendingAttsBufferedCounter.init(allocator, io, "lean_pending_attestations_buffered_total", .{ .help = "Gossip attestations / aggregations buffered for replay after a future onBlock import. Mirrors leanSpec subspecs/sync/service.py::_pending_attestations buffer push. Labeled by kind={attestation,aggregation} and reason={unknown_block,future_slot}." }, .{}),
+        .lean_pending_attestations_evicted_total = try Metrics.LeanPendingAttsEvictedCounter.init(allocator, io, "lean_pending_attestations_evicted_total", .{ .help = "Pending-attestation buffer FIFO evictions when MAX_PENDING_ATTESTATIONS (1024, leanSpec subspecs/sync/config.py) is reached. Labeled by kind={attestation,aggregation}." }, .{}),
+        .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts (mirrors leanSpec _replay_pending_attestations). Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
+        .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),
         .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
     };
     metrics.zeam_blocks_by_root_inflight.set(0);
+    metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};
+    metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, 0) catch {};
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
     metrics.lean_validators_count.set(0);
