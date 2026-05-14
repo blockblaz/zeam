@@ -1466,6 +1466,29 @@ pub const BeamNode = struct {
                         missing_roots.items.len,
                     ) catch {};
                 },
+                error.InFlightCapReached => {
+                    // Issue #863 P3: outbound `BlocksByRoot` cap was hit
+                    // before this batch could dispatch. The cap (8 in
+                    // flight, see `network.MAX_CONCURRENT_BLOCKS_BY_ROOT`)
+                    // is the gossip-flood backpressure that prevented the
+                    // libxev thread from forking hundreds of concurrent
+                    // RPCs, each of which would then time out at
+                    // `RPC_REQUEST_TIMEOUT_SECONDS` (8s) and re-trigger
+                    // the storm. Bucket as `inflight_cap` so Grafana
+                    // distinguishes "cap-saturated" from "no peers" /
+                    // "send failed" — sustained non-zero rate combined
+                    // with `zeam_blocks_by_root_inflight` pinned at the
+                    // cap is the canonical signal that flood is being
+                    // contained rather than absorbed.
+                    self.logger.debug(
+                        "blocks-by-root in-flight cap reached, deferring fetch of {d} root(s)",
+                        .{missing_roots.items.len},
+                    );
+                    zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                        .{ .outcome = "inflight_cap" },
+                        missing_roots.items.len,
+                    ) catch {};
+                },
                 else => {
                     self.logger.warn(
                         "failed to send blocks-by-root request to peer: {any}",
