@@ -210,9 +210,10 @@ pub const BeamChain = struct {
     ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
     ///      pool construction; without that pre-warm, concurrent first-time
     ///      verifies could race the Rust-side initialization.
-    ///   3. `xmss.PublicKeyCache` is documented NOT thread-safe. Workers must
-    ///      not call its `getOrPut` directly. The current parallel paths
-    ///      respect this: cache access is confined to a serial pre-phase.
+    ///   3. `xmss.PublicKeyCache` is lock-free as of P1 of #863
+    ///      (per-slot atomic CAS); concurrent `getOrPut` calls are
+    ///      safe. The pre-PR-#884 serial-pre-phase constraint no
+    ///      longer applies.
     ///
     /// New consumers of `thread_pool` should preserve all three invariants.
     thread_pool: ?*ThreadPool = null,

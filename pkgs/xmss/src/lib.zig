@@ -67,20 +67,20 @@ pub const PublicKeyCache = struct {
 
     /// Get a cached public key handle, deserialising from bytes on miss
     /// and CAS-installing the result. Returns the raw
-    /// `*const HashSigPublicKey` for FFI use.
+    /// `*const HashSigPublicKey` for FFI use; the cache retains
+    /// ownership of the handle for its full lifetime.
     ///
-    /// Out-of-range indices (validator_index >= capacity) deserialise
-    /// each call — slow but correct, never fails because the cache
-    /// is undersized.
+    /// Returns `HashSigError.ValidatorIndexOutOfRange` when
+    /// `validator_index >= capacity`. The cache is sized at
+    /// `BeamChain.init` from `genesis.numValidators()`; lean spec does
+    /// not currently grow the validator set after genesis. If/when
+    /// post-genesis growth lands, the fork-boundary handler must
+    /// rebuild the cache with the new size — until then we fail loudly
+    /// rather than fall back to a leaky uncached deserialise (PR #884
+    /// review by @zclawz).
     pub fn getOrPut(self: *Self, validator_index: usize, pubkey_bytes: []const u8) HashSigError!*const HashSigPublicKey {
         if (validator_index >= self.slots.len) {
-            // Slow uncached path. Caller leaks the handle — same shape
-            // the old code had on cache-miss; this is rare enough that
-            // we accept the leak rather than thread an ownership flag
-            // through every caller. The arena-allocator-backed STF
-            // path frees its own scratch on completion.
-            const pk = try PublicKey.fromBytes(pubkey_bytes);
-            return pk.handle;
+            return HashSigError.ValidatorIndexOutOfRange;
         }
 
         const slot = &self.slots[validator_index];
@@ -148,4 +148,104 @@ test "PublicKeyCache zero-capacity is initialisable and empty" {
 
     try std.testing.expect(cache.count() == 0);
     try std.testing.expect(!cache.contains(0));
+}
+
+test "PublicKeyCache getOrPut populates on miss and returns same handle on hit" {
+    const allocator = std.testing.allocator;
+
+    // Generate one real keypair so we have valid SSZ pubkey bytes.
+    var keypair = try KeyPair.generate(allocator, "cache_test_seed", 0, 2);
+    defer keypair.deinit();
+
+    var pk_buf: [256]u8 = undefined;
+    const pk_len = try keypair.pubkeyToBytes(&pk_buf);
+    const pk_bytes = pk_buf[0..pk_len];
+
+    var cache = try PublicKeyCache.init(allocator, 4);
+    defer cache.deinit();
+
+    try std.testing.expect(!cache.contains(2));
+    const first = try cache.getOrPut(2, pk_bytes);
+    try std.testing.expect(cache.contains(2));
+    try std.testing.expect(cache.count() == 1);
+
+    // Second lookup must return the SAME handle pointer — the
+    // population path is invoked at most once per slot.
+    const second = try cache.getOrPut(2, pk_bytes);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(cache.count() == 1);
+}
+
+test "PublicKeyCache getOrPut returns ValidatorIndexOutOfRange past capacity" {
+    const allocator = std.testing.allocator;
+
+    var keypair = try KeyPair.generate(allocator, "oor_test_seed", 0, 2);
+    defer keypair.deinit();
+    var pk_buf: [256]u8 = undefined;
+    const pk_len = try keypair.pubkeyToBytes(&pk_buf);
+    const pk_bytes = pk_buf[0..pk_len];
+
+    var cache = try PublicKeyCache.init(allocator, 3);
+    defer cache.deinit();
+
+    try std.testing.expectError(
+        HashSigError.ValidatorIndexOutOfRange,
+        cache.getOrPut(3, pk_bytes),
+    );
+    try std.testing.expectError(
+        HashSigError.ValidatorIndexOutOfRange,
+        cache.getOrPut(99, pk_bytes),
+    );
+}
+
+test "PublicKeyCache concurrent getOrPut for same slot installs exactly one handle" {
+    const allocator = std.testing.allocator;
+
+    var keypair = try KeyPair.generate(allocator, "cas_test_seed", 0, 2);
+    defer keypair.deinit();
+    var pk_buf: [256]u8 = undefined;
+    const pk_len = try keypair.pubkeyToBytes(&pk_buf);
+    const pk_bytes = pk_buf[0..pk_len];
+
+    var cache = try PublicKeyCache.init(allocator, 8);
+    // No defer deinit yet — we want to inspect post-race state first;
+    // freed at the end after the assertions.
+
+    const NUM_THREADS = 8;
+    const SLOT: usize = 4;
+
+    const Worker = struct {
+        fn run(c: *PublicKeyCache, idx: usize, bytes: []const u8, out: *?*const HashSigPublicKey) void {
+            out.* = c.getOrPut(idx, bytes) catch null;
+        }
+    };
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    var results: [NUM_THREADS]?*const HashSigPublicKey = .{null} ** NUM_THREADS;
+
+    for (0..NUM_THREADS) |i| {
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ &cache, SLOT, pk_bytes, &results[i] });
+    }
+    for (&threads) |*t| t.join();
+
+    // All threads must observe the SAME winning handle. The cache
+    // slot's atomic load is the single source of truth post-race.
+    const winner = results[0] orelse return error.TestUnexpectedResult;
+    for (results) |r| {
+        try std.testing.expectEqual(winner, r orelse return error.TestUnexpectedResult);
+    }
+    try std.testing.expect(cache.count() == 1);
+
+    // Sanity: the installed handle must round-trip via the slot's
+    // atomic load (i.e. it really is in the cache, not a leaked
+    // loser that some thread is still holding).
+    const post = try cache.getOrPut(SLOT, pk_bytes);
+    try std.testing.expectEqual(winner, post);
+
+    // deinit frees the installed handle exactly once. If the CAS
+    // protocol leaked a loser's handle the testing allocator would
+    // surface it on process exit; the contract here is that
+    // PublicKeyCache.deinit suffices to release every handle the
+    // cache ever held.
+    cache.deinit();
 }
