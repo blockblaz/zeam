@@ -2441,7 +2441,8 @@ pub const BeamChain = struct {
                     // asynchronously, so it needs an independent
                     // allocation. On `submitBlock` success the worker
                     // owns the clone (and will deinit it after
-                    // dispatch); on failure the errdefer frees it.
+                    // dispatch); on failure or queue-full/closed, `defer` frees
+                    // the clone if the worker did not take ownership.
                     //
                     // Trade-offs of the worker path:
                     //   * `missing_attestation_roots` feedback is
@@ -2461,7 +2462,10 @@ pub const BeamChain = struct {
                         var cloned: types.SignedBlock = undefined;
                         try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
                         var cloned_consumed = false;
-                        errdefer if (!cloned_consumed) cloned.deinit();
+                        // `defer` (not `errdefer`): QueueFull / QueueClosed return
+                        // `.{}` from the catch arm — a normal return — so `errdefer`
+                        // would not run and the clone would leak (zclawz review, #886).
+                        defer if (!cloned_consumed) cloned.deinit();
                         // Slice (e): forward the block_root we already computed
                         // above so the worker thread doesn't re-hash the block.
                         self.submitBlock(cloned, true, block_root) catch |err| switch (err) {
@@ -2666,11 +2670,13 @@ pub const BeamChain = struct {
                     // for the duration of this callback. Submitting to
                     // the worker transfers ownership to the worker, so
                     // we need an independent allocation. On submit
-                    // failure the errdefer frees the clone.
+                    // failure or queue-full/closed, `defer` frees the clone if the
+                    // worker did not take ownership (`errdefer` would miss the
+                    // catch-arm `return .{}` paths — zclawz review, #886).
                     var cloned: types.SignedAggregatedAttestation = undefined;
                     try types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned);
                     var cloned_consumed = false;
-                    errdefer if (!cloned_consumed) cloned.deinit();
+                    defer if (!cloned_consumed) cloned.deinit();
                     self.submitGossipAggregatedAttestation(cloned) catch |err| switch (err) {
                         error.QueueFull => {
                             zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
@@ -7089,7 +7095,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     var cloned: types.SignedBlock = undefined;
     try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &cloned);
     var cloned_consumed = false;
-    errdefer if (!cloned_consumed) cloned.deinit();
+    defer if (!cloned_consumed) cloned.deinit();
 
     // Slice (e) of #803: pass `null` for `block_root` so the
     // worker recomputes — this test deliberately exercises the
