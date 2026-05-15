@@ -31,6 +31,34 @@ var g_initialized: bool = false;
 
 const Metrics = struct {
     zeam_chain_onblock_duration_seconds: ChainHistogram,
+    // Per-substep timing inside `chain.onBlock` — used to attribute the
+    // multi-second tail observed on aggregator nodes (#863). Step labels:
+    //   "block_root_compute" — hash_tree_root of the inner block when the
+    //       caller did not supply a precomputed root.
+    //   "parent_state_clone" — snapshot+clone of parent state under
+    //       states_lock.shared.
+    //   "verify_signatures" — XMSS verify (per-attestation) under
+    //       pubkey_cache_lock.
+    //   "state_transition" — `apply_transition` (process_slots +
+    //       process_block) under root_to_slot_lock.
+    //   "forkchoice_onblock" — `forkChoice.onBlock` integration call.
+    //   "block_attestations" — onAttestation/storeAggregatedPayload loop
+    //       over the block body.
+    //   "db_persist" — block + state write batch + commit.
+    //   "ssz_serialize_fallback" — fallback re-serialise when no
+    //       precomputed SSZ bytes were supplied.
+    //   "total_excluding_io_wait" — observed wall-clock total (mirrors
+    //       `_duration_seconds` so dashboards can sanity-check that the
+    //       sub-step buckets sum to roughly the total).
+    zeam_chain_onblock_step_duration_seconds: ChainOnblockStepHistogram,
+    // Slot-driver stall watchdog (#863): a dedicated thread samples the
+    // libxev tick clock every WATCHDOG_PROBE_MS via `Clock.lastTickMs()`
+    // (atomic acquire load); if the value falls more than
+    // WATCHDOG_THRESHOLD_MS behind wall clock it logs an ERROR and
+    // bumps these counters. The histogram captures the distribution of
+    // stall durations across firings.
+    zeam_slot_driver_stall_fired_total: ZeamSlotDriverStallFiredCounter,
+    zeam_slot_driver_stall_seconds: ZeamSlotDriverStallSecondsHistogram,
     lean_head_slot: LeanHeadSlotGauge,
     lean_latest_justified_slot: LeanLatestJustifiedSlotGauge,
     lean_latest_finalized_slot: LeanLatestFinalizedSlotGauge,
@@ -238,6 +266,25 @@ const Metrics = struct {
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
+    // Per-substep timing inside chain.onBlock — see #863 root-cause work.
+    // Same bucket layout as ChainHistogram so dashboards can stack the
+    // step series and the total side-by-side without bucket-aligned diffs.
+    const ChainOnblockStepLabel = struct { step: []const u8 };
+    const ChainOnblockStepHistogram = metrics_lib.HistogramVec(
+        f32,
+        ChainOnblockStepLabel,
+        &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
+    );
+    // Watchdog counters (#863): wall-clock heartbeats from the slot-driver
+    // libxev thread. The watchdog thread bumps `_fired_total` whenever it
+    // observes a stall over the configured threshold; the per-bucket
+    // counters give operators a quick "how bad" without scraping the
+    // histogram.
+    const ZeamSlotDriverStallFiredCounter = metrics_lib.Counter(u64);
+    const ZeamSlotDriverStallSecondsHistogram = metrics_lib.Histogram(
+        f32,
+        &[_]f32{ 1, 2, 5, 10, 30, 60, 120, 300, 600 },
+    );
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
     const SlotsProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const BlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
@@ -677,6 +724,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
+        .zeam_chain_onblock_step_duration_seconds = try Metrics.ChainOnblockStepHistogram.init(allocator, io, "zeam_chain_onblock_step_duration_seconds", .{ .help = "Per-substep wall-clock duration inside chain.onBlock, labeled by step. See #863 for context. Buckets match zeam_chain_onblock_duration_seconds for stack-aligned dashboarding." }, .{}),
+        .zeam_slot_driver_stall_fired_total = Metrics.ZeamSlotDriverStallFiredCounter.init("zeam_slot_driver_stall_fired_total", .{ .help = "Total times the watchdog (#863) observed the libxev slot driver stalled past its threshold (default 5s). Each firing also records the stall duration in zeam_slot_driver_stall_seconds and emits an ERROR log." }, .{}),
+        .zeam_slot_driver_stall_seconds = Metrics.ZeamSlotDriverStallSecondsHistogram.init("zeam_slot_driver_stall_seconds", .{ .help = "Distribution of slot-driver stall durations observed by the watchdog (#863). Stalls beyond ~1s indicate the libxev loop, libp2p Rust thread, or chain-worker held the main loop hostage; pair with zeam_chain_onblock_step_duration_seconds to attribute." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
         .lean_latest_justified_slot = Metrics.LeanLatestJustifiedSlotGauge.init("lean_latest_justified_slot", .{ .help = "Latest justified slot" }, .{}),
         .lean_latest_finalized_slot = Metrics.LeanLatestFinalizedSlotGauge.init("lean_latest_finalized_slot", .{ .help = "Latest finalized slot" }, .{}),

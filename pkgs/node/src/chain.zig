@@ -125,6 +125,37 @@ pub const PendingBlockEntry = struct {
     block_root: types.Root,
 };
 
+/// Cumulative stopwatch for `chain.onBlock` substeps (#863).
+///
+/// `lap(label)` records the time elapsed since the previous `lap` (or
+/// since `init`) into the labeled `zeam_chain_onblock_step_duration_seconds`
+/// histogram. The struct is `comptime`-cheap: a single i128 anchor and
+/// no heap. `lap` failures (metric not initialised) are silently
+/// swallowed so onBlock never fails because instrumentation can't write.
+const OnblockStepWatch = struct {
+    anchor_ns: i128,
+
+    fn init() OnblockStepWatch {
+        return .{ .anchor_ns = zeam_utils.monotonicTimestampNs() };
+    }
+
+    /// Record the elapsed time since the previous lap under
+    /// `step` and rebase the anchor. Safe to call from any
+    /// number of code paths inside one onBlock invocation; the
+    /// total of all laps approximates the outer
+    /// `zeam_chain_onblock_duration_seconds` observation.
+    fn lap(self: *OnblockStepWatch, comptime step: []const u8) void {
+        const now_ns = zeam_utils.monotonicTimestampNs();
+        const elapsed_ns: i128 = if (now_ns >= self.anchor_ns) now_ns - self.anchor_ns else 0;
+        const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+        zeam_metrics.metrics.zeam_chain_onblock_step_duration_seconds.observe(
+            .{ .step = step },
+            elapsed_s,
+        ) catch {};
+        self.anchor_ns = now_ns;
+    }
+};
+
 pub const BeamChain = struct {
     config: configs.ChainConfig,
     anchor_state: *types.BeamState,
@@ -210,9 +241,10 @@ pub const BeamChain = struct {
     ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
     ///      pool construction; without that pre-warm, concurrent first-time
     ///      verifies could race the Rust-side initialization.
-    ///   3. `xmss.PublicKeyCache` is documented NOT thread-safe. Workers must
-    ///      not call its `getOrPut` directly. The current parallel paths
-    ///      respect this: cache access is confined to a serial pre-phase.
+    ///   3. `xmss.PublicKeyCache` is lock-free as of P1 of #863
+    ///      (per-slot atomic CAS); concurrent `getOrPut` calls are
+    ///      safe. The pre-PR-#884 serial-pre-phase constraint no
+    ///      longer applies.
     ///
     /// New consumers of `thread_pool` should preserve all three invariants.
     thread_pool: ?*ThreadPool = null,
@@ -343,7 +375,10 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
-            .public_key_cache = xmss.PublicKeyCache.init(allocator),
+            // Sized to the genesis validator count. Lock-free per-slot
+            // cache (P1 of #863) — see `xmss.PublicKeyCache` doc for the
+            // CAS protocol and validator-set-growth caveats.
+            .public_key_cache = try xmss.PublicKeyCache.init(allocator, @intCast(opts.config.genesis.numValidators())),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .thread_pool = opts.thread_pool,
             // pending_blocks is the future-slot queue (issue #788). It's an
@@ -2240,12 +2275,17 @@ pub const BeamChain = struct {
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
         const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
+        // Per-substep stopwatch (#863). Records into
+        // `zeam_chain_onblock_step_duration_seconds{step="…"}` so the
+        // multi-second tail can be attributed without invasive logging.
+        var step_watch = OnblockStepWatch.init();
 
         const block = signedBlock.block;
 
         const block_root: types.Root = if (blockInfo.blockRoot) |r| r else r: {
             var cblock_root: [32]u8 = undefined;
             try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+            step_watch.lap("block_root_compute");
             break :r cblock_root;
         };
         if (blockInfo.blockRoot != null) {
@@ -2293,33 +2333,26 @@ pub const BeamChain = struct {
             // sszClone succeeded — interior heap fields are now allocated.
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
+            step_watch.lap("parent_state_clone");
 
             // 2. verify XMSS signatures (independent step; placed before STF so an invalid block is
             // rejected without mutating post state). Uses the shared thread pool when available to
             // parallelize per-attestation verification across CPU workers.
             //
             // The XMSS pubkey cache is documented NOT thread-safe; today the
-            // parallel path only consumes the cache from a serial pre-phase.
-            // Slice (a-2) wraps the cache calls in `pubkey_cache_lock`. Tier-5
-            // sibling rule: `root_to_slot_lock` (5b) and `events_lock` (5c)
-            // must NOT be held at this point.
-            {
-                var t_pk = LockTimer.start("pubkey_cache", "onBlock.verifySignatures");
-                locking.assertNoTier5SiblingHeld("onBlock.verifySignatures");
-                self.pubkey_cache_lock.lock();
-                locking.enterTier5();
-                t_pk.acquired();
-                defer {
-                    self.pubkey_cache_lock.unlock();
-                    locking.leaveTier5();
-                    t_pk.released();
-                }
-                if (self.thread_pool) |pool| {
-                    try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
-                } else {
-                    try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
-                }
+            // The XMSS pubkey cache is lock-free as of P1 of #863
+            // (`xmss.PublicKeyCache` uses per-slot atomic CAS). No
+            // `pubkey_cache_lock` acquisition needed here — readers
+            // and the STF's own population path race on the slot's
+            // atomic and the loser frees its handle. The previous
+            // mutex around this block was the dominant contributor
+            // to the ~78ms mean lock hold reported in #863.
+            if (self.thread_pool) |pool| {
+                try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
+            } else {
+                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
             }
+            step_watch.lap("verify_signatures");
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify).
             //    Hold `root_to_slot_lock` for the STF window: STF reads/writes
@@ -2343,6 +2376,7 @@ pub const BeamChain = struct {
                     .rootToSlotCache = &self.root_to_slot_cache,
                 });
             }
+            step_watch.lap("state_transition");
             break :computedstate cpost_state;
         };
         // If post_state was freshly allocated above and a later step errors (e.g. forkChoice.onBlock,
@@ -2393,6 +2427,7 @@ pub const BeamChain = struct {
             try types.sszClone(self.allocator, types.SignedBlock, signedBlock, &fallback_clone);
             fallback_clone_initialized = true;
             try ssz.serialize(types.SignedBlock, fallback_clone, &fallback_ssz, self.allocator);
+            step_watch.lap("ssz_serialize_fallback");
             break :blk fallback_ssz.items;
         };
 
@@ -2408,6 +2443,7 @@ pub const BeamChain = struct {
                 // confirmed in next steps post written to db
                 .confirmed = false,
             });
+            step_watch.lap("forkchoice_onblock");
 
             // 4. fc onattestations
             self.logger.debug("processing attestations of block with root=0x{x} slot={d}", .{
@@ -2529,6 +2565,7 @@ pub const BeamChain = struct {
 
             // 5. fc update head
             _ = try self.forkChoice.updateHead();
+            step_watch.lap("block_attestations");
 
             break :fcprocessing freshFcBlock;
         };
@@ -2606,6 +2643,7 @@ pub const BeamChain = struct {
             });
         };
         try self.forkChoice.confirmBlock(block_root);
+        step_watch.lap("db_persist");
 
         self.logger.info("processed block with root=0x{x} slot={d} processing time={d} (computed root={any} computed state={any})", .{
             &fcBlock.blockRoot,
@@ -3277,18 +3315,9 @@ pub const BeamChain = struct {
             defer borrow.deinit();
             const validators = borrow.state.validators.constSlice();
 
-            // pubkey_cache lookup needs the lock; tier-5 sibling rule says
-            // root_to_slot_lock and events_lock must NOT be held here.
-            var t_pk = LockTimer.start("pubkey_cache", "verifyAggregatedAttestation");
-            locking.assertNoTier5SiblingHeld("verifyAggregatedAttestation");
-            self.pubkey_cache_lock.lock();
-            locking.enterTier5();
-            t_pk.acquired();
-            defer {
-                self.pubkey_cache_lock.unlock();
-                locking.leaveTier5();
-                t_pk.released();
-            }
+            // pubkey_cache is lock-free as of P1 of #863 — no
+            // mutex acquisition needed. See `xmss.PublicKeyCache`
+            // for the per-slot CAS protocol.
 
             for (validator_indices.items) |validator_index| {
                 if (validator_index >= validators.len) {
