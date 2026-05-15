@@ -759,7 +759,9 @@ fn parseAttestationData(obj: std.json.ObjectMap) !types.AttestationData {
 }
 
 /// "attestation" step: single-validator gossip attestation.
-/// Fixture format: {"validatorId": N, "data": {...}, "signature": "0x..." (optional)}
+/// Fixture format: {"validatorId": N, "data": {...}, "signature": "0x..."}
+/// The XMSS signature is required and verified against the validator's
+/// attestation pubkey (hashTreeRoot of AttestationData as the message).
 fn processAttestationStep(
     driver: *ForkChoiceDriverState,
     step_obj: std.json.ObjectMap,
@@ -771,9 +773,32 @@ fn processAttestationStep(
     const validator_id = try parseU64Field(att_obj, &.{ "validatorId", "validator_id" });
     const data_obj = try parseObjectField(att_obj, &.{"data"});
     const att_data = try parseAttestationData(data_obj);
-    const num_validators = driver.fork_choice.anchorState.validators.constSlice().len;
-    if (validator_id >= num_validators) return error.UnknownValidator;
+    const validators_slice = driver.fork_choice.anchorState.validators.constSlice();
+    if (validator_id >= validators_slice.len) return error.UnknownValidator;
     try validateAttestationDataForGossip(driver, att_data);
+
+    // XMSS signature verification. The hive lean-spec-tests fixtures embed a
+    // SignedAttestation per gossip step (see leanSpec/.../gossip_attestation_spec.py:
+    // valid_signature=False produces an all-zero structurally-valid signature
+    // that must fail XMSS verification). Hive fixtures use leanEnv=prod, so we
+    // dispatch to xmss.verifySsz (the test-scheme path is exercised by the
+    // local spectest runner instead).
+    const sig_value = att_obj.get("signature") orelse return error.SignatureVerificationFailed;
+    const sig_hex = parseStringValue(sig_value) catch return error.SignatureVerificationFailed;
+    const sig_body = if (std.mem.startsWith(u8, sig_hex, "0x")) sig_hex[2..] else sig_hex;
+    if (sig_body.len % 2 != 0) return error.SignatureVerificationFailed;
+    const sig_bytes = try driver.allocator.alloc(u8, sig_body.len / 2);
+    defer driver.allocator.free(sig_bytes);
+    _ = std.fmt.hexToBytes(sig_bytes, sig_body) catch return error.SignatureVerificationFailed;
+
+    var msg_hash: [32]u8 = undefined;
+    zeam_utils.hashTreeRoot(types.AttestationData, att_data, &msg_hash, driver.allocator) catch
+        return error.SignatureVerificationFailed;
+
+    const att_pubkey = validators_slice[validator_id].getAttestationPubkey();
+    const epoch: u32 = @intCast(att_data.slot);
+    xmss.verifySsz(att_pubkey, &msg_hash, epoch, sig_bytes) catch
+        return error.SignatureVerificationFailed;
 
     const att = types.Attestation{
         .validator_id = @intCast(validator_id),
@@ -1024,6 +1049,19 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
     const stf_logger = logger_config.logger(.state_transition);
 
     var transition_error: ?[]const u8 = null;
+
+    // Slots-only monotonicity fixtures (leanSpec PR #643: test_process_slots_*)
+    // ship `pre` + `expectException` with no blocks. The test asserts that
+    // `process_slots(state, state.slot)` (or any `target <= state.slot`) is
+    // rejected. zeam's `state.process_slots` returns `InvalidPreState` on
+    // violation, which the spec calls `AssertionError`.
+    if (blocks_arr.items.len == 0 and expect_exception != null) {
+        const target_slot = pre_state.slot;
+        pre_state.process_slots(aa, target_slot, stf_logger) catch |err| {
+            transition_error = @errorName(err);
+        };
+    }
+
     for (blocks_arr.items) |block_val| {
         var block = buildBlockFromJson(aa, block_val) catch |err| {
             transition_error = @errorName(err);
@@ -1032,7 +1070,6 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
         defer block.deinit();
         state_transition.apply_transition(aa, &pre_state, block, .{
             .logger = stf_logger,
-            .validateResult = false,
         }) catch |err| {
             transition_error = @errorName(err);
             break;
