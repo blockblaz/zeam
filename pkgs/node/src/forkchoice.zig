@@ -1205,9 +1205,119 @@ pub const ForkChoice = struct {
             break;
         }
 
+        self.logBlockProposalPayloadCoverage(slot, &agg_attestations);
+
         agg_att_cleanup = false;
         agg_sig_cleanup = false;
         return .{ .attestations = agg_attestations, .signatures = attestation_signatures };
+    }
+
+    /// Log coverage attribution for the attestations selected while building
+    /// a block proposal. `payloads` means validators covered by known
+    /// aggregated payload proofs; `gossip` means validators covered by
+    /// gossiped single attestations that were not already covered by those
+    /// payload proofs; `combined` is the actual block attestation coverage.
+    fn logBlockProposalPayloadCoverage(self: *Self, slot: types.Slot, proposal_attestations: *const types.AggregatedAttestations) void {
+        const validator_count: usize = @intCast(self.config.genesis.numValidators());
+        if (validator_count == 0) return;
+        const committee_count_u32 = self.config.spec.attestation_committee_count;
+        if (committee_count_u32 == 0) return;
+        const committee_count: usize = @intCast(committee_count_u32);
+
+        const payload_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(payload_seen);
+        const gossip_available = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(gossip_available);
+        const final_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(final_seen);
+        const final_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
+        defer self.allocator.free(final_has_subnet);
+        const proposal_payload_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(proposal_payload_seen);
+        const proposal_payload_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
+        defer self.allocator.free(proposal_payload_has_subnet);
+        const proposal_gossip_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(proposal_gossip_seen);
+        const proposal_gossip_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
+        defer self.allocator.free(proposal_gossip_has_subnet);
+
+        @memset(payload_seen, false);
+        @memset(gossip_available, false);
+        @memset(final_seen, false);
+        @memset(final_has_subnet, false);
+        @memset(proposal_payload_seen, false);
+        @memset(proposal_payload_has_subnet, false);
+        @memset(proposal_gossip_seen, false);
+        @memset(proposal_gossip_has_subnet, false);
+
+        for (proposal_attestations.constSlice()) |agg_att| {
+            collectCoverageFromAggregatedAttestation(
+                agg_att,
+                committee_count_u32,
+                final_seen,
+                final_has_subnet,
+            );
+            collectSourceCoverageFromPayloadsForData(
+                &self.latest_known_aggregated_payloads,
+                agg_att.data,
+                committee_count_u32,
+                payload_seen,
+                gossip_available,
+            );
+        }
+
+        for (final_seen, 0..) |is_final, validator_index| {
+            if (!is_final) continue;
+            const subnet_id = types.computeSubnetId(@intCast(validator_index), committee_count_u32) catch continue;
+            const subnet_index: usize = @intCast(subnet_id);
+            if (subnet_index >= committee_count) continue;
+
+            if (payload_seen[validator_index]) {
+                proposal_payload_seen[validator_index] = true;
+                proposal_payload_has_subnet[subnet_index] = true;
+            } else if (gossip_available[validator_index]) {
+                proposal_gossip_seen[validator_index] = true;
+                proposal_gossip_has_subnet[subnet_index] = true;
+            }
+        }
+
+        var has_any = false;
+        for (final_seen) |seen| {
+            if (seen) {
+                has_any = true;
+                break;
+            }
+        }
+
+        recordAggregateCoverageMetrics("proposal_payloads", proposal_payload_seen, proposal_payload_has_subnet);
+        recordAggregateCoverageMetrics("proposal_gossip", proposal_gossip_seen, proposal_gossip_has_subnet);
+        recordAggregateCoverageMetrics("proposal_combined", final_seen, final_has_subnet);
+
+        if (!has_any) {
+            self.logger.info("block proposal slot={d}: attestation aggregate coverage=none", .{slot});
+            return;
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        appendFmt(self.allocator, &out, "block proposal slot={d}: attestation aggregate coverage: ", .{slot}) catch return;
+        appendCoverageSection(self.allocator, &out, "payloads", proposal_payload_seen, proposal_payload_has_subnet, validator_count, committee_count_u32) catch return;
+        out.appendSlice(self.allocator, " | ") catch return;
+        appendCoverageSection(self.allocator, &out, "gossip", proposal_gossip_seen, proposal_gossip_has_subnet, validator_count, committee_count_u32) catch return;
+        out.appendSlice(self.allocator, " | ") catch return;
+        appendCoverageSection(self.allocator, &out, "combined", final_seen, final_has_subnet, validator_count, committee_count_u32) catch return;
+
+        const combined_covered = countSeen(final_seen);
+        const payload_covered = countSeen(proposal_payload_seen);
+        const gossip_covered = countSeen(proposal_gossip_seen);
+        appendFmt(self.allocator, &out, " | network={d}/{d}({d:.2}%) | source_validators=payloads:{d} gossip:{d}", .{
+            combined_covered,
+            validator_count,
+            coveragePct(combined_covered, validator_count),
+            payload_covered,
+            gossip_covered,
+        }) catch return;
+        self.logger.info("{s}", .{out.items});
     }
 
     // Internal unlocked version - assumes caller holds lock
@@ -1728,6 +1838,45 @@ pub const ForkChoice = struct {
         self.logger.info("{s}", .{out.items});
     }
 
+    fn buildAggregateSourceAttribution(
+        self: *Self,
+        att_data: types.AttestationData,
+        proof: types.AggregatedSignatureProof,
+        source_payload_bits: *types.AggregationBits,
+        source_gossip_bits: *types.AggregationBits,
+    ) !void {
+        const validator_count: usize = @intCast(self.config.genesis.numValidators());
+        if (validator_count == 0) return;
+        const committee_count = self.config.spec.attestation_committee_count;
+        if (committee_count == 0) return;
+
+        const payload_seen = try self.allocator.alloc(bool, validator_count);
+        defer self.allocator.free(payload_seen);
+        const gossip_seen = try self.allocator.alloc(bool, validator_count);
+        defer self.allocator.free(gossip_seen);
+        @memset(payload_seen, false);
+        @memset(gossip_seen, false);
+
+        collectSourceCoverageFromPayloadsForData(&self.latest_new_aggregated_payloads, att_data, committee_count, payload_seen, gossip_seen);
+        collectSourceCoverageFromPayloadsForData(&self.latest_known_aggregated_payloads, att_data, committee_count, payload_seen, gossip_seen);
+        collectCoverageFromSignaturesForData(&self.attestation_signatures, att_data, committee_count, gossip_seen);
+
+        for (0..proof.participants.len()) |validator_index| {
+            if (validator_index >= validator_count) continue;
+            if (!(proof.participants.get(validator_index) catch false)) continue;
+
+            if (payload_seen[validator_index]) {
+                try types.aggregationBitsSet(source_payload_bits, validator_index, true);
+            } else if (gossip_seen[validator_index]) {
+                try types.aggregationBitsSet(source_gossip_bits, validator_index, true);
+            } else {
+                // Unknown source (for example, externally imported child payloads).
+                // Count it as payload-originated rather than dropping coverage.
+                try types.aggregationBitsSet(source_payload_bits, validator_index, true);
+            }
+        }
+    }
+
     /// Aggregate attestation signatures using recursive child proofs.
     ///
     /// Extends aggregation with child proofs from new/known payloads
@@ -1793,11 +1942,21 @@ pub const ForkChoice = struct {
 
                 try aggregated_att_data_keys.append(self.allocator, agg_att.data);
 
-                // Store proof into new payloads map
+                // Store proof into new payloads map, preserving source attribution
+                // so block proposal logs can split selected coverage into child-payload
+                // vs raw-gossip origins after this aggregate is promoted to known.
                 const gop = try new_payloads.getOrPut(agg_att.data);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = .empty;
                 }
+
+                var source_payload_bits = try types.AggregationBits.init(self.allocator);
+                var source_payload_bits_owned = true;
+                errdefer if (source_payload_bits_owned) source_payload_bits.deinit();
+                var source_gossip_bits = try types.AggregationBits.init(self.allocator);
+                var source_gossip_bits_owned = true;
+                errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
+                try self.buildAggregateSourceAttribution(agg_att.data, proof, &source_payload_bits, &source_gossip_bits);
 
                 var cloned_proof: types.AggregatedSignatureProof = undefined;
                 try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
@@ -1805,7 +1964,11 @@ pub const ForkChoice = struct {
                 try gop.value_ptr.append(self.allocator, .{
                     .slot = agg_att.data.slot,
                     .proof = cloned_proof,
+                    .source_payload_participants = source_payload_bits,
+                    .source_gossip_participants = source_gossip_bits,
                 });
+                source_payload_bits_owned = false;
+                source_gossip_bits_owned = false;
 
                 var output_proof: types.AggregatedSignatureProof = undefined;
                 try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
@@ -1912,9 +2075,6 @@ pub const ForkChoice = struct {
         while (it.next()) |entry| {
             if (entry.key_ptr.target.slot > finalized_slot) continue;
 
-            for (entry.value_ptr.items) |*stored| {
-                stored.proof.deinit();
-            }
             removed_total += entry.value_ptr.items.len;
             try keys_to_remove.append(allocator, entry.key_ptr.*);
         }
@@ -1922,7 +2082,7 @@ pub const ForkChoice = struct {
         for (keys_to_remove.items) |data| {
             if (payloads.fetchRemove(data)) |kv| {
                 var mutable_val = kv.value;
-                mutable_val.deinit(allocator);
+                deinitAggregatedPayloadsList(allocator, &mutable_val);
             }
         }
         return removed_total;
@@ -2989,13 +3149,19 @@ fn stageAggregatedAttestation(
 // Keep logger config at file scope so ModuleLogger pointers remain valid.
 var rebase_test_logger_config = zeam_utils.getTestLoggerConfig();
 
+fn deinitAggregatedPayloadsList(allocator: Allocator, list: *AggregatedPayloadsList) void {
+    for (list.items) |*stored| {
+        stored.proof.deinit();
+        if (stored.source_payload_participants) |*bits| bits.deinit();
+        if (stored.source_gossip_participants) |*bits| bits.deinit();
+    }
+    list.deinit(allocator);
+}
+
 fn deinitAggregatedPayloadsMap(allocator: Allocator, map: *AggregatedPayloadsMap) void {
     var it = map.iterator();
     while (it.next()) |entry| {
-        for (entry.value_ptr.items) |*stored| {
-            stored.proof.deinit();
-        }
-        entry.value_ptr.deinit(allocator);
+        deinitAggregatedPayloadsList(allocator, entry.value_ptr);
     }
     map.deinit();
 }
@@ -3028,6 +3194,118 @@ fn collectCoverageFromPayloads(
                 combined_has_subnet[subnet_index] = true;
             }
         }
+    }
+}
+
+fn collectCoverageFromPayloadsForData(
+    map: *AggregatedPayloadsMap,
+    att_data: types.AttestationData,
+    committee_count: types.SubnetId,
+    seen: []bool,
+    has_subnet: []bool,
+) void {
+    const payloads = map.get(att_data) orelse return;
+    for (payloads.items) |*stored| {
+        if (stored.slot != att_data.slot) continue;
+        for (0..stored.proof.participants.len()) |validator_index| {
+            markCoverageIfParticipant(stored.proof.participants, validator_index, committee_count, seen, has_subnet);
+        }
+    }
+}
+
+fn collectSourceCoverageFromPayloadsForData(
+    map: *AggregatedPayloadsMap,
+    att_data: types.AttestationData,
+    committee_count: types.SubnetId,
+    payload_seen: []bool,
+    gossip_seen: []bool,
+) void {
+    const payloads = map.get(att_data) orelse return;
+    for (payloads.items) |*stored| {
+        if (stored.slot != att_data.slot) continue;
+
+        if (stored.source_payload_participants) |source_payload| {
+            for (0..source_payload.len()) |validator_index| {
+                markCoverageIfParticipantNoSubnet(source_payload, validator_index, committee_count, payload_seen);
+            }
+        } else {
+            // Unknown/legacy source: treat the child payload itself as payload-originated.
+            for (0..stored.proof.participants.len()) |validator_index| {
+                markCoverageIfParticipantNoSubnet(stored.proof.participants, validator_index, committee_count, payload_seen);
+            }
+        }
+
+        if (stored.source_gossip_participants) |source_gossip| {
+            for (0..source_gossip.len()) |validator_index| {
+                markCoverageIfParticipantNoSubnet(source_gossip, validator_index, committee_count, gossip_seen);
+            }
+        }
+    }
+}
+
+fn markCoverageIfParticipant(
+    participants: types.AggregationBits,
+    validator_index: usize,
+    committee_count: types.SubnetId,
+    seen: []bool,
+    has_subnet: []bool,
+) void {
+    if (validator_index >= seen.len) return;
+    if (!(participants.get(validator_index) catch false)) return;
+
+    const subnet_id = types.computeSubnetId(@intCast(validator_index), committee_count) catch return;
+    const subnet_index: usize = @intCast(subnet_id);
+    if (subnet_index >= has_subnet.len) return;
+
+    seen[validator_index] = true;
+    has_subnet[subnet_index] = true;
+}
+
+fn markCoverageIfParticipantNoSubnet(
+    participants: types.AggregationBits,
+    validator_index: usize,
+    committee_count: types.SubnetId,
+    seen: []bool,
+) void {
+    if (validator_index >= seen.len) return;
+    if (!(participants.get(validator_index) catch false)) return;
+    _ = types.computeSubnetId(@intCast(validator_index), committee_count) catch return;
+    seen[validator_index] = true;
+}
+
+fn collectCoverageFromSignaturesForData(
+    map: *const SignaturesMap,
+    att_data: types.AttestationData,
+    committee_count: types.SubnetId,
+    seen: []bool,
+) void {
+    const signatures = map.get(att_data) orelse return;
+    var it = signatures.iterator();
+    while (it.next()) |entry| {
+        const validator_index: usize = @intCast(entry.key_ptr.*);
+        if (validator_index >= seen.len) continue;
+        if (std.mem.eql(u8, &entry.value_ptr.signature, &ZERO_SIGBYTES)) continue;
+        _ = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+        seen[validator_index] = true;
+    }
+}
+
+fn collectCoverageFromAggregatedAttestation(
+    agg_att: types.AggregatedAttestation,
+    committee_count: types.SubnetId,
+    seen: []bool,
+    has_subnet: []bool,
+) void {
+    for (0..agg_att.aggregation_bits.len()) |validator_index| {
+        if (validator_index >= seen.len) continue;
+        if (!(agg_att.aggregation_bits.get(validator_index) catch false)) continue;
+
+        const subnet_id = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+        const subnet_index: usize = @intCast(subnet_id);
+        if (subnet_index >= has_subnet.len) continue;
+
+        seen[validator_index] = true;
+        has_subnet[subnet_index] = true;
     }
 }
 
