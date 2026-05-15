@@ -261,6 +261,80 @@ const Metrics = struct {
     //     review followup). The benign TOCTOU window is documented
     //     in `BeamNode.fetchBlockByRoots`.
     lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
+    // Issue #863 P2: gossip attestation/aggregation drops on the libxev
+    // main thread BEFORE they are routed to the chain-worker. Bumped by
+    // `chain.onGossip` for raw attestations and aggregations. zeam-
+    // specific (other lean clients shape this differently). Labels:
+    //   * `kind` — `attestation` (raw gossip att) or `aggregation`
+    //     (aggregated payload).
+    //   * `reason`:
+    //     - `syncing` — chain.getSyncStatus() is `behind_peers` /
+    //       `fc_initing` / `no_peers`; suppress validation work and the
+    //       follow-up `BlocksByRoot` fetch enqueue (the death-spiral fix).
+    //       Recovery comes from `BlocksByRange` / gossip block import.
+    //     - `future_slot` — `att.slot > current_slot + GOSSIP_FUTURE_SLOT_TOLERANCE`;
+    //       no point validating against a head we don't know yet, and the
+    //       missing-root would be unhelpful (it's a head we're racing
+    //       against, not a real fetch target).
+    //     - `worker_validation_failed` — attestation reached the chain-
+    //       worker but `validateAttestationData` rejected it on-thread;
+    //       includes the unknown-{head,source,target} cases that used to
+    //       trigger a fetch storm. The chain-worker path silently drops
+    //       these (per the established `chainWorkerOn*Thunk` no-feedback
+    //       contract) so this counter is the only signal.
+    zeam_gossip_atts_dropped_total: ZeamGossipAttsDroppedCounter,
+    // Issue #863 P3: per-resource concurrency cap on outbound
+    // `BlocksByRoot` RPCs. The pre-#863 path issued one RPC per
+    // attestation that referenced an unknown head, multiplied by 4x
+    // subnet fanout for an aggregator — under flood the libxev thread
+    // would fork off hundreds of RPCs that themselves timed out and
+    // retried, saturating the loop. The cap pins concurrent outbound
+    // BlocksByRoot to MAX_CONCURRENT_BLOCKS_BY_ROOT (typically 8) so
+    // gossip pressure can't run the request fan-out away. zeam-specific
+    // (the cap is a zeam implementation detail, not a spec constraint).
+    //   * `zeam_blocks_by_root_inflight` — instantaneous count of
+    //     outbound `BlocksByRoot` RPCs that have been dispatched but
+    //     have not yet been finalized via `finalizePendingRequest`.
+    //   * the cap-rejection bucket is folded into
+    //     `lean_block_fetch_dedup_total{outcome="inflight_cap"}` so
+    //     dashboards see all suppression-by-this-PR causes side by side
+    //     with the existing dedup outcomes — keeps the
+    //     `sum(rate(... by outcome)) == sum(rate(...))` invariant.
+    zeam_blocks_by_root_inflight: ZeamBlocksByRootInflightGauge,
+    // Issue #863 P4: Clock.run drain bounding visibility. The pre-#863
+    // shape called `events.run(.until_done)` per pass, which under
+    // flood drained for many seconds and starved `tickInterval`.
+    // P4 swaps to `.once` (one io_uring CQE batch per pass), which
+    // returns to `tickInterval` as soon as the next-interval timer or
+    // any other completion fires. This counter is the rate of clock
+    // passes — comparing scrape deltas to expected (`5 / SECONDS_PER_SLOT`,
+    // ~1.25 Hz at 4s slots) is a quick liveness signal independent of
+    // the existing `lean_tick_interval_duration_seconds` histogram.
+    zeam_xev_clock_drain_passes_total: ZeamXevClockDrainPassesCounter,
+    // leanSpec parity (`subspecs/sync/service.py`): gossip attestations
+    // and aggregations whose referenced source/target/head block isn't
+    // yet imported, or whose slot is still in the future, are buffered
+    // for replay after the next successful `onBlock` import (see
+    // `_replay_pending_attestations` in the spec; mirrored as
+    // `replayPendingAttestations` in `chain.zig`).
+    //
+    //   * `lean_pending_attestations_buffered_total{kind, reason}` —
+    //     cumulative entries pushed into the pending-attestation buffer.
+    //     `kind={attestation,aggregation}`, `reason={unknown_block,future_slot}`.
+    //   * `lean_pending_attestations_evicted_total{kind}` — entries
+    //     dropped via FIFO eviction at MAX_PENDING_ATTESTATIONS (1024,
+    //     spec value).
+    //   * `lean_pending_attestations_replay_total{kind, outcome}` —
+    //     replay attempts. `outcome={accepted,buffered,dropped}`:
+    //     `accepted` = validate+verify succeeded after replay,
+    //     `buffered` = still missing block (re-enqueued), `dropped` =
+    //     permanent failure (signature, malformed, etc).
+    //   * `lean_pending_attestations_size{kind}` — instantaneous buffer
+    //     depth, refreshed after every enqueue/replay drain.
+    lean_pending_attestations_buffered_total: LeanPendingAttsBufferedCounter,
+    lean_pending_attestations_evicted_total: LeanPendingAttsEvictedCounter,
+    lean_pending_attestations_replay_total: LeanPendingAttsReplayCounter,
+    lean_pending_attestations_size: LeanPendingAttsSizeGauge,
     // Per-site errors swallowed by `BeamNode.onInterval`; sustained non-zero
     // rates mean the node is ticking but a duty/publish layer is failing.
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
@@ -395,6 +469,14 @@ const Metrics = struct {
     // Slice (d)/(e) of #803.
     const LeanBlockRootComputeSkippedCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
+    // Issue #863 P2/P3 metric types.
+    const ZeamGossipAttsDroppedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
+    const ZeamBlocksByRootInflightGauge = metrics_lib.Gauge(u64);
+    const ZeamXevClockDrainPassesCounter = metrics_lib.Counter(u64);
+    const LeanPendingAttsBufferedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
+    const LeanPendingAttsEvictedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8 });
+    const LeanPendingAttsReplayCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, outcome: []const u8 });
+    const LeanPendingAttsSizeGauge = metrics_lib.GaugeVec(u64, struct { kind: []const u8 });
     // Issue #837 — see `lean_node_interval_error_total` field doc.
     const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
@@ -823,10 +905,20 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
-        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race." }, .{}),
-        // Issue #837 — see field doc for label semantics.
+        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race, inflight_cap." }, .{}),
+        // Issue #863 P2/P3/P4 — see field doc for label semantics.
+        .zeam_gossip_atts_dropped_total = try Metrics.ZeamGossipAttsDroppedCounter.init(allocator, io, "zeam_gossip_atts_dropped_total", .{ .help = "Total number of gossip attestations/aggregations dropped on the libxev main thread before chain-worker dispatch. Labeled by kind={attestation,aggregation} and reason={syncing,future_slot,worker_validation_failed}. zeam-specific. See blockblaz/zeam#863." }, .{}),
+        .zeam_blocks_by_root_inflight = Metrics.ZeamBlocksByRootInflightGauge.init("zeam_blocks_by_root_inflight", .{ .help = "Instantaneous count of outbound `BlocksByRoot` RPCs that have been dispatched but not yet finalized via `finalizePendingRequest`. Capped at MAX_CONCURRENT_BLOCKS_BY_ROOT (8) to bound per-flood dispatch fan-out. zeam-specific. See blockblaz/zeam#863." }, .{}),
+        .zeam_xev_clock_drain_passes_total = Metrics.ZeamXevClockDrainPassesCounter.init("zeam_xev_clock_drain_passes_total", .{ .help = "Cumulative passes through `Clock.run`'s libxev drain (one io_uring CQE batch per pass via `events.run(.once)`). Compare scrape deltas against the expected ~1.25 Hz at 4s slots / 5 intervals to detect slot-driver wedges independent of `lean_tick_interval_duration_seconds`. See blockblaz/zeam#863." }, .{}),
+        .lean_pending_attestations_buffered_total = try Metrics.LeanPendingAttsBufferedCounter.init(allocator, io, "lean_pending_attestations_buffered_total", .{ .help = "Gossip attestations / aggregations buffered for replay after a future onBlock import. Mirrors leanSpec subspecs/sync/service.py::_pending_attestations buffer push. Labeled by kind={attestation,aggregation} and reason={unknown_block,future_slot}." }, .{}),
+        .lean_pending_attestations_evicted_total = try Metrics.LeanPendingAttsEvictedCounter.init(allocator, io, "lean_pending_attestations_evicted_total", .{ .help = "Pending-attestation buffer FIFO evictions when MAX_PENDING_ATTESTATIONS (1024, leanSpec subspecs/sync/config.py) is reached. Labeled by kind={attestation,aggregation}." }, .{}),
+        .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts (mirrors leanSpec _replay_pending_attestations). Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
+        .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),
         .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
     };
+    metrics.zeam_blocks_by_root_inflight.set(0);
+    metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};
+    metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, 0) catch {};
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
     metrics.lean_validators_count.set(0);
