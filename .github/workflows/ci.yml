@@ -575,4 +575,7 @@ jobs:
         push: false  # Don't push, just build to verify
         tags: zeam:ci-${{ github.run_number }}
         cache-from: type=gha
-        cache-to: type=gha,mode=max
+        # `ignore-error=true`: cache export talks to GitHub's Actions Cache
+        # API; intermittent 502/HTML responses fail the whole job even when
+        # the image build succeeded (see docker-build ubuntu-22.04-arm on #886).
+        cache-to: type=gha,mode=max,ignore-error=true
