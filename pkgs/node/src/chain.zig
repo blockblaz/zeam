@@ -125,6 +125,37 @@ pub const PendingBlockEntry = struct {
     block_root: types.Root,
 };
 
+/// Cumulative stopwatch for `chain.onBlock` substeps (#863).
+///
+/// `lap(label)` records the time elapsed since the previous `lap` (or
+/// since `init`) into the labeled `zeam_chain_onblock_step_duration_seconds`
+/// histogram. The struct is `comptime`-cheap: a single i128 anchor and
+/// no heap. `lap` failures (metric not initialised) are silently
+/// swallowed so onBlock never fails because instrumentation can't write.
+const OnblockStepWatch = struct {
+    anchor_ns: i128,
+
+    fn init() OnblockStepWatch {
+        return .{ .anchor_ns = zeam_utils.monotonicTimestampNs() };
+    }
+
+    /// Record the elapsed time since the previous lap under
+    /// `step` and rebase the anchor. Safe to call from any
+    /// number of code paths inside one onBlock invocation; the
+    /// total of all laps approximates the outer
+    /// `zeam_chain_onblock_duration_seconds` observation.
+    fn lap(self: *OnblockStepWatch, comptime step: []const u8) void {
+        const now_ns = zeam_utils.monotonicTimestampNs();
+        const elapsed_ns: i128 = if (now_ns >= self.anchor_ns) now_ns - self.anchor_ns else 0;
+        const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+        zeam_metrics.metrics.zeam_chain_onblock_step_duration_seconds.observe(
+            .{ .step = step },
+            elapsed_s,
+        ) catch {};
+        self.anchor_ns = now_ns;
+    }
+};
+
 pub const BeamChain = struct {
     config: configs.ChainConfig,
     anchor_state: *types.BeamState,
@@ -210,9 +241,10 @@ pub const BeamChain = struct {
     ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
     ///      pool construction; without that pre-warm, concurrent first-time
     ///      verifies could race the Rust-side initialization.
-    ///   3. `xmss.PublicKeyCache` is documented NOT thread-safe. Workers must
-    ///      not call its `getOrPut` directly. The current parallel paths
-    ///      respect this: cache access is confined to a serial pre-phase.
+    ///   3. `xmss.PublicKeyCache` is lock-free as of P1 of #863
+    ///      (per-slot atomic CAS); concurrent `getOrPut` calls are
+    ///      safe. The pre-PR-#884 serial-pre-phase constraint no
+    ///      longer applies.
     ///
     /// New consumers of `thread_pool` should preserve all three invariants.
     thread_pool: ?*ThreadPool = null,
@@ -254,6 +286,14 @@ pub const BeamChain = struct {
     pubkey_cache_lock: zeam_utils.SyncMutex = .{},
     root_to_slot_lock: zeam_utils.SyncMutex = .{},
     events_lock: zeam_utils.SyncMutex = .{},
+
+    /// Dedicated Io.Threaded for the aggregate FFI worker (issue #873).
+    /// `concurrent_limit = .limited(1)` enforces at most one in-flight
+    /// aggregate task; a second submit returns `error.ConcurrencyUnavailable`.
+    aggregate_io: *std.Io.Threaded,
+
+    /// Long-lived group hosting submitted aggregate tasks.
+    aggregate_group: std.Io.Group = .init,
 
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
@@ -307,6 +347,16 @@ pub const BeamChain = struct {
         errdefer anchor_rc.release();
         try states.put(fork_choice.head.blockRoot, anchor_rc);
 
+        // Issue #873: dedicated Io.Threaded for aggregate FFI worker.
+        // concurrent_limit = .limited(1) ensures at most one in-flight aggregate task.
+        const agg_io = try allocator.create(std.Io.Threaded);
+        errdefer allocator.destroy(agg_io);
+        agg_io.* = std.Io.Threaded.init(allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(1),
+        });
+        errdefer agg_io.deinit();
+
         var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
@@ -325,7 +375,10 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
-            .public_key_cache = xmss.PublicKeyCache.init(allocator),
+            // Sized to the genesis validator count. Lock-free per-slot
+            // cache (P1 of #863) — see `xmss.PublicKeyCache` doc for the
+            // CAS protocol and validator-set-growth caveats.
+            .public_key_cache = try xmss.PublicKeyCache.init(allocator, @intCast(opts.config.genesis.numValidators())),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .thread_pool = opts.thread_pool,
             // pending_blocks is the future-slot queue (issue #788). It's an
@@ -346,6 +399,9 @@ pub const BeamChain = struct {
             // at its final heap location), so the worker's ctx pointer
             // remains stable for its entire lifetime.
             .chain_worker = null,
+            // aggregate_io: dedicated Io.Threaded for aggregate FFI worker (issue #873).
+            .aggregate_io = agg_io,
+            .aggregate_group = .init,
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
@@ -593,13 +649,14 @@ pub const BeamChain = struct {
         try w.sendAttestation(.{ .on_gossip_attestation = gossip });
     }
 
-    /// Route a gossip aggregated-attestation through the worker queue.
+    /// Route a gossip aggregated-attestation through the worker's
+    /// aggregated-attestation queue so backlog/drop metrics stay labelable.
     pub fn submitGossipAggregatedAttestation(
         self: *Self,
         agg: types.SignedAggregatedAttestation,
     ) SubmitError!void {
         const w = self.chain_worker orelse return error.ChainWorkerDisabled;
-        try w.sendAttestation(.{ .on_gossip_aggregated_attestation = agg });
+        try w.sendAggregatedAttestation(.{ .on_gossip_aggregated_attestation = agg });
     }
 
     /// Route a `processPendingBlocks` tick through the worker queue.
@@ -642,6 +699,10 @@ pub const BeamChain = struct {
         // never called.)
         self.stopChainStateRefcountObserver();
 
+        // Issue #873: wait for any in-flight aggregate worker before
+        // tearing down chain state it references.
+        self.aggregate_group.cancel(self.aggregate_io.io());
+
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
         // `stop()` is idempotent and joins the worker thread; after
@@ -653,6 +714,11 @@ pub const BeamChain = struct {
             self.allocator.destroy(w);
             self.chain_worker = null;
         }
+
+        // Issue #873: tear down aggregate worker pool after chain_worker
+        // is stopped and aggregate_group is cancelled.
+        self.aggregate_io.deinit();
+        self.allocator.destroy(self.aggregate_io);
 
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
@@ -2209,12 +2275,17 @@ pub const BeamChain = struct {
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
         const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
+        // Per-substep stopwatch (#863). Records into
+        // `zeam_chain_onblock_step_duration_seconds{step="…"}` so the
+        // multi-second tail can be attributed without invasive logging.
+        var step_watch = OnblockStepWatch.init();
 
         const block = signedBlock.block;
 
         const block_root: types.Root = if (blockInfo.blockRoot) |r| r else r: {
             var cblock_root: [32]u8 = undefined;
             try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+            step_watch.lap("block_root_compute");
             break :r cblock_root;
         };
         if (blockInfo.blockRoot != null) {
@@ -2262,33 +2333,26 @@ pub const BeamChain = struct {
             // sszClone succeeded — interior heap fields are now allocated.
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
+            step_watch.lap("parent_state_clone");
 
             // 2. verify XMSS signatures (independent step; placed before STF so an invalid block is
             // rejected without mutating post state). Uses the shared thread pool when available to
             // parallelize per-attestation verification across CPU workers.
             //
             // The XMSS pubkey cache is documented NOT thread-safe; today the
-            // parallel path only consumes the cache from a serial pre-phase.
-            // Slice (a-2) wraps the cache calls in `pubkey_cache_lock`. Tier-5
-            // sibling rule: `root_to_slot_lock` (5b) and `events_lock` (5c)
-            // must NOT be held at this point.
-            {
-                var t_pk = LockTimer.start("pubkey_cache", "onBlock.verifySignatures");
-                locking.assertNoTier5SiblingHeld("onBlock.verifySignatures");
-                self.pubkey_cache_lock.lock();
-                locking.enterTier5();
-                t_pk.acquired();
-                defer {
-                    self.pubkey_cache_lock.unlock();
-                    locking.leaveTier5();
-                    t_pk.released();
-                }
-                if (self.thread_pool) |pool| {
-                    try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
-                } else {
-                    try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
-                }
+            // The XMSS pubkey cache is lock-free as of P1 of #863
+            // (`xmss.PublicKeyCache` uses per-slot atomic CAS). No
+            // `pubkey_cache_lock` acquisition needed here — readers
+            // and the STF's own population path race on the slot's
+            // atomic and the loser frees its handle. The previous
+            // mutex around this block was the dominant contributor
+            // to the ~78ms mean lock hold reported in #863.
+            if (self.thread_pool) |pool| {
+                try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
+            } else {
+                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
             }
+            step_watch.lap("verify_signatures");
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify).
             //    Hold `root_to_slot_lock` for the STF window: STF reads/writes
@@ -2312,6 +2376,7 @@ pub const BeamChain = struct {
                     .rootToSlotCache = &self.root_to_slot_cache,
                 });
             }
+            step_watch.lap("state_transition");
             break :computedstate cpost_state;
         };
         // If post_state was freshly allocated above and a later step errors (e.g. forkChoice.onBlock,
@@ -2362,6 +2427,7 @@ pub const BeamChain = struct {
             try types.sszClone(self.allocator, types.SignedBlock, signedBlock, &fallback_clone);
             fallback_clone_initialized = true;
             try ssz.serialize(types.SignedBlock, fallback_clone, &fallback_ssz, self.allocator);
+            step_watch.lap("ssz_serialize_fallback");
             break :blk fallback_ssz.items;
         };
 
@@ -2377,6 +2443,7 @@ pub const BeamChain = struct {
                 // confirmed in next steps post written to db
                 .confirmed = false,
             });
+            step_watch.lap("forkchoice_onblock");
 
             // 4. fc onattestations
             self.logger.debug("processing attestations of block with root=0x{x} slot={d}", .{
@@ -2447,7 +2514,7 @@ pub const BeamChain = struct {
                 var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
                 defer participant_indices.deinit(self.allocator);
 
-                if (validator_indices.items.len != participant_indices.items.len) {
+                if (validator_indices.items.len != participant_indices.items.len or !std.mem.eql(usize, validator_indices.items, participant_indices.items)) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.logger.err(
                         "attestation signature mismatch index={d} validators={d} participants={d}",
@@ -2498,6 +2565,7 @@ pub const BeamChain = struct {
 
             // 5. fc update head
             _ = try self.forkChoice.updateHead();
+            step_watch.lap("block_attestations");
 
             break :fcprocessing freshFcBlock;
         };
@@ -2575,6 +2643,7 @@ pub const BeamChain = struct {
             });
         };
         try self.forkChoice.confirmBlock(block_root);
+        step_watch.lap("db_persist");
 
         self.logger.info("processed block with root=0x{x} slot={d} processing time={d} (computed root={any} computed state={any})", .{
             &fcBlock.blockRoot,
@@ -3246,18 +3315,9 @@ pub const BeamChain = struct {
             defer borrow.deinit();
             const validators = borrow.state.validators.constSlice();
 
-            // pubkey_cache lookup needs the lock; tier-5 sibling rule says
-            // root_to_slot_lock and events_lock must NOT be held here.
-            var t_pk = LockTimer.start("pubkey_cache", "verifyAggregatedAttestation");
-            locking.assertNoTier5SiblingHeld("verifyAggregatedAttestation");
-            self.pubkey_cache_lock.lock();
-            locking.enterTier5();
-            t_pk.acquired();
-            defer {
-                self.pubkey_cache_lock.unlock();
-                locking.leaveTier5();
-                t_pk.released();
-            }
+            // pubkey_cache is lock-free as of P1 of #863 — no
+            // mutex acquisition needed. See `xmss.PublicKeyCache`
+            // for the per-slot CAS protocol.
 
             for (validator_indices.items) |validator_index| {
                 if (validator_index >= validators.len) {
@@ -3300,26 +3360,28 @@ pub const BeamChain = struct {
         return self.forkChoice.aggregate(snapshot);
     }
 
-    pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
+    /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
+    /// Returns within microseconds; the worker calls `publishProducedAggregations`
+    /// itself. If the previous aggregate is still in-flight, the submit is
+    /// skipped and the skip metric is incremented.
+    pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) return null;
+        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_aggregator" }) catch {};
+            return;
+        }
 
         const sync_status = self.getSyncStatus();
         switch (sync_status) {
             .synced => {},
             .fc_initing => {
                 self.logger.warn("skipping aggregation production for slot={d}: forkchoice initializing", .{slot});
-                return null;
+                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                return;
             },
             .no_peers => {
                 // Aggregate even with no peers: local fork-choice benefits from aggregated
                 // attestation weight, and aggregates will propagate once peers connect.
-                // Consistent with proposer and attester which also proceed through .no_peers.
-                //
-                // No double-counting: aggregate() maps per-AttestationData key, replacing
-                // raw attestations with their aggregate. Fork-choice counts each
-                // AttestationData key once regardless of whether the raw or aggregated
-                // form arrived first.
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
@@ -3329,21 +3391,58 @@ pub const BeamChain = struct {
                     info.finalized_slot,
                     info.max_peer_finalized_slot,
                 });
-                return null;
+                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                return;
             },
         }
 
-        const aggregations = self.aggregate() catch |err| {
-            self.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
-            return null;
+        // Snapshot state on the caller's thread (fast path).
+        const head_root = self.forkChoice.getHead().blockRoot;
+        var borrow = self.statesGet(head_root) orelse {
+            self.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "missing_state" }) catch {};
+            return;
+        };
+        defer borrow.assertReleasedOrPanic();
+        const snapshot = borrow.cloneAndRelease(self.allocator) catch |err| {
+            self.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
+            return;
         };
 
-        if (aggregations.len == 0) {
-            self.allocator.free(aggregations);
-            return null;
+        // Submit to the dedicated aggregate worker. concurrent_limit=1
+        // ensures at most one in-flight task.
+        self.aggregate_group.concurrent(self.aggregate_io.io(), aggregateImpl, .{ self, node, snapshot, slot }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                self.logger.info("skipping aggregation for slot={d}: previous aggregate still in-flight", .{slot});
+                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
+                // Free the snapshot we just cloned — the worker won't run.
+                snapshot.deinit();
+                self.allocator.destroy(snapshot);
+                return;
+            },
+        };
+    }
+
+    /// Worker body for the aggregate FFI (runs on `aggregate_io` thread).
+    /// Owns `snapshot` and frees it on exit.
+    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, slot: usize) void {
+        const worker_timer = zeam_metrics.zeam_aggregate_worker_duration_seconds.start();
+        defer _ = worker_timer.observe();
+
+        defer {
+            snapshot.deinit();
+            chain.allocator.destroy(snapshot);
         }
 
-        return aggregations;
+        const aggregations = chain.forkChoice.aggregate(snapshot) catch |err| {
+            chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
+            return;
+        };
+        defer chain.allocator.free(aggregations);
+
+        if (aggregations.len == 0) return;
+
+        node.publishProducedAggregations(aggregations);
     }
 
     pub fn getStatus(self: *Self) types.Status {

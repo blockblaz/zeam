@@ -781,18 +781,16 @@ fn processBlockStep(
         };
         defer proof_template.deinit();
 
-        const bits_len = aggregated_attestation.aggregation_bits.len();
-        for (0..bits_len) |i| {
-            if (aggregated_attestation.aggregation_bits.get(i) catch false) {
-                types.aggregationBitsSet(&proof_template.participants, i, true) catch |err| {
-                    std.debug.print(
-                        "fixture {s} case {s}{f}: failed to set aggregation bit ({s})\n",
-                        .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-                    );
-                    return FixtureError.InvalidFixture;
-                };
-            }
-        }
+        var cloned_bits: types.AggregationBits = undefined;
+        types.sszClone(ctx.allocator, types.AggregationBits, aggregated_attestation.aggregation_bits, &cloned_bits) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to clone aggregation bits ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        proof_template.participants.deinit();
+        proof_template.participants = cloned_bits;
 
         var validator_ids = ctx.allocator.alloc(types.ValidatorIndex, indices.items.len) catch |err| {
             std.debug.print(
@@ -1045,19 +1043,17 @@ fn processGossipAggregatedAttestationStep(
     };
     defer proof.deinit();
 
-    // Copy participant bits into proof.
-    const bits_len = aggregation_bits.len();
-    for (0..bits_len) |i| {
-        if (aggregation_bits.get(i) catch false) {
-            types.aggregationBitsSet(&proof.participants, i, true) catch |err| {
-                std.debug.print(
-                    "fixture {s} case {s}{f}: failed to set aggregation bit ({s})\n",
-                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-                );
-                return FixtureError.InvalidFixture;
-            };
-        }
-    }
+    // Clone participant bits into proof.
+    var cloned_bits: types.AggregationBits = undefined;
+    types.sszClone(ctx.allocator, types.AggregationBits, aggregation_bits, &cloned_bits) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to clone aggregation bits ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    proof.participants.deinit();
+    proof.participants = cloned_bits;
 
     ctx.fork_choice.storeAggregatedPayload(&attestation_data, proof, false) catch |err| {
         std.debug.print(
@@ -1411,6 +1407,88 @@ fn applyChecks(
 
         if (std.mem.eql(u8, key, "lexicographicHeadAmong")) {
             try verifyLexicographicHead(ctx, fixture_path, case_name, step_index, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "justifiedCheckpoint")) {
+            const cp_obj = switch (value) {
+                .object => |m| m,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint must be object\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            if (cp_obj.get("slot")) |sv| {
+                const expected = try expectU64Value(sv, fixture_path, case_name, step_index, "justifiedCheckpoint.slot");
+                const actual = ctx.fork_choice.fcStore.latest_justified.slot;
+                if (actual != expected) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint.slot mismatch got {d} expected {d}\n",
+                        .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            if (cp_obj.get("root")) |rv| {
+                const expected = try expectRootValue(rv, fixture_path, case_name, step_index, "justifiedCheckpoint.root");
+                if (!std.mem.eql(u8, &ctx.fork_choice.fcStore.latest_justified.root, &expected)) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: justifiedCheckpoint.root mismatch\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "finalizedCheckpoint")) {
+            const cp_obj = switch (value) {
+                .object => |m| m,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint must be object\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            if (cp_obj.get("slot")) |sv| {
+                const expected = try expectU64Value(sv, fixture_path, case_name, step_index, "finalizedCheckpoint.slot");
+                const actual = ctx.fork_choice.fcStore.latest_finalized.slot;
+                if (actual != expected) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint.slot mismatch got {d} expected {d}\n",
+                        .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            if (cp_obj.get("root")) |rv| {
+                const expected = try expectRootValue(rv, fixture_path, case_name, step_index, "finalizedCheckpoint.root");
+                if (!std.mem.eql(u8, &ctx.fork_choice.fcStore.latest_finalized.root, &expected)) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: finalizedCheckpoint.root mismatch\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "safeTarget")) {
+            const expected = try expectRootValue(value, fixture_path, case_name, step_index, "safeTarget");
+            if (!std.mem.eql(u8, &ctx.fork_choice.safeTarget.blockRoot, &expected)) {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: safeTarget mismatch\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.FixtureMismatch;
+            }
             continue;
         }
 

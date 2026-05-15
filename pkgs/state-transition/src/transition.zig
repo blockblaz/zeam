@@ -166,19 +166,16 @@ pub fn verifySignatures(
     try xmss.verifySsz(proposal_pubkey, &block_root, block_epoch, &signed_block.signature.proposer_signature);
 }
 
-// Parallel version of verifySignatures using a work-stealing thread pool.
+// Parallel version of verifySignatures.
 //
 // Phase 1 (serial): validates indices, warms pubkey_cache, and computes attestation-data
 // message hashes — all work that touches the non-thread-safe PublicKeyCache or may short-circuit
 // on structural errors. Produces a list of prepared tasks.
 //
-// Phase 2 (parallel): pool.scope spawns one XMSS aggregated-signature verification per task.
-// Tasks check any_err_flag before starting to mimic the serial short-circuit; the first error
-// raised is the one returned. Proposer signature is verified serially at the end (single sig —
-// not worth spawning).
-//
-// `thread_pool` is taken as anytype so state-transition itself does not have to import
-// @zeam/thread-pool — that module is host-only and can't be built for zkVM targets.
+// Phase 2 (parallel): hands the prepared batch to Rust so XMSS verification runs on the same
+// capped rayon pool as recursive aggregation. `thread_pool` is intentionally unused here; it is
+// kept in the signature so call sites do not need a separate serial/parallel dispatch surface.
+// Proposer signature is verified serially at the end (single sig — not worth batching).
 pub fn verifySignaturesParallel(
     allocator: Allocator,
     state: *const types.BeamState,
@@ -194,21 +191,7 @@ pub fn verifySignaturesParallel(
     }
 
     const validators = state.validators.constSlice();
-
-    const VerifyTask = struct {
-        signature_proof: *const types.AggregatedSignatureProof,
-        public_keys: []*const xmss.HashSigPublicKey,
-        message_hash: [32]u8,
-        epoch: u64,
-        // Per-task elapsed time (nanoseconds) measured inside the worker. We
-        // record this so the post-pool emit can call `observe()` once per
-        // attestation, matching the granularity of the serial path. Without
-        // per-task timing the histogram would receive one batch sample per
-        // block and percentiles would diverge from the serial baseline.
-        elapsed_ns: u64 = 0,
-        result: ?anyerror = null,
-        verified: bool = false,
-    };
+    _ = thread_pool;
 
     // All per-task scratch (pubkey handle arrays, pubkey_wrappers when cache is absent)
     // lives in this arena and is freed with one call after the parallel phase returns.
@@ -225,7 +208,7 @@ pub fn verifySignaturesParallel(
         for (pubkey_wrappers.items) |*wrapper| wrapper.deinit();
     };
 
-    const tasks = try scratch_alloc.alloc(VerifyTask, attestations.len);
+    const tasks = try scratch_alloc.alloc(xmss.AggregatedPayloadVerifyBatch, attestations.len);
 
     // -------- Phase 1: serial pre-warm --------
     for (attestations, signature_proofs, 0..) |aggregated_attestation, *signature_proof, i| {
@@ -271,58 +254,28 @@ pub fn verifySignaturesParallel(
         try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
 
         tasks[i] = .{
-            .signature_proof = signature_proof,
             .public_keys = public_keys,
             .message_hash = message_hash,
-            .epoch = aggregated_attestation.data.slot,
+            .epoch = @intCast(aggregated_attestation.data.slot),
+            .agg_sig = &signature_proof.proof_data,
         };
     }
 
-    // -------- Phase 2: parallel verify --------
-    const Runner = struct {
-        fn runScope(scope: anytype, task_slice: []VerifyTask, err_flag: *std.atomic.Value(bool)) Allocator.Error!void {
-            for (task_slice) |*task| {
-                try scope.spawn(runOne, .{ task, err_flag });
-            }
-        }
-
-        fn runOne(task: *VerifyTask, err_flag: *std.atomic.Value(bool)) void {
-            if (err_flag.load(.acquire)) return;
-            task.verified = true;
-            // Time the FFI verify call with a monotonic clock so samples stay
-            // non-negative even if wall clock time is adjusted.
-            const start_ns = zeam_utils.monotonicTimestampNs();
-            task.signature_proof.verify(task.public_keys, &task.message_hash, task.epoch) catch |err| {
-                const end_ns = zeam_utils.monotonicTimestampNs();
-                task.elapsed_ns = if (end_ns >= start_ns) @intCast(end_ns - start_ns) else 0;
-                task.result = err;
-                err_flag.store(true, .release);
-                return;
-            };
-            const end_ns = zeam_utils.monotonicTimestampNs();
-            task.elapsed_ns = if (end_ns >= start_ns) @intCast(end_ns - start_ns) else 0;
-        }
-    };
-
-    var any_err = std.atomic.Value(bool).init(false);
-    try thread_pool.scope(Runner.runScope, .{ tasks, &any_err });
-
-    // Emit one histogram sample per verified task so the parallel path's
-    // percentiles match the serial path (which observes once per
-    // attestation). Mixing the two granularities into the same histogram
-    // would silently distort P50/P99 across deployments.
-    for (tasks) |*task| {
-        if (!task.verified) continue;
-        const elapsed_s: f32 = @as(f32, @floatFromInt(task.elapsed_ns)) / std.time.ns_per_s;
+    // -------- Phase 2: rayon batch verify --------
+    const start_ns = zeam_utils.monotonicTimestampNs();
+    xmss.verifyAggregatedPayloadBatch(scratch_alloc, tasks) catch |err| {
+        const end_ns = zeam_utils.monotonicTimestampNs();
+        const elapsed_s: f32 = @as(f32, @floatFromInt(if (end_ns >= start_ns) end_ns - start_ns else 0)) / std.time.ns_per_s;
         zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.record(elapsed_s);
-        if (task.result) |_| {
-            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
-        } else {
-            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
-        }
-    }
-    for (tasks) |*task| {
-        if (task.result) |err| return err;
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
+        return err;
+    };
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_s: f32 = @as(f32, @floatFromInt(if (end_ns >= start_ns) end_ns - start_ns else 0)) / std.time.ns_per_s;
+    const per_task_elapsed_s = if (tasks.len > 0) elapsed_s / @as(f32, @floatFromInt(tasks.len)) else 0;
+    for (tasks) |_| {
+        zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.record(per_task_elapsed_s);
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
     }
 
     // Proposer signature — single verify, do it serially.

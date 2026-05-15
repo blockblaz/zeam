@@ -31,6 +31,34 @@ var g_initialized: bool = false;
 
 const Metrics = struct {
     zeam_chain_onblock_duration_seconds: ChainHistogram,
+    // Per-substep timing inside `chain.onBlock` — used to attribute the
+    // multi-second tail observed on aggregator nodes (#863). Step labels:
+    //   "block_root_compute" — hash_tree_root of the inner block when the
+    //       caller did not supply a precomputed root.
+    //   "parent_state_clone" — snapshot+clone of parent state under
+    //       states_lock.shared.
+    //   "verify_signatures" — XMSS verify (per-attestation) under
+    //       pubkey_cache_lock.
+    //   "state_transition" — `apply_transition` (process_slots +
+    //       process_block) under root_to_slot_lock.
+    //   "forkchoice_onblock" — `forkChoice.onBlock` integration call.
+    //   "block_attestations" — onAttestation/storeAggregatedPayload loop
+    //       over the block body.
+    //   "db_persist" — block + state write batch + commit.
+    //   "ssz_serialize_fallback" — fallback re-serialise when no
+    //       precomputed SSZ bytes were supplied.
+    //   "total_excluding_io_wait" — observed wall-clock total (mirrors
+    //       `_duration_seconds` so dashboards can sanity-check that the
+    //       sub-step buckets sum to roughly the total).
+    zeam_chain_onblock_step_duration_seconds: ChainOnblockStepHistogram,
+    // Slot-driver stall watchdog (#863): a dedicated thread samples the
+    // libxev tick clock every WATCHDOG_PROBE_MS via `Clock.lastTickMs()`
+    // (atomic acquire load); if the value falls more than
+    // WATCHDOG_THRESHOLD_MS behind wall clock it logs an ERROR and
+    // bumps these counters. The histogram captures the distribution of
+    // stall durations across firings.
+    zeam_slot_driver_stall_fired_total: ZeamSlotDriverStallFiredCounter,
+    zeam_slot_driver_stall_seconds: ZeamSlotDriverStallSecondsHistogram,
     lean_head_slot: LeanHeadSlotGauge,
     lean_latest_justified_slot: LeanLatestJustifiedSlotGauge,
     lean_latest_finalized_slot: LeanLatestFinalizedSlotGauge,
@@ -128,6 +156,11 @@ const Metrics = struct {
     /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
     /// plus `publishProducedAggregations` when the aggregator produces gossip aggregates.
     zeam_node_aggregation_interval_tick_seconds: AggregationIntervalTickHistogram,
+    /// Counter for skipped aggregate submissions, labeled by reason.
+    /// Reasons: "in_flight", "not_aggregator", "not_synced", "missing_state".
+    zeam_aggregate_skip_total: AggregateSkipCounter,
+    /// Histogram for the wall-clock duration of the aggregate FFI worker.
+    zeam_aggregate_worker_duration_seconds: AggregateWorkerDurationHistogram,
     // BeamNode mutex contention metrics (issue #786)
     // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
     // Hold time = how long the callsite kept the mutex locked.
@@ -176,10 +209,11 @@ const Metrics = struct {
     lean_pending_blocks_replayed_total: LeanPendingBlocksReplayedCounter,
     lean_blocks_future_slot_dropped_total: LeanBlocksFutureSlotDroppedCounter,
     // Chain-worker queue + loop metrics (slice c-1 of #803).
-    //   * `_dropped_total{queue="block"|"attestation"}` — producer
+    //   * `_dropped_total{queue="block"|"attestation"|"aggregated_attestation"}` — producer
     //     `trySend` rejections when the queue was full.
-    //   * `_depth{queue="..."}` — instantaneous queue depth, set on
-    //     successful sends; for backlog visibility on devnet stress.
+    //   * `_depth{queue="..."}` — outstanding accepted work, incremented
+    //     on successful sends and decremented after worker processing; for
+    //     backlog visibility on devnet stress.
     //   * `lean_chain_worker_loop_iters_total` — worker-loop liveness
     //     counter; external watchdogs use the delta between scrapes
     //     to detect stalls without touching queue state.
@@ -232,6 +266,25 @@ const Metrics = struct {
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
+    // Per-substep timing inside chain.onBlock — see #863 root-cause work.
+    // Same bucket layout as ChainHistogram so dashboards can stack the
+    // step series and the total side-by-side without bucket-aligned diffs.
+    const ChainOnblockStepLabel = struct { step: []const u8 };
+    const ChainOnblockStepHistogram = metrics_lib.HistogramVec(
+        f32,
+        ChainOnblockStepLabel,
+        &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
+    );
+    // Watchdog counters (#863): wall-clock heartbeats from the slot-driver
+    // libxev thread. The watchdog thread bumps `_fired_total` whenever it
+    // observes a stall over the configured threshold; the per-bucket
+    // counters give operators a quick "how bad" without scraping the
+    // histogram.
+    const ZeamSlotDriverStallFiredCounter = metrics_lib.Counter(u64);
+    const ZeamSlotDriverStallSecondsHistogram = metrics_lib.Histogram(
+        f32,
+        &[_]f32{ 1, 2, 5, 10, 30, 60, 120, 300, 600 },
+    );
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
     const SlotsProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const BlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
@@ -344,6 +397,8 @@ const Metrics = struct {
     const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
     // Issue #837 — see `lean_node_interval_error_total` field doc.
     const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
+    const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const AggregateWorkerDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -527,6 +582,12 @@ fn observeForkChoiceTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeAggregateWorkerDuration(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.AggregateWorkerDurationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeAggregationIntervalTick(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.AggregationIntervalTickHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -639,6 +700,10 @@ pub var zeam_node_aggregation_interval_tick_seconds: Histogram = .{
     .context = null,
     .observe = &observeAggregationIntervalTick,
 };
+pub var zeam_aggregate_worker_duration_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeAggregateWorkerDuration,
+};
 pub var lean_pending_blocks_drain_iters: Histogram = .{
     .context = null,
     .observe = &observePendingBlocksDrainIters,
@@ -659,6 +724,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
+        .zeam_chain_onblock_step_duration_seconds = try Metrics.ChainOnblockStepHistogram.init(allocator, io, "zeam_chain_onblock_step_duration_seconds", .{ .help = "Per-substep wall-clock duration inside chain.onBlock, labeled by step. See #863 for context. Buckets match zeam_chain_onblock_duration_seconds for stack-aligned dashboarding." }, .{}),
+        .zeam_slot_driver_stall_fired_total = Metrics.ZeamSlotDriverStallFiredCounter.init("zeam_slot_driver_stall_fired_total", .{ .help = "Total times the watchdog (#863) observed the libxev slot driver stalled past its threshold (default 5s). Each firing also records the stall duration in zeam_slot_driver_stall_seconds and emits an ERROR log." }, .{}),
+        .zeam_slot_driver_stall_seconds = Metrics.ZeamSlotDriverStallSecondsHistogram.init("zeam_slot_driver_stall_seconds", .{ .help = "Distribution of slot-driver stall durations observed by the watchdog (#863). Stalls beyond ~1s indicate the libxev loop, libp2p Rust thread, or chain-worker held the main loop hostage; pair with zeam_chain_onblock_step_duration_seconds to attribute." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
         .lean_latest_justified_slot = Metrics.LeanLatestJustifiedSlotGauge.init("lean_latest_justified_slot", .{ .help = "Latest justified slot" }, .{}),
         .lean_latest_finalized_slot = Metrics.LeanLatestFinalizedSlotGauge.init("lean_latest_finalized_slot", .{ .help = "Latest finalized slot" }, .{}),
@@ -735,6 +803,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
+        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: in_flight, not_aggregator, not_synced, missing_state." }, .{}),
+        .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of the aggregate FFI worker (XMSS recursive aggregation)." }, .{}),
         // BeamNode mutex contention metrics (issue #786)
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
         .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
@@ -747,8 +817,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_blocks_replayed_total = try Metrics.LeanPendingBlocksReplayedCounter.init(allocator, io, "lean_pending_blocks_replayed_total", .{ .help = "Total number of replays from pending_blocks, by terminal result (issue #788)." }, .{}),
         .lean_blocks_future_slot_dropped_total = Metrics.LeanBlocksFutureSlotDroppedCounter.init("lean_blocks_future_slot_dropped_total", .{ .help = "Total number of gossip blocks hard-rejected as FutureSlot beyond the queueable window (issue #788)." }, .{}),
         // Chain-worker queue + loop metrics (slice c-1 of #803).
-        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
-        .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Instantaneous depth of the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
+        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
+        .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed or explicitly discarded during shutdown, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.
@@ -796,6 +866,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_xev_clock_until_done_drain_seconds.context = @ptrCast(&metrics.zeam_xev_clock_until_done_drain_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
     zeam_node_aggregation_interval_tick_seconds.context = @ptrCast(&metrics.zeam_node_aggregation_interval_tick_seconds);
+    zeam_aggregate_worker_duration_seconds.context = @ptrCast(&metrics.zeam_aggregate_worker_duration_seconds);
     lean_pending_blocks_drain_iters.context = @ptrCast(&metrics.lean_pending_blocks_drain_iters);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
