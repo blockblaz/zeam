@@ -1105,10 +1105,303 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
 
 /// POST /lean/v0/test_driver/verify_signatures/run
 /// Verifies block signatures against an anchor state.
-/// XMSS signature verification is not wired into the HTTP test driver yet.
+/// Implements XMSS proposer + attestation signature verification for hive lean-spec-tests.
 pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
-    _ = body_bytes;
-    return buildSimpleResult(allocator, false, "NotImplemented");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, aa, body_bytes, .{ .ignore_unknown_fields = true }) catch |err| {
+        return buildSimpleResult(allocator, false, @errorName(err));
+    };
+    const obj = switch (parsed.value) {
+        .object => |m| m,
+        else => return buildSimpleResult(allocator, false, "InvalidRequest"),
+    };
+
+    // Determine lean environment (prod vs test); defaults to "prod".
+    const lean_env = if (obj.get("leanEnv")) |v| switch (v) {
+        .string => |s| s,
+        else => "prod",
+    } else "prod";
+    const is_test_env = std.mem.eql(u8, lean_env, "test");
+
+    const expect_exception: ?[]const u8 = if (obj.get("expectException")) |v| switch (v) {
+        .string => |s| s,
+        else => null,
+    } else null;
+
+    // Parse anchor state
+    const anchor_val = obj.get("anchorState") orelse return buildSimpleResult(allocator, false, "MissingAnchorState");
+    var state = buildStateFromJson(aa, anchor_val) catch |err| {
+        return buildSimpleResult(allocator, false, @errorName(err));
+    };
+    defer state.deinit();
+
+    // Parse signedBlock.block and signedBlock.signature
+    const signed_block_val = obj.get("signedBlock") orelse return buildSimpleResult(allocator, false, "MissingSignedBlock");
+    const signed_block_obj = switch (signed_block_val) {
+        .object => |m| m,
+        else => return buildSimpleResult(allocator, false, "InvalidSignedBlock"),
+    };
+
+    const block_val = signed_block_obj.get("block") orelse return buildSimpleResult(allocator, false, "MissingBlock");
+    var block = buildBlockFromJson(aa, block_val) catch |err| {
+        return buildSimpleResult(allocator, false, @errorName(err));
+    };
+    defer block.deinit();
+
+    const sig_val = signed_block_obj.get("signature") orelse return buildSimpleResult(allocator, false, "MissingSignature");
+    const sig_obj = switch (sig_val) {
+        .object => |m| m,
+        else => return buildSimpleResult(allocator, false, "InvalidSignature"),
+    };
+
+    // ----- Proposer signature verification -----
+    const proposer_sig_hex = blk: {
+        const v = getFieldMulti(sig_obj, &.{ "proposerSignature", "proposer_signature" }) orelse
+            break :blk null;
+        break :blk switch (v) {
+            .string => |s| s,
+            else => null,
+        };
+    };
+
+    var any_failure = false;
+    var failure_reason: ?[]const u8 = null;
+
+    if (proposer_sig_hex) |hex| proposer: {
+        // Use a stack buffer — SIGSIZE (2536 bytes) is a known compile-time constant.
+        var sig_buf: [types.SIGSIZE]u8 = undefined;
+        const proposer_sig_bytes = parseHexBytes(&sig_buf, hex) catch {
+            any_failure = true;
+            failure_reason = "InvalidProposerSignatureHex";
+            break :proposer;
+        };
+
+        // Hash the block
+        var block_root: [32]u8 = undefined;
+        zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, aa) catch {
+            any_failure = true;
+            failure_reason = "HashFailed";
+            break :proposer;
+        };
+
+        const proposer_index: usize = @intCast(block.proposer_index);
+        const validators_slice = state.validators.constSlice();
+        if (proposer_index >= validators_slice.len) {
+            any_failure = true;
+            failure_reason = "InvalidProposerIndex";
+            break :proposer;
+        }
+
+        const proposal_pubkey = validators_slice[proposer_index].getProposalPubkey();
+        const epoch: u32 = @intCast(block.slot);
+
+        const result = if (is_test_env)
+            xmss.verifySszTest(proposal_pubkey, &block_root, epoch, proposer_sig_bytes)
+        else
+            xmss.verifySsz(proposal_pubkey, &block_root, epoch, proposer_sig_bytes);
+        if (result) |_| {} else |_| {
+            any_failure = true;
+            failure_reason = "ProposerSignatureVerificationFailed";
+        }
+    } else {
+        any_failure = true;
+        failure_reason = "MissingProposerSignature";
+    }
+
+    // ----- Attestation signature verification -----
+    if (!any_failure) {
+        const att_sigs_result = verifyAttestationSignatures(aa, &state, &block, sig_obj, is_test_env);
+        if (att_sigs_result) |att_failed| {
+            if (att_failed) {
+                any_failure = true;
+                failure_reason = "AttestationSignatureVerificationFailed";
+            }
+        } else |_| {
+            any_failure = true;
+            failure_reason = "AttestationSignatureVerificationError";
+        }
+    }
+
+    // Report the truth about whether signatures verified.
+    // The simulator owns the comparison against `expectException` — it asserts
+    // `response.succeeded == expect_exception.is_none()`, so the driver must
+    // report verification outcome, NOT test outcome.
+    _ = expect_exception;
+    return buildSimpleResult(
+        allocator,
+        !any_failure,
+        if (any_failure) (failure_reason orelse "SignatureVerificationFailed") else null,
+    );
+}
+
+/// Verify each body-attestation aggregated signature for the HTTP test driver.
+/// Returns true if any verification rejected the input.
+fn verifyAttestationSignatures(
+    allocator: Allocator,
+    state: *const types.BeamState,
+    block: *const types.BeamBlock,
+    sig_obj: std.json.ObjectMap,
+    is_test_env: bool,
+) !bool {
+    const attestations = block.body.attestations.constSlice();
+    if (attestations.len == 0) return false;
+
+    // Get attestationSignatures from signature object
+    const att_sigs_val = getFieldMulti(sig_obj, &.{ "attestationSignatures", "attestation_signatures" }) orelse
+        return true; // missing signatures for non-empty attestations = failure
+    const att_sigs_obj = switch (att_sigs_val) {
+        .object => |m| m,
+        else => return true,
+    };
+    const att_sigs_data = att_sigs_obj.get("data") orelse return true;
+    const sig_arr = switch (att_sigs_data) {
+        .array => |a| a,
+        else => return true,
+    };
+
+    if (sig_arr.items.len != attestations.len) return true;
+
+    const validators_slice = state.validators.constSlice();
+    var any_failed = false;
+
+    for (attestations, sig_arr.items) |aggregated_attestation, sig_value| {
+        var validator_indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator) catch {
+            any_failed = true;
+            continue;
+        };
+        defer validator_indices.deinit(allocator);
+
+        var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+        defer {
+            for (pubkey_wrappers.items) |*wrapper| wrapper.deinit();
+            pubkey_wrappers.deinit(allocator);
+        }
+        var public_keys: std.ArrayList(*const xmss.HashSigPublicKey) = .empty;
+        defer public_keys.deinit(allocator);
+
+        var pubkey_load_failed = false;
+        for (validator_indices.items) |validator_index| {
+            if (validator_index >= validators_slice.len) {
+                pubkey_load_failed = true;
+                break;
+            }
+            const pubkey_bytes = validators_slice[validator_index].getAttestationPubkey();
+            const pk = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
+                pubkey_load_failed = true;
+                break;
+            };
+            pubkey_wrappers.append(allocator, pk) catch {
+                pubkey_load_failed = true;
+                break;
+            };
+            public_keys.append(allocator, pk.handle) catch {
+                pubkey_load_failed = true;
+                break;
+            };
+        }
+        if (pubkey_load_failed) {
+            any_failed = true;
+            continue;
+        }
+
+        // Parse the aggregated signature proof
+        const proof_result = parseAggSigProofFromJson(allocator, sig_value);
+        var proof = proof_result catch {
+            any_failed = true;
+            continue;
+        };
+        defer proof.deinit();
+
+        var message_hash: [32]u8 = undefined;
+        zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator) catch {
+            any_failed = true;
+            continue;
+        };
+
+        const epoch: u64 = aggregated_attestation.data.slot;
+        _ = is_test_env; // attestation verification uses leanMultisig which is prod-only currently
+        proof.verify(public_keys.items, &message_hash, epoch) catch {
+            any_failed = true;
+        };
+    }
+
+    return any_failed;
+}
+
+/// Parse an AggregatedSignatureProof from a JSON value (test driver format).
+fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.AggregatedSignatureProof {
+    const obj = switch (value) {
+        .object => |m| m,
+        else => return error.InvalidField,
+    };
+
+    const participants_val = obj.get("participants") orelse return error.MissingField;
+    var participants = types.AggregationBits.init(allocator) catch return error.InvalidField;
+    errdefer participants.deinit();
+
+    const p_obj = switch (participants_val) {
+        .object => |m| m,
+        else => return error.InvalidField,
+    };
+    const p_data = p_obj.get("data") orelse return error.MissingField;
+    const p_arr = switch (p_data) {
+        .array => |a| a,
+        else => return error.InvalidField,
+    };
+    for (p_arr.items) |bit_val| {
+        const b = switch (bit_val) {
+            .bool => |v| v,
+            else => return error.InvalidField,
+        };
+        participants.append(b) catch return error.InvalidField;
+    }
+
+    const proof_data_obj = switch (getFieldMulti(obj, &.{ "proofData", "proof_data" }) orelse return error.MissingField) {
+        .object => |m| m,
+        else => return error.InvalidField,
+    };
+    const proof_data_hex = switch (proof_data_obj.get("data") orelse return error.MissingField) {
+        .string => |s| s,
+        else => return error.InvalidField,
+    };
+    const proof_bytes = try parseHexBytesAlloc(allocator, proof_data_hex);
+    defer allocator.free(proof_bytes);
+
+    var proof_data = try xmss.ByteListMiB.init(allocator);
+    errdefer proof_data.deinit();
+    for (proof_bytes) |b| {
+        proof_data.append(b) catch return error.InvalidField;
+    }
+
+    return types.AggregatedSignatureProof{
+        .participants = participants,
+        .proof_data = proof_data,
+    };
+}
+
+/// Parse a hex-encoded byte string (with 0x prefix) into a caller-supplied buffer.
+/// Returns a slice of the filled portion of `buf`. No heap allocation.
+fn parseHexBytes(buf: []u8, hex: []const u8) ![]u8 {
+    const body = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
+    if (body.len % 2 != 0) return error.InvalidField;
+    const byte_len = body.len / 2;
+    if (byte_len > buf.len) return error.BufferTooSmall;
+    _ = std.fmt.hexToBytes(buf[0..byte_len], body) catch return error.InvalidField;
+    return buf[0..byte_len];
+}
+
+/// Parse a hex-encoded byte string (with 0x prefix) into allocated bytes.
+/// Use only when the output size is not known at comptime (e.g. variable-length proofs).
+fn parseHexBytesAlloc(allocator: Allocator, hex: []const u8) ![]u8 {
+    const body = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
+    if (body.len % 2 != 0) return error.InvalidField;
+    const byte_len = body.len / 2;
+    const out = try allocator.alloc(u8, byte_len);
+    _ = std.fmt.hexToBytes(out, body) catch return error.InvalidField;
+    return out;
 }
 
 fn buildSimpleResult(allocator: Allocator, succeeded: bool, err_name: ?[]const u8) ![]u8 {
