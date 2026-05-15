@@ -310,15 +310,40 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
     );
 }
 
+/// Snappy-frame an RPC error `message`, prepend the `code` result byte and the
+/// uncompressed-size varint, and relay the finished frame to the Rust bridge.
+/// Mirrors the framing `serverStreamSendResponse` applies to success chunks: the
+/// Rust side only relays the bytes (and closes the stream). A peer must be able
+/// to snappy-decode the payload, so the framing cannot be skipped.
+fn sendRpcErrorFramed(zigHandler: *EthLibp2p, channel_id: u64, code: u8, message: []const u8) void {
+    const allocator = zigHandler.allocator;
+
+    const framed = snappyframesz.encode(allocator, message) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to snappy-frame RPC error for channel={d}: {any}",
+            .{ zigHandler.params.networkId, channel_id, err },
+        );
+        return;
+    };
+    defer allocator.free(framed);
+
+    const frame = buildResponseFrame(allocator, code, message.len, framed) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to build RPC error frame for channel={d}: {any}",
+            .{ zigHandler.params.networkId, channel_id, err },
+        );
+        return;
+    };
+    defer allocator.free(frame);
+
+    send_rpc_error_response(zigHandler.params.networkId, channel_id, frame.ptr, frame.len);
+}
+
 fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerror!void {
     const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
     if (ctx.finished) {
         return ServerStreamError.StreamAlreadyFinished;
     }
-
-    const allocator = ctx.zigHandler.allocator;
-    const owned_message = try allocator.dupeZ(u8, message);
-    defer allocator.free(owned_message);
 
     const node_name = ctx.zigHandler.node_registry.getNodeNameFromPeerId(ctx.peer_id);
     ctx.zigHandler.logger.warn(
@@ -326,11 +351,7 @@ fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerr
         .{ ctx.zigHandler.params.networkId, ctx.peer_id, node_name, ctx.channel_id, code, message },
     );
 
-    send_rpc_error_response(
-        ctx.zigHandler.params.networkId,
-        ctx.channel_id,
-        owned_message.ptr,
-    );
+    sendRpcErrorFramed(ctx.zigHandler, ctx.channel_id, @intCast(code), message);
 
     ctx.finished = true;
 }
@@ -651,7 +672,7 @@ export fn handleRPCRequestFromRustBridge(
             "network-{d}:: Unsupported RPC protocol from peer={s}{f} on channel={d}: {s}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, protocol_slice },
         );
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Unsupported RPC protocol");
+        sendRpcErrorFramed(zigHandler, channel_id, 1, "Unsupported RPC protocol");
         return;
     };
 
@@ -662,7 +683,7 @@ export fn handleRPCRequestFromRustBridge(
             "network-{d}:: Invalid RPC request frame from peer={s}{f} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
         );
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request frame");
+        sendRpcErrorFramed(zigHandler, channel_id, 1, "Invalid RPC request frame");
         return;
     };
 
@@ -671,7 +692,7 @@ export fn handleRPCRequestFromRustBridge(
             "network-{d}:: Failed to decode snappy-framed RPC request from peer={s}{f} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
         );
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to decode RPC request");
+        sendRpcErrorFramed(zigHandler, channel_id, 1, "Failed to decode RPC request");
         return;
     };
     defer zigHandler.allocator.free(request_bytes);
@@ -687,7 +708,7 @@ export fn handleRPCRequestFromRustBridge(
                 request_bytes.len,
             },
         );
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request length");
+        sendRpcErrorFramed(zigHandler, channel_id, 1, "Invalid RPC request length");
         return;
     }
 
@@ -701,7 +722,7 @@ export fn handleRPCRequestFromRustBridge(
         if (!writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{f}", .{ label, peer_id_slice, node_name });
         }
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to deserialize RPC request");
+        sendRpcErrorFramed(zigHandler, channel_id, 1, "Failed to deserialize RPC request");
         return;
     };
     defer request.deinit();
@@ -735,7 +756,7 @@ export fn handleRPCRequestFromRustBridge(
             "network-{d}:: Failed to allocate RPC stream context for peer={s}{f} channel={d}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, err },
         );
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Internal error allocating stream context");
+        sendRpcErrorFramed(zigHandler, channel_id, 2, "Internal error allocating stream context");
         return;
     };
     defer zigHandler.allocator.destroy(stream_context);
@@ -1174,7 +1195,8 @@ pub extern fn send_rpc_end_of_stream(networkId: u32, channel_id: u64) callconv(.
 pub extern fn send_rpc_error_response(
     networkId: u32,
     channel_id: u64,
-    message_ptr: [*:0]const u8,
+    frame_ptr: [*]const u8,
+    frame_len: usize,
 ) callconv(.c) void;
 
 /// Issue #808: tag space for `get_swarm_command_dropped_total`. Mirrors the
