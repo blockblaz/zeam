@@ -1643,6 +1643,13 @@ pub const ForkChoice = struct {
             if (pn and !b) prev_new_not_block += 1;
         }
 
+        recordAggregateCoverageMetrics("timely", prev_new_seen, prev_new_has_subnet);
+        recordAggregateCoverageMetrics("late", late_seen, late_has_subnet);
+        recordAggregateCoverageMetrics("block", block_seen, block_has_subnet);
+        recordAggregateCoverageMetrics("combined", combined_seen, combined_has_subnet);
+        zeam_metrics.metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, @intCast(block_not_prev_new)) catch {};
+        zeam_metrics.metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, @intCast(prev_new_not_block)) catch {};
+
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         try out.appendSlice(allocator, "last round attestation aggregate coverage: \n");
@@ -1707,9 +1714,12 @@ pub const ForkChoice = struct {
         }
 
         if (!has_any) {
+            recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet);
             self.logger.info("agg start slot={d}: new payloads coverage=none", .{slot});
             return;
         }
+
+        recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet);
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
@@ -3063,6 +3073,25 @@ fn countSeen(seen: []const bool) usize {
         if (is_seen) count += 1;
     }
     return count;
+}
+
+fn countTrue(values: []const bool) usize {
+    var count: usize = 0;
+    for (values) |value| {
+        if (value) count += 1;
+    }
+    return count;
+}
+
+fn recordAggregateCoverageMetrics(section: []const u8, seen: []const bool, has_subnet: []const bool) void {
+    zeam_metrics.metrics.zeam_attestation_aggregate_coverage_validators.set(
+        .{ .section = section },
+        @intCast(countSeen(seen)),
+    ) catch {};
+    zeam_metrics.metrics.zeam_attestation_aggregate_coverage_subnets.set(
+        .{ .section = section },
+        @intCast(countTrue(has_subnet)),
+    ) catch {};
 }
 
 fn countSubnetSeen(seen: []const bool, subnet_id: types.SubnetId, committee_count: types.SubnetId) usize {
