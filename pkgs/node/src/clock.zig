@@ -201,14 +201,19 @@ pub const Clock = struct {
                 self.logger.warn("xev .once drain batch took {d:.3}s (slot driver backlog; see #863)", .{drain_s});
             }
 
-            // Only re-tick when wall clock has crossed the next
-            // interval boundary. The boundary check mirrors the one
-            // inside `tickInterval` itself (`current_interval_time_ms +
-            // SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS`),
-            // kept synchronised so a future change to either side
-            // doesn't silently drift them apart.
+            // Only re-tick when wall clock has reached the next interval
+            // boundary — **without** `CLOCK_DISPARITY_MS` slack on this
+            // outer trigger. The inner `tickInterval` while-loop still
+            // applies disparity for multi-interval catch-up once we enter
+            // `tickInterval`. Using `+ CLOCK_DISPARITY_MS` here matched the
+            // inner inequality and could fire a full `tickInterval()` up to
+            // ~`CLOCK_DISPARITY_MS` early while the interval timer was still
+            // legitimately pending; `tickInterval` then re-armed/canceled that
+            // timer and the canceled completion does not run `onInterval`,
+            // so gossip-heavy `.once` batches could skip slot duties (#886
+            // review).
             const time_now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
-            if (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS) {
+            if (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS <= time_now_ms) {
                 self.tickInterval();
             }
         }

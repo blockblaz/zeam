@@ -599,10 +599,12 @@ pub const BeamChain = struct {
     ///   * `dropped` — permanent failure (signature mismatch, malformed
     ///     checkpoint ordering); the entry is discarded.
     ///
-    /// MUST be called from the chain-worker thread (or the calling
-    /// thread when the worker is disabled). Holds the buffer mutex
-    /// only across the swap-out / re-append; validation runs lock-free
-    /// over locally-owned slices.
+    /// MUST be called from the chain-worker thread, or from the libxev
+    /// thread when the worker is disabled / when `BeamChain` handles
+    /// `onBlock` + `onBlockFollowup` directly (gossip, RPC, pending-queue,
+    /// publish paths — same thread as other chain mutations). Holds the
+    /// buffer mutex only across the swap-out / re-append; validation runs
+    /// lock-free over locally-owned slices.
     pub fn replayPendingAttestations(self: *Self) void {
         // Swap the buffers out under lock so producers can keep
         // appending into fresh empty buffers while we drain.
@@ -1883,6 +1885,7 @@ pub const BeamChain = struct {
 
                 zeam_metrics.metrics.lean_pending_blocks_replayed_total.incr(.{ .result = "accepted" }) catch {};
                 self.onBlockFollowup(true, &queued_entry.signed_block);
+                self.replayPendingAttestations();
 
                 // Accumulate missing roots so the caller can fetch them.
                 all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
@@ -2501,6 +2504,7 @@ pub const BeamChain = struct {
                     };
                     // followup with additional housekeeping tasks
                     self.onBlockFollowup(true, &signed_block);
+                    self.replayPendingAttestations();
                     // NOTE: ownership of `missing_roots` is transferred to the caller (BeamNode),
                     // which is responsible for freeing it after optionally fetching those roots.
 

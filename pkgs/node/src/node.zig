@@ -558,6 +558,7 @@ pub const BeamNode = struct {
                 // iteration of a deep cached-block chain. Correct semantically; a future optimisation
                 // could pass false during catch-up and prune once at the end.
                 self.chain.onBlockFollowup(true, &cached_block);
+                self.chain.replayPendingAttestations();
 
                 // Remove from cache now that it's been processed. Note:
                 // we own `cached` (clone), so this `removeFetchedBlock`
@@ -846,6 +847,7 @@ pub const BeamNode = struct {
             // Store aggregated signature proofs from this block so they can be reused
             // in future block production. This is the same followup done for gossiped blocks.
             self.chain.onBlockFollowup(true, signed_block);
+            self.chain.replayPendingAttestations();
 
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
@@ -923,6 +925,7 @@ pub const BeamNode = struct {
         defer self.allocator.free(missing_roots);
 
         self.chain.onBlockFollowup(true, signed_block);
+        self.chain.replayPendingAttestations();
         self.processCachedDescendants(block_root);
         self.fetchBlockByRoots(missing_roots, 0) catch |err| {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
@@ -1949,6 +1952,7 @@ pub const BeamNode = struct {
 
         // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
+        self.chain.replayPendingAttestations();
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: networks.AttestationGossip) !void {

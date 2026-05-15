@@ -53,9 +53,10 @@ jobs:
       with:
         toolchain: stable
         components: clippy, rustfmt
-        # The action bundles Swatinem/rust-cache at repo root; our Cargo
-        # workspace lives under rust/. Disable here and use an explicit
-        # rust-cache step with workspaces: rust -> target.
+        # Infra (not #863 perf): setup-rust-toolchain's bundled rust-cache
+        # runs `cargo metadata` at repo root, but zeam's workspace is rust/.
+        # macOS runners also need the Ensure-rustup shim step before any
+        # plain `cargo` call — see workflow comments on that step.
         cache: false
 
     - name: Verify installation
