@@ -3197,22 +3197,6 @@ fn collectCoverageFromPayloads(
     }
 }
 
-fn collectCoverageFromPayloadsForData(
-    map: *AggregatedPayloadsMap,
-    att_data: types.AttestationData,
-    committee_count: types.SubnetId,
-    seen: []bool,
-    has_subnet: []bool,
-) void {
-    const payloads = map.get(att_data) orelse return;
-    for (payloads.items) |*stored| {
-        if (stored.slot != att_data.slot) continue;
-        for (0..stored.proof.participants.len()) |validator_index| {
-            markCoverageIfParticipant(stored.proof.participants, validator_index, committee_count, seen, has_subnet);
-        }
-    }
-}
-
 fn collectSourceCoverageFromPayloadsForData(
     map: *AggregatedPayloadsMap,
     att_data: types.AttestationData,
@@ -3226,18 +3210,18 @@ fn collectSourceCoverageFromPayloadsForData(
 
         if (stored.source_payload_participants) |source_payload| {
             for (0..source_payload.len()) |validator_index| {
-                markCoverageIfParticipantNoSubnet(source_payload, validator_index, committee_count, payload_seen);
+                markCoverageValidatorOnly(source_payload, validator_index, committee_count, payload_seen);
             }
         } else {
             // Unknown/legacy source: treat the child payload itself as payload-originated.
             for (0..stored.proof.participants.len()) |validator_index| {
-                markCoverageIfParticipantNoSubnet(stored.proof.participants, validator_index, committee_count, payload_seen);
+                markCoverageValidatorOnly(stored.proof.participants, validator_index, committee_count, payload_seen);
             }
         }
 
         if (stored.source_gossip_participants) |source_gossip| {
             for (0..source_gossip.len()) |validator_index| {
-                markCoverageIfParticipantNoSubnet(source_gossip, validator_index, committee_count, gossip_seen);
+                markCoverageValidatorOnly(source_gossip, validator_index, committee_count, gossip_seen);
             }
         }
     }
@@ -3261,7 +3245,10 @@ fn markCoverageIfParticipant(
     has_subnet[subnet_index] = true;
 }
 
-fn markCoverageIfParticipantNoSubnet(
+/// Mark validator-level coverage without tracking per-subnet bits.
+/// Validates subnet membership to keep the same inclusion criteria as
+/// markCoverageIfParticipant but does not set has_subnet.
+fn markCoverageValidatorOnly(
     participants: types.AggregationBits,
     validator_index: usize,
     committee_count: types.SubnetId,
@@ -3353,14 +3340,6 @@ fn countSeen(seen: []const bool) usize {
     return count;
 }
 
-fn countTrue(values: []const bool) usize {
-    var count: usize = 0;
-    for (values) |value| {
-        if (value) count += 1;
-    }
-    return count;
-}
-
 fn recordAggregateCoverageMetrics(section: []const u8, seen: []const bool, has_subnet: []const bool) void {
     zeam_metrics.metrics.zeam_attestation_aggregate_coverage_validators.set(
         .{ .section = section },
@@ -3368,7 +3347,7 @@ fn recordAggregateCoverageMetrics(section: []const u8, seen: []const bool, has_s
     ) catch {};
     zeam_metrics.metrics.zeam_attestation_aggregate_coverage_subnets.set(
         .{ .section = section },
-        @intCast(countTrue(has_subnet)),
+        @intCast(countSeen(has_subnet)),
     ) catch {};
 }
 
