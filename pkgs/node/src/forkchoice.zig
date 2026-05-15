@@ -861,7 +861,7 @@ pub const ForkChoice = struct {
         if (self.last_node_tick_time_ms) |last| {
             const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
             zeam_metrics.zeam_fork_choice_tick_interval_duration_seconds.record(elapsed_s);
-            self.logger.info("slot_interval={d} duration={d:.3}s", .{ self.fcStore.slot_clock.slotInterval.load(.monotonic), elapsed_s });
+            self.logger.debug("slot_interval={d} duration={d:.3}s", .{ self.fcStore.slot_clock.slotInterval.load(.monotonic), elapsed_s });
         }
         self.last_node_tick_time_ms = time_now_ms;
 
@@ -1645,13 +1645,13 @@ pub const ForkChoice = struct {
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
-        try out.appendSlice(allocator, "attestation aggregate coverage: ");
-        try appendCoverageSection(allocator, &out, "prev_new", prev_new_seen, prev_new_has_subnet, validator_count, committee_count_u32);
-        try out.appendSlice(allocator, " | ");
+        try out.appendSlice(allocator, "last round attestation aggregate coverage: \n");
+        try appendCoverageSection(allocator, &out, "timely", prev_new_seen, prev_new_has_subnet, validator_count, committee_count_u32);
+        try out.appendSlice(allocator, " | \n");
         try appendCoverageSection(allocator, &out, "late", late_seen, late_has_subnet, validator_count, committee_count_u32);
-        try out.appendSlice(allocator, " | ");
+        try out.appendSlice(allocator, " | \n");
         try appendCoverageSection(allocator, &out, "block", block_seen, block_has_subnet, validator_count, committee_count_u32);
-        try out.appendSlice(allocator, " | ");
+        try out.appendSlice(allocator, " | \n");
         try appendCoverageSection(allocator, &out, "combined", combined_seen, combined_has_subnet, validator_count, committee_count_u32);
 
         const network_covered = countSeen(combined_seen);
