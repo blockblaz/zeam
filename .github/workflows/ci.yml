@@ -53,6 +53,10 @@ jobs:
       with:
         toolchain: stable
         components: clippy, rustfmt
+        # The action bundles Swatinem/rust-cache at repo root; our Cargo
+        # workspace lives under rust/. Disable here and use an explicit
+        # rust-cache step with workspaces: rust -> target.
+        cache: false
 
     - name: Verify installation
       run: |
@@ -62,6 +66,7 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
+        workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Check Rust formatting
@@ -101,6 +106,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
@@ -118,12 +124,17 @@ jobs:
         # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
         # because the `actions-rust-lang/setup-rust-toolchain` step has
         # already done that.
-        if ! rustup run nightly cargo --version >/dev/null 2>&1; then
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
           echo "Rustup proxy shims are broken; reinstalling via rustup-init"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain nightly --no-modify-path \
                        --profile minimal --force
         fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -197,6 +208,7 @@ jobs:
       with:
         toolchain: nightly
         components: clippy, rustfmt
+        cache: false
 
     - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
@@ -214,12 +226,17 @@ jobs:
         # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
         # because the `actions-rust-lang/setup-rust-toolchain` step has
         # already done that.
-        if ! rustup run nightly cargo --version >/dev/null 2>&1; then
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
           echo "Rustup proxy shims are broken; reinstalling via rustup-init"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain nightly --no-modify-path \
                        --profile minimal --force
         fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -301,6 +318,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
@@ -318,12 +336,17 @@ jobs:
         # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
         # because the `actions-rust-lang/setup-rust-toolchain` step has
         # already done that.
-        if ! rustup run nightly cargo --version >/dev/null 2>&1; then
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
           echo "Rustup proxy shims are broken; reinstalling via rustup-init"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain nightly --no-modify-path \
                        --profile minimal --force
         fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -425,6 +448,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
@@ -442,12 +466,17 @@ jobs:
         # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
         # because the `actions-rust-lang/setup-rust-toolchain` step has
         # already done that.
-        if ! rustup run nightly cargo --version >/dev/null 2>&1; then
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
           echo "Rustup proxy shims are broken; reinstalling via rustup-init"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain nightly --no-modify-path \
                        --profile minimal --force
         fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -521,6 +550,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
