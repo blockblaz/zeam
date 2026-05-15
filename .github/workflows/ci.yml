@@ -54,7 +54,6 @@ jobs:
         toolchain: stable
         components: clippy, rustfmt
 
-        cache: false
     - name: Verify installation
       run: |
         rustc --version
@@ -63,7 +62,6 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        cache-bin: false
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Check Rust formatting
@@ -104,7 +102,6 @@ jobs:
       with:
         toolchain: nightly
 
-        cache: false
     - name: Prefer rustup shims on PATH (macOS)
       if: runner.os == 'macOS'
       run: |
@@ -128,7 +125,6 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
@@ -190,7 +186,6 @@ jobs:
         toolchain: nightly
         components: clippy, rustfmt
 
-        cache: false
     - name: Prefer rustup shims on PATH (macOS)
       if: runner.os == 'macOS'
       run: |
@@ -214,7 +209,6 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
@@ -284,7 +278,6 @@ jobs:
       with:
         toolchain: nightly
 
-        cache: false
     - name: Prefer rustup shims on PATH (macOS)
       if: runner.os == 'macOS'
       run: |
@@ -308,7 +301,6 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
@@ -398,7 +390,6 @@ jobs:
       with:
         toolchain: nightly
 
-        cache: false
     - name: Prefer rustup shims on PATH (macOS)
       if: runner.os == 'macOS'
       run: |
@@ -422,7 +413,6 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
@@ -484,7 +474,6 @@ jobs:
       with:
         toolchain: nightly
 
-        cache: false
     - name: Cache Zig packages
       uses: actions/cache@v4
       with:
@@ -496,7 +485,6 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
 
