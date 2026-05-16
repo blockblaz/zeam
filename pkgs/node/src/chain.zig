@@ -267,24 +267,59 @@ pub const BeamChain = struct {
     // the warn in `chainWorkerProcessPendingBlocksThunk`). The callback
     // is the formal channel for that hand-off.
     //
-    // Threading: the callback runs on whatever thread invoked the
-    // import. With chain-worker enabled, that's the worker thread; the
-    // BeamNode handler MUST therefore be safe to call from there. All
-    // touched state is mutex-protected (network's `LockedMap`s,
-    // forkchoice's RwLock, `BeamNode.batch_pending_parent_roots_lock`,
-    // the chain's `Allocator`) so the cross-thread surface is safe
-    // today; future work that adds non-mutex BeamNode state must
-    // audit the callback path.
+    // **Threading audit (zclawz round 3 review on PR #890).** With
+    // chain-worker enabled the callback runs ON THE WORKER THREAD,
+    // not libxev. Every site the production callback
+    // (`BeamNode.handleChainImportedBlock`) reaches must be safe to
+    // invoke from a non-libxev thread:
+    //
+    //   * `network.removeFetchedBlock`,
+    //     `network.hasFetchedBlock`,
+    //     `network.getChildrenOfBlock`,
+    //     `network.pruneCachedBlocks`        → `LockedMap` (mutex)
+    //   * `network.hasPendingBlockRoot`,
+    //     `network.removePendingBlockRoot`   → `LockedMap` (mutex)
+    //   * `network.connected_peers`          → `RwLock` (`selectPeerCopy`)
+    //   * `network.pending_rpc_requests`,
+    //     `network.blocks_by_root_inflight`  → `LockedMap` + atomic
+    //   * `chain.forkChoice` (`hasBlock`,
+    //     `hasBlocksBatch`)                  → forkchoice `RwLock`
+    //   * `BeamNode.batch_pending_parent_roots`
+    //                                        → its own mutex
+    //   * `network.backend.reqresp.sendRequest`
+    //                                        → enqueues onto a
+    //     **Tokio `mpsc::Sender::try_send`** (`SwarmCommandChannel`,
+    //     see `rust/libp2p-glue/src/lib.rs::send_swarm_command`).
+    //     The Rust libp2p swarm runs on its OWN Tokio runtime — the
+    //     Zig caller never touches a libxev primitive on this path.
+    //     `try_send` is `Send + Sync`-safe, so any thread can fire
+    //     it; full / closed channels return error which is bucketed
+    //     into `lean_block_fetch_dedup_total{outcome=...}` like any
+    //     other dispatch failure.
+    //
+    // Net effect: there is no libxev I/O issued from the worker
+    // thread, only mutex-/rwlock-protected state mutations and an
+    // mpsc enqueue across the FFI boundary. Future work that adds
+    // unprotected BeamNode state OR that dispatches libxev I/O
+    // primitives directly from BeamNode helpers MUST re-audit
+    // every callback site.
     //
     // Ownership: the callback takes ownership of `missing_roots` (the
     // chain freed it before this PR — the recipient now owns it).
     // Implementations should defer-free against `chain.allocator`.
-    imported_block_ctx: ?*anyopaque = null,
-    imported_block_fn: ?ImportedBlockFn = null,
+    //
+    // The fn+ctx pair lives in a single optional so the worker
+    // thunk's read is a single `if (.imported_block) |cb| ...`
+    // branch (zclawz round 3 review #M4). Pre-bundle this avoided a
+    // class of bugs where the setter wired one field but not the
+    // other — direct field mutation from tests would skip the
+    // public setter and silently drop the callback (the chain
+    // would free `missing_roots` instead of handing it back).
+    imported_block: ?BlockCallback(ImportedBlockFn) = null,
 
     // -- rejected-block backchannel (#890 zclawz review) -----------------
     //
-    // Sister callback to `imported_block_fn`: fires when
+    // Sister callback to `imported_block`: fires when
     // `chainWorkerOnBlockThunk`'s `onBlock` returns
     // `MissingPreState` or `PreFinalizedSlot`. These are the two
     // errors that are NOT permanent failures of the block itself —
@@ -295,13 +330,12 @@ pub const BeamChain = struct {
     // worker would silently drop the block and sync would stall
     // until a re-broadcast.
     //
-    // Threading + ownership: same contract as `imported_block_fn`.
+    // Threading + ownership: same contract as `imported_block`.
     // The callback receives a borrowed `*const SignedBlock` (the
-    // `Message.deinit` after dispatch frees it); recipients clone if
-    // they need to outlive the callback (e.g.
+    // `Message.deinit` after dispatch frees it); recipients clone
+    // if they need to outlive the callback (e.g.
     // `cacheBlockAndFetchParent`).
-    rejected_block_ctx: ?*anyopaque = null,
-    rejected_block_fn: ?RejectedBlockFn = null,
+    rejected_block: ?BlockCallback(RejectedBlockFn) = null,
 
     // Queue for blocks that arrived before forkchoice had ticked to their slot.
     // When a peer gossips a block for the current slot before our local interval
@@ -383,6 +417,20 @@ pub const BeamChain = struct {
 
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
+    /// Bundles a `ctx` + `fn` pair into one optional struct so the
+    /// worker thunk's "is the callback wired?" check is a single
+    /// branch (zclawz round 3 review on PR #890). The previous
+    /// shape (two independent `?` fields) had a footgun: a test or
+    /// future refactor that assigned one without the other would
+    /// silently drop callbacks because the thunk read both
+    /// independently.
+    pub fn BlockCallback(comptime FnT: type) type {
+        return struct {
+            ctx: *anyopaque,
+            func: FnT,
+        };
+    }
+
     /// Callback fired after every successful chain-worker block import
     /// (#890). `block_root` is the producer's-or-recomputed hash-tree
     /// root of the block that was just imported; `missing_roots` is
@@ -400,8 +448,8 @@ pub const BeamChain = struct {
     ///      accumulated during the import (RPC paths only).
     ///
     /// MUST be safe to call from the chain-worker thread — see the
-    /// `imported_block_ctx` / `imported_block_fn` field doc comment
-    /// above for the threading audit.
+    /// `imported_block` field doc comment above for the threading
+    /// audit.
     pub const ImportedBlockFn = *const fn (
         ctx: *anyopaque,
         block_root: types.Root,
@@ -772,14 +820,37 @@ pub const BeamChain = struct {
                 };
             }
             for (aggs.items) |*agg| {
-                // Debug tripwire (zclawz review on PR #890): the
-                // `*SignedAggregatedAttestation` we hand to the
-                // task is a borrow into `aggs.items` — valid only
-                // because this loop never mutates the buffer
-                // (no `append` / `swapRemove`) before
-                // `waitAndWork` returns. A future refactor that
-                // moves entries mid-loop would silently UAF; the
-                // assert fires loud in debug builds.
+                // Pointer-stability invariant for the spawned task
+                // (zclawz reviews on PR #890):
+                //
+                // The `*SignedAggregatedAttestation` we hand to
+                // `replayOneAggregationTask` is a borrow into
+                // `aggs.items`. It must remain valid for the full
+                // task lifetime, which extends past this loop body
+                // until `pool.waitAndWork(&wg)` returns. Two things
+                // keep that invariant true:
+                //
+                //   1. THIS LOOP NEVER MUTATES `aggs`. There are no
+                //      `append` / `swapRemove` / `resize` calls
+                //      between `pool.spawnWg` and `waitAndWork`. A
+                //      future refactor that moves entries mid-loop
+                //      would invalidate every outstanding `agg`
+                //      pointer and silently UAF in the worker
+                //      threads.
+                //   2. `aggs.deinit(allocator)` runs via the outer
+                //      `defer` AFTER `waitAndWork` joins all tasks
+                //      — guaranteeing the buffer outlives every
+                //      borrow.
+                //
+                // The asserts below are a SPAWN-TIME range check on
+                // the calling thread only; they do NOT guard the
+                // task's runtime invariant (by the time the task
+                // body runs, the assert has already fired and the
+                // pointer-stability claim is what protects the
+                // borrow). Their value is regression detection: if
+                // a future loop hoists a mutation between iterations,
+                // the spawn-side range will be obviously wrong on
+                // the next entry and trip in debug.
                 std.debug.assert(@intFromPtr(agg) >= @intFromPtr(aggs.items.ptr));
                 std.debug.assert(@intFromPtr(agg) < @intFromPtr(aggs.items.ptr) + aggs.items.len * @sizeOf(types.SignedAggregatedAttestation));
                 pool.spawnWg(&wg, replayOneAggregationTask, .{ self, agg }) catch {
@@ -1017,22 +1088,20 @@ pub const BeamChain = struct {
                 else => null,
             };
             if (reason) |r| {
-                if (self.rejected_block_fn) |cb| {
-                    if (self.rejected_block_ctx) |cb_ctx| {
-                        const r_root: types.Root = block_root orelse blk: {
-                            var rr: types.Root = undefined;
-                            zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &rr, self.allocator) catch |hash_err| {
-                                self.logger.err(
-                                    "chain-worker: rejected-block callback skipped, root recompute failed slot={d} reason={s}: {any}",
-                                    .{ signed_block.block.slot, @tagName(r), hash_err },
-                                );
-                                return;
-                            };
-                            break :blk rr;
+                if (self.rejected_block) |cb| {
+                    const r_root: types.Root = block_root orelse blk: {
+                        var rr: types.Root = undefined;
+                        zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &rr, self.allocator) catch |hash_err| {
+                            self.logger.err(
+                                "chain-worker: rejected-block callback skipped, root recompute failed slot={d} reason={s}: {any}",
+                                .{ signed_block.block.slot, @tagName(r), hash_err },
+                            );
+                            return;
                         };
-                        cb(cb_ctx, &signed_block, r_root, r);
-                        return;
-                    }
+                        break :blk rr;
+                    };
+                    cb.func(cb.ctx, &signed_block, r_root, r);
+                    return;
                 }
                 // No callback wired (worker test rigs etc.) — fall
                 // through to the legacy "log and drop" path. That
@@ -1082,11 +1151,9 @@ pub const BeamChain = struct {
             };
             break :blk r;
         };
-        if (self.imported_block_fn) |callback| {
-            if (self.imported_block_ctx) |cb_ctx| {
-                callback(cb_ctx, resolved_root, missing_roots);
-                return;
-            }
+        if (self.imported_block) |cb| {
+            cb.func(cb.ctx, resolved_root, missing_roots);
+            return;
         }
         self.allocator.free(missing_roots);
     }
@@ -1408,29 +1475,25 @@ pub const BeamChain = struct {
     /// Register the imported-block backchannel (#890). The callback
     /// fires from `chainWorkerOnBlockThunk` after every successful
     /// import; takes ownership of the chain's `missing_roots` slice.
-    /// See the `imported_block_ctx`/`imported_block_fn` field doc and
-    /// the `ImportedBlockFn` type alias for the threading and
-    /// ownership contract.
+    /// See the `imported_block` field doc and the `ImportedBlockFn`
+    /// type alias for the threading and ownership contract.
     ///
     /// Both args are required (the chain expects either both wired
     /// or neither). Re-registration is supported and overwrites the
     /// previous pair atomically with respect to chain.deinit; there
     /// is intentionally no "clear" entry point — the chain wipes
-    /// both fields itself in `deinit`.
+    /// the field itself in `deinit`.
     pub fn setImportedBlockCallback(self: *Self, ctx: *anyopaque, func: ImportedBlockFn) void {
-        self.imported_block_ctx = ctx;
-        self.imported_block_fn = func;
+        self.imported_block = .{ .ctx = ctx, .func = func };
     }
 
     /// Register the rejected-block backchannel (#890 follow-up).
     /// Fires from `chainWorkerOnBlockThunk` only when `onBlock`
     /// returns `MissingPreState` or `PreFinalizedSlot` — see
-    /// `RejectedBlockFn` and the `rejected_block_ctx` /
-    /// `rejected_block_fn` field doc. Same registration contract as
-    /// `setImportedBlockCallback`.
+    /// `RejectedBlockFn` and the `rejected_block` field doc. Same
+    /// registration contract as `setImportedBlockCallback`.
     pub fn setRejectedBlockCallback(self: *Self, ctx: *anyopaque, func: RejectedBlockFn) void {
-        self.rejected_block_ctx = ctx;
-        self.rejected_block_fn = func;
+        self.rejected_block = .{ .ctx = ctx, .func = func };
     }
 
     pub fn deinit(self: *Self) void {
@@ -7614,13 +7677,18 @@ const TestCallbackObserver = struct {
         missing_roots: []types.Root,
     ) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        // Take ownership of `missing_roots` per the callback contract.
+        // Capture the length BEFORE the free. Although a Zig slice
+        // header lives on the stack and `.len` after free is
+        // technically defined, reading freed-slice metadata trips
+        // every reasonable static analyzer; explicit capture
+        // documents intent (zclawz round 3 review on PR #890).
+        const missing_len = missing_roots.len;
         self.allocator.free(missing_roots);
         self.mu.lock();
         defer self.mu.unlock();
         self.imported.append(self.allocator, .{
             .block_root = block_root,
-            .missing_roots_len = missing_roots.len,
+            .missing_roots_len = missing_len,
         }) catch {};
     }
 
@@ -7869,6 +7937,118 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
     try std.testing.expectEqualSlices(u8, &orphan_root, &rec.block_root);
     try std.testing.expectEqual(orphan_block.block.slot, rec.slot);
     try std.testing.expectEqual(BeamChain.RejectedBlockReason.missing_pre_state, rec.reason);
+}
+
+test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
+    // PR #890 zclawz round 3 review: the `pre_finalized` arm of
+    // `RejectedBlockReason` is a separate code path
+    // (`pruneCachedBlocks` instead of `cacheBlockAndFetchParent`)
+    // and was previously uncovered by tests. Provoke it by bumping
+    // `forkChoice.fcStore.latest_finalized.slot` past the block's
+    // slot before submitting — same end-state as the production
+    // race where finalization advances between the libxev pre-check
+    // and the worker's dispatch.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 3, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+
+    var db = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir,
+    );
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 0,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    var observer = TestCallbackObserver.init(std.testing.allocator);
+    defer observer.deinit();
+    beam_chain.setImportedBlockCallback(&observer, TestCallbackObserver.onImported);
+    beam_chain.setRejectedBlockCallback(&observer, TestCallbackObserver.onRejected);
+
+    try beam_chain.startChainWorker();
+
+    // Force-advance finalized past the block's slot so onBlock takes
+    // the PreFinalizedSlot arm (the parent — genesis — IS in
+    // forkchoice + states from anchor init, so we won't hit
+    // MissingPreState first).
+    const block = mock_chain.blocks[1];
+    const block_root = mock_chain.blockRoots[1];
+    try beam_chain.forkChoice.onInterval(
+        block.block.slot * constants.INTERVALS_PER_SLOT,
+        false,
+    );
+    {
+        beam_chain.forkChoice.mutex.lock();
+        defer beam_chain.forkChoice.mutex.unlock();
+        beam_chain.forkChoice.fcStore.latest_finalized.slot = block.block.slot + 100;
+    }
+
+    var cloned: types.SignedBlock = undefined;
+    try types.sszClone(std.testing.allocator, types.SignedBlock, block, &cloned);
+    var cloned_consumed = false;
+    defer if (!cloned_consumed) cloned.deinit();
+    try beam_chain.submitBlock(cloned, false, block_root);
+    cloned_consumed = true;
+
+    const start_ns = zeam_utils.monotonicTimestampNs();
+    const deadline_ns: i128 = start_ns + 5 * std.time.ns_per_s;
+    while (zeam_utils.monotonicTimestampNs() < deadline_ns) {
+        if (observer.rejectedCount() >= 1) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 0), observer.importedCount());
+    try std.testing.expectEqual(@as(usize, 1), observer.rejectedCount());
+
+    observer.mu.lock();
+    defer observer.mu.unlock();
+    const rec = observer.rejected.items[0];
+    try std.testing.expectEqualSlices(u8, &block_root, &rec.block_root);
+    try std.testing.expectEqual(BeamChain.RejectedBlockReason.pre_finalized, rec.reason);
 }
 
 test "chain.statesGet under chain_worker enabled returns Backing.none + acquired_rc (slice c-2b commit 4)" {

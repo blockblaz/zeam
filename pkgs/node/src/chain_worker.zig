@@ -140,8 +140,20 @@ pub const Message = union(enum) {
     /// Aggregated-attestation gossip. Producer is libp2p gossip handler.
     /// Owns: `proof` slices inside the aggregated attestation.
     on_gossip_aggregated_attestation: types.SignedAggregatedAttestation,
-    /// `processPendingBlocks` drain trigger. Producer is libxev clock
-    /// (`onInterval`). Heap-free (slot is a value type).
+    /// **TEST-ONLY in production today; see #863 follow-up.**
+    /// `processPendingBlocks` drain trigger. Heap-free (slot is a
+    /// value type). The libxev tick currently runs
+    /// `processPendingBlocks` inline so the returned missing-roots
+    /// can flow back into `BeamNode.fetchBlockByRoots`. Wiring a
+    /// worker producer requires plumbing those missing roots
+    /// through a worker→BeamNode backchannel (see
+    /// `imported_block_fn` for the analogous on_block path) — until
+    /// that lands, this variant is exercised ONLY by the queue
+    /// smoke tests in `chain_worker.zig` and the corresponding
+    /// thunk warns + bumps
+    /// `lean_chain_worker_process_pending_blocks_dropped_missing_roots_total`
+    /// if it ever fires with non-empty missing roots, so an
+    /// accidental re-introduction is loud in metrics.
     process_pending_blocks: struct {
         current_slot: types.Slot,
     },

@@ -476,13 +476,54 @@ pub const BeamNode = struct {
     /// Imported-block backchannel handler (#890). Fires from
     /// `BeamChain.chainWorkerOnBlockThunk` after every successful
     /// chain-worker import. Takes ownership of `missing_roots` —
-    /// frees it before returning. May run on the chain-worker thread,
-    /// the gossip-import thread, or the libxev thread depending on
-    /// which path imported the block; all work routed through here
-    /// uses mutex-protected state (network helpers, forkchoice,
-    /// `batch_pending_parent_roots_lock`) so the cross-thread surface
-    /// is safe today. See `BeamChain.imported_block_ctx` /
-    /// `ImportedBlockFn` for the full contract.
+    /// frees it before returning. May run on the chain-worker
+    /// thread, the gossip-import thread, or the libxev thread
+    /// depending on which path imported the block.
+    ///
+    /// **Thread-safety audit (zclawz round 3 review on PR #890).**
+    /// Every primitive this handler reaches is safe to call from a
+    /// non-libxev thread:
+    ///
+    ///   * `network.removeFetchedBlock` /
+    ///     `network.getChildrenOfBlock` /
+    ///     `network.hasFetchedBlock` /
+    ///     `network.pruneCachedBlocks`
+    ///                  → `LockedMap` (mutex-protected hashmap).
+    ///   * `network.hasPendingBlockRoot` /
+    ///     `network.removePendingBlockRoot` /
+    ///     `network.trackPendingBlockRoot`
+    ///                  → `LockedMap`.
+    ///   * `network.connected_peers.selectPeerCopy`
+    ///                  → `RwLock`-guarded random pick.
+    ///   * `network.pending_rpc_requests`,
+    ///     `network.blocks_by_root_inflight`
+    ///                  → `LockedMap` + atomic counter (CAS reservation).
+    ///   * `chain.forkChoice.hasBlocksBatch` /
+    ///     `chain.forkChoice.hasBlock`
+    ///                  → forkchoice `RwLock` shared/exclusive.
+    ///   * `self.batch_pending_parent_roots`
+    ///                  → its own `batch_pending_parent_roots_lock`.
+    ///   * `network.backend.reqresp.sendRequest`
+    ///                  → enqueues onto a Tokio `mpsc::Sender::try_send`
+    ///                    in the Rust libp2p glue
+    ///                    (`SwarmCommandChannel`,
+    ///                    `rust/libp2p-glue/src/lib.rs::send_swarm_command`).
+    ///                    The Rust libp2p swarm runs on its OWN
+    ///                    Tokio runtime — the Zig caller never
+    ///                    touches a libxev primitive on this path,
+    ///                    so there is no event-loop affinity to
+    ///                    violate. `try_send` is `Send + Sync`.
+    ///
+    /// Net result: this handler issues NO libxev I/O directly. It
+    /// mutates lock-protected state and queues a command across
+    /// the Zig→Rust FFI boundary; the libxev thread is unaffected.
+    /// Future BeamNode helpers that issue libxev I/O primitives
+    /// (timers, fd reads/writes via `xev.Loop`) MUST NOT be called
+    /// from this handler — they would need to be hopped back via
+    /// the chain-worker queue or a dedicated libxev wakeup.
+    ///
+    /// See `BeamChain.imported_block` / `ImportedBlockFn` for the
+    /// full contract.
     fn handleChainImportedBlock(
         ptr: *anyopaque,
         block_root: types.Root,
@@ -543,8 +584,14 @@ pub const BeamNode = struct {
     /// The callback DOES NOT take ownership of `signed_block`; the
     /// worker's `Message.deinit` frees it after this call returns.
     /// `cacheBlockAndFetchParent` clones internally, matching the
-    /// inline `processBlockByRootChunk` MissingPreState arm. Same
-    /// threading contract as `handleChainImportedBlock`.
+    /// inline `processBlockByRootChunk` MissingPreState arm.
+    ///
+    /// Threading: same contract as `handleChainImportedBlock`. The
+    /// reachable network/forkchoice helpers + the
+    /// `cacheBlockAndFetchParent` path that this handler walks are
+    /// audited in the doc on `handleChainImportedBlock` above —
+    /// every primitive is mutex- / atomic- / FFI-mpsc-safe; no
+    /// libxev I/O is issued from the worker thread.
     fn handleChainRejectedBlock(
         ptr: *anyopaque,
         signed_block: *const types.SignedBlock,
@@ -594,6 +641,20 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Producer side identification for `replayPendingAttestationsAsync`
+    /// drop log severity (zclawz round 3 review on PR #890). The
+    /// distinction matters for an isolated single-validator node:
+    /// when there is NO inbound gossip `on_block` to piggy-back on,
+    /// a `QueueFull` drop on `local_publish` means the buffered
+    /// attestations age until FIFO eviction
+    /// (`MAX_PENDING_ATTESTATIONS = 1024`) — the first occurrence is
+    /// the operator's only signal that liveness is degrading.
+    /// `gossip_or_rpc_followup` paths always have a fresh
+    /// `replayPendingAttestations` queued behind every successful
+    /// import, so a missed nudge there is provably benign within
+    /// one block-cycle.
+    const ReplayProducer = enum { local_publish, gossip_or_rpc_followup };
+
     /// Replay the chain's pending-attestation buffers without
     /// blocking the libxev thread (#890). Routes to the chain-worker
     /// queue when the worker is enabled (the worker drains the
@@ -609,24 +670,27 @@ pub const BeamNode = struct {
     /// slot, so a missed nudge just delays a few buffered entries by
     /// one block-cycle.
     ///
-    /// Tail behaviour for an isolated node (zclawz review on PR
-    /// #890): if the producer is `publishBlock` (we just produced
-    /// locally and there is no inbound `on_block` to piggy-back on)
-    /// AND the queue happens to be full AND no other gossip block
-    /// arrives, buffered attestations sit until the FIFO eviction
-    /// tail of the bounded buffer kicks in
-    /// (`MAX_PENDING_ATTESTATIONS = 1024`). Operators should monitor
-    /// `lean_chain_queue_dropped_total{queue="replay_pending"}` against
-    /// `lean_pending_attestations_size{kind=...}` to detect this in
-    /// dashboards. The drop is logged at debug because the
-    /// steady-state path is benign.
-    fn replayPendingAttestationsAsync(self: *Self) void {
+    /// Producer-aware drop severity (zclawz round 3 review on PR
+    /// #890): isolated nodes producing locally have no inbound
+    /// `on_block` to piggy-back on, so a `QueueFull` drop with
+    /// `producer == .local_publish` escalates to `warn` so the
+    /// first occurrence is visible in logs without needing the
+    /// `lean_chain_queue_dropped_total{queue="replay_pending"}`
+    /// dashboard. `gossip_or_rpc_followup` keeps the prior `debug`
+    /// level.
+    fn replayPendingAttestationsAsync(self: *Self, producer: ReplayProducer) void {
         self.chain.submitReplayPendingAttestations() catch |err| switch (err) {
             error.ChainWorkerDisabled => self.chain.replayPendingAttestations(),
-            error.QueueFull, error.QueueClosed => self.logger.debug(
-                "chain-worker replay submit dropped: {any} (next on_block dispatch will replay)",
-                .{err},
-            ),
+            error.QueueFull, error.QueueClosed => switch (producer) {
+                .local_publish => self.logger.warn(
+                    "chain-worker replay submit dropped on local-publish path: {any} (no inbound on_block to piggy-back; pending attestations age toward FIFO eviction at MAX_PENDING_ATTESTATIONS=1024 — see lean_chain_queue_dropped_total{{queue=replay_pending}} and lean_pending_attestations_size{{kind=...}})",
+                    .{err},
+                ),
+                .gossip_or_rpc_followup => self.logger.debug(
+                    "chain-worker replay submit dropped: {any} (next on_block dispatch will replay)",
+                    .{err},
+                ),
+            },
         };
     }
 
@@ -810,7 +874,7 @@ pub const BeamNode = struct {
                 // iteration of a deep cached-block chain. Correct semantically; a future optimisation
                 // could pass false during catch-up and prune once at the end.
                 self.chain.onBlockFollowup(true, &cached_block);
-                self.replayPendingAttestationsAsync();
+                self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
 
                 // Remove from cache now that it's been processed. Note:
                 // we own `cached` (clone), so this `removeFetchedBlock`
@@ -1117,7 +1181,7 @@ pub const BeamNode = struct {
             // Store aggregated signature proofs from this block so they can be reused
             // in future block production. This is the same followup done for gossiped blocks.
             self.chain.onBlockFollowup(true, signed_block);
-            self.replayPendingAttestationsAsync();
+            self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
 
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
@@ -1206,7 +1270,7 @@ pub const BeamNode = struct {
         defer self.allocator.free(missing_roots);
 
         self.chain.onBlockFollowup(true, signed_block);
-        self.replayPendingAttestationsAsync();
+        self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
         self.processCachedDescendants(block_root);
         self.fetchBlockByRoots(missing_roots, 0) catch |err| {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
@@ -2263,7 +2327,7 @@ pub const BeamNode = struct {
 
         // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
-        self.replayPendingAttestationsAsync();
+        self.replayPendingAttestationsAsync(.local_publish);
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: networks.AttestationGossip) !void {
