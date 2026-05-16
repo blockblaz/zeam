@@ -642,6 +642,10 @@ pub const BeamChain = struct {
     pub fn replayPendingAttestationsLibxevBudget(self: *Self) void {
         const is_agg = self.is_aggregator_enabled.load(.acquire);
 
+        // The size gauges are kept in sync with the buffer length on
+        // every pop. `replayOne*` may re-`enqueuePending*` an entry on
+        // retryable failure (which itself updates the gauge), so the
+        // post-replay value can drift back up — that's expected.
         var a_done: usize = 0;
         while (a_done < constants.REPLAY_PENDING_ATTESTATIONS_LIBXEV_BUDGET) : (a_done += 1) {
             self.pending_attestations_mutex.lock();
@@ -650,7 +654,9 @@ pub const BeamChain = struct {
                 break;
             }
             const gossip = self.pending_attestations.orderedRemove(0);
+            const new_depth = self.pending_attestations.items.len;
             self.pending_attestations_mutex.unlock();
+            zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, new_depth) catch {};
             self.replayOneAttestation(gossip, is_agg);
         }
 
@@ -662,7 +668,9 @@ pub const BeamChain = struct {
                 break;
             }
             var agg_owned = self.pending_aggregated_attestations.orderedRemove(0);
+            const new_depth = self.pending_aggregated_attestations.items.len;
             self.pending_attestations_mutex.unlock();
+            zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, new_depth) catch {};
             self.replayOneAggregation(&agg_owned);
         }
     }
@@ -981,8 +989,24 @@ pub const BeamChain = struct {
         // a Message-shape change.
         _ = current_slot;
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // No production caller dispatches this variant today: the
+        // libxev tick runs `processPendingBlocks` inline (in
+        // `BeamNode.onInterval`) so the returned `missing_roots` can
+        // be fed straight into `fetchBlockByRoots` via the network
+        // helpers on `BeamNode`. Wiring a worker producer for this
+        // path requires a worker → libxev backchannel for the
+        // missing-roots fetch (the chain has no `BeamNode` handle).
+        // Until that lands, the thunk only drains the queue; if it
+        // ever fires we log so the regression is visible instead of
+        // silently stranding sync.
         const missing_roots = self.processPendingBlocks();
-        self.allocator.free(missing_roots);
+        defer self.allocator.free(missing_roots);
+        if (missing_roots.len > 0) {
+            self.logger.warn(
+                "chain-worker processPendingBlocks dropped {d} missing root fetch(es) — no backchannel wired (#863 followup)",
+                .{missing_roots.len},
+            );
+        }
     }
 
     fn chainWorkerProcessFinalizationFollowupThunk(
@@ -1072,14 +1096,15 @@ pub const BeamChain = struct {
     }
 
     /// Route a `processPendingBlocks` tick through the worker queue.
+    /// Currently has no production caller: the libxev tick runs
+    /// `processPendingBlocks` inline so the returned missing-roots
+    /// can be fed to `BeamNode.fetchBlockByRoots`. Kept so the
+    /// vtable + queue plumbing is exercised end-to-end and the API
+    /// shape is stable for the follow-up commit that adds the
+    /// missing-roots backchannel.
     pub fn submitProcessPendingBlocks(self: *Self, current_slot: types.Slot) SubmitError!void {
         const w = self.chain_worker orelse return error.ChainWorkerDisabled;
         try w.sendBlock(.{ .process_pending_blocks = .{ .current_slot = current_slot } });
-    }
-
-    /// Returns whether the background chain-worker thread is active.
-    pub fn chainWorkerEnabled(self: *const Self) bool {
-        return self.chain_worker != null;
     }
 
     /// Route a `processFinalizationFollowup` move-off through the worker queue.

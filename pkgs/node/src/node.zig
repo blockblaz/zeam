@@ -1698,21 +1698,16 @@ pub const BeamNode = struct {
                     continue;
                 };
 
-                // Drain the future-slot `pending_blocks` queue on the chain-worker
-                // (#803). `submitProcessPendingBlocks` was added for the worker
-                // plumbing but had no production caller — without this tick the
-                // queue never advanced off the libxev thread. Keeps heavy
-                // `processPendingBlocks` work off the slot driver.
-                if (self.chain.chainWorkerEnabled()) {
-                    self.chain.submitProcessPendingBlocks(slot) catch |err| switch (err) {
-                        error.QueueFull => self.logger.warn(
-                            "chain-worker block queue full; skipped processPendingBlocks for slot={d}",
-                            .{slot},
-                        ),
-                        error.QueueClosed => {},
-                        error.ChainWorkerDisabled => unreachable,
-                    };
-                } else {
+                // Drain the future-slot `pending_blocks` queue. Runs inline
+                // on the libxev thread because `processPendingBlocks` returns
+                // missing block roots that must feed back into
+                // `BeamNode.fetchBlockByRoots`, and the chain-worker thunk has
+                // no handle to `BeamNode` to make that call. A worker → libxev
+                // backchannel for the fetch is tracked as a #863 follow-up;
+                // see the comment on `chainWorkerProcessPendingBlocksThunk`.
+                // Per-call work is bounded by `MAX_PENDING_BLOCKS` (1024) and
+                // in steady state the queue is empty / single-digit.
+                {
                     const missing_roots = self.chain.processPendingBlocks();
                     defer self.allocator.free(missing_roots);
                     if (missing_roots.len > 0) {
