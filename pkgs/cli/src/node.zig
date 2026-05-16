@@ -19,6 +19,7 @@ const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
+const SlotDriverWatchdog = node_lib.SlotDriverWatchdog;
 const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
@@ -94,11 +95,14 @@ pub const NodeOptions = struct {
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
     db_backend: database.Backend = .rocksdb,
+    chain_spec: ?[]const u8 = null,
     /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `false`
-    /// preserves slice-(b) synchronous behavior. Surfaced as
-    /// `--chain-worker` on the `zeam node` CLI.
-    chain_worker_enabled: bool = false,
+    /// handlers through the chain-worker queue. Default `true` post
+    /// devnet-4 burn-in: the worker path is the supported prod path;
+    /// surfaced as `--chain-worker` on the `zeam node` CLI, with
+    /// `--chain-worker false` as the kill-switch for the legacy
+    /// synchronous path.
+    chain_worker_enabled: bool = true,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -150,6 +154,9 @@ pub const Node = struct {
     anchor_state: *types.BeamState,
     /// Shared worker pool for CPU-bound chain work (attestation signature verification).
     thread_pool: *ThreadPool,
+    /// Background watchdog that monitors libxev slot-driver liveness (#863).
+    /// `null` until `run()` spawns it; `stop()` joins it.
+    slot_driver_watchdog: ?SlotDriverWatchdog = null,
 
     const Self = @This();
 
@@ -197,17 +204,56 @@ pub const Node = struct {
         self.options = options;
         self.api_server_handle = null;
         self.metrics_server_handle = null;
-
-        // some base mainnet spec would be loaded to build this up
-        const chain_spec =
+        self.logger = options.logger_config.logger(.node);
+        // If path is specified load from it, otherwise use default settings
+        const chain_spec_owned = self.options.chain_spec != null;
+        const chain_spec = if (self.options.chain_spec) |path|
+            std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1024 * 1024)) catch |err| {
+                self.logger.err("failed to load chain spec at '{s}': {any}", .{ path, err });
+                return err;
+            }
+        else
             \\{"preset": "mainnet", "name": "devnet0", "fork_digest": "12345678"}
         ;
+
+        defer if (chain_spec_owned) allocator.free(chain_spec);
+
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
-        var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
+        // `parseFromSlice` allocates string fields inside the `Parsed` arena.
+        // The slice headers it returns alias arena memory; `chain_config` later
+        // owns these fields and `ChainSpec.deinit(allocator)` calls
+        // `allocator.free(self.name)` / `allocator.free(self.fork_digest)`. We
+        // must move both fields out of the arena onto the top-level allocator
+        // before dropping the arena, otherwise shutdown panics with
+        // "Invalid free" once `chain.deinit -> config.deinit` runs (see #831).
+        const parsed = try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options);
+        defer parsed.deinit();
+        var chain_options = parsed.value;
+        chain_options.name = try allocator.dupe(u8, chain_options.name.?);
+        errdefer if (chain_options.name) |n| allocator.free(n);
+        chain_options.fork_digest = try allocator.dupe(u8, chain_options.fork_digest.?);
+        errdefer if (chain_options.fork_digest) |d| allocator.free(d);
         chain_options.genesis_time = options.genesis_spec.genesis_time;
+
+        if (chain_spec_owned) {
+            if (chain_options.preset == null) {
+                self.logger.err("chain spec: 'preset' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.name == null or chain_options.name.?.len == 0) {
+                self.logger.err("chain spec: 'name' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.fork_digest == null or chain_options.fork_digest.?.len != 8) {
+                self.logger.err("chain spec: 'fork_digest' field must be 4 bytes (8 hex characters)", .{});
+                return error.InvalidChainSpec;
+            }
+        }
 
         // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
         chain_options.validator_attestation_pubkeys = options.genesis_spec.validator_attestation_pubkeys;
@@ -255,8 +301,6 @@ pub const Node = struct {
         );
         errdefer db.deinit();
 
-        self.logger = options.logger_config.logger(.node);
-
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
         self.anchor_state = anchorState;
@@ -299,6 +343,32 @@ pub const Node = struct {
                         self.logger.info("checkpoint sync completed successfully with a recent state at slot={d} as anchor", .{downloaded_state.slot});
                         self.anchor_state.deinit();
                         self.anchor_state.* = downloaded_state;
+                        // Fetch the real anchor block from the checkpoint provider and store
+                        // it in the DB so blocks_by_root can serve it with the correct
+                        // hash_tree_root.  Mirrors leanSpec fetch_finalized_anchor: compute
+                        // anchor_block_root + expected_state_root, then fetch + verify both
+                        // root and state_root pairing before persisting.
+                        //
+                        // Fail closed: if any hash computation fails we skip the block fetch
+                        // rather than passing null to downloadAndStoreCheckpointBlock and
+                        // silently skipping the pairing check.
+                        anchor_block_fetch: {
+                            var anchor_state_root: types.Root = undefined;
+                            zeam_utils.hashTreeRoot(types.BeamState, self.anchor_state.*, &anchor_state_root, allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamState) failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            const hdr = self.anchor_state.genStateBlockHeader(allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: genStateBlockHeader failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            var anchor_block_root: types.Root = undefined;
+                            zeam_utils.hashTreeRoot(types.BeamBlockHeader, hdr, &anchor_block_root, allocator) catch |err| {
+                                self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamBlockHeader) failed: {} — skipping", .{err});
+                                break :anchor_block_fetch;
+                            };
+                            downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, anchor_state_root, &db, self.logger);
+                        }
                     } else {
                         self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
                         downloaded_state.deinit();
@@ -332,7 +402,8 @@ pub const Node = struct {
         const cpu_count = std.Thread.getCpuCount() catch 2;
         const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
         const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
-        const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+        const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
+        const worker_count = @min(zig_worker_budget, @as(usize, ThreadPool.max_thread_count));
         self.thread_pool = try ThreadPool.init(.{
             .allocator = allocator,
             .io = std.Io.Threaded.global_single_threaded.io(),
@@ -340,13 +411,24 @@ pub const Node = struct {
         });
         errdefer self.thread_pool.deinit();
 
+        // Coordinate the Zig worker pool and the rayon pool used by the XMSS
+        // aggregate prover from the same post-system-thread budget so they do
+        // not independently claim every remaining CPU. Prefer the Zig pool for
+        // the extra worker on odd counts since aggregate verification enters
+        // rayon from Zig workers. Both pools still keep a minimum of one worker
+        // so tiny/cgroup-limited systems remain functional.
+        // Must be called before setupProver/setupVerifier since rayon’s global
+        // pool is initialized lazily on first use.
+        const rayon_threads = @max(@as(usize, 1), desired_workers -| worker_count);
+        xmss.setRayonThreads(rayon_threads);
+
         // Pre-warm the XMSS verifier on the main thread before any worker can
         // call `verifyAggregatedPayload`. The Rust-side verifier setup is
         // documented as idempotent but is not hardened against first-time-init
         // races between concurrent callers; doing it once here removes that
         // race regardless of the Rust implementation.
         xmss.setupVerifier() catch |err| {
-            self.thread_pool.deinit();
+            // Do not call `thread_pool.deinit()` here — `errdefer` below already tears it down.
             return err;
         };
 
@@ -417,6 +499,9 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.slot_driver_watchdog) |*wd| {
+            wd.stop();
+        }
         if (self.api_server_handle) |handle| {
             handle.stop();
         }
@@ -437,14 +522,16 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        // Order matters: BeamNode.run() registers gossip handlers (and thereby
-        // declares which subnets we want to be on). EthLibp2p.run() reads that
-        // set to decide which gossipsub topics to subscribe to. Reversing the
-        // order would either subscribe to an empty topic set or — historically
-        // — fall back to subscribing to *all* subnets, defeating the bandwidth
-        // savings of attestation subnets.
-        try self.beam_node.run();
+        // Start the Rust libp2p network BEFORE BeamNode: since #812,
+        // `BeamNode.run()` calls `gossip.subscribe(...)`, which enqueues
+        // `SwarmCommand::SubscribeGossip` on the per-network command channel.
+        // That channel only exists after `EthLibp2p.run()` returns from
+        // `wait_for_network_ready`. Reversing the order drops every subscribe
+        // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
+        // command already does network-first; this is the matching swap for
+        // the production node path.
         try self.network.run();
+        try self.beam_node.run();
 
         const ascii_art =
             \\  ███████████████████████████████████████████████████████
@@ -496,6 +583,22 @@ pub const Node = struct {
         self.logger.info("  Listening on QUIC port: {?d}", .{quic_port});
         self.logger.info("  ENR: {s}", .{encoded_txt});
         self.logger.info("────────────────────────────────────────────────────────", .{});
+
+        // Spawn the slot-driver stall watchdog (#863) so multi-second
+        // libxev stalls surface in the log + metrics even if the main
+        // loop is stuck inside one completion or syscall. Failure to
+        // spawn is non-fatal — log and continue without it.
+        self.slot_driver_watchdog = SlotDriverWatchdog.init(
+            &self.clock,
+            self.options.logger_config.logger(.clock),
+            .{},
+        );
+        if (self.slot_driver_watchdog) |*wd| {
+            wd.start() catch |err| {
+                self.logger.warn("failed to start slot-driver watchdog: {any}", .{err});
+                self.slot_driver_watchdog = null;
+            };
+        }
 
         try self.clock.run();
     }
@@ -684,27 +787,27 @@ pub fn buildStartOptions(
     node_cmd: NodeCommand,
     opts: *NodeOptions,
 ) !void {
-    try utils_lib.checkDIRExists(node_cmd.custom_genesis);
+    try utils_lib.checkDIRExists(node_cmd.@"custom-genesis");
 
-    const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/config.yaml" });
+    const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.@"custom-genesis", "/config.yaml" });
     defer allocator.free(config_filepath);
-    const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/nodes.yaml" });
+    const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.@"custom-genesis", "/nodes.yaml" });
     defer allocator.free(bootnodes_filepath);
     const validators_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{
-        if (std.mem.eql(u8, node_cmd.validator_config, "genesis_bootnode"))
+        if (std.mem.eql(u8, node_cmd.@"validator-config", "genesis_bootnode"))
             //
-            node_cmd.custom_genesis
+            node_cmd.@"custom-genesis"
         else
-            node_cmd.validator_config,
+            node_cmd.@"validator-config",
         "/annotated_validators.yaml",
     });
     defer allocator.free(validators_filepath);
     const validator_config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{
-        if (std.mem.eql(u8, node_cmd.validator_config, "genesis_bootnode"))
+        if (std.mem.eql(u8, node_cmd.@"validator-config", "genesis_bootnode"))
             //
-            node_cmd.custom_genesis
+            node_cmd.@"custom-genesis"
         else
-            node_cmd.validator_config,
+            node_cmd.@"validator-config",
         "/validator-config.yaml",
     });
     defer allocator.free(validator_config_filepath);
@@ -732,7 +835,7 @@ pub fn buildStartOptions(
     if (bootnodes.len == 0) {
         return error.InvalidNodesConfig;
     }
-    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, node_cmd.override_genesis_time);
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, node_cmd.@"override-genesis-time");
 
     const validator_assignments = try validatorAssignmentsFromYAML(allocator, opts.node_key, parsed_validators);
     errdefer {
@@ -749,7 +852,7 @@ pub fn buildStartOptions(
     const node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
 
     const hash_sig_key_dir = try std.mem.concat(allocator, u8, &[_][]const u8{
-        node_cmd.custom_genesis,
+        node_cmd.@"custom-genesis",
         "/",
         node_cmd.@"sig-keys-dir",
     });
@@ -766,6 +869,7 @@ pub fn buildStartOptions(
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+    opts.chain_spec = node_cmd.@"chain-spec";
     opts.is_aggregator = node_cmd.@"is-aggregator";
     opts.chain_worker_enabled = node_cmd.@"chain-worker";
 
@@ -943,6 +1047,132 @@ fn verifyCheckpointState(
         &state_block_header.state_root,
         &block_root,
     });
+}
+
+/// Path suffix that the checkpoint-sync state URL must end with.
+/// Used to derive the block URL (same base, different path tail).
+const FINALIZED_STATE_PATH = "/lean/v0/states/finalized";
+/// Path for the finalized block endpoint (leanSpec FINALIZED_BLOCK_ENDPOINT).
+const FINALIZED_BLOCK_PATH = "/lean/v0/blocks/finalized";
+
+/// Tries to fetch the real SignedBlock for the checkpoint anchor from the
+/// checkpoint provider and persist it to the DB.
+///
+/// The block URL is derived from the state URL by stripping the known
+/// `FINALIZED_STATE_PATH` suffix and appending `FINALIZED_BLOCK_PATH`.
+///
+/// On any failure the error is logged and the function returns without storing
+/// anything — a missing anchor block is non-fatal: blocks_by_root will return
+/// empty for this root until the real block arrives via reqresp or gossip.
+fn downloadAndStoreCheckpointBlock(
+    allocator: std.mem.Allocator,
+    state_url: []const u8,
+    expected_root: types.Root,
+    /// hash_tree_root(anchor_state) — required. Block's state_root is checked
+    /// against this for block/state pairing (leanSpec fetch_finalized_anchor).
+    expected_state_root: types.Root,
+    db: *database.Db,
+    logger: zeam_utils.ModuleLogger,
+) void {
+    // Derive block URL: strip the known state path suffix and append the block path.
+    // Using endsWith avoids ambiguous first-occurrence matches in hostname/query params.
+    const trimmed = std.mem.trimEnd(u8, state_url, "/");
+    const base_url = if (std.mem.endsWith(u8, trimmed, FINALIZED_STATE_PATH))
+        trimmed[0 .. trimmed.len - FINALIZED_STATE_PATH.len]
+    else {
+        logger.warn(
+            "checkpoint block fetch: state URL '{s}' does not end with '{s}', cannot derive block URL",
+            .{ state_url, FINALIZED_STATE_PATH },
+        );
+        return;
+    };
+    const block_url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, FINALIZED_BLOCK_PATH }) catch |err| {
+        logger.warn("checkpoint block fetch: failed to allocate block URL: {}", .{err});
+        return;
+    };
+    defer allocator.free(block_url);
+
+    logger.info("checkpoint block fetch: downloading anchor block from: {s}", .{block_url});
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = block_url },
+        .method = .GET,
+        .response_writer = &body_writer.writer,
+        // Spec: Accept: application/octet-stream for SSZ binary response.
+        .extra_headers = &.{.{ .name = "Accept", .value = "application/octet-stream" }},
+    }) catch |err| {
+        logger.warn("checkpoint block fetch: HTTP request failed: {}", .{err});
+        return;
+    };
+
+    if (result.status != .ok) {
+        logger.warn("checkpoint block fetch: HTTP {d} from {s}", .{ @intFromEnum(result.status), block_url });
+        return;
+    }
+
+    var ssz_data = body_writer.toArrayList();
+    defer ssz_data.deinit(allocator);
+
+    // Deserialize into arena so block fields don't need explicit cleanup.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var block: types.SignedBlock = undefined;
+    ssz.deserialize(types.SignedBlock, ssz_data.items, &block, arena.allocator()) catch |err| {
+        logger.warn("checkpoint block fetch: SSZ deserialize failed: {}", .{err});
+        return;
+    };
+
+    // Verify block root: hash_tree_root(BeamBlock) must equal expected_root.
+    // Fail closed: if hashing fails something is seriously wrong (hashTreeRoot is
+    // deterministic over well-typed values); drop rather than store unverified.
+    var computed_root: types.Root = undefined;
+    zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &computed_root, allocator) catch |err| {
+        logger.warn("checkpoint block fetch: hash verification failed: {}, discarding", .{err});
+        return;
+    };
+    if (!std.mem.eql(u8, &computed_root, &expected_root)) {
+        logger.warn("checkpoint block fetch: root mismatch — computed=0x{x} expected=0x{x}, discarding", .{ &computed_root, &expected_root });
+        return;
+    }
+
+    // Pairing check: block.state_root must equal hash_tree_root(anchor_state).
+    // Mirrors leanSpec fetch_finalized_anchor assertion. Detects server advancing
+    // finalization between the two requests (state then block).
+    if (!std.mem.eql(u8, &block.block.state_root, &expected_state_root)) {
+        logger.warn(
+            "checkpoint block fetch: anchor block/state mismatch — block.state_root=0x{x} hash_tree_root(state)=0x{x}; server may have advanced finalization, discarding",
+            .{ &block.block.state_root, &expected_state_root },
+        );
+        return;
+    }
+
+    // Store the original SSZ bytes directly — no re-serialise round-trip.
+    // The bytes already passed deserialise + hash_tree_root verification so they
+    // are valid; re-encoding would waste CPU and could diverge on non-canonical
+    // encodings (though hash_tree_root catches those too).
+    var batch = db.initWriteBatch() catch |err| {
+        logger.warn("checkpoint block fetch: write-batch init failed: {}", .{err});
+        return;
+    };
+    defer batch.deinit();
+    batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, ssz_data.items);
+    db.commit(&batch) catch |err| {
+        logger.warn("checkpoint block fetch: DB commit failed: {}", .{err});
+        return;
+    };
+
+    logger.info(
+        "checkpoint block fetch: stored real anchor block root=0x{x} slot={d} ({d} bytes)",
+        .{ &expected_root, block.block.slot, ssz_data.items.len },
+    );
 }
 
 /// Parses the nodes from a YAML configuration.
@@ -1564,20 +1794,20 @@ test "populateNodeNameRegistry" {
 test "checkpoint-sync-url parameter is optional" {
     // Verify that the NodeCommand struct has checkpoint-sync-url as optional
     const node_cmd = NodeCommand{
-        .custom_genesis = "test",
+        .@"custom-genesis" = "test",
         .@"node-id" = "test",
-        .validator_config = "test",
-        .override_genesis_time = null,
+        .@"validator-config" = "test",
+        .@"override-genesis-time" = null,
         .@"checkpoint-sync-url" = null, // Should compile and work with null
     };
 
     try std.testing.expect(node_cmd.@"checkpoint-sync-url" == null);
 
     const node_cmd_with_url = NodeCommand{
-        .custom_genesis = "test",
+        .@"custom-genesis" = "test",
         .@"node-id" = "test",
-        .validator_config = "test",
-        .override_genesis_time = null,
+        .@"validator-config" = "test",
+        .@"override-genesis-time" = null,
         .@"checkpoint-sync-url" = "http://localhost:5052/lean/v0/states/finalized",
     };
 

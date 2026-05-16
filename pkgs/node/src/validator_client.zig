@@ -118,8 +118,12 @@ pub const ValidatorClient = struct {
                     return null;
                 },
                 .no_peers => {
-                    self.logger.warn("skipping block production for slot={d} proposer={d}: no peers connected", .{ slot, slot_proposer_id });
-                    return null;
+                    // A validator has a duty to propose at its assigned slot regardless of
+                    // peer connectivity. The block is self-imported (advancing local
+                    // fork-choice and persisted to DB) and will be gossiped once peers
+                    // connect. This also enables reqresp tests that isolate zeam from
+                    // the gossip mesh while still expecting block production.
+                    self.logger.info("producing block for slot={d} proposer={d} with no peers (self-import only)", .{ slot, slot_proposer_id });
                 },
                 .behind_peers => |info| {
                     self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
@@ -173,8 +177,9 @@ pub const ValidatorClient = struct {
                 return null;
             },
             .no_peers => {
-                self.logger.warn("skipping attestation production for slot={d}: no peers connected", .{slot});
-                return null;
+                // Attest even with no peers: local fork-choice benefits from attestations
+                // and they will propagate once peers connect.
+                self.logger.info("attesting for slot={d} with no peers (self-import only)", .{slot});
             },
             .behind_peers => |info| {
                 self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{

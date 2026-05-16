@@ -31,6 +31,34 @@ var g_initialized: bool = false;
 
 const Metrics = struct {
     zeam_chain_onblock_duration_seconds: ChainHistogram,
+    // Per-substep timing inside `chain.onBlock` — used to attribute the
+    // multi-second tail observed on aggregator nodes (#863). Step labels:
+    //   "block_root_compute" — hash_tree_root of the inner block when the
+    //       caller did not supply a precomputed root.
+    //   "parent_state_clone" — snapshot+clone of parent state under
+    //       states_lock.shared.
+    //   "verify_signatures" — XMSS verify (per-attestation) under
+    //       pubkey_cache_lock.
+    //   "state_transition" — `apply_transition` (process_slots +
+    //       process_block) under root_to_slot_lock.
+    //   "forkchoice_onblock" — `forkChoice.onBlock` integration call.
+    //   "block_attestations" — onAttestation/storeAggregatedPayload loop
+    //       over the block body.
+    //   "db_persist" — block + state write batch + commit.
+    //   "ssz_serialize_fallback" — fallback re-serialise when no
+    //       precomputed SSZ bytes were supplied.
+    //   "total_excluding_io_wait" — observed wall-clock total (mirrors
+    //       `_duration_seconds` so dashboards can sanity-check that the
+    //       sub-step buckets sum to roughly the total).
+    zeam_chain_onblock_step_duration_seconds: ChainOnblockStepHistogram,
+    // Slot-driver stall watchdog (#863): a dedicated thread samples the
+    // libxev tick clock every WATCHDOG_PROBE_MS via `Clock.lastTickMs()`
+    // (atomic acquire load); if the value falls more than
+    // WATCHDOG_THRESHOLD_MS behind wall clock it logs an ERROR and
+    // bumps these counters. The histogram captures the distribution of
+    // stall durations across firings.
+    zeam_slot_driver_stall_fired_total: ZeamSlotDriverStallFiredCounter,
+    zeam_slot_driver_stall_seconds: ZeamSlotDriverStallSecondsHistogram,
     lean_head_slot: LeanHeadSlotGauge,
     lean_latest_justified_slot: LeanLatestJustifiedSlotGauge,
     lean_latest_finalized_slot: LeanLatestFinalizedSlotGauge,
@@ -68,6 +96,14 @@ const Metrics = struct {
     // refresher — see `registerScrapeRefresher` and the network-layer
     // implementation in `pkgs/network/src/ethlibp2p.zig`.
     zeam_libp2p_swarm_command_dropped_total: LibP2pSwarmCommandDroppedCounter,
+    // leanMetrics PR #35: number of remote peers in the gossipsub mesh
+    // across all subscribed topics. Refreshed from a Rust-side atomic on
+    // every scrape via a registered refresher — see
+    // `registerScrapeRefresher` and the network-layer implementation in
+    // `pkgs/network/src/ethlibp2p.zig`. TODO: per-remote-peer label scheme
+    // (matching `lean_connected_peers`) requires subscribing to gossipsub
+    // Subscribed/Unsubscribed events; left as follow-up work.
+    lean_gossip_mesh_peers: LeanGossipMeshPeersGauge,
     // Node lifecycle metrics
     lean_node_info: LeanNodeInfoGauge,
     lean_node_start_time_seconds: LeanNodeStartTimeGauge,
@@ -108,8 +144,23 @@ const Metrics = struct {
     zeam_compact_attestations_output_total: CompactAttestationsOutputCounter,
     // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
+    /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run` (issues #863, #867).
+    /// Large values imply completion backlog (gossip / reqresp / bridge) before the next tick.
+    zeam_xev_clock_until_done_drain_seconds: XevClockUntilDoneDrainHistogram,
+    /// Count of clock-loop `run(.until_done)` drains taking ≥500ms wall time.
+    zeam_xev_clock_until_done_slow_ge_500ms_total: ZeamXevClockUntilDoneSlowGe500msCounter,
+    /// Count of clock-loop `run(.until_done)` drains taking ≥1s wall time.
+    zeam_xev_clock_until_done_slow_ge_1s_total: ZeamXevClockUntilDoneSlowGe1sCounter,
     // Fork-choice tick interval duration: actual elapsed time between forkchoice tickIntervalUnlocked calls
     zeam_fork_choice_tick_interval_duration_seconds: ForkChoiceTickIntervalDurationHistogram,
+    /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
+    /// plus `publishProducedAggregations` when the aggregator produces gossip aggregates.
+    zeam_node_aggregation_interval_tick_seconds: AggregationIntervalTickHistogram,
+    /// Counter for skipped aggregate submissions, labeled by reason.
+    /// Reasons: "in_flight", "not_aggregator", "not_synced", "missing_state".
+    zeam_aggregate_skip_total: AggregateSkipCounter,
+    /// Histogram for the wall-clock duration of the aggregate FFI worker.
+    zeam_aggregate_worker_duration_seconds: AggregateWorkerDurationHistogram,
     // BeamNode mutex contention metrics (issue #786)
     // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
     // Hold time = how long the callsite kept the mutex locked.
@@ -134,11 +185,35 @@ const Metrics = struct {
     // measurement floor before deciding whether to bound the queue or add
     // a cursor optimisation.
     lean_pending_blocks_drain_iters: PendingBlocksDrainItersHistogram,
+    // Issue #788: visibility into the future-block queueing path.
+    //   * `lean_pending_blocks_depth` — instantaneous queue depth, set on
+    //     every successful enqueue and every `processPendingBlocks` drain.
+    //     Combined with `_evicted_total{reason="cap"}` it tells operators
+    //     when the queue cap is being hit (which would silently drop
+    //     legitimate near-future gossip blocks).
+    //   * `lean_pending_blocks_evicted_total{reason}` — cumulative count of
+    //     blocks dropped from the queue, by reason: `cap` (capacity hit),
+    //     `pre_finalized` (slot < finalized), `too_far_future` (slot >
+    //     current_slot + MAX_FUTURE_SLOT_QUEUE_TOLERANCE; drain-side
+    //     eviction added in PR #841 review #8), `duplicate` (same root
+    //     already queued), `append_oom` (allocator failure on capacity
+    //     reservation; the new block is dropped, the queue is unchanged).
+    //   * `lean_pending_blocks_replayed_total{result}` — cumulative count
+    //     of replays attempted from `processPendingBlocks`, by
+    //     terminal result: `accepted` / `rejected` / `error`.
+    //   * `lean_blocks_future_slot_dropped_total` — cumulative count of
+    //     gossip blocks hard-rejected as `FutureSlot` (beyond the
+    //     queueable window), the symptom #788 was tracking.
+    lean_pending_blocks_depth: LeanPendingBlocksDepthGauge,
+    lean_pending_blocks_evicted_total: LeanPendingBlocksEvictedCounter,
+    lean_pending_blocks_replayed_total: LeanPendingBlocksReplayedCounter,
+    lean_blocks_future_slot_dropped_total: LeanBlocksFutureSlotDroppedCounter,
     // Chain-worker queue + loop metrics (slice c-1 of #803).
-    //   * `_dropped_total{queue="block"|"attestation"}` — producer
+    //   * `_dropped_total{queue="block"|"attestation"|"aggregated_attestation"}` — producer
     //     `trySend` rejections when the queue was full.
-    //   * `_depth{queue="..."}` — instantaneous queue depth, set on
-    //     successful sends; for backlog visibility on devnet stress.
+    //   * `_depth{queue="..."}` — outstanding accepted work, incremented
+    //     on successful sends and decremented after worker processing; for
+    //     backlog visibility on devnet stress.
     //   * `lean_chain_worker_loop_iters_total` — worker-loop liveness
     //     counter; external watchdogs use the delta between scrapes
     //     to detect stalls without touching queue state.
@@ -150,8 +225,140 @@ const Metrics = struct {
     // via `recordChainStateRefcountDistribution` registered as a
     // context-bearing scrape refresher (see `registerScrapeRefresherCtx`).
     lean_chain_state_refcount_distribution: LeanChainStateRefcountDistributionHistogram,
+    // Slice (e) of #803: visibility into the centralised hash-root
+    // cache. Each block ingress now carries the block_root computed
+    // once at the gossip / RPC entry point through every downstream
+    // consumer (chain.onGossip, enqueuePendingBlock,
+    // processPendingBlocks, chain.onBlock, forkchoice.onBlock).
+    // This counter bumps every time a downstream consumer was able
+    // to skip the second `hashTreeRoot` because the producer threaded
+    // a precomputed root through. The `site` label identifies the
+    // skip site (e.g. "chain.onGossip", "chain.onBlock",
+    // "chain.processPendingBlocks", "chain.enqueuePendingBlock"). A
+    // sustained 0 for any site label means the cache plumbing is
+    // broken there — useful for catching a regression that drops
+    // the root on the floor in a future refactor.
+    lean_block_root_compute_skipped_total: LeanBlockRootComputeSkippedCounter,
+    // Slice (d) of #803: visibility into the parallel net-fetch +
+    // missed-root prune dedup. Bumped per `fetchBlockByRoots` call by
+    // outcome bucket. Every entry of the input `roots` lands in
+    // exactly one bucket, so the outcome counters sum to `roots.len`
+    // per call — useful for asserting `sum(rate(lean_block_fetch_dedup_total))
+    // == sum(rate(… by outcome))` as a Grafana invariant. Buckets:
+    //   * `already_in_forkchoice` — protoArray hit on `hasBlocksBatch`.
+    //   * `already_in_block_cache` — awaiting parent or STF.
+    //   * `already_pending` — RPC in flight; another
+    //     `fetchBlockByRoots` call is already responsible.
+    //   * `fetched` — dispatched to a peer via `blocks_by_root`.
+    //   * `fetch_no_peers` — dispatch attempted but `selectPeer`
+    //     returned `error.NoPeersAvailable` (PR #842 review #1).
+    //   * `fetch_failed` — dispatch attempted but failed for any
+    //     other reason (queue full, encode failure, …).
+    //   * `dedup_lost_race` — every requested root entered
+    //     `network.pending_block_roots` or `network.block_cache`
+    //     between our `hasBlocksBatch` snapshot and the network
+    //     helper's re-check, so dispatch was suppressed (PR #842
+    //     review followup). The benign TOCTOU window is documented
+    //     in `BeamNode.fetchBlockByRoots`.
+    lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
+    // Issue #863 P2: gossip attestation/aggregation drops on the libxev
+    // main thread BEFORE they are routed to the chain-worker. Bumped by
+    // `chain.onGossip` for raw attestations and aggregations. zeam-
+    // specific (other lean clients shape this differently). Labels:
+    //   * `kind` — `attestation` (raw gossip att) or `aggregation`
+    //     (aggregated payload).
+    //   * `reason`:
+    //     - `syncing` — chain.getSyncStatus() is `behind_peers` /
+    //       `fc_initing` / `no_peers`; suppress validation work and the
+    //       follow-up `BlocksByRoot` fetch enqueue (the death-spiral fix).
+    //       Recovery comes from `BlocksByRange` / gossip block import.
+    //     - `future_slot` — `att.slot > current_slot + GOSSIP_FUTURE_SLOT_TOLERANCE`;
+    //       no point validating against a head we don't know yet, and the
+    //       missing-root would be unhelpful (it's a head we're racing
+    //       against, not a real fetch target).
+    //     - `worker_validation_failed` — attestation reached the chain-
+    //       worker but `validateAttestationData` rejected it on-thread;
+    //       includes the unknown-{head,source,target} cases that used to
+    //       trigger a fetch storm. The chain-worker path silently drops
+    //       these (per the established `chainWorkerOn*Thunk` no-feedback
+    //       contract) so this counter is the only signal.
+    zeam_gossip_atts_dropped_total: ZeamGossipAttsDroppedCounter,
+    // Issue #863 P3: per-resource concurrency cap on outbound
+    // `BlocksByRoot` RPCs. The pre-#863 path issued one RPC per
+    // attestation that referenced an unknown head, multiplied by 4x
+    // subnet fanout for an aggregator — under flood the libxev thread
+    // would fork off hundreds of RPCs that themselves timed out and
+    // retried, saturating the loop. The cap pins concurrent outbound
+    // BlocksByRoot to MAX_CONCURRENT_BLOCKS_BY_ROOT (typically 8) so
+    // gossip pressure can't run the request fan-out away. zeam-specific
+    // (the cap is a zeam implementation detail, not a spec constraint).
+    //   * `zeam_blocks_by_root_inflight` — instantaneous count of
+    //     outbound `BlocksByRoot` RPCs that have been dispatched but
+    //     have not yet been finalized via `finalizePendingRequest`.
+    //   * the cap-rejection bucket is folded into
+    //     `lean_block_fetch_dedup_total{outcome="inflight_cap"}` so
+    //     dashboards see all suppression-by-this-PR causes side by side
+    //     with the existing dedup outcomes — keeps the
+    //     `sum(rate(... by outcome)) == sum(rate(...))` invariant.
+    zeam_blocks_by_root_inflight: ZeamBlocksByRootInflightGauge,
+    // Issue #863 P4: Clock.run drain bounding visibility. The pre-#863
+    // shape called `events.run(.until_done)` per pass, which under
+    // flood drained for many seconds and starved `tickInterval`.
+    // P4 swaps to `.once` (one io_uring CQE batch per pass), which
+    // returns to `tickInterval` as soon as the next-interval timer or
+    // any other completion fires. This counter is the rate of clock
+    // passes — comparing scrape deltas to expected (`5 / SECONDS_PER_SLOT`,
+    // ~1.25 Hz at 4s slots) is a quick liveness signal independent of
+    // the existing `lean_tick_interval_duration_seconds` histogram.
+    zeam_xev_clock_drain_passes_total: ZeamXevClockDrainPassesCounter,
+    // leanSpec parity (`subspecs/sync/service.py`): gossip attestations
+    // and aggregations whose referenced source/target/head block isn't
+    // yet imported, or whose slot is still in the future, are buffered
+    // for replay after the next successful `onBlock` import (see
+    // `_replay_pending_attestations` in the spec; mirrored as
+    // `replayPendingAttestations` in `chain.zig`).
+    //
+    //   * `lean_pending_attestations_buffered_total{kind, reason}` —
+    //     cumulative entries pushed into the pending-attestation buffer.
+    //     `kind={attestation,aggregation}`, `reason={unknown_block,future_slot}`.
+    //   * `lean_pending_attestations_evicted_total{kind}` — entries
+    //     dropped via FIFO eviction at MAX_PENDING_ATTESTATIONS (1024,
+    //     spec value).
+    //   * `lean_pending_attestations_replay_total{kind, outcome}` —
+    //     replay attempts. `outcome={accepted,buffered,dropped}`:
+    //     `accepted` = validate+verify succeeded after replay,
+    //     `buffered` = still missing block (re-enqueued), `dropped` =
+    //     permanent failure (signature, malformed, etc).
+    //   * `lean_pending_attestations_size{kind}` — instantaneous buffer
+    //     depth, refreshed after every enqueue/replay drain.
+    lean_pending_attestations_buffered_total: LeanPendingAttsBufferedCounter,
+    lean_pending_attestations_evicted_total: LeanPendingAttsEvictedCounter,
+    lean_pending_attestations_replay_total: LeanPendingAttsReplayCounter,
+    lean_pending_attestations_size: LeanPendingAttsSizeGauge,
+    // Per-site errors swallowed by `BeamNode.onInterval`; sustained non-zero
+    // rates mean the node is ticking but a duty/publish layer is failing.
+    lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
+    // Per-substep timing inside chain.onBlock — see #863 root-cause work.
+    // Same bucket layout as ChainHistogram so dashboards can stack the
+    // step series and the total side-by-side without bucket-aligned diffs.
+    const ChainOnblockStepLabel = struct { step: []const u8 };
+    const ChainOnblockStepHistogram = metrics_lib.HistogramVec(
+        f32,
+        ChainOnblockStepLabel,
+        &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
+    );
+    // Watchdog counters (#863): wall-clock heartbeats from the slot-driver
+    // libxev thread. The watchdog thread bumps `_fired_total` whenever it
+    // observes a stall over the configured threshold; the per-bucket
+    // counters give operators a quick "how bad" without scraping the
+    // histogram.
+    const ZeamSlotDriverStallFiredCounter = metrics_lib.Counter(u64);
+    const ZeamSlotDriverStallSecondsHistogram = metrics_lib.Histogram(
+        f32,
+        &[_]f32{ 1, 2, 5, 10, 30, 60, 120, 300, 600 },
+    );
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
     const SlotsProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const BlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
@@ -184,6 +391,7 @@ const Metrics = struct {
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
     const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
     const LibP2pSwarmCommandDroppedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const LeanGossipMeshPeersGauge = metrics_lib.Gauge(u64);
     // Node lifecycle metric types
     const LeanNodeInfoGauge = metrics_lib.GaugeVec(u64, struct { name: []const u8, version: []const u8 });
     const LeanNodeStartTimeGauge = metrics_lib.Gauge(u64);
@@ -230,7 +438,15 @@ const Metrics = struct {
     // compactAttestations metric types
     const CompactAttestationsTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 });
     const TickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
+    /// Buckets from sub-ms through multi-second xev drains observed on loaded devnets (#863).
+    const XevClockUntilDoneDrainHistogram = metrics_lib.Histogram(f32, &[_]f32{
+        0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60,
+    });
+    const ZeamXevClockUntilDoneSlowGe500msCounter = metrics_lib.Counter(u64);
+    const ZeamXevClockUntilDoneSlowGe1sCounter = metrics_lib.Counter(u64);
     const ForkChoiceTickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
+    /// Aggregation tick (interval-in-slot 2): spans sub-ms through multi-second stalls.
+    const AggregationIntervalTickHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
     const CompactAttestationsInputCounter = metrics_lib.Counter(u64);
     const CompactAttestationsOutputCounter = metrics_lib.Counter(u64);
     // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
@@ -245,6 +461,26 @@ const Metrics = struct {
     const LockHoldTimeHistogram = metrics_lib.HistogramVec(f32, LockLabel, &NODE_MUTEX_BUCKETS);
     // pending_blocks drain iteration histogram type (slice a-2)
     const PendingBlocksDrainItersHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 });
+    // Issue #788: future-block queue visibility.
+    const LeanPendingBlocksDepthGauge = metrics_lib.Gauge(u64);
+    const LeanPendingBlocksEvictedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const LeanPendingBlocksReplayedCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
+    const LeanBlocksFutureSlotDroppedCounter = metrics_lib.Counter(u64);
+    // Slice (d)/(e) of #803.
+    const LeanBlockRootComputeSkippedCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
+    const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
+    // Issue #863 P2/P3 metric types.
+    const ZeamGossipAttsDroppedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
+    const ZeamBlocksByRootInflightGauge = metrics_lib.Gauge(u64);
+    const ZeamXevClockDrainPassesCounter = metrics_lib.Counter(u64);
+    const LeanPendingAttsBufferedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
+    const LeanPendingAttsEvictedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8 });
+    const LeanPendingAttsReplayCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, outcome: []const u8 });
+    const LeanPendingAttsSizeGauge = metrics_lib.GaugeVec(u64, struct { kind: []const u8 });
+    // Issue #837 — see `lean_node_interval_error_total` field doc.
+    const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
+    const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const AggregateWorkerDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -416,9 +652,27 @@ fn observeTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeXevClockUntilDoneDrain(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.XevClockUntilDoneDrainHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeForkChoiceTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.ForkChoiceTickIntervalDurationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeAggregateWorkerDuration(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.AggregateWorkerDurationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeAggregationIntervalTick(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.AggregationIntervalTickHistogram = @ptrCast(@alignCast(histogram_ptr));
     histogram.observe(value);
 }
 
@@ -516,9 +770,21 @@ pub var lean_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeTickIntervalDuration,
 };
+pub var zeam_xev_clock_until_done_drain_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeXevClockUntilDoneDrain,
+};
 pub var zeam_fork_choice_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeForkChoiceTickIntervalDuration,
+};
+pub var zeam_node_aggregation_interval_tick_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeAggregationIntervalTick,
+};
+pub var zeam_aggregate_worker_duration_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeAggregateWorkerDuration,
 };
 pub var lean_pending_blocks_drain_iters: Histogram = .{
     .context = null,
@@ -540,6 +806,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
+        .zeam_chain_onblock_step_duration_seconds = try Metrics.ChainOnblockStepHistogram.init(allocator, io, "zeam_chain_onblock_step_duration_seconds", .{ .help = "Per-substep wall-clock duration inside chain.onBlock, labeled by step. See #863 for context. Buckets match zeam_chain_onblock_duration_seconds for stack-aligned dashboarding." }, .{}),
+        .zeam_slot_driver_stall_fired_total = Metrics.ZeamSlotDriverStallFiredCounter.init("zeam_slot_driver_stall_fired_total", .{ .help = "Total times the watchdog (#863) observed the libxev slot driver stalled past its threshold (default 5s). Each firing also records the stall duration in zeam_slot_driver_stall_seconds and emits an ERROR log." }, .{}),
+        .zeam_slot_driver_stall_seconds = Metrics.ZeamSlotDriverStallSecondsHistogram.init("zeam_slot_driver_stall_seconds", .{ .help = "Distribution of slot-driver stall durations observed by the watchdog (#863). Stalls beyond ~1s indicate the libxev loop, libp2p Rust thread, or chain-worker held the main loop hostage; pair with zeam_chain_onblock_step_duration_seconds to attribute." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
         .lean_latest_justified_slot = Metrics.LeanLatestJustifiedSlotGauge.init("lean_latest_justified_slot", .{ .help = "Latest justified slot" }, .{}),
         .lean_latest_finalized_slot = Metrics.LeanLatestFinalizedSlotGauge.init("lean_latest_finalized_slot", .{ .help = "Latest finalized slot" }, .{}),
@@ -572,6 +841,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, io, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
         .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, io, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
         .zeam_libp2p_swarm_command_dropped_total = try Metrics.LibP2pSwarmCommandDroppedCounter.init(allocator, io, "zeam_libp2p_swarm_command_dropped_total", .{ .help = "Total number of swarm commands dropped before reaching the rust-libp2p event loop, by reason (issue #808)" }, .{}),
+        .lean_gossip_mesh_peers = Metrics.LeanGossipMeshPeersGauge.init("lean_gossip_mesh_peers", .{ .help = "Number of peers in the gossipsub mesh" }, .{}),
         // Node lifecycle metrics
         .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, io, "lean_node_info", .{ .help = "Node information (always 1)" }, .{}),
         .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Start timestamp" }, .{}),
@@ -610,7 +880,13 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("zeam_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
         .zeam_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("zeam_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
+        .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
+        .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
+        .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
+        .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
+        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: in_flight, not_aggregator, not_synced, missing_state." }, .{}),
+        .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of the aggregate FFI worker (XMSS recursive aggregation)." }, .{}),
         // BeamNode mutex contention metrics (issue #786)
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
         .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
@@ -618,12 +894,31 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_lock_wait_seconds = try Metrics.LockWaitTimeHistogram.init(allocator, io, "zeam_lock_wait_seconds", .{ .help = "Time spent waiting to acquire a per-resource lock, labeled by lock and callsite." }, .{}),
         .zeam_lock_hold_seconds = try Metrics.LockHoldTimeHistogram.init(allocator, io, "zeam_lock_hold_seconds", .{ .help = "Time a per-resource lock was held, labeled by lock and callsite." }, .{}),
         .lean_pending_blocks_drain_iters = Metrics.PendingBlocksDrainItersHistogram.init("lean_pending_blocks_drain_iters", .{ .help = "Number of iterations chain.processPendingBlocks ran through before draining the queue or finding nothing ready." }, .{}),
+        .lean_pending_blocks_depth = Metrics.LeanPendingBlocksDepthGauge.init("lean_pending_blocks_depth", .{ .help = "Instantaneous depth of the future-block pending queue (issue #788)." }, .{}),
+        .lean_pending_blocks_evicted_total = try Metrics.LeanPendingBlocksEvictedCounter.init(allocator, io, "lean_pending_blocks_evicted_total", .{ .help = "Total number of blocks evicted from the pending-blocks queue, by reason (issue #788)." }, .{}),
+        .lean_pending_blocks_replayed_total = try Metrics.LeanPendingBlocksReplayedCounter.init(allocator, io, "lean_pending_blocks_replayed_total", .{ .help = "Total number of replays from pending_blocks, by terminal result (issue #788)." }, .{}),
+        .lean_blocks_future_slot_dropped_total = Metrics.LeanBlocksFutureSlotDroppedCounter.init("lean_blocks_future_slot_dropped_total", .{ .help = "Total number of gossip blocks hard-rejected as FutureSlot beyond the queueable window (issue #788)." }, .{}),
         // Chain-worker queue + loop metrics (slice c-1 of #803).
-        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
-        .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Instantaneous depth of the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
+        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
+        .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed or explicitly discarded during shutdown, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
+        // Slice (d)/(e) of #803 — see field doc for label semantics.
+        .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
+        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race, inflight_cap." }, .{}),
+        // Issue #863 P2/P3/P4 — see field doc for label semantics.
+        .zeam_gossip_atts_dropped_total = try Metrics.ZeamGossipAttsDroppedCounter.init(allocator, io, "zeam_gossip_atts_dropped_total", .{ .help = "Total number of gossip attestations/aggregations dropped on the libxev main thread before chain-worker dispatch. Labeled by kind={attestation,aggregation} and reason={syncing,future_slot,worker_validation_failed}. zeam-specific. See blockblaz/zeam#863." }, .{}),
+        .zeam_blocks_by_root_inflight = Metrics.ZeamBlocksByRootInflightGauge.init("zeam_blocks_by_root_inflight", .{ .help = "Instantaneous count of outbound `BlocksByRoot` RPCs that have been dispatched but not yet finalized via `finalizePendingRequest`. Capped at MAX_CONCURRENT_BLOCKS_BY_ROOT (8) to bound per-flood dispatch fan-out. zeam-specific. See blockblaz/zeam#863." }, .{}),
+        .zeam_xev_clock_drain_passes_total = Metrics.ZeamXevClockDrainPassesCounter.init("zeam_xev_clock_drain_passes_total", .{ .help = "Cumulative passes through `Clock.run`'s libxev drain (one io_uring CQE batch per pass via `events.run(.once)`). Compare scrape deltas against the expected ~1.25 Hz at 4s slots / 5 intervals to detect slot-driver wedges independent of `lean_tick_interval_duration_seconds`. See blockblaz/zeam#863." }, .{}),
+        .lean_pending_attestations_buffered_total = try Metrics.LeanPendingAttsBufferedCounter.init(allocator, io, "lean_pending_attestations_buffered_total", .{ .help = "Gossip attestations / aggregations buffered for replay after a future onBlock import. Mirrors leanSpec subspecs/sync/service.py::_pending_attestations buffer push. Labeled by kind={attestation,aggregation} and reason={unknown_block,future_slot}." }, .{}),
+        .lean_pending_attestations_evicted_total = try Metrics.LeanPendingAttsEvictedCounter.init(allocator, io, "lean_pending_attestations_evicted_total", .{ .help = "Pending-attestation buffer FIFO evictions when MAX_PENDING_ATTESTATIONS (1024, leanSpec subspecs/sync/config.py) is reached. Labeled by kind={attestation,aggregation}." }, .{}),
+        .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts (mirrors leanSpec _replay_pending_attestations). Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
+        .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),
+        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
     };
+    metrics.zeam_blocks_by_root_inflight.set(0);
+    metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};
+    metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, 0) catch {};
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
     metrics.lean_validators_count.set(0);
@@ -660,7 +955,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_attestations_production_time_seconds.context = @ptrCast(&metrics.lean_attestations_production_time_seconds);
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
     lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
+    zeam_xev_clock_until_done_drain_seconds.context = @ptrCast(&metrics.zeam_xev_clock_until_done_drain_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
+    zeam_node_aggregation_interval_tick_seconds.context = @ptrCast(&metrics.zeam_node_aggregation_interval_tick_seconds);
+    zeam_aggregate_worker_duration_seconds.context = @ptrCast(&metrics.zeam_aggregate_worker_duration_seconds);
     lean_pending_blocks_drain_iters.context = @ptrCast(&metrics.lean_pending_blocks_drain_iters);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
@@ -670,40 +968,95 @@ pub fn init(allocator: std.mem.Allocator) !void {
     g_initialized = true;
 }
 
-/// Optional pre-scrape refresher. Modules that own state outside the
-/// `Metrics` struct (e.g. a Rust-side atomic counter accessed via FFI) can
-/// register a callback here; it is invoked on every `writeMetrics` so the
-/// counter values reflect the latest source-of-truth at scrape time. Issue
-/// #808 (libp2p swarm command drops) is the first user.
-var g_scrape_refresher: ?*const fn () void = null;
+/// Pre-scrape refresher registry. Modules that own state outside the
+/// `Metrics` struct (e.g. a Rust-side atomic counter accessed via FFI, or
+/// a `*BeamChain` whose in-memory map needs to be sampled) can register
+/// callbacks here; every registered callback is invoked on every
+/// `writeMetrics` so counter/gauge values reflect the latest source of
+/// truth at scrape time.
+///
+/// Two callback shapes are supported:
+///   * `void → void` — for FFI-backed atomic counters that need no
+///     context (issue #808 — libp2p swarm command drops, leanMetrics PR
+///     #35 — `lean_gossip_mesh_peers`).
+///   * `*anyopaque → void` — for callers that need to thread a pointer
+///     back to themselves rather than coerce state into a global (slice
+///     c-2b commit 5 of #803 — `lean_chain_state_refcount_distribution`,
+///     where the observer iterates a `*BeamChain` states map under its
+///     shared lock).
+///
+/// Each kind is stored in its own bounded list. Both lists are appended
+/// to in registration order; on every scrape the void-list runs first,
+/// then the ctx-list, preserving the original `g_scrape_refresher` →
+/// `g_scrape_refresher_ctx` ordering so any caller that relies on it
+/// (e.g. the FFI counters being refreshed before a context-bearing
+/// observer reads from them) keeps working.
+///
+/// The list is bounded (no allocator dependency: this module is used
+/// from ZKVM targets where allocators are constrained, and the registry
+/// is touched at startup only). `MAX_SCRAPE_REFRESHERS` is sized
+/// generously vs. the current ~2 callsites; if a future contributor
+/// needs more, raise the constant rather than adding a parallel slot.
+const MAX_SCRAPE_REFRESHERS: usize = 16;
 
-/// Register (or replace) a scrape refresher. Pass `null` to clear. Safe to
-/// call before `init()`; the registration sticks regardless of init order.
+var g_scrape_refreshers: [MAX_SCRAPE_REFRESHERS]*const fn () void = undefined;
+var g_scrape_refreshers_len: usize = 0;
+
+const CtxRefresher = struct {
+    refresher: *const fn (?*anyopaque) void,
+    ctx: ?*anyopaque,
+};
+var g_scrape_refreshers_ctx: [MAX_SCRAPE_REFRESHERS]CtxRefresher = undefined;
+var g_scrape_refreshers_ctx_len: usize = 0;
+
+/// Append a void-context scrape refresher. Safe to call before `init()`;
+/// the registration sticks regardless of init order. Passing `null` is a
+/// no-op (kept for API symmetry with prior behaviour where `null` cleared
+/// the single slot — the registry is now append-only and individual
+/// callbacks cannot be removed at runtime, which mirrors the actual usage
+/// pattern: every caller is a process-lifetime singleton). Panics if more
+/// than `MAX_SCRAPE_REFRESHERS` callbacks are registered, which would
+/// indicate a bug (callers re-registering on every scrape) rather than
+/// legitimate growth.
 pub fn registerScrapeRefresher(refresher: ?*const fn () void) void {
-    g_scrape_refresher = refresher;
+    const cb = refresher orelse return;
+    if (g_scrape_refreshers_len >= MAX_SCRAPE_REFRESHERS) {
+        std.debug.panic(
+            "registerScrapeRefresher: too many callbacks (limit={d})",
+            .{MAX_SCRAPE_REFRESHERS},
+        );
+    }
+    g_scrape_refreshers[g_scrape_refreshers_len] = cb;
+    g_scrape_refreshers_len += 1;
 }
 
-/// Optional context-bearing pre-scrape refresher. Slice c-2b commit 5 of
-/// #803 (lean_chain_state_refcount_distribution) needed a callback that
-/// receives a `*BeamChain` so the observer could iterate the chain's
-/// in-memory states map under its shared lock and sample each rc's
-/// refcount. The first-form `g_scrape_refresher` slot above is
-/// `void → void` (used for FFI-backed atomic counters that need no
-/// context); rather than coerce the chain into a global, we expose a
-/// parallel slot that takes an opaque pointer back to the caller. The
-/// two slots are independent and both run on every scrape (the FFI
-/// refresher first, then the context-bearing one).
-var g_scrape_refresher_ctx: ?*const fn (?*anyopaque) void = null;
-var g_scrape_refresher_ctx_ptr: ?*anyopaque = null;
-
-/// Register (or replace) a context-bearing scrape refresher. Pass `null`
-/// for `refresher` to clear (the ctx pointer is also cleared).
+/// Append a context-bearing scrape refresher. Passing `null` for
+/// `refresher` is a no-op (see `registerScrapeRefresher` for the
+/// rationale). Panics on overflow for the same reason.
 pub fn registerScrapeRefresherCtx(
     ctx: ?*anyopaque,
     refresher: ?*const fn (?*anyopaque) void,
 ) void {
-    g_scrape_refresher_ctx = refresher;
-    g_scrape_refresher_ctx_ptr = if (refresher == null) null else ctx;
+    const cb = refresher orelse return;
+    if (g_scrape_refreshers_ctx_len >= MAX_SCRAPE_REFRESHERS) {
+        std.debug.panic(
+            "registerScrapeRefresherCtx: too many callbacks (limit={d})",
+            .{MAX_SCRAPE_REFRESHERS},
+        );
+    }
+    g_scrape_refreshers_ctx[g_scrape_refreshers_ctx_len] = .{
+        .refresher = cb,
+        .ctx = ctx,
+    };
+    g_scrape_refreshers_ctx_len += 1;
+}
+
+/// Test-only: drop every registered scrape refresher so unit tests can
+/// exercise `writeMetrics` against a known-empty registry. NOT exposed
+/// outside test code paths in production callers.
+pub fn resetScrapeRefreshersForTest() void {
+    g_scrape_refreshers_len = 0;
+    g_scrape_refreshers_ctx_len = 0;
 }
 
 /// Writes metrics to a writer (for Prometheus endpoint).
@@ -716,13 +1069,273 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
         return;
     }
 
-    // Pull in any externally-owned counters (e.g. Rust-side libp2p drops)
-    // before serializing so each scrape returns up-to-date values.
-    if (g_scrape_refresher) |refresher| refresher();
-    // Context-bearing refresher (slice c-2b commit 5 of #803): runs
-    // after the void-refresher so a future contributor can rely on
-    // ordering when the two refreshers' outputs share buckets/labels.
-    if (g_scrape_refresher_ctx) |refresher| refresher(g_scrape_refresher_ctx_ptr);
+    // Pull in any externally-owned counters (e.g. Rust-side libp2p drops,
+    // gossipsub mesh peers, BeamChain refcount distribution) before
+    // serializing so each scrape returns up-to-date values. Void-context
+    // refreshers run first, then context-bearing ones, preserving the
+    // legacy ordering between FFI-backed atomic refreshes and
+    // context-bearing observers that may read from them.
+    var i: usize = 0;
+    while (i < g_scrape_refreshers_len) : (i += 1) {
+        g_scrape_refreshers[i]();
+    }
+    i = 0;
+    while (i < g_scrape_refreshers_ctx_len) : (i += 1) {
+        const entry = g_scrape_refreshers_ctx[i];
+        entry.refresher(entry.ctx);
+    }
 
     try metrics_lib.write(&metrics, writer);
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+const testing = std.testing;
+
+// leanMetrics PR #35 — lock the gauge↑scrape contract for
+// `lean_gossip_mesh_peers` in code so a future contributor cannot drop
+// the gauge from the `Metrics` struct, rename it, or break the
+// `writeMetrics` serializer without a CI failure here. Slice (b)'s
+// explicit lesson (LockTimer → /metrics output test in
+// `pkgs/node/src/locking.zig`) and slice c-2b's
+// `lean_chain_state_refcount_distribution` audit (PR #803) was that
+// doc-only audits regress silently — every Prometheus-exposed metric
+// added by this PR/repo earns a 20-line scrape test.
+//
+// We cannot exercise the FFI side (`get_mesh_peers_total →
+// refreshMeshPeersMetric → gauge`) without a real swarm, but the path
+// from `gauge.set(N)` through the serializer to the Prometheus body is
+// the only place where a future struct-level change would silently
+// break the contract. That path is what we cover here.
+test "lean_gossip_mesh_peers gauge appears in scrape output" {
+    if (isZKVM()) return;
+
+    // The metrics globals (`metrics`, `g_initialized`, the refresher
+    // arrays) are process-wide and may have been initialized by an
+    // earlier test in this binary. `init` is idempotent (it bails on
+    // `g_initialized`); explicitly call it here so this test can run
+    // standalone too.
+    //
+    // Use the page allocator (rather than `testing.allocator`) for the
+    // same reason `pkgs/node/src/locking.zig`'s LockTimer test does:
+    // the labelled metrics under `metrics` allocate buckets/maps that
+    // outlive any single test, and freeing them through a per-test
+    // allocator after teardown trips the DebugAllocator. The metrics
+    // module is a process-lifetime singleton; tracking its footprint
+    // through `testing.allocator` is not the contract we want to assert.
+    try init(std.heap.page_allocator);
+
+    // Set a recognisable, non-default value so we can grep for it in
+    // the scrape body. Pick something that's unlikely to collide with
+    // any other gauge value in the same scrape.
+    const expected: u64 = 4242;
+    metrics.lean_gossip_mesh_peers.set(expected);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    // The metric name itself must appear (TYPE / HELP lines plus the
+    // value line itself).
+    try testing.expect(
+        std.mem.indexOf(u8, body, "lean_gossip_mesh_peers") != null,
+    );
+
+    // And the value line `lean_gossip_mesh_peers <expected>` (with the
+    // surrounding whitespace expected from Prometheus exposition
+    // format) must be present — this is what locks the gauge↑scrape
+    // contract: the value we set really did make it through
+    // `writeMetrics`.
+    var expected_line_buf: [128]u8 = undefined;
+    const expected_line = std.fmt.bufPrint(
+        &expected_line_buf,
+        "lean_gossip_mesh_peers {d}",
+        .{expected},
+    ) catch unreachable;
+    try testing.expect(
+        std.mem.indexOf(u8, body, expected_line) != null,
+    );
+}
+
+// Lock the append-only behaviour of the scrape-refresher registry: a
+// previous design stored a single callback per kind, and registering a
+// second callback silently overwrote the first. The metrics module now
+// keeps a bounded list (`MAX_SCRAPE_REFRESHERS`); this test guards the
+// list semantics in code so a future contributor cannot regress to a
+// single-slot design without CI failing.
+test "registerScrapeRefresher fans out to all registered callbacks" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    // Snapshot + reset the registry for this test, then restore the
+    // production callbacks afterwards so we don't perturb other tests
+    // running in the same binary.
+    const saved_void_len = g_scrape_refreshers_len;
+    const saved_ctx_len = g_scrape_refreshers_ctx_len;
+    var saved_void: [MAX_SCRAPE_REFRESHERS]*const fn () void = undefined;
+    var saved_ctx: [MAX_SCRAPE_REFRESHERS]CtxRefresher = undefined;
+    @memcpy(saved_void[0..saved_void_len], g_scrape_refreshers[0..saved_void_len]);
+    @memcpy(saved_ctx[0..saved_ctx_len], g_scrape_refreshers_ctx[0..saved_ctx_len]);
+    defer {
+        g_scrape_refreshers_len = saved_void_len;
+        g_scrape_refreshers_ctx_len = saved_ctx_len;
+        @memcpy(g_scrape_refreshers[0..saved_void_len], saved_void[0..saved_void_len]);
+        @memcpy(g_scrape_refreshers_ctx[0..saved_ctx_len], saved_ctx[0..saved_ctx_len]);
+    }
+
+    resetScrapeRefreshersForTest();
+
+    const Hits = struct {
+        var first: u32 = 0;
+        var second: u32 = 0;
+        var ctx_first: u32 = 0;
+        var ctx_second: u32 = 0;
+        var ctx_value: u64 = 0;
+
+        fn firstCb() void {
+            first += 1;
+        }
+        fn secondCb() void {
+            second += 1;
+        }
+        fn ctxFirstCb(p: ?*anyopaque) void {
+            ctx_first += 1;
+            if (p) |raw| {
+                const slot: *u64 = @ptrCast(@alignCast(raw));
+                ctx_value = slot.*;
+            }
+        }
+        fn ctxSecondCb(_: ?*anyopaque) void {
+            ctx_second += 1;
+        }
+    };
+
+    Hits.first = 0;
+    Hits.second = 0;
+    Hits.ctx_first = 0;
+    Hits.ctx_second = 0;
+    Hits.ctx_value = 0;
+
+    var ctx_payload: u64 = 7;
+
+    registerScrapeRefresher(Hits.firstCb);
+    registerScrapeRefresher(Hits.secondCb);
+    registerScrapeRefresherCtx(@ptrCast(&ctx_payload), Hits.ctxFirstCb);
+    registerScrapeRefresherCtx(null, Hits.ctxSecondCb);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+
+    // Both void-context callbacks fired exactly once — single-slot
+    // overwrite would have left `first == 0`.
+    try testing.expectEqual(@as(u32, 1), Hits.first);
+    try testing.expectEqual(@as(u32, 1), Hits.second);
+    // Both context-bearing callbacks fired exactly once.
+    try testing.expectEqual(@as(u32, 1), Hits.ctx_first);
+    try testing.expectEqual(@as(u32, 1), Hits.ctx_second);
+    // The opaque pointer was threaded through to the callback.
+    try testing.expectEqual(@as(u64, 7), Hits.ctx_value);
+
+    // Calling writeMetrics again invokes them again, proving the
+    // refreshers run on every scrape (not just first scrape).
+    var alloc_writer2 = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer2.deinit();
+    try writeMetrics(&alloc_writer2.writer);
+    try testing.expectEqual(@as(u32, 2), Hits.first);
+    try testing.expectEqual(@as(u32, 2), Hits.second);
+    try testing.expectEqual(@as(u32, 2), Hits.ctx_first);
+    try testing.expectEqual(@as(u32, 2), Hits.ctx_second);
+}
+
+// Slice (d)/(e) of #803 (PR #842 review #4 / nit followup):
+// lock the metrics scrape contract for the slice (d) per-fetch dedup
+// counters and the slice (e) per-site root-compute-skipped counters
+// in code, so a label rename / family drop / serializer regression
+// fails CI here, not silently in production. Mirrors the slice-(b)
+// LockTimer audit pattern (`pkgs/node/src/locking.zig`) and the #788
+// metric audit added in PR #841.
+test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    // Bump every label the production code emits. `incr` / `incrBy`
+    // failures are swallowed to mirror production usage (the chain /
+    // node code uses `catch {}` on every metric write).
+
+    // lean_block_root_compute_skipped_total{site} — slice (e).
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onGossip" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onBlock" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.processPendingBlocks" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
+
+    // lean_block_fetch_dedup_total{outcome} — slice (d). PR #842
+    // review #1 added `fetch_no_peers` and `fetch_failed`; the
+    // review followup added `dedup_lost_race`. Assert all seven
+    // outcomes appear so a label rename / drop fails CI.
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_forkchoice" }, 3) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_block_cache" }, 5) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_pending" }, 7) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetched" }, 11) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_no_peers" }, 13) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_failed" }, 17) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "dedup_lost_race" }, 19) catch {};
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    // Top-level metric families must be advertised.
+    try testing.expect(std.mem.indexOf(u8, body, "lean_block_root_compute_skipped_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lean_block_fetch_dedup_total") != null);
+
+    const skip_sites = [_][]const u8{
+        "site=\"chain.onGossip\"",
+        "site=\"chain.onBlock\"",
+        "site=\"chain.processPendingBlocks\"",
+        "site=\"forkchoice.onBlock\"",
+    };
+    for (skip_sites) |lbl| {
+        try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
+    }
+
+    const fetch_outcomes = [_][]const u8{
+        "outcome=\"already_in_forkchoice\"",
+        "outcome=\"already_in_block_cache\"",
+        "outcome=\"already_pending\"",
+        "outcome=\"fetched\"",
+        "outcome=\"fetch_no_peers\"",
+        "outcome=\"fetch_failed\"",
+        "outcome=\"dedup_lost_race\"",
+    };
+    for (fetch_outcomes) |lbl| {
+        try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
+    }
+}
+
+// Issues #863 / #867: clock-loop xev drain observability must stay in the
+// Prometheus scrape output (histogram + slow-drain counters).
+test "issues #863/#867: xev until_done drain metrics appear in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    zeam_xev_clock_until_done_drain_seconds.record(0.012);
+    metrics.zeam_xev_clock_until_done_slow_ge_500ms_total.incr();
+    metrics.zeam_xev_clock_until_done_slow_ge_1s_total.incr();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_drain_seconds") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_500ms_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_1s_total") != null);
 }

@@ -41,6 +41,9 @@ jobs:
         toolchain: stable
         components: clippy, rustfmt
 
+    - name: Install Rust nightly toolchain
+      run: rustup toolchain install nightly --no-self-update
+
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:

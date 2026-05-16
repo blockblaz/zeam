@@ -19,6 +19,23 @@ const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
+/// Maximum number of distinct AttestationData entries a single block may
+/// include, matching leanSpec's chain.config.MAX_ATTESTATIONS_DATA.
+pub const MAX_ATTESTATIONS_DATA: usize = 16;
+
+fn validateAttestationDataLimits(
+    allocator: Allocator,
+    aggregated_attestations: []const types.AggregatedAttestation,
+) ForkChoiceError!void {
+    var seen = std.AutoHashMap(types.AttestationData, void).init(allocator);
+    defer seen.deinit();
+    for (aggregated_attestations) |agg_att| {
+        const gop = seen.getOrPut(agg_att.data) catch return ForkChoiceError.InvalidForkchoiceBlock;
+        if (gop.found_existing) return ForkChoiceError.DuplicateAttestationData;
+    }
+    if (seen.count() > MAX_ATTESTATIONS_DATA) return ForkChoiceError.TooManyAttestationData;
+}
+
 const ProtoBlock = types.ProtoBlock;
 pub const ProtoNode = struct {
     // Fields from ProtoBlock
@@ -500,7 +517,7 @@ pub const ForkChoice = struct {
         return true;
     }
 
-    fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
+    pub fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
         const finalized_slot = self.fcStore.latest_finalized.slot;
         const finalized_root = self.fcStore.latest_finalized.root;
 
@@ -1054,12 +1071,12 @@ pub const ForkChoice = struct {
                     try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
                     errdefer cloned_proof.deinit();
 
-                    var att_bits = try types.AggregationBits.init(self.allocator);
+                    var att_bits: types.AggregationBits = undefined;
+                    try types.sszClone(self.allocator, types.AggregationBits, cloned_proof.participants, &att_bits);
                     errdefer att_bits.deinit();
 
                     for (0..cloned_proof.participants.len()) |i| {
                         if (cloned_proof.participants.get(i) catch false) {
-                            try types.aggregationBitsSet(&att_bits, i, true);
                             if (i >= covered.capacity()) {
                                 try covered.resize(i + 1, false);
                             }
@@ -1100,13 +1117,9 @@ pub const ForkChoice = struct {
             }
 
             for (agg_attestations.constSlice()) |agg_att| {
-                var cloned_bits = try types.AggregationBits.init(self.allocator);
+                var cloned_bits: types.AggregationBits = undefined;
+                try types.sszClone(self.allocator, types.AggregationBits, agg_att.aggregation_bits, &cloned_bits);
                 errdefer cloned_bits.deinit();
-                for (0..agg_att.aggregation_bits.len()) |i| {
-                    if (agg_att.aggregation_bits.get(i) catch false) {
-                        try types.aggregationBitsSet(&cloned_bits, i, true);
-                    }
-                }
                 try candidate_atts.append(.{ .aggregation_bits = cloned_bits, .data = agg_att.data });
             }
 
@@ -1378,14 +1391,21 @@ pub const ForkChoice = struct {
                     .attestation_data = attestation_data,
                 };
 
-                // also clear out our latest new non included attestation if this is even later than that
-                const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
-                if (attestation_slot > attestation_tracker_latest_new_slot) {
-                    attestation_tracker.latestNew = attestation_tracker.latestKnown;
-                }
+                // leanSpec PR #680 keeps the gossip ("new") and on-chain
+                // ("known") pools strictly separate: `update_safe_target`
+                // operates on the new pool only, while head selection uses
+                // the known pool. Mirroring `latestKnown → latestNew` here
+                // would smuggle on-chain weight back into the safe-target
+                // computation and break the
+                // `test_safe_target_ignores_known_pool_at_interval_3`
+                // contract from the spec test vectors.
             }
         } else {
-            if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic)) {
+            // leanSpec allows attestations up to 1 slot in the future:
+            //   assert data.slot <= current_slot + Slot(1)
+            // In production, chain.validateAttestationData enforces the stricter gossip
+            // check (data.slot <= current_slot) upstream.
+            if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic) + 1) {
                 return ForkChoiceError.InvalidFutureAttestation;
             }
             // just update latest new attested head of the validator
@@ -1646,16 +1666,27 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
-                return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.latest_finalized.slot) {
+            // Block admission only requires a known parent and a slot above
+            // the finalized boundary; STF and signature verification are the
+            // gating layers.
+            if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
-            const is_finalized_descendant = self.isFinalizedDescendant(parent_root);
-            if (is_finalized_descendant != true) {
-                return ForkChoiceError.NotFinalizedDesendant;
-            }
+            // Per leanSpec store.process_block: a block may include at most
+            // MAX_ATTESTATIONS_DATA (16) distinct AttestationData entries, and
+            // each distinct entry must appear exactly once. Enforce this before
+            // registering the block in protoArray so rejected blocks leave no
+            // residue in fork choice state.
+            try validateAttestationDataLimits(self.allocator, block.body.attestations.constSlice());
+
+            // onBlock is a pure store operation aligned with leanSpec's
+            // store.on_block: any block whose parent is in protoArray is stored,
+            // and head selection naturally ignores forks that do not descend
+            // from the finalized root (get_head walks best descendants from
+            // latest_justified). The gossip-level DoS defense against forks
+            // branching off pre-finalization ancestors lives in
+            // chain.validateBlock, not here.
 
             const justified = state.latest_justified;
             const finalized = state.latest_finalized;
@@ -1668,11 +1699,52 @@ pub const ForkChoice = struct {
                 self.logger.info("[forkchoice] status=ready: first justified checkpoint observed slot={d} root={x} — validator duties now enabled", .{ self.fcStore.latest_justified.slot, &self.fcStore.latest_justified.root });
             }
 
-            const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
+            const block_root: [32]u8 = if (opts.blockRoot) |r| r else r: {
                 var cblock_root: [32]u8 = undefined;
                 try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
-                break :computedroot cblock_root;
+                break :r cblock_root;
             };
+            if (opts.blockRoot != null) {
+                // Slice (e) of #803 — see metrics field doc on
+                // `lean_block_root_compute_skipped_total`.
+                zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
+
+                // PR #842 review #2: trust-but-verify the
+                // caller-supplied root against a fresh hash in
+                // debug + ReleaseSafe builds. Cheap (debug-only)
+                // safety net for future call sites that thread a
+                // stale or wrong root through
+                // `OnBlockOpts.blockRoot`. The forkchoice's
+                // protoArray indexes by this root and the spec
+                // guarantees uniqueness via SSZ collision-
+                // resistance; if a caller fabricates a root, we'd
+                // silently corrupt the protoArray. Per-call cost is
+                // one `hashTreeRoot(BeamBlock, ...)` and is paid
+                // ONLY in `Debug` / `ReleaseSafe`; `ReleaseFast` /
+                // `ReleaseSmall` skip the block entirely so
+                // production keeps the slice-(e) win.
+                if (std.debug.runtime_safety) verify: {
+                    var verify_root: [32]u8 = undefined;
+                    zeam_utils.hashTreeRoot(types.BeamBlock, block, &verify_root, self.allocator) catch |err| {
+                        // Re-hash failure here is itself a bug, but
+                        // we don't want a forkchoice panic on an
+                        // OOM during the verification step — log
+                        // and skip so the caller-supplied root is
+                        // still used.
+                        self.logger.warn(
+                            "forkchoice.onBlock: blockRoot verification re-hash failed: {any}",
+                            .{err},
+                        );
+                        break :verify;
+                    };
+                    if (!std.mem.eql(u8, &block_root, &verify_root)) {
+                        std.debug.panic(
+                            "forkchoice.onBlock: caller-supplied blockRoot=0x{x} does NOT match recomputed=0x{x} for block slot={d} — protoArray would be silently corrupted; call site bug",
+                            .{ &block_root, &verify_root, slot },
+                        );
+                    }
+                }
+            }
             const is_timely = self.isBlockTimely(opts.blockDelayMs);
 
             const proto_block = ProtoBlock{
@@ -1790,6 +1862,36 @@ pub const ForkChoice = struct {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
         return self.hasBlockUnlocked(blockRoot);
+    }
+
+    /// Slice (d) of #803: batch presence check.
+    ///
+    /// Snapshots `hasBlock` for every root in `roots` under a single
+    /// shared-lock acquisition, writing results into `out` (which the
+    /// caller pre-allocates with `out.len == roots.len`). The batched
+    /// shape lets the producer (`BeamNode.fetchBlockByRoots`) trade N
+    /// shared-lock acquisitions + N hashmap lookups for 1 + N — the
+    /// hashmap lookup is unchanged but the lock-acquire/release pair
+    /// (and the ConcurrencyKit memory fence inside it) collapses to
+    /// one. Under heavy gossip-fanout the lock-acquire dominates the
+    /// hashmap lookup, so this is the call we want for every dedup
+    /// pass that operates on a list of roots.
+    ///
+    /// Returns `error.LengthMismatch` if `roots.len != out.len` so
+    /// the caller cannot accidentally read garbage past the end of
+    /// `out`.
+    pub fn hasBlocksBatch(
+        self: *Self,
+        roots: []const types.Root,
+        out: []bool,
+    ) error{LengthMismatch}!void {
+        if (roots.len != out.len) return error.LengthMismatch;
+        if (roots.len == 0) return;
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        for (roots, 0..) |root, i| {
+            out[i] = self.hasBlockUnlocked(root);
+        }
     }
 
     pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
@@ -1918,6 +2020,15 @@ pub const ForkChoice = struct {
         return self.protoArray.nodes.items[idx];
     }
 
+    /// Get a ProtoNode's index in the underlying nodes array. Callers use
+    /// this to measure how many nodes precede a given block (e.g. to gate
+    /// proto-array rebase on a grace-window threshold).
+    pub fn getProtoNodeIndex(self: *Self, blockRoot: types.Root) ?usize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.protoArray.indices.get(blockRoot);
+    }
+
     /// Get the current number of nodes in the forkchoice tree
     pub fn getNodeCount(self: *Self) usize {
         self.mutex.lockShared();
@@ -1929,11 +2040,9 @@ pub const ForkChoice = struct {
 pub const ForkChoiceError = error{
     NotImplemented,
     UnknownParent,
-    FutureSlot,
     InvalidFutureAttestation,
     InvalidOnChainAttestation,
     PreFinalizedSlot,
-    NotFinalizedDesendant,
     InvalidAttestation,
     InvalidDeltas,
     InvalidJustifiedRoot,
@@ -1945,6 +2054,8 @@ pub const ForkChoiceError = error{
     InvalidCanonicalTraversal,
     InvalidForkchoiceBlock,
     InvalidSafeTargetCompute,
+    DuplicateAttestationData,
+    TooManyAttestationData,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
@@ -1992,11 +2103,8 @@ test "forkchoice block tree" {
         const block = signed_block.block;
         try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
-        // shouldn't accept a future slot
-        const current_slot = block.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
-
-        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        // onBlock only requires a known parent and a non-pre-finalized slot.
+        try fork_choice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
@@ -2004,6 +2112,70 @@ test "forkchoice block tree" {
         const searched_idx = fork_choice.protoArray.indices.get(mock_chain.blockRoots[i]);
         try std.testing.expect(searched_idx == i);
     }
+}
+
+test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence semantics" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const module_logger = zeam_logger_config.logger(.forkchoice);
+    var fork_choice = try ForkChoice.init(allocator, .{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .logger = module_logger,
+    });
+
+    // 1. Empty input is a no-op (does not panic / does not deadlock).
+    var empty_buf: [0]bool = .{};
+    try fork_choice.hasBlocksBatch(&[_]types.Root{}, &empty_buf);
+
+    // 2. Length mismatch is reported as an error rather than a UB read.
+    var bad_out: [1]bool = .{false};
+    try std.testing.expectError(
+        error.LengthMismatch,
+        fork_choice.hasBlocksBatch(&[_]types.Root{ mock_chain.blockRoots[0], mock_chain.blockRoots[0] }, &bad_out),
+    );
+
+    // 3. Anchor block (genesis) is present; a synthetic root is not.
+    //    Same shared lock acquisition snapshots both answers.
+    const synthetic = std.mem.zeroes(types.Root);
+    var roots: [3]types.Root = .{ mock_chain.blockRoots[0], synthetic, mock_chain.blockRoots[0] };
+    var present: [3]bool = .{ false, true, false };
+    try fork_choice.hasBlocksBatch(&roots, &present);
+    try std.testing.expect(present[0]);
+    try std.testing.expect(!present[1]);
+    try std.testing.expect(present[2]);
+
+    // 4. After ingesting block[1], `hasBlocksBatch` reflects the new state
+    //    in the same call shape — confirms the shared-lock snapshot is
+    //    re-taken on every call (not cached across).
+    const block1 = mock_chain.blocks[1].block;
+    try stf.apply_transition(allocator, &beam_state, block1, .{ .logger = module_logger });
+    try fork_choice.onInterval(block1.slot * constants.INTERVALS_PER_SLOT, false);
+    _ = try fork_choice.onBlock(block1, &beam_state, .{ .currentSlot = block1.slot, .blockDelayMs = 0, .confirmed = true });
+
+    var roots2: [2]types.Root = .{ mock_chain.blockRoots[1], synthetic };
+    var present2: [2]bool = .{ false, true };
+    try fork_choice.hasBlocksBatch(&roots2, &present2);
+    try std.testing.expect(present2[0]);
+    try std.testing.expect(!present2[1]);
 }
 
 test "aggregate prunes attestation signatures" {

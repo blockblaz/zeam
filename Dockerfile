@@ -30,7 +30,7 @@ RUN ZIG_VERSION="0.16.0" && \
     mv "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /opt/zig && \
     ln -s /opt/zig/zig /usr/local/bin/zig
 
-# Install Rust nightly (required by build.zig which uses +nightly)
+# Install Rust nightly (required by build.zig: rustup run nightly cargo …)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
 ENV PATH="/root/.cargo/bin:${PATH}"
 

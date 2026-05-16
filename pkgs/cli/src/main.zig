@@ -50,9 +50,9 @@ const ZERO_HASH = types.ZERO_HASH;
 
 pub const NodeCommand = struct {
     help: bool = false,
-    custom_genesis: []const u8,
+    @"custom-genesis": []const u8,
     // internal libp2p network id, only matters when two or more nodes are run in same process
-    network_id: u32 = 0,
+    @"network-id": u32 = 0,
     // the string id to pick configuration in validators.yaml/validator_config.yaml
     @"node-id": []const u8,
     // the private libp2p key arg currently ignored but supported to be cross client compatible for
@@ -62,11 +62,11 @@ pub const NodeCommand = struct {
     //   the configuration is to be picked from genesis
     // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and annotated_validators.yaml
     //   and one must use all the nodes in genesis nodes.yaml as peers
-    validator_config: []const u8,
-    metrics_enable: bool = false,
+    @"validator-config": []const u8,
+    @"metrics-enable": bool = false,
     @"api-port": u16 = constants.DEFAULT_API_PORT,
     @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
-    override_genesis_time: ?u64,
+    @"override-genesis-time": ?u64,
     @"sig-keys-dir": []const u8 = "hash-sig-keys",
     @"network-dir": []const u8 = "./network",
     @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
@@ -75,26 +75,29 @@ pub const NodeCommand = struct {
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
     @"db-backend": database.Backend = .rocksdb,
+    @"chain-spec": ?[]const u8 = null,
     /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `false`
-    /// preserves slice-(b) synchronous behavior.
-    @"chain-worker": bool = false,
+    /// handlers through the chain-worker queue. Default `true` post
+    /// devnet-4 burn-in (#788 follow-up + slice (d)/(e) PR): the
+    /// worker path is the supported prod path; the synchronous path
+    /// stays in place as a kill-switch via `--chain-worker false`.
+    @"chain-worker": bool = true,
 
     pub const __shorts__ = .{
         .help = .h,
     };
 
     pub const __messages__ = .{
-        .custom_genesis = "Custom genesis directory path",
-        .network_id = "Internal libp2p network id relevant when running nodes in same process",
+        .@"custom-genesis" = "Custom genesis directory path",
+        .@"network-id" = "Internal libp2p network id relevant when running nodes in same process",
         .@"node-id" = "The node id in the genesis config for this lean node",
         .@"node-key" = "Path to the node key file",
-        .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
+        .@"validator-config" = "Path to the validator config directory or 'genesis_bootnode'",
         .@"api-port" = "Port for the API server (health, events, forkchoice graph, checkpoint state)",
         .@"metrics-port" = "Port for the Prometheus metrics server",
-        .metrics_enable = "Enable API and metrics servers (health, events, forkchoice graph, checkpoint state, metrics)",
+        .@"metrics-enable" = "Enable API and metrics servers (health, events, forkchoice graph, checkpoint state, metrics)",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
-        .override_genesis_time = "Override genesis time in the config.yaml",
+        .@"override-genesis-time" = "Override genesis time in the config.yaml",
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
         .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
@@ -102,7 +105,8 @@ pub const NodeCommand = struct {
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
-        .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. Off by default; the synchronous path stays in place when disabled.",
+        .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
+        .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .help = "Show help information for the node command",
     };
 };
@@ -112,16 +116,16 @@ const BeamCmd = struct {
     mockNetwork: bool = false,
     @"api-port": u16 = constants.DEFAULT_API_PORT,
     @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
-    data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
+    @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
     @"is-aggregator": bool = true,
     @"db-backend": database.Backend = .rocksdb,
 
     pub fn format(self: BeamCmd, writer: anytype) !void {
-        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\", is-aggregator={}, db-backend={s} }}", .{
+        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data-dir=\"{s}\", is-aggregator={}, db-backend={s} }}", .{
             self.mockNetwork,
             self.@"api-port",
             self.@"metrics-port",
-            self.data_dir,
+            self.@"data-dir",
             self.@"is-aggregator",
             @tagName(self.@"db-backend"),
         });
@@ -160,17 +164,17 @@ const ZeamArgs = struct {
         },
         beam: BeamCmd,
         prove: struct {
-            dist_dir: []const u8 = "zig-out/bin",
+            @"dist-dir": []const u8 = "zig-out/bin",
             zkvm: state_proving_manager.ZKVMs = .risc0,
             help: bool = false,
 
             pub const __shorts__ = .{
-                .dist_dir = .d,
+                .@"dist-dir" = .d,
                 .zkvm = .z,
             };
 
             pub const __messages__ = .{
-                .dist_dir = "Directory where the zkvm guest programs are found",
+                .@"dist-dir" = "Directory where the zkvm guest programs are found",
             };
         },
         prometheus: struct {
@@ -235,11 +239,11 @@ const ZeamArgs = struct {
         switch (self.__commands__) {
             .clock => try writer.writeAll("clock"),
             .beam => |cmd| try writer.print("{f}", .{cmd}),
-            .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
+            .prove => |cmd| try writer.print("prove(zkvm={s}, dist-dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.@"dist-dir" }),
             .prometheus => |cmd| switch (cmd.__commands__) {
-                .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
+                .genconfig => |genconfig| try writer.print("prometheus.genconfig(api-port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
             },
-            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", api_port={d}), is-aggregator={}", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.@"api-port", cmd.@"is-aggregator" }),
+            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom-genesis=\"{s}\", validator-config=\"{s}\", data-dir=\"{s}\", api-port={d}), is-aggregator={}", .{ cmd.@"node-id", cmd.@"custom-genesis", cmd.@"validator-config", cmd.@"data-dir", cmd.@"api-port", cmd.@"is-aggregator" }),
             .testsig => |cmd| try writer.print("testsig(epoch={d}, slot={d})", .{ cmd.epoch, cmd.slot }),
         }
         try writer.writeAll(")");
@@ -319,7 +323,7 @@ fn mainInner(init: std.process.Init) !void {
             };
         },
         .prove => |provecmd| {
-            std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
+            std.debug.print("distribution dir={s}\n", .{provecmd.@"dist-dir"});
             var zeam_logger_config = utils_lib.getLoggerConfig(null, null);
             const logger = zeam_logger_config.logger(.state_proving_manager);
             const stf_logger = zeam_logger_config.logger(.state_transition);
@@ -386,7 +390,7 @@ fn mainInner(init: std.process.Init) !void {
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(utils_lib.unixTimestampSeconds()));
 
             // Create logger config for API and metrics servers
-            var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.@"data-dir", .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             // Validate that API and metrics ports are different
             if (beamcmd.@"api-port" == beamcmd.@"metrics-port") {
@@ -418,7 +422,17 @@ fn mainInner(init: std.process.Init) !void {
                 .ignore_unknown_fields = true,
                 .allocate = .alloc_if_needed,
             };
-            var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
+            // See pkgs/cli/src/node.zig (and #831): `parseFromSlice` returns
+            // string fields aliased into the `Parsed` arena. `ChainSpec.deinit`
+            // later calls `allocator.free` on `name` / `fork_digest`, so move
+            // both fields onto the top-level allocator before the arena dies.
+            const parsed = try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options);
+            defer parsed.deinit();
+            var chain_options = parsed.value;
+            chain_options.name = try gpa.allocator().dupe(u8, chain_options.name.?);
+            errdefer if (chain_options.name) |n| gpa.allocator().free(n);
+            chain_options.fork_digest = try gpa.allocator().dupe(u8, chain_options.fork_digest.?);
+            errdefer if (chain_options.fork_digest) |d| gpa.allocator().free(d);
 
             // Create key manager FIRST to get validator pubkeys for genesis
             // Using 3 validators for 3-node setup with initial sync testing
@@ -463,12 +477,12 @@ fn mainInner(init: std.process.Init) !void {
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
 
-            try std.Io.Dir.cwd().createDirPath(init.io, beamcmd.data_dir);
+            try std.Io.Dir.cwd().createDirPath(init.io, beamcmd.@"data-dir");
 
             // Create loggers first so they can be passed to network implementations
-            var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
-            var logger2_config = utils_lib.getScopedLoggerConfig(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
-            var logger3_config = utils_lib.getScopedLoggerConfig(.n3, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.@"data-dir", .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger2_config = utils_lib.getScopedLoggerConfig(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.@"data-dir", .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger3_config = utils_lib.getScopedLoggerConfig(.n3, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.@"data-dir", .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
@@ -624,11 +638,11 @@ fn mainInner(init: std.process.Init) !void {
             var validator_ids_2 = [_]usize{1};
             var validator_ids_3 = [_]usize{2}; // Node 3 gets validator 2, starts delayed
 
-            const data_dir_1 = try std.fmt.allocPrint(allocator, "{s}/node1", .{beamcmd.data_dir});
+            const data_dir_1 = try std.fmt.allocPrint(allocator, "{s}/node1", .{beamcmd.@"data-dir"});
             defer allocator.free(data_dir_1);
-            const data_dir_2 = try std.fmt.allocPrint(allocator, "{s}/node2", .{beamcmd.data_dir});
+            const data_dir_2 = try std.fmt.allocPrint(allocator, "{s}/node2", .{beamcmd.@"data-dir"});
             defer allocator.free(data_dir_2);
-            const data_dir_3 = try std.fmt.allocPrint(allocator, "{s}/node3", .{beamcmd.data_dir});
+            const data_dir_3 = try std.fmt.allocPrint(allocator, "{s}/node3", .{beamcmd.@"data-dir"});
             defer allocator.free(data_dir_3);
 
             const db_backend = beamcmd.@"db-backend";
@@ -814,11 +828,11 @@ fn mainInner(init: std.process.Init) !void {
             node_registry.* = node_lib.NodeNameRegistry.init(allocator);
 
             var start_options: node.NodeOptions = .{
-                .network_id = leancmd.network_id,
+                .network_id = leancmd.@"network-id",
                 .node_key = leancmd.@"node-id",
-                .validator_config = leancmd.validator_config,
+                .validator_config = leancmd.@"validator-config",
                 .node_key_index = undefined,
-                .metrics_enable = leancmd.metrics_enable,
+                .metrics_enable = leancmd.@"metrics-enable",
                 .is_aggregator = leancmd.@"is-aggregator",
                 .api_port = leancmd.@"api-port",
                 .metrics_port = leancmd.@"metrics-port",
@@ -838,8 +852,8 @@ fn mainInner(init: std.process.Init) !void {
             node.buildStartOptions(allocator, leancmd, &start_options) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "build node start options", .{
                     .node_id = leancmd.@"node-id",
-                    .validator_config = leancmd.validator_config,
-                    .custom_genesis = leancmd.custom_genesis,
+                    .validator_config = leancmd.@"validator-config",
+                    .custom_genesis = leancmd.@"custom-genesis",
                 });
                 return err;
             };

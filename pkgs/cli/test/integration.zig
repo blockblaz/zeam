@@ -71,9 +71,12 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 
     std.debug.print("INFO: Process spawned successfully with PID\n", .{});
 
-    // Wait for server to be ready
+    // Wait for both API (9667) and metrics (9668) listeners. Integration tests
+    // hit `/metrics` on the metrics port immediately after this returns; only
+    // probing the API port caused flaky `ConnectionRefused` on slow/loaded CI.
     const start_time = zeam_utils.unixTimestampMillis();
-    var server_ready = false;
+    var api_ready = false;
+    var metrics_ready = false;
     var retry_count: u32 = 0;
 
     while (zeam_utils.unixTimestampMillis() - start_time < constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS) {
@@ -82,34 +85,58 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         // Print progress every 10 retries
         if (retry_count % 10 == 0) {
             const elapsed = @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000);
-            std.debug.print("INFO: Still waiting for server... ({} seconds, {} retries)\n", .{ elapsed, retry_count });
+            std.debug.print("INFO: Still waiting for beam sim (api={any} metrics={any})... ({}s, {} retries)\n", .{
+                api_ready,
+                metrics_ready,
+                elapsed,
+                retry_count,
+            });
         }
 
-        // Try to connect to the metrics server
-        const address = net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT) catch {
+        const port: u16 = if (!api_ready) constants.DEFAULT_API_PORT else constants.DEFAULT_METRICS_PORT;
+
+        const address = net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, port) catch {
             zeam_utils.sleepNs(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
 
         var connection = address.connect(io, .{ .mode = .stream }) catch |err| {
-            // Only print error details on certain intervals to avoid spam
             if (retry_count % 20 == 0) {
-                std.debug.print("DEBUG: Connection attempt {} failed: {}\n", .{ retry_count, err });
+                std.debug.print("DEBUG: TCP {d} attempt {} failed: {}\n", .{ port, retry_count, err });
             }
             zeam_utils.sleepNs(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
-
-        // Test if we can actually send/receive data
         connection.close(io);
-        server_ready = true;
-        std.debug.print("SUCCESS: Server ready after {} seconds ({} retries)\n", .{ @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000), retry_count });
+
+        if (!api_ready) {
+            api_ready = true;
+            std.debug.print("SUCCESS: API port {d} accepting after {}s ({} retries)\n", .{
+                constants.DEFAULT_API_PORT,
+                @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000),
+                retry_count,
+            });
+            continue;
+        }
+        metrics_ready = true;
+        std.debug.print("SUCCESS: Metrics port {d} accepting after {}s ({} retries)\n", .{
+            constants.DEFAULT_METRICS_PORT,
+            @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000),
+            retry_count,
+        });
         break;
     }
 
+    const server_ready = api_ready and metrics_ready;
+
     // If server didn't start, try to get process output for debugging
     if (!server_ready) {
-        std.debug.print("ERROR: Metrics server not ready after {} seconds ({} retries)\n", .{ @divTrunc(constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS, 1000), retry_count });
+        std.debug.print("ERROR: Beam sim not ready after {}s (api={any} metrics={any}, retries={})\n", .{
+            @divTrunc(constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS, 1000),
+            api_ready,
+            metrics_ready,
+            retry_count,
+        });
 
         // Try to read any output from the process
         if (cli_process.stdout) |stdout| {
@@ -158,15 +185,20 @@ const ZeamRequest = struct {
         return ZeamRequest{ .allocator = allocator };
     }
 
+    /// Full Prometheus scrape can exceed 8KiB; keep this comfortably above the
+    /// current exposition size so tests do not truncate mid-body (CI was
+    /// missing `zeam_node_*` histograms while still finding `zeam_chain_*`).
+    const metrics_response_max_bytes: usize = 2 * 1024 * 1024;
+
     /// Make a request to the /metrics endpoint and return the response
     /// Note: Metrics are served on the separate metrics port (default: 9668)
     fn getMetrics(self: ZeamRequest) ![]u8 {
-        return self.makeRequestToPort("/metrics", constants.DEFAULT_METRICS_PORT);
+        return self.makeRequestToPort("/metrics", constants.DEFAULT_METRICS_PORT, metrics_response_max_bytes);
     }
 
     /// Make a request to the /lean/v0/health endpoint and return the response
     fn getHealth(self: ZeamRequest) ![]u8 {
-        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT);
+        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT, 256 * 1024);
     }
 
     /// Parsed HTTP response returned by the aggregator helpers. Use `std.http.Client`
@@ -240,7 +272,7 @@ const ZeamRequest = struct {
     /// Make a request to the plain GET endpoints (metrics, health). These still
     /// use a raw TCP writer because the metrics/health callers predate the
     /// aggregator work and aren't in scope here.
-    fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16) ![]u8 {
+    fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16, max_response_bytes: usize) ![]u8 {
         const io = std.testing.io;
         const address = try net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, port);
         var connection = try address.connect(io, .{ .mode = .stream });
@@ -257,23 +289,28 @@ const ZeamRequest = struct {
         try conn_writer.interface.writeAll(request);
         try conn_writer.interface.flush();
 
-        return try self.readFullResponse(&connection);
+        return try self.readFullResponse(&connection, max_response_bytes);
     }
 
-    fn readFullResponse(self: ZeamRequest, connection: *net.Stream) ![]u8 {
+    fn readFullResponse(self: ZeamRequest, connection: *net.Stream, max_response_bytes: usize) ![]u8 {
         const io = std.testing.io;
-        var response_buffer: [8192]u8 = undefined;
-        var read_buf: [8192]u8 = undefined;
-        var stream_reader = connection.reader(io, &read_buf);
-        var total_bytes: usize = 0;
-        while (total_bytes < response_buffer.len) {
-            const bytes_read = stream_reader.interface.readSliceShort(response_buffer[total_bytes..]) catch |err| switch (err) {
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(self.allocator);
+        // `connection.reader` uses `reader_scratch` internally; `readSliceShort` must read
+        // into a disjoint buffer or Zig detects illegal @memcpy aliasing (Debug panic on CI).
+        var reader_scratch: [8192]u8 = undefined;
+        var chunk: [8192]u8 = undefined;
+        var stream_reader = connection.reader(io, &reader_scratch);
+        while (list.items.len < max_response_bytes) {
+            const remaining = max_response_bytes - list.items.len;
+            const chunk_cap = @min(chunk.len, remaining);
+            const bytes_read = stream_reader.interface.readSliceShort(chunk[0..chunk_cap]) catch |err| switch (err) {
                 error.ReadFailed => if (stream_reader.err) |e| (if (e == error.ConnectionResetByPeer) break else return e) else return err,
             };
             if (bytes_read == 0) break;
-            total_bytes += bytes_read;
+            try list.appendSlice(self.allocator, chunk[0..bytes_read]);
         }
-        return try self.allocator.dupe(u8, response_buffer[0..total_bytes]);
+        return try list.toOwnedSlice(self.allocator);
     }
 
     /// Free a response returned by getMetrics() / getHealth() / aggregator helpers
@@ -571,6 +608,7 @@ test "CLI beam command with mock network - complete integration test" {
 
     // Verify response contains actual metric names from the metrics system
     try std.testing.expect(std.mem.indexOf(u8, response, "zeam_chain_onblock_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "zeam_node_aggregation_interval_tick_seconds") != null);
 
     // Verify response is not empty
     try std.testing.expect(response.len > 100);
