@@ -165,6 +165,17 @@ pub const Message = union(enum) {
         latest_finalized: types.Checkpoint,
         prune_forkchoice: bool,
     },
+    /// Trigger an unbounded replay of the pending-attestation /
+    /// pending-aggregation buffers on the worker thread. POD payload
+    /// — the chain pulls the buffer contents itself. Issued by libxev
+    /// callers that imported a block via the disabled-worker fallback
+    /// path or that produced a block locally (`BeamNode.publishBlock`),
+    /// since neither dispatches an `on_block` message that would
+    /// auto-replay on the worker side. Coalesces naturally: if multiple
+    /// libxev paths queue a replay before the worker drains, the
+    /// worker still only reads one buffer state per dispatch — the
+    /// extra messages are harmless no-ops.
+    replay_pending_attestations: void,
 
     /// Free any heap-owned data on this message. The worker must call
     /// this on every message it pops, including in error paths from
@@ -181,6 +192,7 @@ pub const Message = union(enum) {
             .on_gossip_attestation,
             .process_pending_blocks,
             .process_finalization_followup,
+            .replay_pending_attestations,
             => {
                 // Plain-old-data; nothing to free. Listed explicitly
                 // so that a future variant added with heap fields
@@ -427,6 +439,16 @@ pub const Handlers = struct {
         latest_finalized: types.Checkpoint,
         prune_forkchoice: bool,
     ) void,
+    /// Drain the chain's pending-attestation / pending-aggregation
+    /// buffers via `BeamChain.replayPendingAttestations`. Producer is
+    /// the libxev thread (post-RPC-block-import paths and `publishBlock`)
+    /// — see `BeamChain.submitReplayPendingAttestations`. The worker's
+    /// own `on_block` thunk replays inline after every successful
+    /// import, so this variant is only needed when the libxev side
+    /// imports a block (e.g. via the inline fallback path) or when
+    /// the producer wants to nudge the worker after structural work
+    /// that may unblock buffered attestations (#863).
+    replay_pending_attestations: *const fn (ctx: *anyopaque) void,
 };
 
 /// Default capacities. Generous enough that a 30s gossip burst on
@@ -635,6 +657,30 @@ pub const ChainWorker = struct {
             .{ .queue = "attestation" },
             self.attestation_queue.outstandingDepth(),
         ) catch {};
+    }
+
+    /// Enqueue a `replay_pending_attestations` nudge on the attestation
+    /// queue. Same wake/backpressure contract as `sendAttestation` —
+    /// `error.QueueFull` returns immediately and increments the
+    /// `attestation`-labelled drop metric. Producers (libxev fallback
+    /// paths after a synchronous `chain.onBlock`, `BeamNode.publishBlock`
+    /// after publishing a locally produced block) treat a full-queue
+    /// drop as benign: the next worker `on_block` dispatch already
+    /// runs `replayPendingAttestations`, and the buffers themselves are
+    /// FIFO-bounded so a missed replay just delays a few entries by
+    /// one block-cycle. Routed onto the attestation queue (rather than
+    /// adding a fourth queue) because the work it triggers is per-
+    /// attestation/per-aggregation; the queue-depth metric label
+    /// stays consistent with the workload it gates.
+    pub fn sendReplayPending(self: *Self) AttestationQueue.TrySendError!void {
+        self.attestation_queue.trySend(.{ .replay_pending_attestations = {} }) catch |err| {
+            if (err == error.QueueFull) {
+                zeam_metrics.metrics.lean_chain_queue_dropped_total.incr(.{ .queue = "attestation" }) catch {};
+            }
+            return err;
+        };
+        self.recordAttestationQueueDepth();
+        self.wake();
     }
 
     /// Send an aggregated-attestation-flavored message and wake the worker.
@@ -878,6 +924,7 @@ pub const ChainWorker = struct {
                 payload.latest_finalized,
                 payload.prune_forkchoice,
             ),
+            .replay_pending_attestations => h.replay_pending_attestations(h.ctx),
         }
     }
 };

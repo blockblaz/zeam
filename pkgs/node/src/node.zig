@@ -182,15 +182,24 @@ pub const BeamNode = struct {
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
+        chain.setImportedBlockCallback(self, handleChainImportedBlock);
 
         network_init_cleanup = false;
     }
 
     pub fn deinit(self: *Self) void {
         self.batch_pending_parent_roots.deinit();
-        self.network.deinit();
+        // Order matters under #890: the chain-worker's
+        // `imported_block_fn` callback (`handleChainImportedBlock`)
+        // touches `self.network` (cache removal, missing-root fetches,
+        // pending-parent flush). `BeamChain.deinit` is what
+        // stops/joins the worker thread, so it MUST run before
+        // `network.deinit()` — otherwise a still-draining worker
+        // dispatch fires the callback against a freed `LockedMap`
+        // (alignment panic on the cache hashmap header).
         self.chain.deinit();
         self.allocator.destroy(self.chain);
+        self.network.deinit();
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
@@ -451,6 +460,134 @@ pub const BeamNode = struct {
         };
     }
 
+    /// Imported-block backchannel handler (#890). Fires from
+    /// `BeamChain.chainWorkerOnBlockThunk` after every successful
+    /// chain-worker import. Takes ownership of `missing_roots` —
+    /// frees it before returning. May run on the chain-worker thread,
+    /// the gossip-import thread, or the libxev thread depending on
+    /// which path imported the block; all work routed through here
+    /// uses mutex-protected state (network helpers, forkchoice,
+    /// `batch_pending_parent_roots_lock`) so the cross-thread surface
+    /// is safe today. See `BeamChain.imported_block_ctx` /
+    /// `ImportedBlockFn` for the full contract.
+    fn handleChainImportedBlock(
+        ptr: *anyopaque,
+        block_root: types.Root,
+        missing_roots: []types.Root,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        defer self.allocator.free(missing_roots);
+
+        // If the block was previously cached (a `processCachedDescendants`
+        // submission, or a long-orphan block that arrived ahead of its
+        // parent and got buffered in `network.fetched_blocks`), the
+        // cache entry is now stale — clear it before driving descendant
+        // retry so we don't re-process the same root in a future pass.
+        // Idempotent: no-op for blocks that arrived via gossip or RPC
+        // and never sat in the cache.
+        _ = self.network.removeFetchedBlock(block_root);
+
+        // The block was just imported, so any cached descendants
+        // waiting on it can now be retried. Mirrors the post-import
+        // recursion in the inline RPC paths
+        // (`processBlockByRootChunk` / `processBlockByRangeChunk`).
+        // Internally uses cache-lock-protected helpers + chain.onBlock
+        // (mutex-guarded), so it is safe to invoke from whichever
+        // thread the worker dispatched on.
+        self.processCachedDescendants(block_root);
+
+        // Drive the missing-attestation-root fetch fan-out. Pre-#890
+        // this slice was silently dropped by the worker thunk
+        // (chain.onGossip's `.block` arm comment, and
+        // `chainWorkerProcessPendingBlocksThunk` warn) so attestation
+        // sync stalled until a re-broadcast nudged us. With the
+        // backchannel wired, RPC fetches kick off the moment the
+        // chain knows the dependency.
+        if (missing_roots.len > 0) {
+            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+                self.logger.warn(
+                    "imported-block callback: failed to fetch {d} missing block(s): {any}",
+                    .{ missing_roots.len, err },
+                );
+            };
+        }
+
+        // Coalesce any parent fetches accumulated during the
+        // descendant retry into one batched `blocks_by_root` request.
+        self.flushPendingParentFetches();
+    }
+
+    /// Replay the chain's pending-attestation buffers without
+    /// blocking the libxev thread (#890). Routes to the chain-worker
+    /// queue when the worker is enabled (the worker drains the
+    /// buffers off-thread in `chainWorkerReplayPendingAttestationsThunk`),
+    /// falls back to the synchronous `replayPendingAttestations` only
+    /// when the worker is disabled — in that mode libxev IS the chain
+    /// thread, so a direct call is the only option. `error.QueueFull`
+    /// / `error.QueueClosed` from the worker submit are non-fatal:
+    /// the chain-worker's own `on_block` thunk replays after every
+    /// successful block import, so a missed nudge just delays a few
+    /// buffered entries by one block-cycle.
+    fn replayPendingAttestationsAsync(self: *Self) void {
+        self.chain.submitReplayPendingAttestations() catch |err| switch (err) {
+            error.ChainWorkerDisabled => self.chain.replayPendingAttestations(),
+            error.QueueFull, error.QueueClosed => self.logger.debug(
+                "chain-worker replay submit dropped: {any} (next on_block dispatch will replay)",
+                .{err},
+            ),
+        };
+    }
+
+    /// Try to route a block import through the chain-worker (#890).
+    /// Returns `true` when the worker accepted ownership of the block
+    /// — followup (`onBlockFollowup` + `replayPendingAttestations` +
+    /// the imported-block callback that drives `processCachedDescendants`
+    /// / `fetchBlockByRoots`) all run on the worker thread, so the
+    /// caller MUST NOT redo any of that work. Returns `false` when
+    /// the worker is disabled, the block queue is full / closed, or
+    /// the SSZ clone needed to transfer ownership failed; the caller
+    /// is then responsible for the inline fallback path.
+    ///
+    /// Caller pre-conditions (so we never queue a block that would
+    /// fail with errors the worker can't recover from): the block's
+    /// parent MUST already be in the forkchoice. The chain-worker
+    /// thunk only logs on error (it has no network handle to drive
+    /// recursive parent fetches), so a `MissingPreState` or
+    /// `PreFinalizedSlot` from `onBlock` would otherwise strand sync.
+    /// The libxev caller keeps those error paths.
+    fn trySubmitImportToWorker(
+        self: *Self,
+        signed_block: *const types.SignedBlock,
+        block_root: types.Root,
+    ) bool {
+        var cloned: types.SignedBlock = undefined;
+        types.sszClone(self.allocator, types.SignedBlock, signed_block.*, &cloned) catch |err| {
+            self.logger.warn(
+                "chain-worker submit: sszClone failed for slot={d} root=0x{x}: {any}, falling back to inline import",
+                .{ signed_block.block.slot, &block_root, err },
+            );
+            return false;
+        };
+        var consumed = false;
+        // `defer` (not `errdefer`): the catch arm below `return false`s
+        // on QueueFull / QueueClosed which are *normal* returns — an
+        // `errdefer` would not run and the clone would leak.
+        defer if (!consumed) cloned.deinit();
+
+        self.chain.submitBlock(cloned, true, block_root) catch |err| switch (err) {
+            error.ChainWorkerDisabled => return false,
+            error.QueueFull, error.QueueClosed => {
+                self.logger.warn(
+                    "chain-worker block queue {s} for slot={d} root=0x{x}, falling back to inline import",
+                    .{ @errorName(err), signed_block.block.slot, &block_root },
+                );
+                return false;
+            },
+        };
+        consumed = true;
+        return true;
+    }
+
     fn processCachedDescendants(self: *Self, parent_root: types.Root) void {
         // Get cached children of this parent (helper returns an owned
         // copy under the cache lock so we can iterate after release).
@@ -516,6 +653,25 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
+                // #890 note: cached-descendant retry stays inline (no
+                // chain-worker submit). Two reasons:
+                //   1. Test/caller contract: `processCachedDescendants`
+                //      is observed synchronously (assertions on
+                //      forkchoice / cache state) by the gossip-import
+                //      tests and by `processReadyCachedBlocks`'s
+                //      callers; an async submit defers the side-effect
+                //      past the return.
+                //   2. Re-entrance is safe: when the chain-worker fires
+                //      `imported_block_fn` we are POST-`onBlock` (locks
+                //      released) on the worker thread, so calling
+                //      `chain.onBlock` again here is sequential same-
+                //      thread work — exactly what the worker already
+                //      serialises.
+                // The libxev fallback paths (`processBlockByRootChunk`
+                // / `processBlockByRangeChunk`) are still off-libxev
+                // because they used `trySubmitImportToWorker` for the
+                // *primary* import; cache-retry is the cheap recursive
+                // tail.
                 const block_ssz = cached.ssz;
                 const missing_roots = self.chain.onBlock(cached_block, .{ .sszBytes = block_ssz }) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
@@ -558,7 +714,7 @@ pub const BeamNode = struct {
                 // iteration of a deep cached-block chain. Correct semantically; a future optimisation
                 // could pass false during catch-up and prune once at the end.
                 self.chain.onBlockFollowup(true, &cached_block);
-                self.chain.replayPendingAttestationsLibxevBudget();
+                self.replayPendingAttestationsAsync();
 
                 // Remove from cache now that it's been processed. Note:
                 // we own `cached` (clone), so this `removeFetchedBlock`
@@ -771,6 +927,25 @@ pub const BeamNode = struct {
                 return;
             }
 
+            // #890: route to the chain-worker when the parent is already
+            // resolved. The MissingPreState fallback (cache + fetch
+            // parent) below stays libxev-side because the chain-worker
+            // thunk has no network handle to recurse — see
+            // `trySubmitImportToWorker` doc.
+            if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
+                if (self.trySubmitImportToWorker(signed_block, block_root)) {
+                    // Worker takes ownership; followup (cached
+                    // descendants + missing-root fetch + replay) runs
+                    // from the imported-block callback. We still flush
+                    // any parent fetches accumulated on the libxev
+                    // side during the pre-checks above.
+                    self.flushPendingParentFetches();
+                    return;
+                }
+                // Submit failed (worker disabled / queue full); fall
+                // through to inline path.
+            }
+
             // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 // Check if the error is due to missing parent
@@ -847,7 +1022,7 @@ pub const BeamNode = struct {
             // Store aggregated signature proofs from this block so they can be reused
             // in future block production. This is the same followup done for gossiped blocks.
             self.chain.onBlockFollowup(true, signed_block);
-            self.chain.replayPendingAttestationsLibxevBudget();
+            self.replayPendingAttestationsAsync();
 
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
@@ -891,6 +1066,17 @@ pub const BeamNode = struct {
             return;
         }
 
+        // #890: route to the chain-worker when the parent is already
+        // resolved. By-range chunks arrive slot-ordered so this is the
+        // common case after the first chunk; the
+        // MissingPreState/cache-and-fetch fallback below stays inline.
+        if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
+            if (self.trySubmitImportToWorker(signed_block, block_root)) {
+                self.flushPendingParentFetches();
+                return;
+            }
+        }
+
         const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
             if (err == chainFactory.BlockProcessingError.MissingPreState) {
                 // Cache and try to fetch parent. Range responses arrive ordered by slot,
@@ -925,7 +1111,7 @@ pub const BeamNode = struct {
         defer self.allocator.free(missing_roots);
 
         self.chain.onBlockFollowup(true, signed_block);
-        self.chain.replayPendingAttestationsLibxevBudget();
+        self.replayPendingAttestationsAsync();
         self.processCachedDescendants(block_root);
         self.fetchBlockByRoots(missing_roots, 0) catch |err| {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
@@ -1943,6 +2129,14 @@ pub const BeamNode = struct {
         // entry already exists, so locally produced blocks no longer leak
         // their initial post-state on the publish hop. See the design doc
         // §Resource-by-resource design / `BeamChain.states` for context.
+        //
+        // Stays inline (NOT routed through the chain-worker like the RPC
+        // paths in #890): the validator path runs on the libxev thread,
+        // and downstream callers / tests assume the block is in
+        // forkchoice by the time `publishBlock` returns. Async would
+        // surface a race where attestations produced in the same
+        // interval reference a block the chain hasn't imported yet.
+        // The replay below still goes via the worker.
         const missing_roots = try self.chain.onBlock(signed_block, .{
             .blockRoot = block_root,
         });
@@ -1974,7 +2168,7 @@ pub const BeamNode = struct {
 
         // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
-        self.chain.replayPendingAttestationsLibxevBudget();
+        self.replayPendingAttestationsAsync();
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: networks.AttestationGossip) !void {

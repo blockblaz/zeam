@@ -17,7 +17,9 @@ const event_broadcaster = api.event_broadcaster;
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
 const xmss = @import("@zeam/xmss");
-const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
+const thread_pool_pkg = @import("@zeam/thread-pool");
+const ThreadPool = thread_pool_pkg.ThreadPool;
+const WaitGroup = thread_pool_pkg.WaitGroup;
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
@@ -253,6 +255,33 @@ pub const BeamChain = struct {
     prune_cached_blocks_ctx: ?*anyopaque = null,
     prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
 
+    // -- imported-block backchannel (#863, #890) -------------------------
+    //
+    // Worker → BeamNode hand-back fired from `chainWorkerOnBlockThunk`
+    // after every successful import. Lets the network-aware code (cached-
+    // descendant retry, missing-attestation-root fetch, batched parent
+    // flush) run without re-checking inside the chain — historically the
+    // worker thunk silently dropped `missing_attestation_roots` because
+    // it had no way to call back into `BeamNode.fetchBlockByRoots` (see
+    // the pre-existing comment on `chain.onGossip`'s `.block` arm and
+    // the warn in `chainWorkerProcessPendingBlocksThunk`). The callback
+    // is the formal channel for that hand-off.
+    //
+    // Threading: the callback runs on whatever thread invoked the
+    // import. With chain-worker enabled, that's the worker thread; the
+    // BeamNode handler MUST therefore be safe to call from there. All
+    // touched state is mutex-protected (network's `LockedMap`s,
+    // forkchoice's RwLock, BeamNode.batch_pending_parent_roots_lock,
+    // the GeneralPurposeAllocator) so cross-thread is correct today;
+    // future work that adds non-mutex BeamNode state must audit the
+    // callback path.
+    //
+    // Ownership: the callback takes ownership of `missing_roots` (the
+    // chain freed it before this PR — the recipient now owns it).
+    // Implementations should defer-free against `chain.allocator`.
+    imported_block_ctx: ?*anyopaque = null,
+    imported_block_fn: ?ImportedBlockFn = null,
+
     // Queue for blocks that arrived before forkchoice had ticked to their slot.
     // When a peer gossips a block for the current slot before our local interval
     // timer fires, the forkchoice rejects it with FutureSlot.  We hold such
@@ -332,6 +361,31 @@ pub const BeamChain = struct {
     pending_aggregated_attestations: std.ArrayListUnmanaged(types.SignedAggregatedAttestation) = .empty,
 
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
+
+    /// Callback fired after every successful chain-worker block import
+    /// (#890). `block_root` is the producer's-or-recomputed hash-tree
+    /// root of the block that was just imported; `missing_roots` is
+    /// the slice of attestation head/source/target roots the chain
+    /// could not resolve while applying the block. **Ownership of
+    /// `missing_roots` transfers to the callback** — the chain no
+    /// longer frees it. Recipients typically:
+    ///
+    ///   1. Fan out a `blocks_by_root` RPC for `missing_roots` so the
+    ///      sync layer can fetch the missing referents.
+    ///   2. Run `processCachedDescendants(block_root)` to retry any
+    ///      previously orphaned children that were waiting on this
+    ///      parent.
+    ///   3. Flush any batched `pending_parent_root` requests
+    ///      accumulated during the import (RPC paths only).
+    ///
+    /// MUST be safe to call from the chain-worker thread — see the
+    /// `imported_block_ctx` / `imported_block_fn` field doc comment
+    /// above for the threading audit.
+    pub const ImportedBlockFn = *const fn (
+        ctx: *anyopaque,
+        block_root: types.Root,
+        missing_roots: []types.Root,
+    ) void;
 
     const Self = @This();
 
@@ -483,6 +537,7 @@ pub const BeamChain = struct {
                 .on_gossip_aggregated_attestation = chainWorkerOnGossipAggregatedAttestationThunk,
                 .process_pending_blocks = chainWorkerProcessPendingBlocksThunk,
                 .process_finalization_followup = chainWorkerProcessFinalizationFollowupThunk,
+                .replay_pending_attestations = chainWorkerReplayPendingAttestationsThunk,
             },
         });
         errdefer w.deinit();
@@ -599,15 +654,17 @@ pub const BeamChain = struct {
     ///   * `dropped` — permanent failure (signature mismatch, malformed
     ///     checkpoint ordering); the entry is discarded.
     ///
-    /// MUST be called from the chain-worker thread, or from the libxev
-    /// thread when the worker is disabled / when `BeamChain` handles
-    /// `onBlock` + `onBlockFollowup` directly (gossip, RPC, pending-queue,
-    /// publish paths — same thread as other chain mutations). When the
-    /// chain-worker is enabled, libxev-thread `BeamNode` paths that replay
-    /// after block import should prefer `replayPendingAttestationsLibxevBudget`
-    /// so a deep pending buffer cannot stall the slot driver (#863).
-    /// Holds the buffer mutex only across the swap-out / re-append;
-    /// validation runs lock-free over locally-owned slices.
+    /// Threading contract (#863, #890): when the chain-worker is enabled
+    /// this function MUST run on the worker thread. The `chain-worker`
+    /// `on_block` thunk drives it inline after every successful import;
+    /// libxev-side producers (`BeamNode.publishBlock`, the disabled-worker
+    /// fallback inside the RPC paths) MUST go through
+    /// `submitReplayPendingAttestations` so the unbounded drain happens
+    /// on the worker thread instead of stalling the slot driver. When
+    /// the worker is disabled, the libxev thread is the chain thread —
+    /// calling this directly is correct (and the only option). Holds
+    /// the buffer mutex only across the swap-out; validation runs
+    /// lock-free over locally-owned slices.
     pub fn replayPendingAttestations(self: *Self) void {
         // Swap the buffers out under lock so producers can keep
         // appending into fresh empty buffers while we drain.
@@ -624,55 +681,80 @@ pub const BeamChain = struct {
 
         const is_agg = self.is_aggregator_enabled.load(.acquire);
 
-        for (atts.items) |gossip| {
-            self.replayOneAttestation(gossip, is_agg);
-        }
-        for (aggs.items) |*agg| {
-            self.replayOneAggregation(agg);
+        // #890: parallelize per-entry replay across the shared thread
+        // pool when one is configured. Each replay does
+        // `validateAttestationData → verifySingleAttestation → (for
+        // aggregators) forkChoice.onSignedAttestation` for raw atts,
+        // or the equivalent aggregate-attestation path for
+        // aggregations. Validation and storage take internal locks
+        // (forkchoice rwlock, pubkey_cache lock-free CAS, the
+        // pending-attestations mutex on retryable failure), so
+        // concurrent invocations serialize on those without
+        // explicit coordination here. The big win is the XMSS verify
+        // — `verifySingleAttestation` is CPU-bound and has no shared
+        // state with siblings (#863 stall data shows aggregator-heavy
+        // replay batches dominate by-far the longest libxev drain
+        // windows).
+        //
+        // No pool ⇒ in-thread serial loop. The fallback path also
+        // covers the chain-worker test rigs that don't wire a pool
+        // and the disabled-worker case where the libxev thread
+        // already serialized everything.
+        if (self.thread_pool) |pool| {
+            // Bound the fan-out so a 1024-entry buffer doesn't
+            // allocate 1024 task wrappers up front. The pool's
+            // worker count is what limits real parallelism anyway;
+            // any more than ~thread_count outstanding tasks just
+            // queues. Pre-#890 measurements on aggregator-heavy
+            // devnet bursts showed 90%+ of replay calls have ≤ 64
+            // entries — keep the simple "spawn each" shape.
+            var wg: WaitGroup = .{};
+            for (atts.items) |gossip| {
+                pool.spawnWg(&wg, replayOneAttestationTask, .{ self, gossip, is_agg }) catch {
+                    // Allocator exhaustion on the task wrapper — fall
+                    // back to running this entry serially so we don't
+                    // strand it. Subsequent entries still try the pool.
+                    self.replayOneAttestation(gossip, is_agg);
+                };
+            }
+            for (aggs.items) |*agg| {
+                pool.spawnWg(&wg, replayOneAggregationTask, .{ self, agg }) catch {
+                    self.replayOneAggregation(agg);
+                };
+            }
+            pool.waitAndWork(&wg);
+        } else {
+            for (atts.items) |gossip| {
+                self.replayOneAttestation(gossip, is_agg);
+            }
+            for (aggs.items) |*agg| {
+                self.replayOneAggregation(agg);
+            }
         }
     }
 
-    /// Like `replayPendingAttestations`, but caps how many entries are
-    /// processed per call so libxev-thread producers (RPC, cache, publish)
-    /// cannot monopolize the slot driver for seconds when the pending buffers
-    /// are deep (#863, aggregator-heavy devnets).
-    ///
-    /// The chain-worker path continues to use `replayPendingAttestations`
-    /// (unbounded) because it does not share the libxev clock thread.
-    pub fn replayPendingAttestationsLibxevBudget(self: *Self) void {
-        const is_agg = self.is_aggregator_enabled.load(.acquire);
+    /// Static thunk so `ThreadPool.spawnWg` can take a function
+    /// pointer — `replayOneAttestation` is a method and would need a
+    /// closure. The pool calls this with the runtime tuple
+    /// `.{ chain, gossip, is_aggregator_role }` we pass at spawn time.
+    fn replayOneAttestationTask(
+        chain: *Self,
+        gossip: networks.AttestationGossip,
+        is_aggregator_role: bool,
+    ) void {
+        chain.replayOneAttestation(gossip, is_aggregator_role);
+    }
 
-        // The size gauges are kept in sync with the buffer length on
-        // every pop. `replayOne*` may re-`enqueuePending*` an entry on
-        // retryable failure (which itself updates the gauge), so the
-        // post-replay value can drift back up — that's expected.
-        var a_done: usize = 0;
-        while (a_done < constants.REPLAY_PENDING_ATTESTATIONS_LIBXEV_BUDGET) : (a_done += 1) {
-            self.pending_attestations_mutex.lock();
-            if (self.pending_attestations.items.len == 0) {
-                self.pending_attestations_mutex.unlock();
-                break;
-            }
-            const gossip = self.pending_attestations.orderedRemove(0);
-            const new_depth = self.pending_attestations.items.len;
-            self.pending_attestations_mutex.unlock();
-            zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, new_depth) catch {};
-            self.replayOneAttestation(gossip, is_agg);
-        }
-
-        var g_done: usize = 0;
-        while (g_done < constants.REPLAY_PENDING_AGGREGATIONS_LIBXEV_BUDGET) : (g_done += 1) {
-            self.pending_attestations_mutex.lock();
-            if (self.pending_aggregated_attestations.items.len == 0) {
-                self.pending_attestations_mutex.unlock();
-                break;
-            }
-            var agg_owned = self.pending_aggregated_attestations.orderedRemove(0);
-            const new_depth = self.pending_aggregated_attestations.items.len;
-            self.pending_attestations_mutex.unlock();
-            zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, new_depth) catch {};
-            self.replayOneAggregation(&agg_owned);
-        }
+    /// Same shape as `replayOneAttestationTask` for aggregations.
+    /// Takes the pointer-into-buffer alias produced by the parent
+    /// `replayPendingAttestations` loop. The buffer outlives the
+    /// pool's `waitAndWork`, so the pointer remains valid for the
+    /// task's lifetime.
+    fn replayOneAggregationTask(
+        chain: *Self,
+        agg: *types.SignedAggregatedAttestation,
+    ) void {
+        chain.replayOneAggregation(agg);
     }
 
     /// Inner replay step for a single buffered attestation. The entry
@@ -844,7 +926,6 @@ pub const BeamChain = struct {
             });
             return;
         };
-        defer self.allocator.free(missing_roots);
         // Mirror the gossip path: followup runs after a successful
         // import. We pass the (immutable) signed_block by reference
         // for symmetry with chain.onGossip; current onBlockFollowup
@@ -857,6 +938,38 @@ pub const BeamChain = struct {
         // / future slots get a fresh validation attempt against the
         // updated store.
         self.replayPendingAttestations();
+
+        // Invoke the imported-block backchannel (#890). When wired
+        // (BeamNode in production), the callback takes ownership of
+        // `missing_roots` and runs `fetchBlockByRoots` +
+        // `processCachedDescendants` from this worker thread. When
+        // the callback is not wired (queue-only worker tests), we
+        // free the slice ourselves so the buffer never leaks. The
+        // recipient's contract is documented on `ImportedBlockFn`.
+        const resolved_root: types.Root = block_root orelse blk: {
+            // The chain just imported the block, so its hash-tree
+            // root is in the slot-cache or recomputable; recompute
+            // here so the callback gets a definite root. Failure to
+            // recompute is possible only on OOM — log + drop the
+            // missing-roots slice (we still freed locally).
+            var r: types.Root = undefined;
+            zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &r, self.allocator) catch |err| {
+                self.logger.err(
+                    "chain-worker: imported-block callback skipped, root recompute failed slot={d}: {any}",
+                    .{ signed_block.block.slot, err },
+                );
+                self.allocator.free(missing_roots);
+                return;
+            };
+            break :blk r;
+        };
+        if (self.imported_block_fn) |callback| {
+            if (self.imported_block_ctx) |cb_ctx| {
+                callback(cb_ctx, resolved_root, missing_roots);
+                return;
+            }
+        }
+        self.allocator.free(missing_roots);
     }
 
     fn chainWorkerOnGossipAttestationThunk(
@@ -1028,6 +1141,18 @@ pub const BeamChain = struct {
         };
     }
 
+    /// Worker-thread thunk for the `replay_pending_attestations`
+    /// queue message (#890). Producers post one of these messages
+    /// after a libxev-side block import (publish path / disabled-
+    /// worker fallback) so the unbounded `replayPendingAttestations`
+    /// drain happens here instead of on the slot-driver thread.
+    /// `replayPendingAttestations` is itself idempotent, so duplicate
+    /// nudges from coalesced producers are harmless.
+    fn chainWorkerReplayPendingAttestationsThunk(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.replayPendingAttestations();
+    }
+
     // ------------------------------------------------------------------
     // submit* family (slice c-2b commit 3)
     // ------------------------------------------------------------------
@@ -1124,9 +1249,43 @@ pub const BeamChain = struct {
         } });
     }
 
+    /// Same error set as `SubmitError` but flavoured for the
+    /// attestation queue's `trySend` errors. Kept distinct so callers
+    /// don't have to import the worker module to spell the error
+    /// union.
+    pub const SubmitReplayError = chain_worker.AttestationQueue.TrySendError || error{ChainWorkerDisabled};
+
+    /// Nudge the chain-worker to drain `pending_attestations` /
+    /// `pending_aggregated_attestations` (#890). Producers are libxev
+    /// paths that imported a block synchronously (the disabled-worker
+    /// fallback inside `BeamNode.processBlockByRoot|RangeChunk`,
+    /// `processCachedDescendants`) and `BeamNode.publishBlock` (locally
+    /// produced block — no `on_block` is dispatched, so the worker
+    /// would never auto-replay). When the worker is disabled,
+    /// returns `error.ChainWorkerDisabled`; the caller then runs
+    /// `replayPendingAttestations` inline since libxev IS the chain
+    /// thread in that mode. `error.QueueFull` is non-fatal:
+    /// `replayPendingAttestations` is idempotent and the next
+    /// worker `on_block` dispatch will replay anyway.
+    pub fn submitReplayPendingAttestations(self: *Self) SubmitReplayError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendReplayPending();
+    }
+
     pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
         self.prune_cached_blocks_ctx = ctx;
         self.prune_cached_blocks_fn = func;
+    }
+
+    /// Register the imported-block backchannel (#890). The callback
+    /// fires from `chainWorkerOnBlockThunk` after every successful
+    /// import; takes ownership of the chain's `missing_roots` slice.
+    /// See the `imported_block_ctx`/`imported_block_fn` field doc and
+    /// the `ImportedBlockFn` type alias for the threading and
+    /// ownership contract. Pass `null`/no-op-fn pair to clear.
+    pub fn setImportedBlockCallback(self: *Self, ctx: *anyopaque, func: ImportedBlockFn) void {
+        self.imported_block_ctx = ctx;
+        self.imported_block_fn = func;
     }
 
     pub fn deinit(self: *Self) void {
