@@ -5649,6 +5649,329 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
 }
+
+// Shared setup for the justification-aware produceBlock tests.
+// Heap-allocates zeam_logger_config and beam_state via the arena so their
+// addresses are stable across the deep call stacks inside produceBlock
+// (stack locals would be clobbered when the call depth grows; see the
+// FutureSlotTestFixture pattern used elsewhere in this file).
+fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) !struct {
+    mock_chain: stf.MockChainData,
+    beam_chain: *BeamChain,
+    connected_peers: *ConnectedPeers,
+    test_registry: *NodeNameRegistry,
+    db: database.Db,
+    tmp_dir: std.testing.TmpDir,
+} {
+    const mock_chain = try stf.genMockChain(allocator, n_blocks, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    // chain_config on heap so that embedded slices aren't on a stack frame
+    // that may be clobbered during produceBlock's deep call chain.
+    const chain_config = try allocator.create(configs.ChainConfig);
+    chain_config.* = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    // Heap-allocate beam_state and zeam_logger_config so their addresses are
+    // stable.  BeamChain stores *BeamState and *ZeamLoggerConfig; if those
+    // live on the test stack they get stomped when produceBlock grows the
+    // call stack past them.
+    const beam_state = try allocator.create(types.BeamState);
+    beam_state.* = mock_chain.genesis_state;
+    const zeam_logger_config = try allocator.create(zeam_utils.ZeamLoggerConfig);
+    zeam_logger_config.* = zeam_utils.getTestLoggerConfig();
+
+    const tmp_dir = std.testing.tmpDir(.{});
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    defer allocator.free(data_dir);
+    const db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+
+    const connected_peers = try allocator.create(ConnectedPeers);
+    connected_peers.* = ConnectedPeers.init(allocator);
+    const test_registry = try allocator.create(NodeNameRegistry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+
+    const beam_chain = try allocator.create(BeamChain);
+    beam_chain.* = try BeamChain.init(allocator, ChainOpts{
+        .config = chain_config.*,
+        .anchorState = beam_state,
+        .nodeId = 0,
+        .logger_config = zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+
+    return .{
+        .mock_chain = mock_chain,
+        .beam_chain = beam_chain,
+        .connected_peers = connected_peers,
+        .test_registry = test_registry,
+        .db = db,
+        .tmp_dir = tmp_dir,
+    };
+}
+
+test "produceBlock - older-but-justified source is accepted" {
+    // leanSpec commit 00556d8: build_block must accept any attestation whose
+    // source *slot* is in justified_slots, not just the most recent justified
+    // checkpoint's root. This test places an attestation whose source is an
+    // older justified slot (not the latest_justified checkpoint) and verifies
+    // it ends up in the produced block.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // 8 blocks: enough for at least two justification cycles (pattern repeats every 4).
+    var fx = try setupJustifiedSourceTestChain(allocator, 8);
+    defer {
+        fx.beam_chain.deinit();
+        fx.test_registry.deinit();
+        fx.db.deinit();
+        fx.tmp_dir.cleanup();
+    }
+    const mock_chain = fx.mock_chain;
+    const beam_chain = fx.beam_chain;
+
+    // Apply 4 blocks so the chain has at least one justified slot.
+    for (1..5) |i| {
+        const signed_block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(signed_block.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        allocator.free(missing_roots);
+    }
+
+    // Use mock_chain.latestJustified which was precomputed by genMockChain
+    // without going through states.get (avoids unsafe raw pointer access).
+    const justified_cp = mock_chain.latestJustified[4];
+    const justified_slot: types.Slot = justified_cp.slot;
+    try std.testing.expect(justified_slot >= 1);
+
+    // Craft an attestation with an *older* justified source slot (not the latest).
+    // Under the old root-equality filter this would be dropped; under the new
+    // slot-based filter it must be included.
+    const older_justified_slot: types.Slot = if (justified_slot > 1) justified_slot - 1 else justified_slot;
+    const older_source_root = mock_chain.blockRoots[older_justified_slot];
+    const proposal_slot: types.Slot = 5;
+    const parent_root = mock_chain.blockRoots[4];
+
+    const att_data_older_source = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = parent_root, .slot = 4 },
+        .source = .{ .root = older_source_root, .slot = older_justified_slot },
+    };
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
+    var proof = try types.AggregatedSignatureProof.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true);
+
+    const produced = try beam_chain.produceBlock(.{
+        .slot = proposal_slot,
+        .proposer_index = proposal_slot % num_validators,
+    });
+    defer @constCast(&produced).deinit();
+
+    const atts = produced.block.body.attestations.constSlice();
+    var found_older = false;
+    for (atts) |att| {
+        if (att.data.source.slot == older_justified_slot and
+            std.mem.eql(u8, &att.data.source.root, &older_source_root))
+        {
+            found_older = true;
+        }
+    }
+    try std.testing.expect(found_older);
+}
+
+test "produceBlock - zero-hash source/target rejected by build_block" {
+    // attestationDataMatchesChainExtended must reject attestations whose source or
+    // target root is ZERO_HASH even when the slot would otherwise pass the justified check.
+    // A valid control attestation is also stored to guarantee the block is non-empty,
+    // so the negative assertions cannot pass vacuously.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var fx = try setupJustifiedSourceTestChain(allocator, 6);
+    defer {
+        fx.beam_chain.deinit();
+        fx.test_registry.deinit();
+        fx.db.deinit();
+        fx.tmp_dir.cleanup();
+    }
+    const mock_chain = fx.mock_chain;
+    const beam_chain = fx.beam_chain;
+
+    for (1..5) |i| {
+        const signed_block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(signed_block.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        allocator.free(missing_roots);
+    }
+
+    const justified_cp = mock_chain.latestJustified[4];
+    const justified_slot: types.Slot = justified_cp.slot;
+    const justified_root = justified_cp.root;
+    const proposal_slot: types.Slot = 5;
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
+    const parent_root = mock_chain.blockRoots[4];
+
+    // Attestation with ZERO_HASH source root — must be rejected.
+    const att_zero_source = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = parent_root, .slot = 4 },
+        .source = .{ .root = types.ZERO_HASH, .slot = justified_slot },
+    };
+    var proof_zs = try types.AggregatedSignatureProof.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zs.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true);
+
+    // Attestation with ZERO_HASH target root — must be rejected.
+    const att_zero_target = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = types.ZERO_HASH, .slot = 4 },
+        .source = .{ .root = justified_root, .slot = justified_slot },
+    };
+    var proof_zt = try types.AggregatedSignatureProof.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zt.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true);
+
+    // Control: a valid attestation that must appear in the block, ensuring the
+    // produced block is non-empty so the negative assertions below are not vacuous.
+    const att_valid = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = parent_root, .slot = 4 },
+        .source = .{ .root = justified_root, .slot = justified_slot },
+    };
+    var proof_valid = try types.AggregatedSignatureProof.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_valid.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true);
+
+    const produced = try beam_chain.produceBlock(.{
+        .slot = proposal_slot,
+        .proposer_index = proposal_slot % num_validators,
+    });
+    defer @constCast(&produced).deinit();
+
+    const atts = produced.block.body.attestations.constSlice();
+    // Control attestation must be present — proves block non-empty.
+    var found_valid = false;
+    for (atts) |att| {
+        if (std.mem.eql(u8, &att.data.source.root, &justified_root) and
+            att.data.source.slot == justified_slot)
+        {
+            found_valid = true;
+        }
+        try std.testing.expect(!std.mem.eql(u8, &att.data.source.root, &types.ZERO_HASH));
+        try std.testing.expect(!std.mem.eql(u8, &att.data.target.root, &types.ZERO_HASH));
+    }
+    try std.testing.expect(found_valid);
+}
+
+test "produceBlock - already-justified target skipped, genesis self-vote exemption" {
+    // Two assertions:
+    //   (a) NEGATIVE: a non-genesis attestation whose target slot is already justified
+    //       must be excluded from the produced block.
+    //   (b) POSITIVE: a genesis self-vote (source.slot==0, target.slot==0) must be
+    //       included even though slot 0 is already justified — the exemption in
+    //       isSlotJustifiedForBuild explicitly allows it for fork-choice bootstrapping.
+    // Both attestations are stored; the test asserts (a) is absent and (b) is present.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var fx = try setupJustifiedSourceTestChain(allocator, 6);
+    defer {
+        fx.beam_chain.deinit();
+        fx.test_registry.deinit();
+        fx.db.deinit();
+        fx.tmp_dir.cleanup();
+    }
+    const mock_chain = fx.mock_chain;
+    const beam_chain = fx.beam_chain;
+
+    for (1..5) |i| {
+        const signed_block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(signed_block.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        allocator.free(missing_roots);
+    }
+
+    const justified_cp = mock_chain.latestJustified[4];
+    const justified_slot: types.Slot = justified_cp.slot;
+    const justified_root = justified_cp.root;
+    const proposal_slot: types.Slot = 5;
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
+    const parent_root = mock_chain.blockRoots[4];
+
+    // (a) NEGATIVE: attestation targeting an already-justified slot — must be dropped.
+    const already_justified_slot: types.Slot = justified_slot;
+    const att_already_justified = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = justified_root, .slot = already_justified_slot },
+        .source = .{ .root = mock_chain.blockRoots[1], .slot = 1 },
+    };
+    var proof_aj = try types.AggregatedSignatureProof.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
+
+    // (b) POSITIVE: genesis self-vote — source.slot==0, target.slot==0.
+    // Slot 0 is already justified (finalized genesis slot), but the exemption
+    // must let this through the target-already-justified filter.
+    // historical_block_hashes[0] == blockRoots[0] once block 1 is applied,
+    // so the chain-match check passes too.
+    const genesis_root = mock_chain.blockRoots[0];
+    const att_genesis_self_vote = types.AttestationData{
+        .slot = 0,
+        .head = .{ .root = genesis_root, .slot = 0 },
+        .target = .{ .root = genesis_root, .slot = 0 },
+        .source = .{ .root = genesis_root, .slot = 0 },
+    };
+    var proof_gsv = try types.AggregatedSignatureProof.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_gsv.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true);
+
+    const produced = try beam_chain.produceBlock(.{
+        .slot = proposal_slot,
+        .proposer_index = proposal_slot % num_validators,
+    });
+    defer @constCast(&produced).deinit();
+
+    const atts = produced.block.body.attestations.constSlice();
+
+    // (a) Negative: already-justified non-genesis target must be absent.
+    for (atts) |att| {
+        const is_genesis_sv = att.data.source.slot == 0 and att.data.target.slot == 0;
+        if (!is_genesis_sv and att.data.target.slot == already_justified_slot) {
+            try std.testing.expect(false); // unreachable: must be filtered
+        }
+    }
+
+    // (b) Positive: the genesis self-vote must appear — this exercises the
+    // positive path of the exemption.
+    var found_genesis_sv = false;
+    for (atts) |att| {
+        if (att.data.source.slot == 0 and att.data.target.slot == 0 and
+            std.mem.eql(u8, &att.data.source.root, &genesis_root) and
+            std.mem.eql(u8, &att.data.target.root, &genesis_root))
+        {
+            found_genesis_sv = true;
+        }
+    }
+    try std.testing.expect(found_genesis_sv);
+}
 test "BorrowedState: cloneAndRelease success path against real BeamState" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
