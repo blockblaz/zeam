@@ -1576,9 +1576,43 @@ pub const ForkChoice = struct {
         return results.toOwnedSlice(self.allocator);
     }
 
+    /// Build aggregate-attestation payloads from the gossip
+    /// `attestation_signatures` map and the cached
+    /// `latest_known_aggregated_payloads`.
+    ///
+    /// **#863 / #890 followup — the forkchoice main mutex is intentionally
+    /// NOT acquired here.** The body lives inside `aggregateUnlocked`,
+    /// which only touches state guarded by `signatures_mutex`
+    /// (`attestation_signatures`, `latest_new_aggregated_payloads`,
+    /// `latest_known_aggregated_payloads`). The heavy XMSS aggregate
+    /// proof FFI inside `computeAggregatedSignatures` runs for
+    /// **~70s per call** on devnet aggregators (see metric
+    /// `lean_committee_signatures_aggregation_time_seconds_sum`).
+    /// The previous shape took `mutex.lock()` (forkchoice exclusive)
+    /// for the entire FFI window. That serialised the libxev slot
+    /// driver — `chain.onInterval` → `forkChoice.onInterval` waits on
+    /// the same mutex — so the watchdog fired with multi-second
+    /// stalls every interval an aggregation was in flight, and the
+    /// chain-worker (block import, gossip-attestation tracker
+    /// updates) blocked behind us too. With the mutex dropped:
+    ///
+    ///   * libxev `chain.onInterval` (intervals 1, 2, 3 and i=0 on
+    ///     non-proposer slots) acquires forkchoice exclusive on the
+    ///     happy path.
+    ///   * Worker `chain.onBlock` / `forkChoice.onAttestation` acquires
+    ///     forkchoice exclusive on the happy path.
+    ///   * Other aggregator-thread `aggregate` invocations are gated
+    ///     upstream by `aggregate_group.concurrent` (concurrent_limit=1
+    ///     in `submitAggregateOnInterval`), so two aggregations cannot
+    ///     race here.
+    ///
+    /// What `aggregateUnlocked` DOES still hold (correctly) is
+    /// `signatures_mutex` for the read+compute+write window. The
+    /// follow-up to remove that residual hold (snapshot-then-release
+    /// over the FFI window so libxev's i=4 `acceptNewAttestations`
+    /// also runs unblocked) is tracked in the issue linked from
+    /// `submitAggregateOnInterval`.
     pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.aggregateUnlocked(state_opt);
     }
 
@@ -2266,6 +2300,120 @@ test "aggregate prunes attestation signatures" {
     try std.testing.expectEqual(@as(usize, 1), aggregations.len);
     try std.testing.expectEqual(@as(usize, 0), fork_choice.attestation_signatures.count());
     try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(attestation_data) != null);
+}
+
+test "aggregate (#890): does not acquire forkchoice main mutex" {
+    // Regression for the slot-driver stall on aggregator devnet nodes:
+    // before this PR, `forkChoice.aggregate` took `mutex.lock()` for the
+    // entire ~70s XMSS aggregate FFI, blocking libxev's `chain.onInterval`
+    // (which also acquires the same mutex) and the chain-worker thread
+    // (block import / per-attestation tracker updates).
+    //
+    // The contract going forward: `aggregate` MUST NOT acquire the
+    // forkchoice main mutex. Internal coordination is via
+    // `signatures_mutex`, which is the only lock the heavy aggregation
+    // body needs. We assert the contract by holding the main mutex
+    // EXCLUSIVE on the test thread and observing that the aggregator
+    // thread completes without deadlocking. If a future refactor
+    // re-introduces `mutex.lock()` (or any acquisition that the
+    // aggregator must wait for), this test will hang at `thread.join()`
+    // and the CI watchdog will fail it.
+    const allocator = std.testing.allocator;
+    const validator_count: usize = 4;
+    const num_blocks: usize = 1;
+
+    var key_manager = try keymanager.getTestKeyManager(allocator, validator_count, num_blocks);
+    defer key_manager.deinit();
+
+    const all_pubkeys = try key_manager.getAllPubkeys(allocator, validator_count);
+    defer allocator.free(all_pubkeys.attestation_pubkeys);
+    defer allocator.free(all_pubkeys.proposal_pubkeys);
+
+    const genesis_spec = types.GenesisSpec{
+        .genesis_time = 1234,
+        .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
+        .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
+    };
+
+    var mock_chain = try stf.genMockChain(allocator, num_blocks, genesis_spec);
+    defer mock_chain.deinit(allocator);
+    defer mock_chain.genesis_state.validators.deinit();
+    defer mock_chain.genesis_state.historical_block_hashes.deinit();
+    defer mock_chain.genesis_state.justified_slots.deinit();
+    defer mock_chain.genesis_state.justifications_roots.deinit();
+    defer mock_chain.genesis_state.justifications_validators.deinit();
+
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    defer allocator.free(spec_name);
+    defer allocator.free(fork_digest);
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    var fork_choice = try ForkChoice.init(allocator, .{
+        .config = chain_config,
+        .anchorState = &mock_chain.genesis_state,
+        .logger = zeam_logger_config.logger(.forkchoice),
+    });
+    defer fork_choice.deinit();
+
+    // Seed one signature so `aggregate` has work to do (otherwise an
+    // empty-input return path could pass without ever touching the
+    // mutex even before the fix).
+    const attestation_data = types.AttestationData{
+        .slot = 0,
+        .head = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
+        .target = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
+        .source = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
+    };
+    const attestation = types.Attestation{ .validator_id = 0, .data = attestation_data };
+    const signature = try key_manager.signAttestation(&attestation, allocator);
+    try fork_choice.onSignedAttestation(.{
+        .validator_id = 0,
+        .message = attestation_data,
+        .signature = signature,
+    });
+
+    // Hold the forkchoice main mutex exclusive on the test thread for
+    // the entire aggregator-thread lifetime. If `aggregate` (still)
+    // calls `mutex.lock()`, the aggregator deadlocks and `join()`
+    // never returns; the surrounding test runner watchdog will then
+    // fail the test.
+    fork_choice.mutex.lock();
+    defer fork_choice.mutex.unlock();
+
+    const Worker = struct {
+        fork_choice: *ForkChoice,
+        state: *const types.BeamState,
+        result: anyerror![]types.SignedAggregatedAttestation = undefined,
+
+        fn run(ctx: *@This()) void {
+            ctx.result = ctx.fork_choice.aggregate(ctx.state);
+        }
+    };
+    var worker: Worker = .{ .fork_choice = &fork_choice, .state = &mock_chain.genesis_state };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    thread.join();
+
+    const aggregations = try worker.result;
+    defer {
+        for (aggregations) |*signed_aggregation| {
+            signed_aggregation.deinit();
+        }
+        allocator.free(aggregations);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), aggregations.len);
 }
 
 // Helper function to create a deterministic test root filled with a specific byte
