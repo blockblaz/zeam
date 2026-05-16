@@ -1033,8 +1033,10 @@ pub const BeamNode = struct {
                                 // fc_initing. Without this branch the node deadlocks: it stays in
                                 // fc_initing because no blocks arrive, and no blocks arrive because
                                 // the sync code skips fc_initing.
-                                // Treat this exactly like behind_peers: if the peer's head is ahead
-                                // of our anchor, request their head block to start the parent chain.
+                                //
+                                // Mirror the behind_peers logic: prefer blocks_by_range for large
+                                // gaps (avoids the one-round-trip-per-block parent-chain walk);
+                                // fall back to head-by-root for small gaps or on range failure.
                                 // Snapshot once: forkChoice.head is a
                                 // multi-field ProtoBlock written under
                                 // exclusive. A second raw read in the log
@@ -1042,21 +1044,49 @@ pub const BeamNode = struct {
                                 // different update's blockRoot.
                                 const head_snapshot = self.chain.forkChoice.getHead();
                                 if (status_resp.head_slot > head_snapshot.slot) {
-                                    self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
-                                        status_ctx.peer_id,
-                                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                        status_resp.head_slot,
-                                        head_snapshot.slot,
-                                        &status_resp.head_root,
-                                    });
-                                    const roots = [_]types.Root{status_resp.head_root};
-                                    self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                        self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
+                                    const gap: u64 = status_resp.head_slot - head_snapshot.slot;
+                                    if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+                                        const start_slot: types.Slot = head_snapshot.slot + 1;
+                                        const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
+                                        self.logger.info("peer {s}{f} is ahead during fc init by {d} slots, bulk-syncing via blocks_by_range start_slot={d} count={d}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            err,
+                                            gap,
+                                            start_slot,
+                                            requested_count,
                                         });
-                                    };
+                                        const handler = networks.OnReqRespResponseCbHandler{
+                                            .ptr = self,
+                                            .onReqRespResponseCb = onReqRespResponse,
+                                        };
+                                        _ = self.network.sendBlocksByRangeRequest(status_ctx.peer_id, start_slot, requested_count, handler) catch |err| {
+                                            self.logger.warn("fc_initing: blocks_by_range from peer {s}{f} failed: {any}; falling back to head-by-root", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                            const roots = [_]types.Root{status_resp.head_root};
+                                            self.fetchBlockByRoots(&roots, 0) catch |fetch_err| {
+                                                self.logger.warn("fc_initing: fallback head-by-root also failed: {any}", .{fetch_err});
+                                            };
+                                        };
+                                    } else {
+                                        self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
+                                            status_ctx.peer_id,
+                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                            status_resp.head_slot,
+                                            head_snapshot.slot,
+                                            &status_resp.head_root,
+                                        });
+                                        const roots = [_]types.Root{status_resp.head_root};
+                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                            self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                        };
+                                    }
                                 }
                             },
                             .synced, .no_peers => {},
@@ -1117,6 +1147,15 @@ pub const BeamNode = struct {
                             err_payload.code,
                             err_payload.message,
                         });
+                        // Failure means the peer did not serve any of the
+                        // requested roots. Collect them for retry BEFORE
+                        // finalizePendingRequest removes them from
+                        // pending_block_roots so a different peer can
+                        // serve them. Without this, a failed request
+                        // permanently stalls the parent-chain walk used
+                        // during fc_initing / behind_peers sync.
+                        self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
+                        return;
                     },
                     .blocks_by_range => {
                         self.logger.warn("blocks-by-range request to peer {s}{f} failed ({d}): {s}", .{
@@ -1130,6 +1169,17 @@ pub const BeamNode = struct {
                 self.network.finalizePendingRequest(request_id);
             },
             .completed => {
+                // For blocks_by_root requests: detect roots that were not
+                // served by any chunk (still in pending_block_roots after
+                // all chunks arrived) and re-schedule them with a new
+                // peer. Without this, a peer that returns EOS without
+                // fulfilling all requested roots (e.g., a mesh helper
+                // with head_slot=0) permanently stalls the parent-chain
+                // walk used during fc_initing / behind_peers sync.
+                if (snap.request_kind == .blocks_by_root) {
+                    self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
+                    return;
+                }
                 self.network.finalizePendingRequest(request_id);
             },
         }
@@ -1814,6 +1864,56 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(peer_id),
                     err,
                 });
+            };
+        }
+    }
+
+    /// Collect `blocks_by_root` roots that were NOT served by any chunk
+    /// (still present in `pending_block_roots` when the request ends),
+    /// finalize the request, then re-schedule each unserved root via
+    /// `fetchBlockByRoots` so a new (hopefully different) peer can serve
+    /// it.
+    ///
+    /// Called from the `.completed` and `.failure` arms of
+    /// `handleReqRespResponse` for `blocks_by_root` requests.
+    /// Without this, a peer that returns EOS or a protocol error without
+    /// serving one or more of the requested roots permanently removes
+    /// those roots from `pending_block_roots` (via `finalizePendingRequest`)
+    /// and leaves the parent-chain-walk orphaned — the cached child
+    /// blocks sit in `block_cache` forever waiting for a parent nobody
+    /// fetches again. This manifests as a sync stall during `fc_initing`
+    /// when one of the two connected peers has `head_slot=0` and the
+    /// random peer selector (`selectPeerCopy`) occasionally routes a
+    /// parent-chain fetch to it.
+    fn retryUnservedBlockRoots(
+        self: *Self,
+        request_id: u64,
+        requested_roots: []const types.Root,
+        peer_id: []const u8,
+    ) void {
+        // Collect roots still in pending_block_roots (unserved) BEFORE
+        // finalizePendingRequest removes them.
+        var roots_to_retry: std.ArrayListUnmanaged(struct { root: types.Root, depth: u32 }) = .empty;
+        defer roots_to_retry.deinit(self.allocator);
+        for (requested_roots) |root| {
+            if (self.network.getPendingBlockRootDepth(root)) |depth| {
+                roots_to_retry.append(self.allocator, .{ .root = root, .depth = depth }) catch {};
+            }
+        }
+        if (roots_to_retry.items.len > 0) {
+            self.logger.warn(
+                "blocks-by-root request_id={d} from peer {s}: {d}/{d} root(s) unserved — scheduling retry via new peer",
+                .{ request_id, peer_id, roots_to_retry.items.len, requested_roots.len },
+            );
+        }
+        // Finalize clears pending state + releases in-flight slot.
+        self.network.finalizePendingRequest(request_id);
+        // Re-schedule each unserved root; fetchBlockByRoots will
+        // dedup against forkchoice/cache/pending and pick a new peer.
+        for (roots_to_retry.items) |item| {
+            const single = [_]types.Root{item.root};
+            self.fetchBlockByRoots(&single, item.depth) catch |err| {
+                self.logger.warn("retryUnservedBlockRoots: failed to re-fetch root after unserved EOS/failure: {any}", .{err});
             };
         }
     }
