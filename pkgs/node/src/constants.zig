@@ -81,6 +81,20 @@ pub const MAX_PENDING_BLOCKS: usize = 1024;
 // vectors. FIFO eviction matches the spec's "drop oldest" policy.
 pub const MAX_PENDING_ATTESTATIONS: usize = 1024;
 
+/// When the **libxev** thread replays pending gossip attestations / aggregations
+/// (`BeamNode` paths: RPC block import, cached-block resolution, `publishBlock`),
+/// drain at most this many attestations per call. The full buffer can hold
+/// `MAX_PENDING_ATTESTATIONS` entries; replaying all of them in one completion
+/// stacks with libxev's io_uring behaviour where a single `run(.once)` may
+/// process many CQEs before returning — a major contributor to slot-driver
+/// stalls on aggregators (#863). The chain-worker thread uses unbounded
+/// `replayPendingAttestations` instead.
+pub const REPLAY_PENDING_ATTESTATIONS_LIBXEV_BUDGET: usize = 48;
+
+/// Same as `REPLAY_PENDING_ATTESTATIONS_LIBXEV_BUDGET` but for aggregated
+/// attestations (each replay runs aggregate XMSS verify).
+pub const REPLAY_PENDING_AGGREGATIONS_LIBXEV_BUDGET: usize = 8;
+
 // Maximum depth for recursive block fetching
 // When fetching parent blocks, we stop after this many levels to avoid infinite loops
 pub const MAX_BLOCK_FETCH_DEPTH = 512;

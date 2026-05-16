@@ -602,9 +602,12 @@ pub const BeamChain = struct {
     /// MUST be called from the chain-worker thread, or from the libxev
     /// thread when the worker is disabled / when `BeamChain` handles
     /// `onBlock` + `onBlockFollowup` directly (gossip, RPC, pending-queue,
-    /// publish paths — same thread as other chain mutations). Holds the
-    /// buffer mutex only across the swap-out / re-append; validation runs
-    /// lock-free over locally-owned slices.
+    /// publish paths — same thread as other chain mutations). When the
+    /// chain-worker is enabled, libxev-thread `BeamNode` paths that replay
+    /// after block import should prefer `replayPendingAttestationsLibxevBudget`
+    /// so a deep pending buffer cannot stall the slot driver (#863).
+    /// Holds the buffer mutex only across the swap-out / re-append;
+    /// validation runs lock-free over locally-owned slices.
     pub fn replayPendingAttestations(self: *Self) void {
         // Swap the buffers out under lock so producers can keep
         // appending into fresh empty buffers while we drain.
@@ -626,6 +629,41 @@ pub const BeamChain = struct {
         }
         for (aggs.items) |*agg| {
             self.replayOneAggregation(agg);
+        }
+    }
+
+    /// Like `replayPendingAttestations`, but caps how many entries are
+    /// processed per call so libxev-thread producers (RPC, cache, publish)
+    /// cannot monopolize the slot driver for seconds when the pending buffers
+    /// are deep (#863, aggregator-heavy devnets).
+    ///
+    /// The chain-worker path continues to use `replayPendingAttestations`
+    /// (unbounded) because it does not share the libxev clock thread.
+    pub fn replayPendingAttestationsLibxevBudget(self: *Self) void {
+        const is_agg = self.is_aggregator_enabled.load(.acquire);
+
+        var a_done: usize = 0;
+        while (a_done < constants.REPLAY_PENDING_ATTESTATIONS_LIBXEV_BUDGET) : (a_done += 1) {
+            self.pending_attestations_mutex.lock();
+            if (self.pending_attestations.items.len == 0) {
+                self.pending_attestations_mutex.unlock();
+                break;
+            }
+            const gossip = self.pending_attestations.orderedRemove(0);
+            self.pending_attestations_mutex.unlock();
+            self.replayOneAttestation(gossip, is_agg);
+        }
+
+        var g_done: usize = 0;
+        while (g_done < constants.REPLAY_PENDING_AGGREGATIONS_LIBXEV_BUDGET) : (g_done += 1) {
+            self.pending_attestations_mutex.lock();
+            if (self.pending_aggregated_attestations.items.len == 0) {
+                self.pending_attestations_mutex.unlock();
+                break;
+            }
+            var agg_owned = self.pending_aggregated_attestations.orderedRemove(0);
+            self.pending_attestations_mutex.unlock();
+            self.replayOneAggregation(&agg_owned);
         }
     }
 
@@ -1034,18 +1072,19 @@ pub const BeamChain = struct {
     }
 
     /// Route a `processPendingBlocks` tick through the worker queue.
-    /// (Not migrated by any caller in commit 3 — included so the
-    /// vtable + queue plumbing is exercised end-to-end and the API
-    /// shape is stable for the follow-up commit that migrates the
-    /// libxev tick path.)
     pub fn submitProcessPendingBlocks(self: *Self, current_slot: types.Slot) SubmitError!void {
         const w = self.chain_worker orelse return error.ChainWorkerDisabled;
         try w.sendBlock(.{ .process_pending_blocks = .{ .current_slot = current_slot } });
     }
 
+    /// Returns whether the background chain-worker thread is active.
+    pub fn chainWorkerEnabled(self: *const Self) bool {
+        return self.chain_worker != null;
+    }
+
     /// Route a `processFinalizationFollowup` move-off through the worker queue.
-    /// (Not migrated by any caller in commit 3; see
-    /// `submitProcessPendingBlocks` for the rationale.)
+    /// (Not yet called from production; reserved for the finalization follow-up
+    /// migration off the libxev thread.)
     pub fn submitProcessFinalizationFollowup(
         self: *Self,
         previous_finalized: types.Checkpoint,
