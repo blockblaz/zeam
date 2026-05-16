@@ -660,22 +660,37 @@ pub const ChainWorker = struct {
     }
 
     /// Enqueue a `replay_pending_attestations` nudge on the attestation
-    /// queue. Same wake/backpressure contract as `sendAttestation` —
-    /// `error.QueueFull` returns immediately and increments the
-    /// `attestation`-labelled drop metric. Producers (libxev fallback
-    /// paths after a synchronous `chain.onBlock`, `BeamNode.publishBlock`
-    /// after publishing a locally produced block) treat a full-queue
-    /// drop as benign: the next worker `on_block` dispatch already
-    /// runs `replayPendingAttestations`, and the buffers themselves are
-    /// FIFO-bounded so a missed replay just delays a few entries by
-    /// one block-cycle. Routed onto the attestation queue (rather than
-    /// adding a fourth queue) because the work it triggers is per-
-    /// attestation/per-aggregation; the queue-depth metric label
-    /// stays consistent with the workload it gates.
+    /// queue. Same wake/backpressure contract as `sendAttestation` but
+    /// with its OWN drop label (`replay_pending`) so it doesn't muddy
+    /// the per-attestation-message queue-depth metric (zclawz review on
+    /// PR #890): one nudge fans out into N replays inside the worker,
+    /// so charging it against `queue="attestation"` would make
+    /// dashboards read "attestation throughput fine" while the
+    /// pending-buffer behind it sits at 800+ entries. The buffer
+    /// depth itself is already exposed via
+    /// `lean_pending_attestations_size{kind=attestation|aggregation}`
+    /// — operators looking for "how full is the replay backlog?"
+    /// should read that gauge.
+    ///
+    /// Producers (libxev fallback paths after a synchronous
+    /// `chain.onBlock`, `BeamNode.publishBlock` after publishing a
+    /// locally produced block) treat a full-queue drop as benign in
+    /// the steady-state aggregator case: the next worker `on_block`
+    /// dispatch already runs `replayPendingAttestations`, and the
+    /// buffers themselves are FIFO-bounded
+    /// (`MAX_PENDING_ATTESTATIONS`) so a missed replay just delays a
+    /// few entries by one block-cycle. Tail behaviour for an isolated
+    /// node producing in a quiet network (no inbound `on_block` to
+    /// piggy-back on): buffered attestations age behind FIFO eviction
+    /// — at the spec's 1024-cap that is ~hundreds of slots of
+    /// inbound traffic before head-of-line eviction kicks in.
+    /// Operators monitor `lean_chain_queue_dropped_total{queue=replay_pending}`
+    /// rate against `lean_pending_attestations_size` to spot a stuck
+    /// node.
     pub fn sendReplayPending(self: *Self) AttestationQueue.TrySendError!void {
         self.attestation_queue.trySend(.{ .replay_pending_attestations = {} }) catch |err| {
             if (err == error.QueueFull) {
-                zeam_metrics.metrics.lean_chain_queue_dropped_total.incr(.{ .queue = "attestation" }) catch {};
+                zeam_metrics.metrics.lean_chain_queue_dropped_total.incr(.{ .queue = "replay_pending" }) catch {};
             }
             return err;
         };

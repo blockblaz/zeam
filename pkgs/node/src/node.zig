@@ -183,22 +183,35 @@ pub const BeamNode = struct {
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
         chain.setImportedBlockCallback(self, handleChainImportedBlock);
+        chain.setRejectedBlockCallback(self, handleChainRejectedBlock);
 
         network_init_cleanup = false;
     }
 
     pub fn deinit(self: *Self) void {
-        self.batch_pending_parent_roots.deinit();
-        // Order matters under #890: the chain-worker's
-        // `imported_block_fn` callback (`handleChainImportedBlock`)
-        // touches `self.network` (cache removal, missing-root fetches,
-        // pending-parent flush). `BeamChain.deinit` is what
-        // stops/joins the worker thread, so it MUST run before
-        // `network.deinit()` — otherwise a still-draining worker
-        // dispatch fires the callback against a freed `LockedMap`
-        // (alignment panic on the cache hashmap header).
+        // Order matters under #890. `chain.deinit()` is what stops/
+        // joins the chain-worker thread, so any state the worker
+        // callbacks (`handleChainImportedBlock`,
+        // `handleChainRejectedBlock`) reach into MUST outlive the
+        // join. Concretely the callbacks touch:
+        //
+        //   * `self.network`            (cache removal, missing-root
+        //                                fetches, pre-finalized prune)
+        //   * `self.batch_pending_parent_roots` + its lock
+        //                                (`flushPendingParentFetches`,
+        //                                `cacheBlockAndFetchParent`)
+        //   * `self.chain.forkChoice`   (already torn down inside
+        //                                `chain.deinit` — but only
+        //                                AFTER the worker has joined,
+        //                                so still safe)
+        //
+        // Any new BeamNode field a worker callback can reach must be
+        // deinit'd AFTER `chain.deinit()` — failure surfaces as an
+        // alignment panic / UAF on the still-draining worker
+        // dispatch (zclawz review on PR #890).
         self.chain.deinit();
         self.allocator.destroy(self.chain);
+        self.batch_pending_parent_roots.deinit();
         self.network.deinit();
     }
 
@@ -517,17 +530,96 @@ pub const BeamNode = struct {
         self.flushPendingParentFetches();
     }
 
+    /// Rejected-block backchannel handler (#890 zclawz review). Fires
+    /// from `BeamChain.chainWorkerOnBlockThunk` ONLY when worker-side
+    /// `onBlock` returns `MissingPreState` or `PreFinalizedSlot` —
+    /// the two errors caused by a TOCTOU race between the libxev
+    /// caller's `forkChoice.hasBlock(parent)` pre-check inside
+    /// `trySubmitImportToWorker` and the worker's eventual dispatch
+    /// (finalization can prune the parent in between). Without this
+    /// hand-back the worker would silently drop the block — sync
+    /// would stall until a re-broadcast.
+    ///
+    /// The callback DOES NOT take ownership of `signed_block`; the
+    /// worker's `Message.deinit` frees it after this call returns.
+    /// `cacheBlockAndFetchParent` clones internally, matching the
+    /// inline `processBlockByRootChunk` MissingPreState arm. Same
+    /// threading contract as `handleChainImportedBlock`.
+    fn handleChainRejectedBlock(
+        ptr: *anyopaque,
+        signed_block: *const types.SignedBlock,
+        block_root: types.Root,
+        reason: chainFactory.BeamChain.RejectedBlockReason,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        switch (reason) {
+            .missing_pre_state => {
+                // Mirror the inline `processBlockByRootChunk`
+                // MissingPreState arm. Use depth=1 since the libxev
+                // caller already accepted this block (depth 0); a
+                // subsequent parent fetch is the next hop.
+                if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
+                    self.logger.debug(
+                        "chain-worker rejected MissingPreState slot={d} root=0x{x}, cached + fetching parent 0x{x}",
+                        .{ signed_block.block.slot, &block_root, &parent_root },
+                    );
+                } else |cache_err| {
+                    if (cache_err == CacheBlockError.PreFinalized) {
+                        self.logger.info(
+                            "chain-worker rejected MissingPreState slot={d} root=0x{x} but block is now pre-finalized; pruning cached descendants",
+                            .{ signed_block.block.slot, &block_root },
+                        );
+                        _ = self.network.pruneCachedBlocks(block_root, null);
+                    } else if (cache_err == CacheBlockError.AlreadyCached) {
+                        self.logger.debug(
+                            "chain-worker rejected MissingPreState slot={d} root=0x{x} but block already cached (concurrent re-arrival)",
+                            .{ signed_block.block.slot, &block_root },
+                        );
+                    } else {
+                        self.logger.warn(
+                            "chain-worker rejected MissingPreState slot={d} root=0x{x}: cache failed: {any}",
+                            .{ signed_block.block.slot, &block_root, cache_err },
+                        );
+                    }
+                }
+                self.flushPendingParentFetches();
+            },
+            .pre_finalized => {
+                self.logger.info(
+                    "chain-worker rejected PreFinalizedSlot slot={d} root=0x{x}; pruning cached descendants",
+                    .{ signed_block.block.slot, &block_root },
+                );
+                _ = self.network.pruneCachedBlocks(block_root, null);
+            },
+        }
+    }
+
     /// Replay the chain's pending-attestation buffers without
     /// blocking the libxev thread (#890). Routes to the chain-worker
     /// queue when the worker is enabled (the worker drains the
     /// buffers off-thread in `chainWorkerReplayPendingAttestationsThunk`),
     /// falls back to the synchronous `replayPendingAttestations` only
     /// when the worker is disabled — in that mode libxev IS the chain
-    /// thread, so a direct call is the only option. `error.QueueFull`
-    /// / `error.QueueClosed` from the worker submit are non-fatal:
-    /// the chain-worker's own `on_block` thunk replays after every
-    /// successful block import, so a missed nudge just delays a few
-    /// buffered entries by one block-cycle.
+    /// thread, so a direct call is the only option.
+    ///
+    /// `error.QueueFull` / `error.QueueClosed` from the worker submit
+    /// are non-fatal in the steady-state aggregator case: the
+    /// chain-worker's own `on_block` thunk runs `replayPendingAttestations`
+    /// after every successful import, and gossip blocks land within a
+    /// slot, so a missed nudge just delays a few buffered entries by
+    /// one block-cycle.
+    ///
+    /// Tail behaviour for an isolated node (zclawz review on PR
+    /// #890): if the producer is `publishBlock` (we just produced
+    /// locally and there is no inbound `on_block` to piggy-back on)
+    /// AND the queue happens to be full AND no other gossip block
+    /// arrives, buffered attestations sit until the FIFO eviction
+    /// tail of the bounded buffer kicks in
+    /// (`MAX_PENDING_ATTESTATIONS = 1024`). Operators should monitor
+    /// `lean_chain_queue_dropped_total{queue="replay_pending"}` against
+    /// `lean_pending_attestations_size{kind=...}` to detect this in
+    /// dashboards. The drop is logged at debug because the
+    /// steady-state path is benign.
     fn replayPendingAttestationsAsync(self: *Self) void {
         self.chain.submitReplayPendingAttestations() catch |err| switch (err) {
             error.ChainWorkerDisabled => self.chain.replayPendingAttestations(),
@@ -548,13 +640,17 @@ pub const BeamNode = struct {
     /// the SSZ clone needed to transfer ownership failed; the caller
     /// is then responsible for the inline fallback path.
     ///
-    /// Caller pre-conditions (so we never queue a block that would
-    /// fail with errors the worker can't recover from): the block's
-    /// parent MUST already be in the forkchoice. The chain-worker
-    /// thunk only logs on error (it has no network handle to drive
-    /// recursive parent fetches), so a `MissingPreState` or
-    /// `PreFinalizedSlot` from `onBlock` would otherwise strand sync.
-    /// The libxev caller keeps those error paths.
+    /// Caller pre-condition: the libxev caller MUST have observed
+    /// the parent under `forkChoice.hasBlock` before submitting.
+    /// The check is racy by design: finalization can advance and
+    /// prune the parent between the check and the worker's
+    /// eventual dispatch. The race is closed by the rejected-block
+    /// backchannel — `chainWorkerOnBlockThunk` invokes
+    /// `handleChainRejectedBlock` on `MissingPreState` /
+    /// `PreFinalizedSlot`, which runs the same `cacheBlockAndFetch
+    /// Parent` / `pruneCachedBlocks` path the inline
+    /// `processBlockByRootChunk` would have taken. Net effect: the
+    /// worker can never strand sync on this race.
     fn trySubmitImportToWorker(
         self: *Self,
         signed_block: *const types.SignedBlock,
@@ -927,19 +1023,18 @@ pub const BeamNode = struct {
                 return;
             }
 
-            // #890: route to the chain-worker when the parent is already
-            // resolved. The MissingPreState fallback (cache + fetch
-            // parent) below stays libxev-side because the chain-worker
-            // thunk has no network handle to recurse — see
-            // `trySubmitImportToWorker` doc.
+            // #890: route to the chain-worker when the parent is
+            // already resolved. The MissingPreState / PreFinalizedSlot
+            // race against finalization is closed by the rejected-
+            // block backchannel — `handleChainRejectedBlock` runs
+            // the same cache-and-fetch / prune path the inline arm
+            // below would. See `trySubmitImportToWorker` doc.
             if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
                 if (self.trySubmitImportToWorker(signed_block, block_root)) {
                     // Worker takes ownership; followup (cached
-                    // descendants + missing-root fetch + replay) runs
-                    // from the imported-block callback. We still flush
-                    // any parent fetches accumulated on the libxev
-                    // side during the pre-checks above.
-                    self.flushPendingParentFetches();
+                    // descendants + missing-root fetch + replay +
+                    // parent-fetch flush) all run from the imported-
+                    // block callback. No redundant flush here.
                     return;
                 }
                 // Submit failed (worker disabled / queue full); fall
@@ -1067,12 +1162,12 @@ pub const BeamNode = struct {
         }
 
         // #890: route to the chain-worker when the parent is already
-        // resolved. By-range chunks arrive slot-ordered so this is the
-        // common case after the first chunk; the
-        // MissingPreState/cache-and-fetch fallback below stays inline.
+        // resolved. By-range chunks arrive slot-ordered so this is
+        // the common case after the first chunk. The TOCTOU race
+        // against finalization is closed by `handleChainRejectedBlock`
+        // — see `trySubmitImportToWorker` doc.
         if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
             if (self.trySubmitImportToWorker(signed_block, block_root)) {
-                self.flushPendingParentFetches();
                 return;
             }
         }
