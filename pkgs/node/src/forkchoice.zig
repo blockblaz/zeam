@@ -966,6 +966,71 @@ pub const ForkChoice = struct {
         signatures: types.AttestationSignatures,
     };
 
+    /// Checks whether `slot` is justified under the given tracking state,
+    /// matching leanSpec `build_block`'s `current_justified_slots.is_slot_justified`
+    /// (leanSpec commit 00556d8).
+    /// Returns `false` (never an error) when `slot` is beyond the current
+    /// justified_slots window — those slots are simply not yet justified.
+    /// Slots at or before `finalized_slot` are implicitly justified (return `true`).
+    fn isSlotJustifiedForBuild(
+        finalized_slot: types.Slot,
+        justified_slots: *const types.JustifiedSlots,
+        slot: types.Slot,
+    ) bool {
+        if (slot <= finalized_slot) return true;
+        // idx = slot - (finalized_slot + 1)
+        const idx: usize = @intCast(slot - finalized_slot - 1);
+        if (idx >= justified_slots.len()) return false;
+        return justified_slots.get(idx) catch false;
+    }
+
+    /// Mirrors leanSpec `_attestation_data_matches_chain` (leanSpec commit 00556d8).
+    /// Checks whether `att_data`'s source and target roots are consistent with
+    /// the *extended* historical block hashes view — i.e. `state.historical_block_hashes`
+    /// as it would appear after `process_block_header` on the candidate block:
+    ///
+    ///   extended = historical_block_hashes + [parent_root] + [ZERO_HASH] * num_empty_slots
+    ///
+    /// Receives the pre-state's `historical_block_hashes` and the candidate
+    /// `parent_root` separately to avoid an allocation; `hist_len` is computed
+    /// internally from the slice length.
+    /// Also rejects attestations whose source or target root is the zero hash.
+    fn attestationDataMatchesChainExtended(
+        historical_block_hashes: *const types.HistoricalBlockHashes,
+        parent_root: [32]u8,
+        att_data: types.AttestationData,
+    ) bool {
+        const ZERO_HASH = types.ZERO_HASH;
+        if (std.mem.eql(u8, &att_data.source.root, &ZERO_HASH)) return false;
+        if (std.mem.eql(u8, &att_data.target.root, &ZERO_HASH)) return false;
+
+        const hist_len: u64 = @intCast(historical_block_hashes.len());
+        const hist_slice = historical_block_hashes.constSlice();
+        const source_slot: u64 = att_data.source.slot;
+        const target_slot: u64 = att_data.target.slot;
+
+        // Resolve a slot index against the extended view:
+        //   [0, hist_len)  → historical_block_hashes[i]
+        //   hist_len       → parent_root (the parent block's slot)
+        //   > hist_len     → ZERO_HASH  (empty slots; will fail equality check)
+        const stored_source: [32]u8 = if (source_slot < hist_len)
+            hist_slice[source_slot]
+        else if (source_slot == hist_len)
+            parent_root
+        else
+            ZERO_HASH;
+
+        const stored_target: [32]u8 = if (target_slot < hist_len)
+            hist_slice[target_slot]
+        else if (target_slot == hist_len)
+            parent_root
+        else
+            ZERO_HASH;
+
+        return std.mem.eql(u8, &att_data.source.root, &stored_source) and
+            std.mem.eql(u8, &att_data.target.root, &stored_target);
+    }
+
     fn getProposalAttestationsUnlocked(
         self: *Self,
         pre_state: *const types.BeamState,
@@ -989,26 +1054,45 @@ pub const ForkChoice = struct {
 
         // Fixed-point attestation collection with greedy proof selection.
         //
-        // For the current latest_justified checkpoint, find matching attestation_data
-        // entries in latest_known_aggregated_payloads and greedily select proofs that
-        // maximize new validator coverage. Then apply STF to check if justification
-        // changed. If it did, look for entries matching the new justified checkpoint
-        // and repeat. If no matching entries exist or justification did not change,
-        // block production is done.
-        // When building on top of genesis (slot 0), process_block_header will
-        // update the justified root to parent_root. Apply the same derivation
-        // here so attestation sources match (leanSpec d0c5030).
-        var current_justified_root = if (pre_state.latest_block_header.slot == 0)
-            parent_root
-        else
-            pre_state.latest_justified.root;
+        // leanSpec `build_block` (commit 00556d8): instead of filtering by a single
+        // justified root, we now accept any attestation whose *source slot* is marked
+        // justified in `current_justified_slots`. This allows older-but-still-justified
+        // sources to appear in a block, not just the latest justified checkpoint.
+        //
+        // The extended historical block hashes view (pre_state hashes + parent_root +
+        // zero-hashes for empty slots) is used to validate source/target roots without
+        // running the full STF first.
+        //
+        // The loop restarts whenever justification OR finalization advances so we can
+        // pick up attestations that become valid only after a justification update.
+        var current_finalized_slot: types.Slot = pre_state.latest_finalized.slot;
+        // Spec note (leanSpec d0c5030 / commit 00556d8): when building on top of genesis
+        // (pre_state.latest_block_header.slot == 0), process_block_header would set
+        // latest_justified.root = parent_root. The old code applied that same derivation
+        // eagerly so the source-root filter matched. With the new slot-based filter we no
+        // longer need the root at all — we only test whether the source *slot* is justified.
+        // At genesis, slot 0 <= finalized_slot 0 so isSlotJustifiedForBuild returns true
+        // unconditionally, which is correct. The one observable difference is that the first
+        // STF run will see justified_changed == true (pre_state has ZERO_HASH root; post-state
+        // has parent_root) and do one extra loop iteration. That iteration finds no new
+        // entries (genesis self-votes are already in processed_att_data) and breaks, so the
+        // output is identical — the extra iteration is intentionally accepted in exchange for
+        // simpler code with no genesis special-case.
+        var current_justified: types.Checkpoint = pre_state.latest_justified;
+
+        // Clone pre_state.justified_slots so we can update it across loop iterations
+        // without touching the immutable pre_state.
+        var current_justified_slots: types.JustifiedSlots = undefined;
+        try types.sszClone(self.allocator, types.JustifiedSlots, pre_state.justified_slots, &current_justified_slots);
+        defer current_justified_slots.deinit();
+
         var processed_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
         defer processed_att_data.deinit();
 
         while (true) {
-            // Find all attestation_data entries whose source matches the current justified checkpoint
-            // and greedily select proofs maximizing new validator coverage for each.
-            // Collect entries and sort by target slot for deterministic processing order.
+            // Find attestation_data entries whose source slot is justified on this chain,
+            // that reference blocks we know about, and whose target is not yet justified.
+            // Collect and sort by target slot for deterministic processing order.
             const MapEntry = struct {
                 att_data: *types.AttestationData,
                 payloads: *types.AggregatedPayloadsList,
@@ -1018,10 +1102,30 @@ pub const ForkChoice = struct {
 
             var payload_it = self.latest_known_aggregated_payloads.iterator();
             while (payload_it.next()) |entry| {
-                if (!std.mem.eql(u8, &current_justified_root, &entry.key_ptr.source.root)) continue;
-                if (!self.protoArray.indices.contains(entry.key_ptr.head.root)) continue;
-                if (processed_att_data.contains(entry.key_ptr.*)) continue;
-                try sorted_entries.append(self.allocator, .{ .att_data = entry.key_ptr, .payloads = entry.value_ptr });
+                const att_data = entry.key_ptr;
+
+                // Source slot must already be justified on this chain (leanSpec build_block).
+                if (!isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.source.slot)) continue;
+
+                // Source and target roots must match our chain's historical block hashes
+                // (extended to include parent_root and empty-slot zeros up to slot-1).
+                // Also rejects zero-hash source or target roots inline.
+                if (!attestationDataMatchesChainExtended(&pre_state.historical_block_hashes, parent_root, att_data.*)) continue;
+
+                // Skip attestations whose target slot is already justified on this chain,
+                // except for genesis self-votes used for fork-choice bootstrapping.
+                const is_genesis_self_vote = att_data.source.slot == 0 and att_data.target.slot == 0;
+                if (!is_genesis_self_vote and isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
+
+                if (!self.protoArray.indices.contains(att_data.head.root)) continue;
+                // Spec divergence (intentional): leanSpec removed the processed_att_data
+                // dedup in this commit, relying on a final proof_groups compaction pass.
+                // Zeam keeps it because we compact *inside* the loop and each AttestationData
+                // is processed exactly once per outer iteration. Removing the skip here would
+                // re-select the same entry on loop restarts, producing duplicate attestations
+                // in the candidate without changing the final justified checkpoint.
+                if (processed_att_data.contains(att_data.*)) continue;
+                try sorted_entries.append(self.allocator, .{ .att_data = att_data, .payloads = entry.value_ptr });
             }
 
             std.mem.sort(MapEntry, sorted_entries.items, {}, struct {
@@ -1138,13 +1242,27 @@ pub const ForkChoice = struct {
             try candidate_state.process_slots(self.allocator, slot, self.logger);
             try candidate_state.process_block(self.allocator, candidate_block, self.logger, null);
 
-            if (!std.mem.eql(u8, &candidate_state.latest_justified.root, &current_justified_root)) {
-                // Justification changed - look for entries matching the new checkpoint
-                current_justified_root = candidate_state.latest_justified.root;
+            // Restart if justification or finalization advanced (leanSpec build_block).
+            // When either changes, update all tracking state and re-scan for newly
+            // eligible attestations (older sources whose slots are now justified, or
+            // targets that were previously already-justified but aren't after a finality
+            // shift).
+            const justified_changed = !std.mem.eql(u8, &candidate_state.latest_justified.root, &current_justified.root) or
+                candidate_state.latest_justified.slot != current_justified.slot;
+            const finalized_changed = candidate_state.latest_finalized.slot != current_finalized_slot;
+            if (justified_changed or finalized_changed) {
+                current_justified = candidate_state.latest_justified;
+                current_finalized_slot = candidate_state.latest_finalized.slot;
+                // Swap in the updated justified_slots (clone first so candidate_state
+                // can be safely deinitialized at end of this iteration).
+                var new_justified_slots: types.JustifiedSlots = undefined;
+                try types.sszClone(self.allocator, types.JustifiedSlots, candidate_state.justified_slots, &new_justified_slots);
+                current_justified_slots.deinit();
+                current_justified_slots = new_justified_slots;
                 continue;
             }
 
-            // Justification unchanged or no new entries - block production done
+            // Justification and finalization unchanged - block production done.
             break;
         }
 
