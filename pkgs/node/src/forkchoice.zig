@@ -967,7 +967,8 @@ pub const ForkChoice = struct {
     };
 
     /// Checks whether `slot` is justified under the given tracking state,
-    /// matching leanSpec `build_block`'s `current_justified_slots.is_slot_justified`.
+    /// matching leanSpec `build_block`'s `current_justified_slots.is_slot_justified`
+    /// (leanSpec commit 00556d8).
     /// Returns `false` (never an error) when `slot` is beyond the current
     /// justified_slots window — those slots are simply not yet justified.
     /// Slots at or before `finalized_slot` are implicitly justified (return `true`).
@@ -983,6 +984,7 @@ pub const ForkChoice = struct {
         return justified_slots.get(idx) catch false;
     }
 
+    /// Mirrors leanSpec `_attestation_data_matches_chain` (leanSpec commit 00556d8).
     /// Checks whether `att_data`'s source and target roots are consistent with
     /// the *extended* historical block hashes view — i.e. `state.historical_block_hashes`
     /// as it would appear after `process_block_header` on the candidate block:
