@@ -3,6 +3,7 @@ const networks = @import("@zeam/network");
 const types = @import("@zeam/types");
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 const ssz = @import("ssz");
 const locking = @import("./locking.zig");
 
@@ -95,6 +96,23 @@ pub const BlocksByRootRequestResult = struct {
     }
 };
 
+/// Issue #863 P3: cap on outbound `BlocksByRoot` RPCs in flight at any
+/// given moment. The pre-#863 path issued one RPC per attestation that
+/// referenced an unknown head, multiplied by 4× subnet fanout for an
+/// aggregator — under flood the libxev thread fanned hundreds of
+/// concurrent RPCs that themselves timed out (8s default per
+/// `RPC_REQUEST_TIMEOUT_SECONDS`) and retried, saturating the loop and
+/// the timed-out-requests sweep.
+///
+/// 8 is empirically generous: each RPC fetches up to MAX_BLOCKS_BY_ROOT
+/// roots in one batch, so 8 in-flight covers ~64 missing roots
+/// concurrently — comfortably above the worst observed sustained
+/// missing-root rate while keeping the RPC dispatch fan-out bounded.
+/// Tune by watching `zeam_blocks_by_root_inflight` saturate at this
+/// value combined with `lean_block_fetch_dedup_total{outcome="inflight_cap"}`
+/// climbing — under healthy operation neither should be hot.
+pub const MAX_CONCURRENT_BLOCKS_BY_ROOT: u32 = 8;
+
 pub const Network = struct {
     allocator: Allocator,
     backend: networks.NetworkInterface,
@@ -113,6 +131,17 @@ pub const Network = struct {
     /// no other thread reads it).
     timed_out_requests: std.ArrayList(u64) = .empty,
     timed_out_requests_lock: zeam_utils.SyncMutex = .{},
+
+    /// Issue #863 P3: in-flight outbound `BlocksByRoot` RPC count.
+    /// Incremented by `ensureBlocksByRootRequest` after a successful
+    /// dispatch, decremented by `finalizePendingRequest` regardless of
+    /// success / timeout / peer disconnect. Read by
+    /// `ensureBlocksByRootRequest` to enforce
+    /// `MAX_CONCURRENT_BLOCKS_BY_ROOT` and exported as
+    /// `zeam_blocks_by_root_inflight`. Atomic so the timeout sweep
+    /// thread (`processTimedOutRequests`) and the gossip dispatch
+    /// path on the libxev thread don't tear it.
+    blocks_by_root_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     const Self = @This();
 
@@ -711,6 +740,14 @@ pub const Network = struct {
         return request_id;
     }
 
+    /// Issue #863 P3: errors that signal "request would exceed the
+    /// in-flight cap" so the caller can bucket them as a soft-rejection
+    /// rather than a hard error. This is intentionally a separate error
+    /// from `error.NoPeersAvailable` because the calling code in
+    /// `BeamNode.fetchBlockByRoots` accounts for both in different
+    /// `lean_block_fetch_dedup_total{outcome=…}` buckets.
+    pub const EnsureBlocksByRootError = error{InFlightCapReached};
+
     pub fn ensureBlocksByRootRequest(
         self: *Self,
         roots: []const types.Root,
@@ -721,12 +758,43 @@ pub const Network = struct {
 
         if (!self.shouldRequestBlocksByRoot(roots)) return null;
 
+        // Issue #863 P3: enforce the in-flight cap BEFORE `selectPeer`
+        // so a saturated cap doesn't burn a peer-selection round trip.
+        // The compare-and-set loop is monotonic; under contention each
+        // attempt observes the latest count, so a concurrent finalize
+        // (decrement) is reflected on the next iteration.
+        while (true) {
+            const cur = self.blocks_by_root_inflight.load(.monotonic);
+            if (cur >= MAX_CONCURRENT_BLOCKS_BY_ROOT) {
+                return error.InFlightCapReached;
+            }
+            if (self.blocks_by_root_inflight.cmpxchgWeak(cur, cur + 1, .acq_rel, .monotonic) == null) {
+                // Reservation succeeded — we now own one in-flight slot
+                // until either (a) the dispatch path below errors and we
+                // release explicitly, or (b) the request completes and
+                // `finalizePendingRequest` releases it.
+                break;
+            }
+        }
+
+        // Reservation released on any error path before the request_id
+        // is recorded in `pending_rpc_requests`. After dispatch, the
+        // slot stays held until `finalizePendingRequest` runs.
+        var reservation_owned = true;
+        errdefer if (reservation_owned) {
+            _ = self.blocks_by_root_inflight.fetchSub(1, .acq_rel);
+            zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
+        };
+
         const peer = (try self.selectPeer()) orelse return error.NoPeersAvailable;
         var peer_owned = true;
         errdefer if (peer_owned) self.allocator.free(peer);
 
         const request_id = try self.sendBlocksByRootRequest(peer, roots, depth, handler);
         peer_owned = false; // ownership transferred to result
+        reservation_owned = false; // ownership transferred to pending_rpc_requests
+
+        zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
 
         return BlocksByRootRequestResult{
             .peer_id = peer,
@@ -832,6 +900,12 @@ pub const Network = struct {
                     for (block_ctx.requested_roots) |root| {
                         _ = self.removePendingBlockRoot(root);
                     }
+                    // Issue #863 P3: release the in-flight slot reserved by
+                    // `ensureBlocksByRootRequest`. Decrement is unconditional
+                    // (success / timeout / disconnect / cancellation all flow
+                    // through here).
+                    _ = self.blocks_by_root_inflight.fetchSub(1, .acq_rel);
+                    zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
                 },
                 .blocks_by_range => {},
                 .status => {},

@@ -70,6 +70,17 @@ pub const MAX_FUTURE_SLOT_QUEUE_TOLERANCE: u64 = 256;
 // can find the spec source when leanSpec test vectors land.
 pub const MAX_PENDING_BLOCKS: usize = 1024;
 
+// Maximum buffered gossip attestations / aggregations awaiting their
+// referenced block to be processed. Direct mirror of leanSpec
+// `subspecs/sync/config.py::MAX_PENDING_ATTESTATIONS` (also 1024).
+//
+// The buffer underwrites the spec's "validate, on AssertionError buffer
+// for replay" lifecycle (`subspecs/sync/service.py::on_gossip_attestation`,
+// retried on every successful `on_gossip_block`). Keeping the bound in
+// sync with the spec value ensures replay churn stays within spec test
+// vectors. FIFO eviction matches the spec's "drop oldest" policy.
+pub const MAX_PENDING_ATTESTATIONS: usize = 1024;
+
 // Maximum depth for recursive block fetching
 // When fetching parent blocks, we stop after this many levels to avoid infinite loops
 pub const MAX_BLOCK_FETCH_DEPTH = 512;

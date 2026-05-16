@@ -311,6 +311,26 @@ pub const BeamChain = struct {
     /// stop/deinit/destroy ordering at the top of `BeamChain.deinit`.
     chain_worker: ?*chain_worker.ChainWorker = null,
 
+    /// leanSpec parity (`subspecs/sync/service.py::_pending_attestations`,
+    /// `_pending_aggregated_attestations`): gossip attestations whose
+    /// referenced source/target/head block is not yet imported, OR whose
+    /// slot is still in the future, are buffered here for replay after
+    /// the next successful `onBlock` import (`_replay_pending_attestations`
+    /// in the spec; mirrored by `replayPendingAttestations` below).
+    ///
+    /// Capacity bounded by `constants.MAX_PENDING_ATTESTATIONS` (1024,
+    /// the spec's `MAX_PENDING_ATTESTATIONS`); FIFO eviction once full.
+    ///
+    /// Concurrency: appends happen on the chain-worker thread (gossip
+    /// dispatch lands in `chainWorkerOn*Thunk`) and on the calling
+    /// thread when the worker is disabled (tests / single-threaded
+    /// mode). Reads happen during `replayPendingAttestations` from the
+    /// chain-worker thread. Guarded by a mutex so the test path stays
+    /// safe even though prod uses a single writer.
+    pending_attestations_mutex: zeam_utils.SyncMutex = .{},
+    pending_attestations: std.ArrayListUnmanaged(networks.AttestationGossip) = .empty,
+    pending_aggregated_attestations: std.ArrayListUnmanaged(types.SignedAggregatedAttestation) = .empty,
+
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
@@ -402,6 +422,12 @@ pub const BeamChain = struct {
             // aggregate_io: dedicated Io.Threaded for aggregate FFI worker (issue #873).
             .aggregate_io = agg_io,
             .aggregate_group = .init,
+            // leanSpec _pending_attestations / _pending_aggregated_attestations
+            // buffers — empty at init; FIFO-bounded by
+            // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
+            .pending_attestations_mutex = .{},
+            .pending_attestations = .empty,
+            .pending_aggregated_attestations = .empty,
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
@@ -469,6 +495,255 @@ pub const BeamChain = struct {
     }
 
     // ------------------------------------------------------------------
+    // leanSpec pending-attestation buffer (subspecs/sync/service.py)
+    // ------------------------------------------------------------------
+    //
+    // Direct mirror of the spec's `_pending_attestations` and
+    // `_pending_aggregated_attestations` lists plus
+    // `_replay_pending_attestations`. The spec's contract:
+    //
+    //   * Validation failure (AssertionError / KeyError) on a gossip
+    //     attestation/aggregation → append to the pending list.
+    //   * Buffer is bounded by `MAX_PENDING_ATTESTATIONS` (1024 in
+    //     `subspecs/sync/config.py`); FIFO eviction when full.
+    //   * After every successful `on_gossip_block` import, the spec
+    //     calls `_replay_pending_attestations` which drains both
+    //     lists, retries each entry, and re-enqueues anything that
+    //     still fails (next replay attempt).
+    //
+    // Retryable validation errors (per leanSpec
+    // `forks/lstar/spec.py::validate_attestation`):
+    //
+    //   * `error.UnknownHeadBlock` / `UnknownSourceBlock` /
+    //     `UnknownTargetBlock` — the spec's `assert ... in store.blocks`.
+    //   * `error.AttestationTooFarInFuture` — the spec's
+    //     `assert attestation_start_interval <= store.time + GOSSIP_DISPARITY_INTERVALS`.
+    //
+    // Permanent failures (signature mismatch, malformed checkpoint
+    // ordering, slot mismatch) are dropped without buffering.
+
+    /// Append a gossip attestation to the pending buffer for replay
+    /// after the next `onBlock` import. FIFO-evicts the oldest entry
+    /// when the buffer is at `MAX_PENDING_ATTESTATIONS`.
+    ///
+    /// `gossip` is plain-old-data (`AttestationGossip` carries no
+    /// heap allocations — see `network/src/interface.zig`), so the
+    /// value is copied by-value; no clone needed.
+    fn enqueuePendingAttestation(
+        self: *Self,
+        gossip: networks.AttestationGossip,
+        reason: []const u8,
+    ) void {
+        self.pending_attestations_mutex.lock();
+        defer self.pending_attestations_mutex.unlock();
+
+        if (self.pending_attestations.items.len >= constants.MAX_PENDING_ATTESTATIONS) {
+            // FIFO eviction: drop the oldest entry to make room. Spec
+            // semantics — `subspecs/sync/service.py::_pending_attestations[
+            // -MAX_PENDING_ATTESTATIONS:]` slice.
+            _ = self.pending_attestations.orderedRemove(0);
+            zeam_metrics.metrics.lean_pending_attestations_evicted_total.incr(.{ .kind = "attestation" }) catch {};
+        }
+        self.pending_attestations.append(self.allocator, gossip) catch {
+            // OOM on append shouldn't drop the contract — log and
+            // surface via metric. The attestation is lost (same effect
+            // as if FIFO eviction caught it next pass).
+            zeam_metrics.metrics.lean_pending_attestations_evicted_total.incr(.{ .kind = "attestation" }) catch {};
+            return;
+        };
+        zeam_metrics.metrics.lean_pending_attestations_buffered_total.incr(.{ .kind = "attestation", .reason = reason }) catch {};
+        zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, self.pending_attestations.items.len) catch {};
+    }
+
+    /// Append a cloned aggregated attestation to the pending buffer.
+    /// Caller MUST pass an owned clone — the buffer takes ownership and
+    /// will `deinit()` the entry on FIFO eviction, replay drop, or
+    /// `BeamChain.deinit`.
+    fn enqueuePendingAggregation(
+        self: *Self,
+        agg: types.SignedAggregatedAttestation,
+        reason: []const u8,
+    ) void {
+        self.pending_attestations_mutex.lock();
+        defer self.pending_attestations_mutex.unlock();
+
+        if (self.pending_aggregated_attestations.items.len >= constants.MAX_PENDING_ATTESTATIONS) {
+            var evicted = self.pending_aggregated_attestations.orderedRemove(0);
+            evicted.deinit();
+            zeam_metrics.metrics.lean_pending_attestations_evicted_total.incr(.{ .kind = "aggregation" }) catch {};
+        }
+        self.pending_aggregated_attestations.append(self.allocator, agg) catch {
+            // OOM: free the clone we were handed and bump evicted.
+            var lost = agg;
+            lost.deinit();
+            zeam_metrics.metrics.lean_pending_attestations_evicted_total.incr(.{ .kind = "aggregation" }) catch {};
+            return;
+        };
+        zeam_metrics.metrics.lean_pending_attestations_buffered_total.incr(.{ .kind = "aggregation", .reason = reason }) catch {};
+        zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, self.pending_aggregated_attestations.items.len) catch {};
+    }
+
+    /// Drain and retry both pending buffers. Mirrors leanSpec
+    /// `subspecs/sync/service.py::_replay_pending_attestations` which
+    /// the spec calls after every successful `on_gossip_block`.
+    ///
+    /// For each buffered entry: re-run the same validate / verify path
+    /// the libxev-arrived gossip would. Outcomes:
+    ///
+    ///   * `accepted` — validate + signature-verify both succeed; the
+    ///     entry is consumed (storage is per-role: aggregators store
+    ///     in fork-choice, non-aggregators just verify-and-drop).
+    ///   * `buffered` — still missing block / still future-slot; the
+    ///     entry is re-appended to the back of the buffer (spec FIFO
+    ///     "kept in the buffer for the next replay attempt").
+    ///   * `dropped` — permanent failure (signature mismatch, malformed
+    ///     checkpoint ordering); the entry is discarded.
+    ///
+    /// MUST be called from the chain-worker thread, or from the libxev
+    /// thread when the worker is disabled / when `BeamChain` handles
+    /// `onBlock` + `onBlockFollowup` directly (gossip, RPC, pending-queue,
+    /// publish paths — same thread as other chain mutations). Holds the
+    /// buffer mutex only across the swap-out / re-append; validation runs
+    /// lock-free over locally-owned slices.
+    pub fn replayPendingAttestations(self: *Self) void {
+        // Swap the buffers out under lock so producers can keep
+        // appending into fresh empty buffers while we drain.
+        self.pending_attestations_mutex.lock();
+        var atts = self.pending_attestations;
+        self.pending_attestations = .empty;
+        var aggs = self.pending_aggregated_attestations;
+        self.pending_aggregated_attestations = .empty;
+        zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};
+        zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, 0) catch {};
+        self.pending_attestations_mutex.unlock();
+        defer atts.deinit(self.allocator);
+        defer aggs.deinit(self.allocator);
+
+        const is_agg = self.is_aggregator_enabled.load(.acquire);
+
+        for (atts.items) |gossip| {
+            self.replayOneAttestation(gossip, is_agg);
+        }
+        for (aggs.items) |*agg| {
+            self.replayOneAggregation(agg);
+        }
+    }
+
+    /// Inner replay step for a single buffered attestation. The entry
+    /// is consumed unconditionally: on retryable failure we re-enqueue
+    /// (which copies — `AttestationGossip` is POD), on success or
+    /// permanent failure we just drop.
+    fn replayOneAttestation(
+        self: *Self,
+        gossip: networks.AttestationGossip,
+        is_aggregator_role: bool,
+    ) void {
+        self.validateAttestationData(gossip.message.message, false) catch |err| {
+            switch (err) {
+                error.UnknownHeadBlock,
+                error.UnknownSourceBlock,
+                error.UnknownTargetBlock,
+                error.MissingState,
+                => {
+                    self.enqueuePendingAttestation(gossip, "unknown_block");
+                    zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "attestation", .outcome = "buffered" }) catch {};
+                },
+                error.AttestationTooFarInFuture => {
+                    self.enqueuePendingAttestation(gossip, "future_slot");
+                    zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "attestation", .outcome = "buffered" }) catch {};
+                },
+                else => {
+                    zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "attestation", .outcome = "dropped" }) catch {};
+                },
+            }
+            return;
+        };
+
+        // Validation passed on replay. Run signature verify + (for
+        // aggregators) fork-choice tracker update. leanSpec stores in
+        // `attestation_signatures` only for `is_aggregator`; non-
+        // aggregators "validate and drop".
+        self.runVerifiedGossipAttestation(gossip, is_aggregator_role) catch {
+            zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "attestation", .outcome = "dropped" }) catch {};
+            return;
+        };
+        zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "attestation", .outcome = "accepted" }) catch {};
+    }
+
+    /// Inner replay step for a single buffered aggregation. The buffer
+    /// owns the aggregation; on success or permanent failure we
+    /// `deinit()` it; on retryable failure we move ownership back into
+    /// the buffer via `enqueuePendingAggregation` (no clone).
+    fn replayOneAggregation(self: *Self, agg: *types.SignedAggregatedAttestation) void {
+        // Re-run the full gossip aggregation path. `onGossipAggregatedAttestation`
+        // does validate + signature verify + fork-choice store; on
+        // unknown-block we re-enqueue without dropping the clone.
+        self.onGossipAggregatedAttestation(agg.*) catch |err| {
+            switch (err) {
+                error.UnknownHeadBlock,
+                error.UnknownSourceBlock,
+                error.UnknownTargetBlock,
+                error.MissingState,
+                => {
+                    // Move ownership back into the buffer.
+                    self.enqueuePendingAggregation(agg.*, "unknown_block");
+                    zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "aggregation", .outcome = "buffered" }) catch {};
+                    return;
+                },
+                error.AttestationTooFarInFuture => {
+                    self.enqueuePendingAggregation(agg.*, "future_slot");
+                    zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "aggregation", .outcome = "buffered" }) catch {};
+                    return;
+                },
+                else => {
+                    agg.deinit();
+                    zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "aggregation", .outcome = "dropped" }) catch {};
+                    return;
+                },
+            }
+        };
+        agg.deinit();
+        zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "aggregation", .outcome = "accepted" }) catch {};
+    }
+
+    /// Run the post-validation gossip-attestation steps that match the
+    /// spec's `on_gossip_attestation` (signature verify + role-gated
+    /// store). `validateAttestationData` MUST have already run and
+    /// succeeded. Splitting this out lets both the libxev-dispatched
+    /// thunk and `replayOneAttestation` share the same code path.
+    fn runVerifiedGossipAttestation(
+        self: *Self,
+        gossip: networks.AttestationGossip,
+        is_aggregator_role: bool,
+    ) !void {
+        const attestation = gossip.message.toAttestation();
+
+        // Signature verification — run for ALL nodes (spec:
+        // `forks/lstar/spec.py::on_gossip_attestation`, lines 1090-1131).
+        // Non-aggregators verify + drop; aggregators verify + store.
+        var borrow = self.statesGet(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        defer borrow.assertReleasedOrPanic();
+        defer borrow.deinit();
+        try stf.verifySingleAttestation(
+            self.allocator,
+            borrow.state,
+            @intCast(gossip.message.validator_id),
+            &gossip.message.message,
+            &gossip.message.signature,
+        );
+
+        // Role-gated storage — leanSpec: `if is_aggregator: ...`.
+        // zeam's analog of `attestation_signatures` is the per-validator
+        // attestation tracker maintained by `forkChoice.onSignedAttestation`,
+        // which in turn feeds head selection. Skipping it for non-
+        // aggregators matches the spec's "Non-aggregator nodes validate
+        // and drop — they never store gossip signatures" contract.
+        if (is_aggregator_role) {
+            try self.forkChoice.onSignedAttestation(gossip.message);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // chain_worker handler thunks (slice c-2b commit 3)
     // ------------------------------------------------------------------
     //
@@ -530,6 +805,12 @@ pub const BeamChain = struct {
         // ignores the parameter (see the explicit `_ = signedBlock`
         // at its top), so the value is functionally unused here.
         self.onBlockFollowup(prune_forkchoice, &signed_block);
+        // leanSpec parity: `subspecs/sync/service.py::on_gossip_block`
+        // calls `_replay_pending_attestations` after every successful
+        // block import so attestations that referenced unknown blocks
+        // / future slots get a fresh validation attempt against the
+        // updated store.
+        self.replayPendingAttestations();
     }
 
     fn chainWorkerOnGossipAttestationThunk(
@@ -537,12 +818,60 @@ pub const BeamChain = struct {
         gossip: networks.AttestationGossip,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.onGossipAttestation(gossip) catch |err| {
+        // leanSpec parity (`forks/lstar/spec.py::on_gossip_attestation`,
+        // `subspecs/sync/service.py::on_gossip_attestation`):
+        //
+        //   1. Validate (block availability + topology + consistency +
+        //      future-slot bound). On AssertionError-equivalent →
+        //      buffer for replay (`_pending_attestations`). On
+        //      permanent failure → drop.
+        //   2. Verify the XMSS signature. Run for ALL roles (spec's
+        //      `assert self.sig_scheme.verify(...)`).
+        //   3. Store ONLY if `is_aggregator` (spec's `if is_aggregator:
+        //      new_committee_sigs.setdefault(...).add(...)`).
+        const is_aggregator_role = self.is_aggregator_enabled.load(.acquire);
+
+        self.validateAttestationData(gossip.message.message, false) catch |err| {
+            switch (err) {
+                error.UnknownHeadBlock,
+                error.UnknownSourceBlock,
+                error.UnknownTargetBlock,
+                error.MissingState,
+                => {
+                    // Spec says buffer for replay after the next
+                    // `on_gossip_block` import.
+                    self.enqueuePendingAttestation(gossip, "unknown_block");
+                    return;
+                },
+                error.AttestationTooFarInFuture => {
+                    // Spec buffers future-slot attestations too: the
+                    // wall-clock `store.time` may have advanced past the
+                    // slot by the time the next block lands and replay
+                    // runs.
+                    self.enqueuePendingAttestation(gossip, "future_slot");
+                    return;
+                },
+                else => {
+                    zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "attestation", .reason = "worker_validation_failed" }) catch {};
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                    self.logger.debug(
+                        "chain-worker: attestation validation failed slot={d} validator={d}: {any}",
+                        .{ gossip.message.message.slot, gossip.message.validator_id, err },
+                    );
+                    return;
+                },
+            }
+        };
+
+        self.runVerifiedGossipAttestation(gossip, is_aggregator_role) catch |err| {
+            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
             self.logger.warn(
                 "chain-worker: onGossipAttestation failed slot={d} validator={d}: {any}",
                 .{ gossip.message.message.slot, gossip.message.validator_id, err },
             );
+            return;
         };
+        zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
     }
 
     fn chainWorkerOnGossipAggregatedAttestationThunk(
@@ -550,12 +879,57 @@ pub const BeamChain = struct {
         agg: types.SignedAggregatedAttestation,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // leanSpec parity (`forks/lstar/spec.py::on_gossip_aggregated_attestation`,
+        // `subspecs/sync/service.py::on_gossip_aggregated_attestation`):
+        // validate + verify. On retryable error → buffer for replay
+        // after the next `on_gossip_block` (`_pending_aggregated_attestations`).
+        // The Message-owned `agg` is freed by chain_worker.dispatch
+        // (defer m.deinit()) when this function returns; to retain
+        // ownership in the buffer we MUST clone before re-handing to
+        // the buffer.
         self.onGossipAggregatedAttestation(agg) catch |err| {
-            self.logger.warn(
-                "chain-worker: onGossipAggregatedAttestation failed slot={d}: {any}",
-                .{ agg.data.slot, err },
-            );
+            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+            switch (err) {
+                error.UnknownHeadBlock,
+                error.UnknownSourceBlock,
+                error.UnknownTargetBlock,
+                error.MissingState,
+                => {
+                    var cloned: types.SignedAggregatedAttestation = undefined;
+                    types.sszClone(self.allocator, types.SignedAggregatedAttestation, agg, &cloned) catch |clone_err| {
+                        zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "worker_validation_failed" }) catch {};
+                        self.logger.warn(
+                            "chain-worker: aggregation buffer clone failed slot={d}: {any}",
+                            .{ agg.data.slot, clone_err },
+                        );
+                        return;
+                    };
+                    self.enqueuePendingAggregation(cloned, "unknown_block");
+                    return;
+                },
+                error.AttestationTooFarInFuture => {
+                    var cloned: types.SignedAggregatedAttestation = undefined;
+                    types.sszClone(self.allocator, types.SignedAggregatedAttestation, agg, &cloned) catch |clone_err| {
+                        zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "worker_validation_failed" }) catch {};
+                        self.logger.warn(
+                            "chain-worker: aggregation buffer clone failed slot={d}: {any}",
+                            .{ agg.data.slot, clone_err },
+                        );
+                        return;
+                    };
+                    self.enqueuePendingAggregation(cloned, "future_slot");
+                    return;
+                },
+                else => {
+                    self.logger.warn(
+                        "chain-worker: onGossipAggregatedAttestation failed slot={d}: {any}",
+                        .{ agg.data.slot, err },
+                    );
+                    return;
+                },
+            }
         };
+        zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "aggregation" }) catch {};
     }
 
     fn chainWorkerProcessPendingBlocksThunk(
@@ -757,6 +1131,18 @@ pub const BeamChain = struct {
             entry.signed_block.deinit();
         }
         self.pending_blocks.deinit(self.allocator);
+
+        // leanSpec _pending_attestations / _pending_aggregated_attestations
+        // buffers. Attestations are POD (no heap); aggregations were cloned
+        // on enqueue and need explicit `.deinit()` per entry to free the
+        // proof participants BitList + signature bytes.
+        self.pending_attestations_mutex.lock();
+        self.pending_attestations.deinit(self.allocator);
+        for (self.pending_aggregated_attestations.items) |*agg| {
+            agg.deinit();
+        }
+        self.pending_aggregated_attestations.deinit(self.allocator);
+        self.pending_attestations_mutex.unlock();
 
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
@@ -1499,6 +1885,7 @@ pub const BeamChain = struct {
 
                 zeam_metrics.metrics.lean_pending_blocks_replayed_total.incr(.{ .result = "accepted" }) catch {};
                 self.onBlockFollowup(true, &queued_entry.signed_block);
+                self.replayPendingAttestations();
 
                 // Accumulate missing roots so the caller can fetch them.
                 all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
@@ -2057,7 +2444,8 @@ pub const BeamChain = struct {
                     // asynchronously, so it needs an independent
                     // allocation. On `submitBlock` success the worker
                     // owns the clone (and will deinit it after
-                    // dispatch); on failure the errdefer frees it.
+                    // dispatch); on failure or queue-full/closed, `defer` frees
+                    // the clone if the worker did not take ownership.
                     //
                     // Trade-offs of the worker path:
                     //   * `missing_attestation_roots` feedback is
@@ -2077,7 +2465,10 @@ pub const BeamChain = struct {
                         var cloned: types.SignedBlock = undefined;
                         try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
                         var cloned_consumed = false;
-                        errdefer if (!cloned_consumed) cloned.deinit();
+                        // `defer` (not `errdefer`): QueueFull / QueueClosed return
+                        // `.{}` from the catch arm — a normal return — so `errdefer`
+                        // would not run and the clone would leak (zclawz review, #886).
+                        defer if (!cloned_consumed) cloned.deinit();
                         // Slice (e): forward the block_root we already computed
                         // above so the worker thread doesn't re-hash the block.
                         self.submitBlock(cloned, true, block_root) catch |err| switch (err) {
@@ -2113,6 +2504,7 @@ pub const BeamChain = struct {
                     };
                     // followup with additional housekeeping tasks
                     self.onBlockFollowup(true, &signed_block);
+                    self.replayPendingAttestations();
                     // NOTE: ownership of `missing_roots` is transferred to the caller (BeamNode),
                     // which is responsible for freeing it after optionally fetching those roots.
 
@@ -2146,77 +2538,106 @@ pub const BeamChain = struct {
                     sender_node_name,
                 });
 
-                // Validate attestation before processing (gossip = not from block)
-                self.validateAttestationData(signed_attestation.message.message, false) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    switch (err) {
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
-                            // Add the missing root to the result so node's onGossip can enqueue it for fetching
-                            const att_data = signed_attestation.message.message;
-                            const missing_root = if (err == error.UnknownHeadBlock)
-                                att_data.head.root
-                            else if (err == error.UnknownSourceBlock)
-                                att_data.source.root
-                            else
-                                att_data.target.root;
-                            var roots: std.ArrayListUnmanaged(types.Root) = .empty;
-                            errdefer roots.deinit(self.allocator);
-                            try roots.append(self.allocator, missing_root);
-                            return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
-                        },
-                        else => {
-                            self.logger.warn("gossip attestation validation failed: {any}", .{err});
+                // leanSpec sync-state gating
+                // (`subspecs/sync/service.py::on_gossip_attestation`):
+                // gossip is processed in `SYNCING` and `SYNCED`; only
+                // dropped in `IDLE` (no peers / forkchoice not yet
+                // initialised). The behind_peers state maps to spec
+                // `SYNCING` — accept attestations and let the buffer
+                // catch unknown-block / future-slot ones for replay
+                // after the next gossip block lands.
+                switch (self.getSyncStatus()) {
+                    .synced, .behind_peers => {},
+                    .no_peers, .fc_initing => {
+                        zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "attestation", .reason = "syncing" }) catch {};
+                        return .{};
+                    },
+                }
+
+                // leanSpec parity for non-aggregators: spec runs
+                // validate + signature verify even when not storing
+                // (`forks/lstar/spec.py::on_gossip_attestation` gates
+                // ONLY the `attestation_signatures` write on
+                // `is_aggregator`). Dispatching through the chain-
+                // worker for both roles keeps the libxev thread out
+                // of the heavy XMSS verify; the worker thunk skips
+                // the fork-choice tracker update for non-aggregators.
+                if (self.chain_worker != null) {
+                    // Pure dispatch on the libxev thread —
+                    // `validateAttestationData` (proto-array reads
+                    // under `forkChoice.mutex`) and the XMSS verify
+                    // both run on the worker thread. The worker thunk
+                    // runs them for ALL roles (leanSpec parity); only
+                    // the fork-choice tracker update is gated on
+                    // `is_aggregator_enabled`.
+                    //
+                    // Retryable validation failures (unknown block /
+                    // future slot) land in the spec's pending buffer
+                    // for replay after the next `onBlock` import; see
+                    // `enqueuePendingAttestation` and
+                    // `replayPendingAttestations`. `BlocksByRoot`
+                    // fetch storms are absorbed by that buffer
+                    // instead of being amplified into per-attestation
+                    // RPCs.
+                    //
+                    // `AttestationGossip` is POD so no clone is
+                    // required — the value is copied into the
+                    // `Message` enum at queue push time.
+                    self.submitGossipAttestation(signed_attestation) catch |err| switch (err) {
+                        error.QueueFull => {
+                            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                            self.logger.warn(
+                                "chain-worker: attestation queue full, dropping slot={d} validator={d}",
+                                .{ slot, validator_id },
+                            );
                             return .{};
                         },
-                    }
-                };
-
-                if (self.is_aggregator_enabled.load(.acquire)) {
-                    // Slice c-2b commit 3 of #803: when the chain-worker
-                    // is enabled, route the validated attestation
-                    // through its queue. `AttestationGossip` is plain-
-                    // old-data (see `Message.deinit` in chain_worker.zig),
-                    // so no clone is required — the value is copied into
-                    // the `Message` enum at queue push time.
-                    if (self.chain_worker != null) {
-                        self.submitGossipAttestation(signed_attestation) catch |err| switch (err) {
-                            error.QueueFull => {
-                                zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                                self.logger.warn(
-                                    "chain-worker: attestation queue full, dropping slot={d} validator={d}",
-                                    .{ slot, validator_id },
-                                );
-                                return .{};
-                            },
-                            error.QueueClosed => {
-                                self.logger.warn(
-                                    "chain-worker: attestation queue closed, dropping slot={d} validator={d}",
-                                    .{ slot, validator_id },
-                                );
-                                return .{};
-                            },
-                            error.ChainWorkerDisabled => unreachable,
-                        };
-                    } else {
-                        // Process validated attestation synchronously.
-                        self.onGossipAttestation(signed_attestation) catch |err| {
-                            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                            self.logger.err("attestation processing error: {any}", .{err});
-                            return err;
-                        };
-                    }
-                    self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
-                        slot,
-                        validator_id,
-                        validator_node_name,
-                    });
+                        error.QueueClosed => {
+                            self.logger.warn(
+                                "chain-worker: attestation queue closed, dropping slot={d} validator={d}",
+                                .{ slot, validator_id },
+                            );
+                            return .{};
+                        },
+                        error.ChainWorkerDisabled => unreachable,
+                    };
                 } else {
-                    self.logger.debug("skipping gossip attestation import (not aggregator): subnet={d} slot={d} validator={d}", .{
-                        signed_attestation.subnet_id,
-                        slot,
-                        validator_id,
-                    });
+                    // Worker-disabled path (tests / single-threaded
+                    // mode). Run validate + verify inline; on retryable
+                    // error, buffer for replay (matches spec's
+                    // `_pending_attestations` semantics).
+                    const is_aggregator_role = self.is_aggregator_enabled.load(.acquire);
+                    self.validateAttestationData(signed_attestation.message.message, false) catch |err| {
+                        switch (err) {
+                            error.UnknownHeadBlock,
+                            error.UnknownSourceBlock,
+                            error.UnknownTargetBlock,
+                            => {
+                                self.enqueuePendingAttestation(signed_attestation, "unknown_block");
+                                return .{};
+                            },
+                            error.AttestationTooFarInFuture => {
+                                self.enqueuePendingAttestation(signed_attestation, "future_slot");
+                                return .{};
+                            },
+                            else => {
+                                zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                                self.logger.warn("gossip attestation validation failed: {any}", .{err});
+                                return .{};
+                            },
+                        }
+                    };
+                    self.runVerifiedGossipAttestation(signed_attestation, is_aggregator_role) catch |err| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                        self.logger.err("attestation processing error: {any}", .{err});
+                        return err;
+                    };
                 }
+                self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
+                    slot,
+                    validator_id,
+                    validator_node_name,
+                });
                 zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
                 return .{};
             },
@@ -2227,37 +2648,93 @@ pub const BeamChain = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // Validate attestation data before processing (same rules as individual gossip attestations)
-                self.validateAttestationData(signed_aggregation.data, false) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    switch (err) {
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
-                            // Add the missing root to the result so node's onGossip can enqueue it for fetching
-                            const att_data = signed_aggregation.data;
-                            const missing_root = if (err == error.UnknownHeadBlock)
-                                att_data.head.root
-                            else if (err == error.UnknownSourceBlock)
-                                att_data.source.root
-                            else
-                                att_data.target.root;
-                            var roots: std.ArrayListUnmanaged(types.Root) = .empty;
-                            errdefer roots.deinit(self.allocator);
-                            try roots.append(self.allocator, missing_root);
-                            return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
-                        },
-                        else => {
-                            self.logger.warn("gossip aggregation validation failed: {any}", .{err});
+                // leanSpec sync-state gating (same as `.attestation`
+                // arm): accept gossip in `SYNCING` and `SYNCED`; drop
+                // only in `IDLE` (no peers / fc not initialised).
+                // Retryable validation failures land in the pending
+                // buffer for replay.
+                switch (self.getSyncStatus()) {
+                    .synced, .behind_peers => {},
+                    .no_peers, .fc_initing => {
+                        zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "syncing" }) catch {};
+                        return .{};
+                    },
+                }
+
+                if (self.chain_worker != null) {
+                    // Issue #863 P5: same as the attestation arm — pure
+                    // dispatch on the libxev thread; the worker thunk
+                    // runs `onGossipAggregatedAttestation` (which itself
+                    // calls `validateAttestationData` then the heavy
+                    // XMSS aggregate-verify).
+                    //
+                    // Clone is required: `SignedAggregatedAttestation`
+                    // owns heap (the `proof.participants` BitList and
+                    // `proof.signature`) which the gossip layer borrows
+                    // for the duration of this callback. Submitting to
+                    // the worker transfers ownership to the worker, so
+                    // we need an independent allocation. On submit
+                    // failure or queue-full/closed, `defer` frees the clone if the
+                    // worker did not take ownership (`errdefer` would miss the
+                    // catch-arm `return .{}` paths — zclawz review, #886).
+                    var cloned: types.SignedAggregatedAttestation = undefined;
+                    try types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned);
+                    var cloned_consumed = false;
+                    defer if (!cloned_consumed) cloned.deinit();
+                    self.submitGossipAggregatedAttestation(cloned) catch |err| switch (err) {
+                        error.QueueFull => {
+                            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                            self.logger.warn(
+                                "chain-worker: aggregated attestation queue full, dropping slot={d}",
+                                .{signed_aggregation.data.slot},
+                            );
                             return .{};
                         },
-                    }
-                };
+                        error.QueueClosed => {
+                            self.logger.warn(
+                                "chain-worker: aggregated attestation queue closed, dropping slot={d}",
+                                .{signed_aggregation.data.slot},
+                            );
+                            return .{};
+                        },
+                        error.ChainWorkerDisabled => unreachable,
+                    };
+                    cloned_consumed = true;
+                    zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "aggregation" }) catch {};
+                    return .{};
+                }
 
+                // Worker-disabled path (tests / single-threaded mode):
+                // run validate + verify + store inline. On retryable
+                // failure, clone-and-buffer for replay so spec's
+                // `_pending_aggregated_attestations` semantics hold
+                // even without the chain-worker.
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                     switch (err) {
-                        // Propagate unknown block errors to node.zig for context-aware logging
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
+                        error.UnknownHeadBlock,
+                        error.UnknownSourceBlock,
+                        error.UnknownTargetBlock,
+                        error.MissingState,
+                        => {
+                            var cloned: types.SignedAggregatedAttestation = undefined;
+                            types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned) catch {
+                                zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                                return .{};
+                            };
+                            self.enqueuePendingAggregation(cloned, "unknown_block");
+                            return .{};
+                        },
+                        error.AttestationTooFarInFuture => {
+                            var cloned: types.SignedAggregatedAttestation = undefined;
+                            types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned) catch {
+                                zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                                return .{};
+                            };
+                            self.enqueuePendingAggregation(cloned, "future_slot");
+                            return .{};
+                        },
                         else => {
+                            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                             self.logger.warn("gossip aggregation processing error: {any}", .{err});
                             return .{};
                         },
@@ -3131,9 +3608,50 @@ pub const BeamChain = struct {
     ///
     /// Block-included attestations skip the time check; they are trusted under
     /// the block's own validation. `is_from_block` is retained as a log marker.
+    /// Issue #863 P3: cheap O(1) future-slot bound check for gossip
+    /// attestations — extracted so the libxev main thread can fast-drop
+    /// future-slot attestations BEFORE dispatching to the chain-worker
+    /// (rec 5: keep the libxev hot path doing only constant-time
+    /// per-message work). The check is identical to the one inside
+    /// `validateAttestationData`'s pre-lookup section and is repeated
+    /// there so the worker-thread path remains correct under future
+    /// callers that bypass the libxev fast-drop.
+    pub fn attestationIsTooFarInFuture(self: *Self, data: types.AttestationData) bool {
+        const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+        const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
+        const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
+        return attestation_start_interval > max_allowed_interval;
+    }
+
     pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
+
+        // Issue #863 P3 part 1: future-slot drop is hoisted to BEFORE the
+        // proto-node lookups. Pre-fix order ran the lookups first, so an
+        // attestation for `current_slot + 100` referencing future blocks
+        // bottomed out at `UnknownHeadBlock` and the caller dutifully
+        // enqueued a `BlocksByRoot` for that future head — which always
+        // 404'd because the block didn't exist anywhere. Multiplied by
+        // 4× subnet fan-out on aggregators this was a fetch-storm
+        // amplifier and a primary contributor to the slot-driver
+        // starvation in #863. Rejecting the attestation here means we
+        // never derive a missing root for it and the fetch is simply
+        // never enqueued.
+        //
+        // Bound is intervals-based (`GOSSIP_DISPARITY_INTERVALS`, =1) so
+        // we still accept the very first interval of the next slot —
+        // attestations clients legitimately publish at the slot
+        // boundary tick — without bumping the disparity tolerance. The
+        // bound only applies to gossip; block-included attestations are
+        // trusted under the block's own validation.
+        if (!is_from_block and self.attestationIsTooFarInFuture(data)) {
+            self.logger.debug("attestation validation failed: future slot=(slot={d}, time={d})", .{
+                data.slot,
+                self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
+            });
+            return AttestationValidationError.AttestationTooFarInFuture;
+        }
 
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
         const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
@@ -3213,26 +3731,9 @@ pub const BeamChain = struct {
             return AttestationValidationError.HeadCheckpointSlotMismatch;
         }
 
-        // 4. Validate gossip attestation is not too far in the future.
-        //
-        //    Bound is in intervals, not slots, and only applies to the gossip
-        //    path. Block-included attestations are trusted under the block's
-        //    own validation (matching leanSpec on_block, which doesn't run
-        //    validate_attestation on block-body attestations at all).
-        if (!is_from_block) {
-            const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
-            const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
-            const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
-            if (attestation_start_interval > max_allowed_interval) {
-                self.logger.debug("attestation validation failed: gossip attestation start interval {d} > max allowed interval {d} (slot={d}, time={d})", .{
-                    attestation_start_interval,
-                    max_allowed_interval,
-                    data.slot,
-                    current_time,
-                });
-                return AttestationValidationError.AttestationTooFarInFuture;
-            }
-        }
+        // (Future-slot bound check is hoisted above the proto-node
+        // lookups — see the issue-#863 P3 comment at the top of this
+        // function.)
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
             data.source.slot,
@@ -6598,7 +7099,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     var cloned: types.SignedBlock = undefined;
     try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &cloned);
     var cloned_consumed = false;
-    errdefer if (!cloned_consumed) cloned.deinit();
+    defer if (!cloned_consumed) cloned.deinit();
 
     // Slice (e) of #803: pass `null` for `block_root` so the
     // worker recomputes — this test deliberately exercises the

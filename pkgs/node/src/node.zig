@@ -558,6 +558,7 @@ pub const BeamNode = struct {
                 // iteration of a deep cached-block chain. Correct semantically; a future optimisation
                 // could pass false during catch-up and prune once at the end.
                 self.chain.onBlockFollowup(true, &cached_block);
+                self.chain.replayPendingAttestations();
 
                 // Remove from cache now that it's been processed. Note:
                 // we own `cached` (clone), so this `removeFetchedBlock`
@@ -846,6 +847,7 @@ pub const BeamNode = struct {
             // Store aggregated signature proofs from this block so they can be reused
             // in future block production. This is the same followup done for gossiped blocks.
             self.chain.onBlockFollowup(true, signed_block);
+            self.chain.replayPendingAttestations();
 
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
@@ -923,6 +925,7 @@ pub const BeamNode = struct {
         defer self.allocator.free(missing_roots);
 
         self.chain.onBlockFollowup(true, signed_block);
+        self.chain.replayPendingAttestations();
         self.processCachedDescendants(block_root);
         self.fetchBlockByRoots(missing_roots, 0) catch |err| {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
@@ -1552,6 +1555,29 @@ pub const BeamNode = struct {
                         missing_roots.items.len,
                     ) catch {};
                 },
+                error.InFlightCapReached => {
+                    // Issue #863 P3: outbound `BlocksByRoot` cap was hit
+                    // before this batch could dispatch. The cap (8 in
+                    // flight, see `network.MAX_CONCURRENT_BLOCKS_BY_ROOT`)
+                    // is the gossip-flood backpressure that prevented the
+                    // libxev thread from forking hundreds of concurrent
+                    // RPCs, each of which would then time out at
+                    // `RPC_REQUEST_TIMEOUT_SECONDS` (8s) and re-trigger
+                    // the storm. Bucket as `inflight_cap` so Grafana
+                    // distinguishes "cap-saturated" from "no peers" /
+                    // "send failed" — sustained non-zero rate combined
+                    // with `zeam_blocks_by_root_inflight` pinned at the
+                    // cap is the canonical signal that flood is being
+                    // contained rather than absorbed.
+                    self.logger.debug(
+                        "blocks-by-root in-flight cap reached, deferring fetch of {d} root(s)",
+                        .{missing_roots.items.len},
+                    );
+                    zeam_metrics.metrics.lean_block_fetch_dedup_total.incrBy(
+                        .{ .outcome = "inflight_cap" },
+                        missing_roots.items.len,
+                    ) catch {};
+                },
                 else => {
                     self.logger.warn(
                         "failed to send blocks-by-root request to peer: {any}",
@@ -2012,6 +2038,7 @@ pub const BeamNode = struct {
 
         // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
+        self.chain.replayPendingAttestations();
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: networks.AttestationGossip) !void {
