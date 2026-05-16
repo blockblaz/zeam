@@ -5650,12 +5650,12 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     try std.testing.expect(known_count > 0);
 }
 
-// Shared setup for the three leanSpec #716 produceBlock tests.
+// Shared setup for the justification-aware produceBlock tests.
 // Heap-allocates zeam_logger_config and beam_state via the arena so their
 // addresses are stable across the deep call stacks inside produceBlock
 // (stack locals would be clobbered when the call depth grows; see the
 // FutureSlotTestFixture pattern used elsewhere in this file).
-fn setup716TestChain(allocator: std.mem.Allocator, n_blocks: usize) !struct {
+fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) !struct {
     mock_chain: stf.MockChainData,
     beam_chain: *BeamChain,
     connected_peers: *ConnectedPeers,
@@ -5719,7 +5719,7 @@ fn setup716TestChain(allocator: std.mem.Allocator, n_blocks: usize) !struct {
     };
 }
 
-test "produceBlock - older-but-justified source is accepted (leanSpec #716)" {
+test "produceBlock - older-but-justified source is accepted" {
     // leanSpec commit 00556d8: build_block must accept any attestation whose
     // source *slot* is in justified_slots, not just the most recent justified
     // checkpoint's root. This test places an attestation whose source is an
@@ -5730,7 +5730,7 @@ test "produceBlock - older-but-justified source is accepted (leanSpec #716)" {
     const allocator = arena_allocator.allocator();
 
     // 8 blocks: enough for at least two justification cycles (pattern repeats every 4).
-    var fx = try setup716TestChain(allocator, 8);
+    var fx = try setupJustifiedSourceTestChain(allocator, 8);
     defer {
         fx.beam_chain.deinit();
         fx.test_registry.deinit();
@@ -5791,7 +5791,7 @@ test "produceBlock - older-but-justified source is accepted (leanSpec #716)" {
     try std.testing.expect(found_older);
 }
 
-test "produceBlock - zero-hash source/target rejected by build_block (leanSpec #716)" {
+test "produceBlock - zero-hash source/target rejected by build_block" {
     // attestationDataMatchesChainExtended must reject attestations whose source or
     // target root is ZERO_HASH even when the slot would otherwise pass the justified check.
     // A valid control attestation is also stored to guarantee the block is non-empty,
@@ -5800,7 +5800,7 @@ test "produceBlock - zero-hash source/target rejected by build_block (leanSpec #
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    var fx = try setup716TestChain(allocator, 6);
+    var fx = try setupJustifiedSourceTestChain(allocator, 6);
     defer {
         fx.beam_chain.deinit();
         fx.test_registry.deinit();
@@ -5879,7 +5879,7 @@ test "produceBlock - zero-hash source/target rejected by build_block (leanSpec #
     try std.testing.expect(found_valid);
 }
 
-test "produceBlock - already-justified target skipped, genesis self-vote exemption (leanSpec #716)" {
+test "produceBlock - already-justified target skipped, genesis self-vote exemption" {
     // Two assertions:
     //   (a) NEGATIVE: a non-genesis attestation whose target slot is already justified
     //       must be excluded from the produced block.
@@ -5891,7 +5891,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    var fx = try setup716TestChain(allocator, 6);
+    var fx = try setupJustifiedSourceTestChain(allocator, 6);
     defer {
         fx.beam_chain.deinit();
         fx.test_registry.deinit();

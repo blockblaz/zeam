@@ -983,9 +983,9 @@ pub const ForkChoice = struct {
         return justified_slots.get(idx) catch false;
     }
 
-    /// Mirror of leanSpec `_attestation_data_matches_chain` using the *extended*
-    /// historical block hashes view — i.e. `state.historical_block_hashes` as it
-    /// would appear after `process_block_header` on the candidate block:
+    /// Checks whether `att_data`'s source and target roots are consistent with
+    /// the *extended* historical block hashes view — i.e. `state.historical_block_hashes`
+    /// as it would appear after `process_block_header` on the candidate block:
     ///
     ///   extended = historical_block_hashes + [parent_root] + [ZERO_HASH] * num_empty_slots
     ///
