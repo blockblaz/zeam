@@ -30,11 +30,47 @@ pub const NodeNameRegistry = networks.NodeNameRegistry;
 const ZERO_HASH = types.ZERO_HASH;
 
 /// Pure gap helper for status-driven `blocks_by_range` catch-up (issue #893).
+/// Caps the peer-reported gap used for sync thresholding and pagination; per-request
+/// size is still bounded separately by `MAX_REQUEST_BLOCKS`.
 fn cappedSyncGapSlots(peer_head_slot: types.Slot, our_head_slot: types.Slot, wall_slot: types.Slot) u64 {
     if (peer_head_slot <= our_head_slot) return 0;
     const peer_gap: u64 = peer_head_slot - our_head_slot;
     const wall_gap: u64 = if (wall_slot > our_head_slot) wall_slot - our_head_slot else 0;
     return @min(peer_gap, wall_gap);
+}
+
+const BlocksByRangeSyncEndReason = enum { completed, failed, timeout };
+
+const BlocksByRangeSyncEndInput = struct {
+    aborted: bool,
+    chunks_received: u32,
+    chunks_imported: u32,
+    chunks_pre_finalized: u32,
+    range_attempt: u8,
+    max_attempts: u8,
+    end_reason: BlocksByRangeSyncEndReason,
+    has_alternate_peer: bool,
+};
+
+const BlocksByRangeSyncEndAction = enum {
+    abort_fallback,
+    pre_finalized_complete,
+    retry,
+    exhausted_fallback,
+    success_continue,
+};
+
+fn blocksByRangeSyncEndDecision(input: BlocksByRangeSyncEndInput) BlocksByRangeSyncEndAction {
+    if (input.aborted) return .abort_fallback;
+    if (input.chunks_received > 0 and input.chunks_pre_finalized == input.chunks_received) {
+        return .pre_finalized_complete;
+    }
+    const no_progress = input.chunks_imported == 0;
+    const should_retry = (input.end_reason == .failed or input.end_reason == .timeout or no_progress) and
+        input.range_attempt < input.max_attempts and input.has_alternate_peer;
+    if (should_retry) return .retry;
+    if (input.end_reason == .failed or input.end_reason == .timeout or no_progress) return .exhausted_fallback;
+    return .success_continue;
 }
 
 const NodeOpts = struct {
@@ -97,6 +133,11 @@ pub const BeamNode = struct {
     /// can touch this map concurrently.
     batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
     batch_pending_parent_roots_lock: zeam_utils.SyncMutex = .{},
+
+    /// Range chunks handed to the chain-worker before `onBlock` completes (#893).
+    /// Maps block_root → blocks_by_range request_id for post-import accounting.
+    range_async_chunk_imports: std.AutoHashMap(types.Root, u64),
+    range_async_chunk_imports_lock: zeam_utils.SyncMutex = .{},
 
     /// Test-only failure injection for `onInterval` catch-and-continue paths.
     test_inject_validator_error_at_intervals: []const usize = &.{},
@@ -187,6 +228,7 @@ pub const BeamNode = struct {
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
             .batch_pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
+            .range_async_chunk_imports = std.AutoHashMap(types.Root, u64).init(allocator),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -220,7 +262,62 @@ pub const BeamNode = struct {
         self.chain.deinit();
         self.allocator.destroy(self.chain);
         self.batch_pending_parent_roots.deinit();
+        self.range_async_chunk_imports.deinit();
         self.network.deinit();
+    }
+
+    fn recordRangeSyncOutcome(_: *Self, outcome: []const u8) void {
+        zeam_metrics.metrics.zeam_blocks_by_range_sync_total.incr(.{ .outcome = outcome }) catch {};
+    }
+
+    /// Post-import accounting for range chunks that were queued on the chain-worker.
+    fn finishRangeAsyncChunkImport(
+        self: *Self,
+        block_root: types.Root,
+        imported: bool,
+        pre_finalized: bool,
+    ) void {
+        self.range_async_chunk_imports_lock.lock();
+        const removed = self.range_async_chunk_imports.fetchRemove(block_root);
+        self.range_async_chunk_imports_lock.unlock();
+        const rid = removed orelse return;
+
+        var update = networkFactory.Network.BlocksByRangeChunkUpdate{
+            .record_async_finished = true,
+        };
+        if (imported) update.record_imported = true;
+        if (pre_finalized) update.record_pre_finalized = true;
+        const result = self.network.updateBlocksByRangeRequest(rid.value, update);
+        if (result.run_sync_end) self.runDeferredBlocksByRangeSyncEnd(rid.value);
+    }
+
+    fn runDeferredBlocksByRangeSyncEnd(self: *Self, request_id: u64) void {
+        var snap = (self.network.snapshotPendingRequest(request_id) catch |err| {
+            self.logger.warn("deferred blocks_by_range end: snapshot request_id={d} failed: {any}", .{ request_id, err });
+            return;
+        }) orelse {
+            self.logger.warn("deferred blocks_by_range end: unknown request_id={d}", .{request_id});
+            return;
+        };
+        defer snap.deinit(self.allocator);
+        if (snap.request_kind != .blocks_by_range) return;
+        self.handleBlocksByRangeSyncEnd(request_id, snap, .completed);
+    }
+
+    fn clearRangeAsyncChunkImport(self: *Self, block_root: types.Root) void {
+        self.range_async_chunk_imports_lock.lock();
+        const removed = self.range_async_chunk_imports.fetchRemove(block_root);
+        self.range_async_chunk_imports_lock.unlock();
+        const rid = removed orelse return;
+        const result = self.network.updateBlocksByRangeRequest(rid.value, .{ .record_async_finished = true });
+        if (result.run_sync_end) self.runDeferredBlocksByRangeSyncEnd(rid.value);
+    }
+
+    fn trackRangeAsyncChunkImport(self: *Self, block_root: types.Root, request_id: u64) void {
+        _ = self.network.updateBlocksByRangeRequest(request_id, .{ .record_async_submitted = true });
+        self.range_async_chunk_imports_lock.lock();
+        defer self.range_async_chunk_imports_lock.unlock();
+        self.range_async_chunk_imports.put(block_root, request_id) catch {};
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
@@ -540,6 +637,8 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         defer self.allocator.free(missing_roots);
 
+        self.finishRangeAsyncChunkImport(block_root, true, false);
+
         // If the block was previously cached (a `processCachedDescendants`
         // submission, or a long-orphan block that arrived ahead of its
         // parent and got buffered in `network.fetched_blocks`), the
@@ -609,6 +708,7 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         switch (reason) {
             .missing_pre_state => {
+                self.clearRangeAsyncChunkImport(block_root);
                 // Mirror the inline `processBlockByRootChunk`
                 // MissingPreState arm. Use depth=1 since the libxev
                 // caller already accepted this block (depth 0); a
@@ -640,6 +740,7 @@ pub const BeamNode = struct {
                 self.flushPendingParentFetches();
             },
             .pre_finalized => {
+                self.finishRangeAsyncChunkImport(block_root, false, true);
                 self.logger.info(
                     "chain-worker rejected PreFinalizedSlot slot={d} root=0x{x}; pruning cached descendants",
                     .{ signed_block.block.slot, &block_root },
@@ -1215,8 +1316,8 @@ pub const BeamNode = struct {
         finalized_slot: types.Slot,
     };
 
-    /// Gap to a peer head, capped by wall-clock slot so bogus peer status cannot
-    /// schedule multi-thousand-slot range requests. Issue #893.
+    /// Gap to a peer head, capped by wall-clock slot for threshold/pagination
+    /// decisions (per-request size is still capped by `MAX_REQUEST_BLOCKS`). Issue #893.
     fn cappedSyncGap(self: *Self, peer_head_slot: types.Slot, our_head_slot: types.Slot) u64 {
         const wall_slot = self.chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
         return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot);
@@ -1286,6 +1387,8 @@ pub const BeamNode = struct {
 
         const head_snapshot = self.chain.forkChoice.getHead();
 
+        // Large gaps use one in-flight `blocks_by_range` (MAX_CONCURRENT_BLOCKS_BY_RANGE).
+        // Additional qualifying peers with small gaps still get head-by-root below.
         if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
             const start_slot: types.Slot = our_head_slot + 1;
             const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
@@ -1351,69 +1454,108 @@ pub const BeamNode = struct {
         self: *Self,
         request_id: u64,
         snap: networkFactory.Network.PendingRequestSnapshot,
-        reason: enum { completed, failed, timeout },
+        end_reason: BlocksByRangeSyncEndReason,
     ) void {
         const node_name = self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy);
 
-        if (snap.range_aborted) {
-            self.logger.warn(
-                "blocks_by_range request_id={d} from peer {s}{f} aborted (fork mismatch); falling back to head-by-root 0x{x}",
-                .{ request_id, snap.peer_id_copy, node_name, &snap.peer_head_root },
-            );
-            self.network.finalizePendingRequest(request_id);
-            self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
-            return;
+        const next_peer_opt = self.network.selectPeerExcluding(snap.peer_id_copy) catch null;
+        defer if (next_peer_opt) |p| self.allocator.free(p);
+        const has_alternate_peer = if (next_peer_opt) |p| !std.mem.eql(u8, p, snap.peer_id_copy) else false;
+
+        const action = blocksByRangeSyncEndDecision(.{
+            .aborted = snap.range_aborted,
+            .chunks_received = snap.range_chunks_received,
+            .chunks_imported = snap.range_chunks_imported,
+            .chunks_pre_finalized = snap.range_chunks_pre_finalized,
+            .range_attempt = snap.range_attempt,
+            .max_attempts = constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+            .end_reason = end_reason,
+            .has_alternate_peer = has_alternate_peer,
+        });
+
+        switch (action) {
+            .abort_fallback => {
+                self.recordRangeSyncOutcome("abort");
+                self.logger.warn(
+                    "blocks_by_range request_id={d} from peer {s}{f} aborted (fork mismatch); falling back to head-by-root 0x{x}",
+                    .{ request_id, snap.peer_id_copy, node_name, &snap.peer_head_root },
+                );
+                self.network.finalizePendingRequest(request_id);
+                self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
+            },
+            .pre_finalized_complete => {
+                self.recordRangeSyncOutcome("pre_finalized_noop");
+                self.logger.info(
+                    "blocks_by_range request_id={d} from peer {s}{f}: all {d} chunks pre-finalized; treating as no-op",
+                    .{ request_id, snap.peer_id_copy, node_name, snap.range_chunks_received },
+                );
+                self.network.finalizePendingRequest(request_id);
+                self.maybeContinueBlocksByRangeCatchUp(snap);
+            },
+            .retry => {
+                self.recordRangeSyncOutcome("retry");
+                const next_attempt = snap.range_attempt + 1;
+                const peer_id = next_peer_opt.?;
+                self.logger.warn(
+                    "blocks_by_range request_id={d} from peer {s}{f} ended ({s}, chunks={d} imported={d}); retry attempt {d}/{d} on peer {s}{f}",
+                    .{
+                        request_id,
+                        snap.peer_id_copy,
+                        node_name,
+                        @tagName(end_reason),
+                        snap.range_chunks_received,
+                        snap.range_chunks_imported,
+                        next_attempt,
+                        constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+                        peer_id,
+                        self.node_registry.getNodeNameFromPeerId(peer_id),
+                    },
+                );
+                self.network.finalizePendingRequest(request_id);
+                self.initiateBlocksByRangeCatchUp(.{
+                    .peer_id = peer_id,
+                    .start_slot = snap.start_slot,
+                    .count = snap.count,
+                    .peer_head_slot = snap.peer_head_slot,
+                    .peer_head_root = snap.peer_head_root,
+                    .our_head_root_at_start = snap.our_head_root_at_start,
+                    .attempt = next_attempt,
+                });
+            },
+            .exhausted_fallback => {
+                self.recordRangeSyncOutcome(if (end_reason == .timeout) "timeout" else "exhausted");
+                self.logger.warn(
+                    "blocks_by_range request_id={d} from peer {s}{f} gave no usable progress ({s}, chunks={d} imported={d}); falling back to head-by-root 0x{x}",
+                    .{
+                        request_id,
+                        snap.peer_id_copy,
+                        node_name,
+                        @tagName(end_reason),
+                        snap.range_chunks_received,
+                        snap.range_chunks_imported,
+                        &snap.peer_head_root,
+                    },
+                );
+                self.network.finalizePendingRequest(request_id);
+                self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
+            },
+            .success_continue => {
+                self.recordRangeSyncOutcome("success");
+                self.logger.info(
+                    "blocks_by_range request_id={d} from peer {s}{f} completed ({s}): chunks_received={d} imported={d}",
+                    .{
+                        request_id,
+                        snap.peer_id_copy,
+                        node_name,
+                        @tagName(end_reason),
+                        snap.range_chunks_received,
+                        snap.range_chunks_imported,
+                    },
+                );
+                self.network.finalizePendingRequest(request_id);
+                self.maybeContinueBlocksByRangeCatchUp(snap);
+            },
         }
-
-        const no_progress = snap.range_chunks_imported == 0;
-        const should_retry = (reason == .failed or reason == .timeout or no_progress) and
-            snap.range_attempt < constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS;
-
-        if (should_retry) {
-            const next_attempt = snap.range_attempt + 1;
-            self.logger.warn(
-                "blocks_by_range request_id={d} from peer {s}{f} ended ({s}, chunks={d} imported={d}); retry attempt {d}/{d}",
-                .{
-                    request_id,
-                    snap.peer_id_copy,
-                    node_name,
-                    @tagName(reason),
-                    snap.range_chunks_received,
-                    snap.range_chunks_imported,
-                    next_attempt,
-                    constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
-                },
-            );
-            self.network.finalizePendingRequest(request_id);
-
-            const next_peer = self.network.selectPeerExcluding(snap.peer_id_copy) catch null;
-            defer if (next_peer) |p| self.allocator.free(p);
-
-            const peer_id = next_peer orelse snap.peer_id_copy;
-            self.initiateBlocksByRangeCatchUp(.{
-                .peer_id = peer_id,
-                .start_slot = snap.start_slot,
-                .count = snap.count,
-                .peer_head_slot = snap.peer_head_slot,
-                .peer_head_root = snap.peer_head_root,
-                .our_head_root_at_start = snap.our_head_root_at_start,
-                .attempt = next_attempt,
-            });
-            return;
-        }
-
-        if (reason == .failed or reason == .timeout or no_progress) {
-            self.logger.warn(
-                "blocks_by_range request_id={d} from peer {s}{f} gave no usable progress ({s}); falling back to head-by-root 0x{x}",
-                .{ request_id, snap.peer_id_copy, node_name, @tagName(reason), &snap.peer_head_root },
-            );
-            self.network.finalizePendingRequest(request_id);
-            self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
-            return;
-        }
-
-        self.network.finalizePendingRequest(request_id);
-        self.maybeContinueBlocksByRangeCatchUp(snap);
     }
 
     /// Process a single block chunk received in response to a blocks_by_range request.
@@ -1426,9 +1568,9 @@ pub const BeamNode = struct {
         peer_id: []const u8,
         signed_block: *const types.SignedBlock,
     ) !void {
-        if (self.network.isBlocksByRangeAborted(request_id)) return;
-
-        const chunk_meta = self.network.blocksByRangeChunkMeta(request_id);
+        const recv = self.network.updateBlocksByRangeRequest(request_id, .{ .record_received = true });
+        const view = recv.view orelse return;
+        if (view.aborted) return;
 
         var block_root: types.Root = undefined;
         zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator) catch |err| {
@@ -1440,17 +1582,18 @@ pub const BeamNode = struct {
             return;
         };
 
-        if (chunk_meta) |meta| {
-            if (signed_block.block.slot == meta.start_slot and
-                !std.mem.eql(u8, &signed_block.block.parent_root, &meta.our_head_root_at_start))
-            {
-                self.logger.warn(
-                    "blocks_by_range: fork mismatch at start_slot={d} (parent 0x{x} != our head 0x{x}); aborting range batch",
-                    .{ meta.start_slot, &signed_block.block.parent_root, &meta.our_head_root_at_start },
-                );
-                self.network.markBlocksByRangeAborted(request_id);
-                return;
-            }
+        // First chunk must extend the head we had when this request was issued.
+        // Conservative: if our head advanced to a sibling via gossip/reorg, abort
+        // even though both branches may be valid — do not loosen without rethinking retry.
+        if (signed_block.block.slot == view.start_slot and
+            !std.mem.eql(u8, &signed_block.block.parent_root, &view.our_head_root_at_start))
+        {
+            self.logger.warn(
+                "blocks_by_range: fork mismatch at start_slot={d} (parent 0x{x} != our head-at-start 0x{x}); aborting range batch",
+                .{ view.start_slot, &signed_block.block.parent_root, &view.our_head_root_at_start },
+            );
+            _ = self.network.updateBlocksByRangeRequest(request_id, .{ .mark_aborted = true });
+            return;
         }
 
         // Skip if already known to fork choice — same guard as processBlockByRootChunk.
@@ -1460,18 +1603,18 @@ pub const BeamNode = struct {
                 .{&block_root},
             );
             self.processCachedDescendants(block_root);
-            self.network.recordBlocksByRangeChunk(request_id, true);
+            _ = self.network.updateBlocksByRangeRequest(request_id, .{ .record_imported = true });
             return;
         }
 
         // #890: route to the chain-worker when the parent is already
         // resolved. By-range chunks arrive slot-ordered so this is
-        // the common case after the first chunk. The TOCTOU race
-        // against finalization is closed by `handleChainRejectedBlock`
-        // — see `trySubmitImportToWorker` doc.
+        // the common case after the first chunk. Import accounting
+        // (`chunks_imported`) is bumped in `handleChainImportedBlock` /
+        // `handleChainRejectedBlock` after `onBlock` completes — not here.
         if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
             if (self.trySubmitImportToWorker(signed_block, block_root)) {
-                self.network.recordBlocksByRangeChunk(request_id, true);
+                self.trackRangeAsyncChunkImport(block_root, request_id);
                 return;
             }
         }
@@ -1480,7 +1623,6 @@ pub const BeamNode = struct {
             if (err == chainFactory.BlockProcessingError.MissingPreState) {
                 // Cache and try to fetch parent. Range responses arrive ordered by slot,
                 // but the first chunk in a batch may still need its parent fetched.
-                self.network.recordBlocksByRangeChunk(request_id, false);
                 if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
                     self.logger.debug(
                         "blocks_by_range: cached block 0x{x}, fetching parent 0x{x}",
@@ -1498,7 +1640,7 @@ pub const BeamNode = struct {
             }
             if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                 _ = self.network.pruneCachedBlocks(block_root, null);
-                self.network.recordBlocksByRangeChunk(request_id, false);
+                _ = self.network.updateBlocksByRangeRequest(request_id, .{ .record_pre_finalized = true });
                 return;
             }
             self.logger.warn("blocks_by_range: failed to import block 0x{x} from peer={s}{f}: {any}", .{
@@ -1507,12 +1649,11 @@ pub const BeamNode = struct {
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 err,
             });
-            self.network.recordBlocksByRangeChunk(request_id, false);
             return;
         };
         defer self.allocator.free(missing_roots);
 
-        self.network.recordBlocksByRangeChunk(request_id, true);
+        _ = self.network.updateBlocksByRangeRequest(request_id, .{ .record_imported = true });
         self.chain.onBlockFollowup(true, signed_block);
         self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
         self.processCachedDescendants(block_root);
@@ -1520,6 +1661,13 @@ pub const BeamNode = struct {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
         };
         self.flushPendingParentFetches();
+    }
+
+    fn completeBlocksByRangeRequest(self: *Self, request_id: u64, snap: networkFactory.Network.PendingRequestSnapshot) void {
+        const pending = self.network.updateBlocksByRangeRequest(request_id, .{ .mark_sync_end_pending = true });
+        if (pending.run_sync_end) {
+            self.handleBlocksByRangeSyncEnd(request_id, snap, .completed);
+        }
     }
 
     fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
@@ -1675,7 +1823,7 @@ pub const BeamNode = struct {
                     return;
                 }
                 if (snap.request_kind == .blocks_by_range) {
-                    self.handleBlocksByRangeSyncEnd(request_id, snap, .completed);
+                    self.completeBlocksByRangeRequest(request_id, snap);
                     return;
                 }
                 self.network.finalizePendingRequest(request_id);
@@ -3819,4 +3967,56 @@ test "cappedSyncGapSlots limits range catch-up to wall-clock head" {
     try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(50, 100, 200));
     try std.testing.expectEqual(@as(u64, 50), cappedSyncGapSlots(200, 100, 150));
     try std.testing.expectEqual(@as(u64, 100), cappedSyncGapSlots(200, 100, 250));
+    // Clock skew: our head ahead of wall slot → no wall-clock gap.
+    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(200, 150, 100));
+}
+
+test "blocksByRangeSyncEndDecision retry requires alternate peer" {
+    const base = BlocksByRangeSyncEndInput{
+        .aborted = false,
+        .chunks_received = 5,
+        .chunks_imported = 0,
+        .chunks_pre_finalized = 0,
+        .range_attempt = 1,
+        .max_attempts = 3,
+        .end_reason = .completed,
+        .has_alternate_peer = false,
+    };
+    try std.testing.expectEqual(BlocksByRangeSyncEndAction.exhausted_fallback, blocksByRangeSyncEndDecision(base));
+
+    var with_peer = base;
+    with_peer.has_alternate_peer = true;
+    try std.testing.expectEqual(BlocksByRangeSyncEndAction.retry, blocksByRangeSyncEndDecision(with_peer));
+
+    var imported = base;
+    imported.chunks_imported = 3;
+    try std.testing.expectEqual(BlocksByRangeSyncEndAction.success_continue, blocksByRangeSyncEndDecision(imported));
+}
+
+test "blocksByRangeSyncEndDecision all pre-finalized is no-op not retry" {
+    const input = BlocksByRangeSyncEndInput{
+        .aborted = false,
+        .chunks_received = 4,
+        .chunks_imported = 0,
+        .chunks_pre_finalized = 4,
+        .range_attempt = 1,
+        .max_attempts = 3,
+        .end_reason = .completed,
+        .has_alternate_peer = true,
+    };
+    try std.testing.expectEqual(BlocksByRangeSyncEndAction.pre_finalized_complete, blocksByRangeSyncEndDecision(input));
+}
+
+test "blocksByRangeSyncEndDecision fork abort" {
+    const input = BlocksByRangeSyncEndInput{
+        .aborted = true,
+        .chunks_received = 1,
+        .chunks_imported = 0,
+        .chunks_pre_finalized = 0,
+        .range_attempt = 1,
+        .max_attempts = 3,
+        .end_reason = .completed,
+        .has_alternate_peer = true,
+    };
+    try std.testing.expectEqual(BlocksByRangeSyncEndAction.abort_fallback, blocksByRangeSyncEndDecision(input));
 }

@@ -46,6 +46,12 @@ pub const BlockByRangeContext = struct {
     attempt: u8 = 1,
     chunks_received: u32 = 0,
     chunks_imported: u32 = 0,
+    /// Chunks rejected at or below our finalized slot (peer served stale history).
+    chunks_pre_finalized: u32 = 0,
+    /// Chunks queued on the chain-worker; sync-end runs after this hits zero.
+    chunks_async_pending: u32 = 0,
+    /// RPC stream finished; defer `handleBlocksByRangeSyncEnd` until async imports drain.
+    sync_end_pending: bool = false,
     /// Set when the first chunk cannot attach to `our_head_root_at_start`; further chunks are ignored.
     aborted: bool = false,
 
@@ -780,82 +786,66 @@ pub const Network = struct {
         return request_id;
     }
 
-    pub fn recordBlocksByRangeChunk(self: *Self, request_id: u64, imported: bool) void {
-        const Ctx = struct {
-            imported: bool,
-            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
-                const entry = value_ptr orelse return;
-                const mutable: *PendingRPCEntry = @constCast(entry);
-                switch (mutable.request) {
-                    .blocks_by_range => |*ctx| {
-                        ctx.chunks_received += 1;
-                        if (c.imported) ctx.chunks_imported += 1;
-                    },
-                    else => {},
-                }
-            }
-        };
-        var ctx = Ctx{ .imported = imported };
-        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
-    }
-
-    pub fn markBlocksByRangeAborted(self: *Self, request_id: u64) void {
-        const Ctx = struct {
-            fn each(_: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
-                const entry = value_ptr orelse return;
-                const mutable: *PendingRPCEntry = @constCast(entry);
-                switch (mutable.request) {
-                    .blocks_by_range => |*ctx| ctx.aborted = true,
-                    else => {},
-                }
-            }
-        };
-        var ctx = Ctx{};
-        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
-    }
-
-    pub fn isBlocksByRangeAborted(self: *Self, request_id: u64) bool {
-        const Ctx = struct {
-            aborted: bool = false,
-            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
-                const entry = value_ptr orelse return;
-                switch (entry.request) {
-                    .blocks_by_range => |*ctx| c.aborted = ctx.aborted,
-                    else => {},
-                }
-            }
-        };
-        var ctx = Ctx{};
-        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
-        return ctx.aborted;
-    }
-
-    pub const BlocksByRangeChunkMeta = struct {
+    pub const BlocksByRangeChunkView = struct {
         start_slot: types.Slot,
         our_head_root_at_start: types.Root,
         aborted: bool,
     };
 
-    pub fn blocksByRangeChunkMeta(self: *Self, request_id: u64) ?BlocksByRangeChunkMeta {
+    pub const BlocksByRangeChunkUpdate = struct {
+        record_received: bool = false,
+        record_imported: bool = false,
+        record_pre_finalized: bool = false,
+        record_async_submitted: bool = false,
+        record_async_finished: bool = false,
+        mark_aborted: bool = false,
+        mark_sync_end_pending: bool = false,
+    };
+
+    pub const BlocksByRangeRequestUpdate = struct {
+        view: ?BlocksByRangeChunkView = null,
+        /// True when the RPC stream has ended and all async imports have drained.
+        run_sync_end: bool = false,
+    };
+
+    /// Single lock acquisition for range-chunk bookkeeping (issue #893).
+    pub fn updateBlocksByRangeRequest(
+        self: *Self,
+        request_id: u64,
+        update: BlocksByRangeChunkUpdate,
+    ) BlocksByRangeRequestUpdate {
         const Ctx = struct {
-            out: ?BlocksByRangeChunkMeta = null,
-            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
+            update: BlocksByRangeChunkUpdate,
+            result: BlocksByRangeRequestUpdate = .{},
+            fn each(c: *@This(), value_ptr: ?*PendingRPCEntry) anyerror!void {
                 const entry = value_ptr orelse return;
                 switch (entry.request) {
                     .blocks_by_range => |*ctx| {
-                        c.out = .{
+                        if (c.update.record_received) ctx.chunks_received += 1;
+                        if (c.update.record_imported) ctx.chunks_imported += 1;
+                        if (c.update.record_pre_finalized) ctx.chunks_pre_finalized += 1;
+                        if (c.update.record_async_submitted) ctx.chunks_async_pending += 1;
+                        if (c.update.record_async_finished) {
+                            if (ctx.chunks_async_pending > 0) ctx.chunks_async_pending -= 1;
+                        }
+                        if (c.update.mark_aborted) ctx.aborted = true;
+                        if (c.update.mark_sync_end_pending) ctx.sync_end_pending = true;
+                        c.result.view = .{
                             .start_slot = ctx.start_slot,
                             .our_head_root_at_start = ctx.our_head_root_at_start,
                             .aborted = ctx.aborted,
                         };
+                        if (ctx.sync_end_pending and ctx.chunks_async_pending == 0) {
+                            c.result.run_sync_end = true;
+                        }
                     },
                     else => {},
                 }
             }
         };
-        var ctx = Ctx{};
-        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
-        return ctx.out;
+        var ctx = Ctx{ .update = update };
+        self.pending_rpc_requests.withMutableValueLocked(request_id, &ctx, Ctx.each) catch {};
+        return ctx.result;
     }
 
     /// Issue #863 P3: errors that signal "request would exceed the
@@ -936,6 +926,7 @@ pub const Network = struct {
         range_attempt: u8 = 1,
         range_chunks_received: u32 = 0,
         range_chunks_imported: u32 = 0,
+        range_chunks_pre_finalized: u32 = 0,
         range_aborted: bool = false,
         created_at: i64,
 
@@ -994,6 +985,7 @@ pub const Network = struct {
                             .range_attempt = r.attempt,
                             .range_chunks_received = r.chunks_received,
                             .range_chunks_imported = r.chunks_imported,
+                            .range_chunks_pre_finalized = r.chunks_pre_finalized,
                             .range_aborted = r.aborted,
                             .created_at = entry.created_at,
                         };

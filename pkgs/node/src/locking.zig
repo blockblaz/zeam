@@ -275,6 +275,23 @@ pub fn LockedMap(comptime K: type, comptime V: type) type {
                 try each(ctx, null);
             }
         }
+
+        /// Mutable variant of `withValueLocked`. The mutex is held exclusively
+        /// for the callback duration; callers may mutate `*V` in place.
+        pub fn withMutableValueLocked(
+            self: *Self,
+            key: K,
+            ctx: anytype,
+            comptime each: fn (@TypeOf(ctx), ?*V) anyerror!void,
+        ) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.map.getPtr(key)) |p| {
+                try each(ctx, p);
+            } else {
+                try each(ctx, null);
+            }
+        }
     };
 }
 
@@ -957,6 +974,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         }
 
         /// Pick a random connected peer, optionally excluding one id (for RPC retry).
+        /// Returns null when every connected peer is excluded (e.g. single-peer devnet).
         pub fn selectPeerExcluding(self: *Self, allocator: Allocator, exclude: ?[]const u8) !?[]u8 {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
@@ -964,34 +982,23 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             const n = self.map.count();
             if (n == 0) return null;
 
-            const io = std.Io.Threaded.global_single_threaded.io();
-            var random_source = std.Random.IoSource{ .io = io };
-            const random = random_source.interface();
+            var candidates: std.ArrayList([]const u8) = .empty;
+            defer candidates.deinit(allocator);
 
-            const max_tries = @min(n * 2, 16);
-            var try_index: usize = 0;
-            while (try_index < max_tries) : (try_index += 1) {
-                const target_index = random.uintLessThan(usize, n);
-                var it = self.map.iterator();
-                var current_index: usize = 0;
-                while (it.next()) |entry| : (current_index += 1) {
-                    if (current_index != target_index) continue;
-                    if (exclude) |ex| {
-                        if (std.mem.eql(u8, entry.key_ptr.*, ex)) break;
-                    }
-                    return try allocator.dupe(u8, entry.value_ptr.peer_id);
-                }
-            }
-
-            // Fallback: first peer that is not excluded (deterministic when only one alternative).
             var it = self.map.iterator();
             while (it.next()) |entry| {
                 if (exclude) |ex| {
                     if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
                 }
-                return try allocator.dupe(u8, entry.value_ptr.peer_id);
+                try candidates.append(allocator, entry.value_ptr.peer_id);
             }
-            return null;
+            if (candidates.items.len == 0) return null;
+
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var random_source = std.Random.IoSource{ .io = io };
+            const random = random_source.interface();
+            const pick = random.uintLessThan(usize, candidates.items.len);
+            return try allocator.dupe(u8, candidates.items[pick]);
         }
     };
 }
