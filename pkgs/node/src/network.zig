@@ -37,10 +37,35 @@ pub const BlockByRangeContext = struct {
     peer_id: []const u8,
     start_slot: types.Slot,
     count: u64,
+    /// Peer head when this catch-up was scheduled (pagination + gap sanity).
+    peer_head_slot: types.Slot,
+    /// Fallback target when range sync cannot link to our chain.
+    peer_head_root: types.Root,
+    /// Our forkchoice head root at request start — first range chunk must extend this.
+    our_head_root_at_start: types.Root,
+    attempt: u8 = 1,
+    chunks_received: u32 = 0,
+    chunks_imported: u32 = 0,
+    /// Set when the first chunk cannot attach to `our_head_root_at_start`; further chunks are ignored.
+    aborted: bool = false,
 
     pub fn deinit(self: *BlockByRangeContext, allocator: Allocator) void {
         allocator.free(self.peer_id);
     }
+};
+
+/// Issue #893: at most one outbound `blocks_by_range` catch-up at a time so a
+/// stuck or fork-mismatched bulk sync does not stack with gossip parent fetches.
+pub const MAX_CONCURRENT_BLOCKS_BY_RANGE: u32 = 1;
+
+pub const BlocksByRangeSyncParams = struct {
+    peer_id: []const u8,
+    start_slot: types.Slot,
+    count: u64,
+    peer_head_slot: types.Slot,
+    peer_head_root: types.Root,
+    our_head_root_at_start: types.Root,
+    attempt: u8 = 1,
 };
 
 pub const PendingRPC = union(enum) {
@@ -142,6 +167,9 @@ pub const Network = struct {
     /// thread (`processTimedOutRequests`) and the gossip dispatch
     /// path on the libxev thread don't tear it.
     blocks_by_root_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// Issue #893: in-flight outbound `blocks_by_range` catch-up count (max 1).
+    blocks_by_range_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     const Self = @This();
 
@@ -270,6 +298,10 @@ pub const Network = struct {
     /// no peers are connected. Caller frees with `self.allocator.free`.
     pub fn selectPeer(self: *Self) !?[]u8 {
         return self.connected_peers.selectPeerCopy(self.allocator);
+    }
+
+    pub fn selectPeerExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude);
     }
 
     pub fn getPeerCount(self: *Self) usize {
@@ -687,31 +719,50 @@ pub const Network = struct {
         return request_id;
     }
 
+    pub fn hasBlocksByRangeInFlight(self: *Self) bool {
+        return self.blocks_by_range_inflight.load(.monotonic) >= MAX_CONCURRENT_BLOCKS_BY_RANGE;
+    }
+
     pub fn sendBlocksByRangeRequest(
         self: *Self,
-        peer_id: []const u8,
-        start_slot: types.Slot,
-        count: u64,
+        range_sync: BlocksByRangeSyncParams,
         handler: networks.OnReqRespResponseCbHandler,
     ) !u64 {
-        if (count == 0) return error.NoBlocksRequested;
+        if (range_sync.count == 0) return error.NoBlocksRequested;
 
-        const peer_copy = try self.allocator.dupe(u8, peer_id);
+        while (true) {
+            const cur = self.blocks_by_range_inflight.load(.monotonic);
+            if (cur >= MAX_CONCURRENT_BLOCKS_BY_RANGE) {
+                return error.BlocksByRangeInFlightCapReached;
+            }
+            if (self.blocks_by_range_inflight.cmpxchgWeak(cur, cur + 1, .acq_rel, .monotonic) == null) {
+                break;
+            }
+        }
+        var reservation_owned = true;
+        errdefer if (reservation_owned) {
+            _ = self.blocks_by_range_inflight.fetchSub(1, .acq_rel);
+        };
+
+        const peer_copy = try self.allocator.dupe(u8, range_sync.peer_id);
         var peer_copy_owned = true;
         errdefer if (peer_copy_owned) self.allocator.free(peer_copy);
 
         var pending = PendingRPC{ .blocks_by_range = .{
             .peer_id = peer_copy,
-            .start_slot = start_slot,
-            .count = count,
+            .start_slot = range_sync.start_slot,
+            .count = range_sync.count,
+            .peer_head_slot = range_sync.peer_head_slot,
+            .peer_head_root = range_sync.peer_head_root,
+            .our_head_root_at_start = range_sync.our_head_root_at_start,
+            .attempt = range_sync.attempt,
         } };
         var pending_owned = false;
         errdefer if (!pending_owned) pending.deinit(self.allocator);
 
-        // ownership transferred to pending
         peer_copy_owned = false;
 
-        const request_id = self.requestBlocksByRange(peer_id, start_slot, count, handler) catch |err| {
+        const request_id = self.requestBlocksByRange(range_sync.peer_id, range_sync.start_slot, range_sync.count, handler) catch |err| {
             return err;
         };
 
@@ -724,8 +775,87 @@ pub const Network = struct {
         };
 
         pending_owned = true;
+        reservation_owned = false;
 
         return request_id;
+    }
+
+    pub fn recordBlocksByRangeChunk(self: *Self, request_id: u64, imported: bool) void {
+        const Ctx = struct {
+            imported: bool,
+            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
+                const entry = value_ptr orelse return;
+                const mutable: *PendingRPCEntry = @constCast(entry);
+                switch (mutable.request) {
+                    .blocks_by_range => |*ctx| {
+                        ctx.chunks_received += 1;
+                        if (c.imported) ctx.chunks_imported += 1;
+                    },
+                    else => {},
+                }
+            }
+        };
+        var ctx = Ctx{ .imported = imported };
+        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
+    }
+
+    pub fn markBlocksByRangeAborted(self: *Self, request_id: u64) void {
+        const Ctx = struct {
+            fn each(_: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
+                const entry = value_ptr orelse return;
+                const mutable: *PendingRPCEntry = @constCast(entry);
+                switch (mutable.request) {
+                    .blocks_by_range => |*ctx| ctx.aborted = true,
+                    else => {},
+                }
+            }
+        };
+        var ctx = Ctx{};
+        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
+    }
+
+    pub fn isBlocksByRangeAborted(self: *Self, request_id: u64) bool {
+        const Ctx = struct {
+            aborted: bool = false,
+            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
+                const entry = value_ptr orelse return;
+                switch (entry.request) {
+                    .blocks_by_range => |*ctx| c.aborted = ctx.aborted,
+                    else => {},
+                }
+            }
+        };
+        var ctx = Ctx{};
+        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
+        return ctx.aborted;
+    }
+
+    pub const BlocksByRangeChunkMeta = struct {
+        start_slot: types.Slot,
+        our_head_root_at_start: types.Root,
+        aborted: bool,
+    };
+
+    pub fn blocksByRangeChunkMeta(self: *Self, request_id: u64) ?BlocksByRangeChunkMeta {
+        const Ctx = struct {
+            out: ?BlocksByRangeChunkMeta = null,
+            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
+                const entry = value_ptr orelse return;
+                switch (entry.request) {
+                    .blocks_by_range => |*ctx| {
+                        c.out = .{
+                            .start_slot = ctx.start_slot,
+                            .our_head_root_at_start = ctx.our_head_root_at_start,
+                            .aborted = ctx.aborted,
+                        };
+                    },
+                    else => {},
+                }
+            }
+        };
+        var ctx = Ctx{};
+        self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each) catch {};
+        return ctx.out;
     }
 
     /// Issue #863 P3: errors that signal "request would exceed the
@@ -800,6 +930,13 @@ pub const Network = struct {
         requested_roots_copy: []types.Root = &[_]types.Root{},
         start_slot: types.Slot = 0,
         count: u64 = 0,
+        peer_head_slot: types.Slot = 0,
+        peer_head_root: types.Root = types.ZERO_HASH,
+        our_head_root_at_start: types.Root = types.ZERO_HASH,
+        range_attempt: u8 = 1,
+        range_chunks_received: u32 = 0,
+        range_chunks_imported: u32 = 0,
+        range_aborted: bool = false,
         created_at: i64,
 
         pub fn deinit(self: *PendingRequestSnapshot, allocator: Allocator) void {
@@ -851,6 +988,13 @@ pub const Network = struct {
                             .peer_id_copy = peer_id_copy,
                             .start_slot = r.start_slot,
                             .count = r.count,
+                            .peer_head_slot = r.peer_head_slot,
+                            .peer_head_root = r.peer_head_root,
+                            .our_head_root_at_start = r.our_head_root_at_start,
+                            .range_attempt = r.attempt,
+                            .range_chunks_received = r.chunks_received,
+                            .range_chunks_imported = r.chunks_imported,
+                            .range_aborted = r.aborted,
                             .created_at = entry.created_at,
                         };
                     },
@@ -895,7 +1039,9 @@ pub const Network = struct {
                     _ = self.blocks_by_root_inflight.fetchSub(1, .acq_rel);
                     zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
                 },
-                .blocks_by_range => {},
+                .blocks_by_range => {
+                    _ = self.blocks_by_range_inflight.fetchSub(1, .acq_rel);
+                },
                 .status => {},
             }
             rpc_entry.deinit(self.allocator);

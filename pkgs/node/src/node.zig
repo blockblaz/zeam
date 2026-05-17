@@ -29,6 +29,14 @@ pub const NodeNameRegistry = networks.NodeNameRegistry;
 
 const ZERO_HASH = types.ZERO_HASH;
 
+/// Pure gap helper for status-driven `blocks_by_range` catch-up (issue #893).
+fn cappedSyncGapSlots(peer_head_slot: types.Slot, our_head_slot: types.Slot, wall_slot: types.Slot) u64 {
+    if (peer_head_slot <= our_head_slot) return 0;
+    const peer_gap: u64 = peer_head_slot - our_head_slot;
+    const wall_gap: u64 = if (wall_slot > our_head_slot) wall_slot - our_head_slot else 0;
+    return @min(peer_gap, wall_gap);
+}
+
 const NodeOpts = struct {
     config: configs.ChainConfig,
     anchorState: *types.BeamState,
@@ -1200,11 +1208,228 @@ pub const BeamNode = struct {
         self.flushPendingParentFetches();
     }
 
+    const CatchUpPeerStatus = struct {
+        peer_id: []const u8,
+        head_slot: types.Slot,
+        head_root: types.Root,
+        finalized_slot: types.Slot,
+    };
+
+    /// Gap to a peer head, capped by wall-clock slot so bogus peer status cannot
+    /// schedule multi-thousand-slot range requests. Issue #893.
+    fn cappedSyncGap(self: *Self, peer_head_slot: types.Slot, our_head_slot: types.Slot) u64 {
+        const wall_slot = self.chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot);
+    }
+
+    fn shouldCatchUpFromPeerStatus(
+        self: *Self,
+        status: CatchUpPeerStatus,
+        our_head_slot: types.Slot,
+        our_finalized_slot: types.Slot,
+    ) bool {
+        if (status.finalized_slot > our_finalized_slot) return true;
+        const gap = self.cappedSyncGap(status.head_slot, our_head_slot);
+        return gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD;
+    }
+
+    fn syncFetchPeerHeadByRoot(self: *Self, peer_id: []const u8, head_root: types.Root) void {
+        const roots = [_]types.Root{head_root};
+        self.fetchBlockByRoots(&roots, 0) catch |err| {
+            self.logger.warn("failed to fetch peer head block 0x{x} from peer {s}{f}: {any}", .{
+                &head_root,
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                err,
+            });
+        };
+    }
+
+    fn initiateBlocksByRangeCatchUp(
+        self: *Self,
+        range_sync: networkFactory.BlocksByRangeSyncParams,
+    ) void {
+        if (self.network.hasBlocksByRangeInFlight()) {
+            self.logger.debug(
+                "skipping blocks_by_range catch-up start_slot={d}: another range request in flight",
+                .{range_sync.start_slot},
+            );
+            return;
+        }
+
+        const handler = networks.OnReqRespResponseCbHandler{
+            .ptr = self,
+            .onReqRespResponseCb = onReqRespResponse,
+        };
+        _ = self.network.sendBlocksByRangeRequest(range_sync, handler) catch |err| {
+            self.logger.warn(
+                "blocks_by_range catch-up from peer {s}{f} start_slot={d} count={d} failed: {any}; falling back to head-by-root",
+                .{
+                    range_sync.peer_id,
+                    self.node_registry.getNodeNameFromPeerId(range_sync.peer_id),
+                    range_sync.start_slot,
+                    range_sync.count,
+                    err,
+                },
+            );
+            self.syncFetchPeerHeadByRoot(range_sync.peer_id, range_sync.peer_head_root);
+        };
+    }
+
+    fn initiateCatchUpFromPeerStatus(
+        self: *Self,
+        status: CatchUpPeerStatus,
+        our_head_slot: types.Slot,
+    ) void {
+        const gap = self.cappedSyncGap(status.head_slot, our_head_slot);
+        if (gap == 0) return;
+
+        const head_snapshot = self.chain.forkChoice.getHead();
+
+        if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+            const start_slot: types.Slot = our_head_slot + 1;
+            const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
+            self.logger.info(
+                "peer {s}{f} is far ahead (gap={d} slots), initiating bulk catch-up via blocks_by_range start_slot={d} count={d}",
+                .{
+                    status.peer_id,
+                    self.node_registry.getNodeNameFromPeerId(status.peer_id),
+                    gap,
+                    start_slot,
+                    requested_count,
+                },
+            );
+            self.initiateBlocksByRangeCatchUp(.{
+                .peer_id = status.peer_id,
+                .start_slot = start_slot,
+                .count = requested_count,
+                .peer_head_slot = status.head_slot,
+                .peer_head_root = status.head_root,
+                .our_head_root_at_start = head_snapshot.blockRoot,
+            });
+        } else {
+            self.logger.info(
+                "peer {s}{f} is ahead (peer_head={d} our_head={d}), requesting head block 0x{x}",
+                .{
+                    status.peer_id,
+                    self.node_registry.getNodeNameFromPeerId(status.peer_id),
+                    status.head_slot,
+                    our_head_slot,
+                    &status.head_root,
+                },
+            );
+            self.syncFetchPeerHeadByRoot(status.peer_id, status.head_root);
+        }
+    }
+
+    fn maybeContinueBlocksByRangeCatchUp(self: *Self, snap: networkFactory.Network.PendingRequestSnapshot) void {
+        if (snap.range_aborted) return;
+        if (self.network.hasBlocksByRangeInFlight()) return;
+
+        const our_head_slot = self.chain.forkChoice.getHead().slot;
+        const gap = self.cappedSyncGap(snap.peer_head_slot, our_head_slot);
+        if (gap <= constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) return;
+
+        const head_snapshot = self.chain.forkChoice.getHead();
+        const start_slot: types.Slot = our_head_slot + 1;
+        const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
+        self.logger.info(
+            "continuing blocks_by_range catch-up after partial success: start_slot={d} count={d} (peer_head={d} our_head={d})",
+            .{ start_slot, requested_count, snap.peer_head_slot, our_head_slot },
+        );
+        self.initiateBlocksByRangeCatchUp(.{
+            .peer_id = snap.peer_id_copy,
+            .start_slot = start_slot,
+            .count = requested_count,
+            .peer_head_slot = snap.peer_head_slot,
+            .peer_head_root = snap.peer_head_root,
+            .our_head_root_at_start = head_snapshot.blockRoot,
+        });
+    }
+
+    fn handleBlocksByRangeSyncEnd(
+        self: *Self,
+        request_id: u64,
+        snap: networkFactory.Network.PendingRequestSnapshot,
+        reason: enum { completed, failed, timeout },
+    ) void {
+        const node_name = self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy);
+
+        if (snap.range_aborted) {
+            self.logger.warn(
+                "blocks_by_range request_id={d} from peer {s}{f} aborted (fork mismatch); falling back to head-by-root 0x{x}",
+                .{ request_id, snap.peer_id_copy, node_name, &snap.peer_head_root },
+            );
+            self.network.finalizePendingRequest(request_id);
+            self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
+            return;
+        }
+
+        const no_progress = snap.range_chunks_imported == 0;
+        const should_retry = (reason == .failed or reason == .timeout or no_progress) and
+            snap.range_attempt < constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS;
+
+        if (should_retry) {
+            const next_attempt = snap.range_attempt + 1;
+            self.logger.warn(
+                "blocks_by_range request_id={d} from peer {s}{f} ended ({s}, chunks={d} imported={d}); retry attempt {d}/{d}",
+                .{
+                    request_id,
+                    snap.peer_id_copy,
+                    node_name,
+                    @tagName(reason),
+                    snap.range_chunks_received,
+                    snap.range_chunks_imported,
+                    next_attempt,
+                    constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+                },
+            );
+            self.network.finalizePendingRequest(request_id);
+
+            const next_peer = self.network.selectPeerExcluding(snap.peer_id_copy) catch null;
+            defer if (next_peer) |p| self.allocator.free(p);
+
+            const peer_id = next_peer orelse snap.peer_id_copy;
+            self.initiateBlocksByRangeCatchUp(.{
+                .peer_id = peer_id,
+                .start_slot = snap.start_slot,
+                .count = snap.count,
+                .peer_head_slot = snap.peer_head_slot,
+                .peer_head_root = snap.peer_head_root,
+                .our_head_root_at_start = snap.our_head_root_at_start,
+                .attempt = next_attempt,
+            });
+            return;
+        }
+
+        if (reason == .failed or reason == .timeout or no_progress) {
+            self.logger.warn(
+                "blocks_by_range request_id={d} from peer {s}{f} gave no usable progress ({s}); falling back to head-by-root 0x{x}",
+                .{ request_id, snap.peer_id_copy, node_name, @tagName(reason), &snap.peer_head_root },
+            );
+            self.network.finalizePendingRequest(request_id);
+            self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
+            return;
+        }
+
+        self.network.finalizePendingRequest(request_id);
+        self.maybeContinueBlocksByRangeCatchUp(snap);
+    }
+
     /// Process a single block chunk received in response to a blocks_by_range request.
     /// Reuses onBlock for STF + forkchoice integration; on missing-parent we cache the block
     /// and queue a parent fetch (same as the by-root path), but we don't track per-root
     /// pending state since the original request was slot-based.
-    fn processBlockByRangeChunk(self: *Self, peer_id: []const u8, signed_block: *const types.SignedBlock) !void {
+    fn processBlockByRangeChunk(
+        self: *Self,
+        request_id: u64,
+        peer_id: []const u8,
+        signed_block: *const types.SignedBlock,
+    ) !void {
+        if (self.network.isBlocksByRangeAborted(request_id)) return;
+
+        const chunk_meta = self.network.blocksByRangeChunkMeta(request_id);
+
         var block_root: types.Root = undefined;
         zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator) catch |err| {
             self.logger.warn("failed to compute block root from blocks_by_range response from peer={s}{f}: {any}", .{
@@ -1215,6 +1440,19 @@ pub const BeamNode = struct {
             return;
         };
 
+        if (chunk_meta) |meta| {
+            if (signed_block.block.slot == meta.start_slot and
+                !std.mem.eql(u8, &signed_block.block.parent_root, &meta.our_head_root_at_start))
+            {
+                self.logger.warn(
+                    "blocks_by_range: fork mismatch at start_slot={d} (parent 0x{x} != our head 0x{x}); aborting range batch",
+                    .{ meta.start_slot, &signed_block.block.parent_root, &meta.our_head_root_at_start },
+                );
+                self.network.markBlocksByRangeAborted(request_id);
+                return;
+            }
+        }
+
         // Skip if already known to fork choice — same guard as processBlockByRootChunk.
         if (self.chain.forkChoice.hasBlock(block_root)) {
             self.logger.debug(
@@ -1222,6 +1460,7 @@ pub const BeamNode = struct {
                 .{&block_root},
             );
             self.processCachedDescendants(block_root);
+            self.network.recordBlocksByRangeChunk(request_id, true);
             return;
         }
 
@@ -1232,6 +1471,7 @@ pub const BeamNode = struct {
         // — see `trySubmitImportToWorker` doc.
         if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
             if (self.trySubmitImportToWorker(signed_block, block_root)) {
+                self.network.recordBlocksByRangeChunk(request_id, true);
                 return;
             }
         }
@@ -1240,6 +1480,7 @@ pub const BeamNode = struct {
             if (err == chainFactory.BlockProcessingError.MissingPreState) {
                 // Cache and try to fetch parent. Range responses arrive ordered by slot,
                 // but the first chunk in a batch may still need its parent fetched.
+                self.network.recordBlocksByRangeChunk(request_id, false);
                 if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
                     self.logger.debug(
                         "blocks_by_range: cached block 0x{x}, fetching parent 0x{x}",
@@ -1257,6 +1498,7 @@ pub const BeamNode = struct {
             }
             if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                 _ = self.network.pruneCachedBlocks(block_root, null);
+                self.network.recordBlocksByRangeChunk(request_id, false);
                 return;
             }
             self.logger.warn("blocks_by_range: failed to import block 0x{x} from peer={s}{f}: {any}", .{
@@ -1265,10 +1507,12 @@ pub const BeamNode = struct {
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 err,
             });
+            self.network.recordBlocksByRangeChunk(request_id, false);
             return;
         };
         defer self.allocator.free(missing_roots);
 
+        self.network.recordBlocksByRangeChunk(request_id, true);
         self.chain.onBlockFollowup(true, signed_block);
         self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
         self.processCachedDescendants(block_root);
@@ -1312,126 +1556,29 @@ pub const BeamNode = struct {
                             });
                         }
 
-                        // Proactive initial sync: if peer's finalized slot is ahead of us, request their head block
-                        // This triggers parent syncing which will fetch all blocks back to our current state
-                        // We compare finalized slots (not head slots) because finalized is more reliable for sync decisions
+                        // Proactive catch-up: prefer `blocks_by_range` for large gaps (issue #893).
+                        const catch_up_status = CatchUpPeerStatus{
+                            .peer_id = status_ctx.peer_id,
+                            .head_slot = status_resp.head_slot,
+                            .head_root = status_resp.head_root,
+                            .finalized_slot = status_resp.finalized_slot,
+                        };
                         const sync_status = self.chain.getSyncStatus();
                         switch (sync_status) {
                             .behind_peers => |info| {
-                                // Only sync from this peer if their finalized slot is ahead of ours
                                 const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
-                                if (status_resp.finalized_slot > our_finalized_slot) {
-                                    // If the peer is far ahead, prefer a blocks_by_range bulk fetch
-                                    // for efficient catch-up. The head-block-by-root path walks parents
-                                    // one round-trip at a time which is too slow for large gaps.
-                                    const gap: u64 = if (status_resp.head_slot > info.head_slot)
-                                        status_resp.head_slot - info.head_slot
-                                    else
-                                        0;
-                                    if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
-                                        const start_slot: types.Slot = info.head_slot + 1;
-                                        const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
-                                        self.logger.info("peer {s}{f} is far ahead (gap={d} slots), initiating bulk sync via blocks_by_range start_slot={d} count={d}", .{
-                                            status_ctx.peer_id,
-                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            gap,
-                                            start_slot,
-                                            requested_count,
-                                        });
-                                        const handler = networks.OnReqRespResponseCbHandler{
-                                            .ptr = self,
-                                            .onReqRespResponseCb = onReqRespResponse,
-                                        };
-                                        _ = self.network.sendBlocksByRangeRequest(status_ctx.peer_id, start_slot, requested_count, handler) catch |err| {
-                                            self.logger.warn("failed to initiate blocks_by_range sync from peer {s}{f}: {any}; falling back to head-by-root", .{
-                                                status_ctx.peer_id,
-                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                                err,
-                                            });
-                                            const roots = [_]types.Root{status_resp.head_root};
-                                            self.fetchBlockByRoots(&roots, 0) catch |fetch_err| {
-                                                self.logger.warn("fallback head-by-root fetch also failed: {any}", .{fetch_err});
-                                            };
-                                        };
-                                    } else {
-                                        self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
-                                            status_ctx.peer_id,
-                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            status_resp.finalized_slot,
-                                            info.head_slot,
-                                            &status_resp.head_root,
-                                        });
-                                        const roots = [_]types.Root{status_resp.head_root};
-                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{f}: {any}", .{
-                                                status_ctx.peer_id,
-                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                                err,
-                                            });
-                                        };
-                                    }
+                                if (self.shouldCatchUpFromPeerStatus(
+                                    catch_up_status,
+                                    info.head_slot,
+                                    our_finalized_slot,
+                                )) {
+                                    self.initiateCatchUpFromPeerStatus(catch_up_status, info.head_slot);
                                 }
                             },
                             .fc_initing => {
-                                // Forkchoice is still initializing (checkpoint-sync or DB restore).
-                                // We need blocks to reach the first justified checkpoint and exit
-                                // fc_initing. Without this branch the node deadlocks: it stays in
-                                // fc_initing because no blocks arrive, and no blocks arrive because
-                                // the sync code skips fc_initing.
-                                //
-                                // Mirror the behind_peers logic: prefer blocks_by_range for large
-                                // gaps (avoids the one-round-trip-per-block parent-chain walk);
-                                // fall back to head-by-root for small gaps or on range failure.
-                                // Snapshot once: forkChoice.head is a
-                                // multi-field ProtoBlock written under
-                                // exclusive. A second raw read in the log
-                                // call could pair this slot with a
-                                // different update's blockRoot.
                                 const head_snapshot = self.chain.forkChoice.getHead();
                                 if (status_resp.head_slot > head_snapshot.slot) {
-                                    const gap: u64 = status_resp.head_slot - head_snapshot.slot;
-                                    if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
-                                        const start_slot: types.Slot = head_snapshot.slot + 1;
-                                        const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
-                                        self.logger.info("peer {s}{f} is ahead during fc init by {d} slots, bulk-syncing via blocks_by_range start_slot={d} count={d}", .{
-                                            status_ctx.peer_id,
-                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            gap,
-                                            start_slot,
-                                            requested_count,
-                                        });
-                                        const handler = networks.OnReqRespResponseCbHandler{
-                                            .ptr = self,
-                                            .onReqRespResponseCb = onReqRespResponse,
-                                        };
-                                        _ = self.network.sendBlocksByRangeRequest(status_ctx.peer_id, start_slot, requested_count, handler) catch |err| {
-                                            self.logger.warn("fc_initing: blocks_by_range from peer {s}{f} failed: {any}; falling back to head-by-root", .{
-                                                status_ctx.peer_id,
-                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                                err,
-                                            });
-                                            const roots = [_]types.Root{status_resp.head_root};
-                                            self.fetchBlockByRoots(&roots, 0) catch |fetch_err| {
-                                                self.logger.warn("fc_initing: fallback head-by-root also failed: {any}", .{fetch_err});
-                                            };
-                                        };
-                                    } else {
-                                        self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
-                                            status_ctx.peer_id,
-                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            status_resp.head_slot,
-                                            head_snapshot.slot,
-                                            &status_resp.head_root,
-                                        });
-                                        const roots = [_]types.Root{status_resp.head_root};
-                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                            self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
-                                                status_ctx.peer_id,
-                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                                err,
-                                            });
-                                        };
-                                    }
+                                    self.initiateCatchUpFromPeerStatus(catch_up_status, head_snapshot.slot);
                                 }
                             },
                             .synced, .no_peers => {},
@@ -1467,7 +1614,7 @@ pub const BeamNode = struct {
                                 node_name,
                                 block_resp.block.slot,
                             });
-                            try self.processBlockByRangeChunk(peer_id, &block_resp);
+                            try self.processBlockByRangeChunk(request_id, peer_id, &block_resp);
                         },
                         else => {
                             self.logger.warn("blocks-by-range response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
@@ -1509,6 +1656,8 @@ pub const BeamNode = struct {
                             err_payload.code,
                             err_payload.message,
                         });
+                        self.handleBlocksByRangeSyncEnd(request_id, snap, .failed);
+                        return;
                     },
                 }
                 self.network.finalizePendingRequest(request_id);
@@ -1523,6 +1672,10 @@ pub const BeamNode = struct {
                 // walk used during fc_initing / behind_peers sync.
                 if (snap.request_kind == .blocks_by_root) {
                     self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
+                    return;
+                }
+                if (snap.request_kind == .blocks_by_range) {
+                    self.handleBlocksByRangeSyncEnd(request_id, snap, .completed);
                     return;
                 }
                 self.network.finalizePendingRequest(request_id);
@@ -2342,12 +2495,13 @@ pub const BeamNode = struct {
                     self.network.finalizePendingRequest(request_id);
                 },
                 .blocks_by_range => {
-                    self.logger.warn("blocks_by_range RPC request_id={d} to peer {s}{f} timed out, finalizing", .{
+                    self.logger.warn("blocks_by_range RPC request_id={d} to peer {s}{f} timed out after {d}s", .{
                         request_id,
                         snap.peer_id_copy,
                         self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
+                        constants.RPC_REQUEST_TIMEOUT_SECONDS,
                     });
-                    self.network.finalizePendingRequest(request_id);
+                    self.handleBlocksByRangeSyncEnd(request_id, snap, .timeout);
                 },
             }
         }
@@ -3658,4 +3812,11 @@ test "Issue #837: last_interval commits per-iteration on a multi-interval onInte
 
     BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), 8) catch {};
     try std.testing.expectEqual(@as(isize, 8), harness.node.last_interval);
+}
+
+test "cappedSyncGapSlots limits range catch-up to wall-clock head" {
+    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(100, 100, 200));
+    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(50, 100, 200));
+    try std.testing.expectEqual(@as(u64, 50), cappedSyncGapSlots(200, 100, 150));
+    try std.testing.expectEqual(@as(u64, 100), cappedSyncGapSlots(200, 100, 250));
 }

@@ -120,6 +120,10 @@ pub const SYNC_STATUS_REFRESH_INTERVAL_SLOTS: u64 = 8;
 // than chasing the parent chain one block at a time.
 pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 64;
 
+// Maximum `blocks_by_range` catch-up attempts (peer rotation + fallback) before
+// switching to head-by-root parent walk. Issue #893.
+pub const MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS: u8 = 3;
+
 // Minimum number of recent slots that a blocksByRange responder MUST keep available.
 // Derived from leanSpec networking/config.py MIN_SLOTS_FOR_BLOCK_REQUESTS.
 // Requests whose start_slot falls before (head_slot - MIN_SLOTS_FOR_BLOCK_REQUESTS)

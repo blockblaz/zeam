@@ -953,6 +953,11 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// freshly-allocated copy of the peer id so the caller can use
         /// it after the lock is released. Caller frees with `allocator`.
         pub fn selectPeerCopy(self: *Self, allocator: Allocator) !?[]u8 {
+            return self.selectPeerExcluding(allocator, null);
+        }
+
+        /// Pick a random connected peer, optionally excluding one id (for RPC retry).
+        pub fn selectPeerExcluding(self: *Self, allocator: Allocator, exclude: ?[]const u8) !?[]u8 {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
@@ -962,14 +967,29 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             const io = std.Io.Threaded.global_single_threaded.io();
             var random_source = std.Random.IoSource{ .io = io };
             const random = random_source.interface();
-            const target_index = random.uintLessThan(usize, n);
 
-            var it = self.map.iterator();
-            var current_index: usize = 0;
-            while (it.next()) |entry| : (current_index += 1) {
-                if (current_index == target_index) {
+            const max_tries = @min(n * 2, 16);
+            var try_index: usize = 0;
+            while (try_index < max_tries) : (try_index += 1) {
+                const target_index = random.uintLessThan(usize, n);
+                var it = self.map.iterator();
+                var current_index: usize = 0;
+                while (it.next()) |entry| : (current_index += 1) {
+                    if (current_index != target_index) continue;
+                    if (exclude) |ex| {
+                        if (std.mem.eql(u8, entry.key_ptr.*, ex)) break;
+                    }
                     return try allocator.dupe(u8, entry.value_ptr.peer_id);
                 }
+            }
+
+            // Fallback: first peer that is not excluded (deterministic when only one alternative).
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                if (exclude) |ex| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
+                }
+                return try allocator.dupe(u8, entry.value_ptr.peer_id);
             }
             return null;
         }
