@@ -2735,6 +2735,16 @@ pub const BeamChain = struct {
             &finalized.root,
         });
 
+        if (slot > 0) {
+            if (self.forkChoice.formatAggregationCoverageReport(self.allocator, slot - 1) catch |err| blk: {
+                self.logger.warn("failed to format attestation aggregate coverage for slot={d}: {any}", .{ slot - 1, err });
+                break :blk null;
+            }) |coverage_report| {
+                defer self.allocator.free(coverage_report);
+                self.logger.info("{s}", .{coverage_report});
+            }
+        }
+
         // Build tree visualization (thread-safe snapshot)
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -4374,6 +4384,9 @@ pub const BeamChain = struct {
             snapshot.deinit();
             chain.allocator.destroy(snapshot);
         }
+
+        // Log subnet-wise coverage of current new payloads before starting aggregation.
+        chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
 
         const aggregations = chain.forkChoice.aggregate(snapshot) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
