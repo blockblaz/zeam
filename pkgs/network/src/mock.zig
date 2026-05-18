@@ -28,6 +28,7 @@ pub const Mock = struct {
     connectedPairs: std.AutoHashMapUnmanaged(PairKey, void),
     activeStreams: std.AutoHashMapUnmanaged(u64, *MockServerStream),
     timer: xev.Timer,
+    pending_publish_drain_scheduled: bool,
     nextPeerIndex: usize,
     nextRequestId: u64,
     /// Issue #808 review: when set to true, every `publish` call returns
@@ -227,6 +228,28 @@ pub const Mock = struct {
         return .disarm;
     }
 
+    fn pendingPublishDrainCallback(ud: ?*Mock, _: *xev.Loop, completion: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        if (ud) |mock| {
+            defer mock.allocator.destroy(completion);
+            mock.pending_publish_drain_scheduled = false;
+
+            _ = r catch |err| {
+                mock.logger.err("mock:: pending publish drain scheduling failed: {any}", .{err});
+                return .disarm;
+            };
+
+            mock.drainPendingPublishes() catch |err| {
+                mock.logger.err("mock:: pending publish drain failed: {any}", .{err});
+            };
+
+            if (mock.pending_publishes.items.len > 0) {
+                mock.schedulePendingPublishDrain();
+            }
+        }
+
+        return .disarm;
+    }
+
     pub fn init(allocator: Allocator, loop: *xev.Loop, logger: zeam_utils.ModuleLogger, registry: ?*NodeNameRegistry) !Self {
         // Use provided registry or create empty one for backward compatibility
         const RegistryInfo = struct {
@@ -271,6 +294,7 @@ pub const Mock = struct {
             .connectedPairs = .empty,
             .activeStreams = .empty,
             .timer = timer,
+            .pending_publish_drain_scheduled = false,
             .nextPeerIndex = 0,
             .nextRequestId = 1,
             .force_publish_drop = false,
@@ -342,6 +366,41 @@ pub const Mock = struct {
         self.pending_publishes.clearRetainingCapacity();
     }
 
+    fn discardDrainedPublishes(self: *Self, drained_count: usize) void {
+        for (self.pending_publishes.items[0..drained_count]) |entry| {
+            self.freePendingPublish(entry);
+        }
+
+        const remaining_count = self.pending_publishes.items.len - drained_count;
+        if (remaining_count > 0) {
+            std.mem.copyForwards(
+                PendingPublish,
+                self.pending_publishes.items[0..remaining_count],
+                self.pending_publishes.items[drained_count..],
+            );
+        }
+        self.pending_publishes.shrinkRetainingCapacity(remaining_count);
+    }
+
+    fn schedulePendingPublishDrain(self: *Self) void {
+        if (self.pending_publish_drain_scheduled) return;
+
+        const completion = self.allocator.create(xev.Completion) catch |err| {
+            self.logger.err("mock:: failed to allocate pending publish drain completion: {any}", .{err});
+            return;
+        };
+        self.pending_publish_drain_scheduled = true;
+
+        self.timer.run(
+            self.gossipHandler.loop,
+            completion,
+            1,
+            Mock,
+            self,
+            pendingPublishDrainCallback,
+        );
+    }
+
     fn enqueuePublish(self: *Self, data: *const interface.GossipMessage, sender_peer_id: []const u8) !void {
         const cloned_message = try data.clone(self.allocator);
         errdefer {
@@ -356,6 +415,7 @@ pub const Mock = struct {
             .message = cloned_message,
             .sender_peer_id = sender_peer_id_copy,
         });
+        self.schedulePendingPublishDrain();
     }
 
     fn getOrCreatePeerEntry(self: *Self, owner_ptr: *anyopaque) !struct { idx: usize, peer: *Peer } {
@@ -705,15 +765,16 @@ pub const Mock = struct {
     }
 
     pub fn drainPendingPublishes(self: *Self) !void {
+        const drain_count = self.pending_publishes.items.len;
         var i: usize = 0;
-        while (i < self.pending_publishes.items.len) : (i += 1) {
+        while (i < drain_count) : (i += 1) {
             const entry = self.pending_publishes.items[i];
             self.gossipHandler.onGossip(entry.message, entry.sender_peer_id) catch |e| {
                 self.logger.err("mock:: drain gossip handler error: {any}", .{e});
             };
         }
 
-        self.clearPendingPublishes();
+        self.discardDrainedPublishes(drain_count);
     }
 
     pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest, callback: ?interface.OnReqRespResponseCbHandler) anyerror!u64 {
@@ -953,7 +1014,7 @@ test "Mock messaging across two subscribers" {
     mock.setForcePublishDrop(false);
 }
 
-test "Mock gossip drain delivers re-entrant publish in same pass" {
+test "Mock gossip drain leaves re-entrant publish for next pass" {
     const ReentrantSubscriber = struct {
         gossip: interface.GossipSub,
         nested_message: *interface.GossipMessage,
@@ -1015,8 +1076,13 @@ test "Mock gossip drain delivers re-entrant publish in same pass" {
 
     try mock.drainPendingPublishes();
 
-    try std.testing.expectEqual(@as(u32, 2), subscriber.calls);
+    try std.testing.expectEqual(@as(u32, 1), subscriber.calls);
     try std.testing.expectEqual(@as(types.Slot, 1), subscriber.received_slots[0]);
+    try std.testing.expectEqual(@as(usize, 1), mock.pending_publishes.items.len);
+
+    try mock.drainPendingPublishes();
+
+    try std.testing.expectEqual(@as(u32, 2), subscriber.calls);
     try std.testing.expectEqual(@as(types.Slot, 2), subscriber.received_slots[1]);
     try std.testing.expectEqual(@as(usize, 0), mock.pending_publishes.items.len);
 }
