@@ -53,6 +53,11 @@ jobs:
       with:
         toolchain: stable
         components: clippy, rustfmt
+        # Infra (not #863 perf): setup-rust-toolchain's bundled rust-cache
+        # runs `cargo metadata` at repo root, but zeam's workspace is rust/.
+        # macOS runners also need the Ensure-rustup shim step before any
+        # plain `cargo` call — see workflow comments on that step.
+        cache: false
 
     - name: Verify installation
       run: |
@@ -62,6 +67,8 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
+        workspaces: "rust -> target"
+        cache-bin: false
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Check Rust formatting
@@ -101,17 +108,35 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
-    - name: Prefer rustup shims on PATH (macOS)
+    - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
       run: |
-        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-        command -v cargo
-        # Verify the nightly toolchain is reachable. Use `rustup run`
-        # rather than the `+nightly` selector — the latter requires
-        # `~/.cargo/bin/cargo` to be the rustup proxy shim, but on
-        # some macOS runner images that path is `rustup-init` and
-        # the `+nightly` selector fails with "unexpected argument".
+        # The macos-15-arm64 GitHub Actions runner image ships with
+        # `~/.cargo/bin/{cargo,rustup}` as symlinks that resolve to the
+        # `rustup-init` installer (same multi-call binary, but rustup picks
+        # its mode from the resolved exe basename, so the shims behave as
+        # the installer rather than as the rustup/cargo proxies). That
+        # breaks every `cargo` / `rustup run` invocation with
+        # `error: unexpected argument 'foo' found / Usage: rustup-init…`.
+        #
+        # The official installer fixes this by recreating the proxy shims
+        # as hardlinks, so we re-run it (with --force) before any cargo
+        # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
+        # because the `actions-rust-lang/setup-rust-toolchain` step has
+        # already done that.
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
+          echo "Rustup proxy shims are broken; reinstalling via rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain nightly --no-modify-path \
+                       --profile minimal --force
+        fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -125,6 +150,7 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
+        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
@@ -185,17 +211,35 @@ jobs:
       with:
         toolchain: nightly
         components: clippy, rustfmt
+        cache: false
 
-    - name: Prefer rustup shims on PATH (macOS)
+    - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
       run: |
-        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-        command -v cargo
-        # Verify the nightly toolchain is reachable. Use `rustup run`
-        # rather than the `+nightly` selector — the latter requires
-        # `~/.cargo/bin/cargo` to be the rustup proxy shim, but on
-        # some macOS runner images that path is `rustup-init` and
-        # the `+nightly` selector fails with "unexpected argument".
+        # The macos-15-arm64 GitHub Actions runner image ships with
+        # `~/.cargo/bin/{cargo,rustup}` as symlinks that resolve to the
+        # `rustup-init` installer (same multi-call binary, but rustup picks
+        # its mode from the resolved exe basename, so the shims behave as
+        # the installer rather than as the rustup/cargo proxies). That
+        # breaks every `cargo` / `rustup run` invocation with
+        # `error: unexpected argument 'foo' found / Usage: rustup-init…`.
+        #
+        # The official installer fixes this by recreating the proxy shims
+        # as hardlinks, so we re-run it (with --force) before any cargo
+        # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
+        # because the `actions-rust-lang/setup-rust-toolchain` step has
+        # already done that.
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
+          echo "Rustup proxy shims are broken; reinstalling via rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain nightly --no-modify-path \
+                       --profile minimal --force
+        fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -209,6 +253,7 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
+        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
@@ -277,17 +322,35 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
-    - name: Prefer rustup shims on PATH (macOS)
+    - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
       run: |
-        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-        command -v cargo
-        # Verify the nightly toolchain is reachable. Use `rustup run`
-        # rather than the `+nightly` selector — the latter requires
-        # `~/.cargo/bin/cargo` to be the rustup proxy shim, but on
-        # some macOS runner images that path is `rustup-init` and
-        # the `+nightly` selector fails with "unexpected argument".
+        # The macos-15-arm64 GitHub Actions runner image ships with
+        # `~/.cargo/bin/{cargo,rustup}` as symlinks that resolve to the
+        # `rustup-init` installer (same multi-call binary, but rustup picks
+        # its mode from the resolved exe basename, so the shims behave as
+        # the installer rather than as the rustup/cargo proxies). That
+        # breaks every `cargo` / `rustup run` invocation with
+        # `error: unexpected argument 'foo' found / Usage: rustup-init…`.
+        #
+        # The official installer fixes this by recreating the proxy shims
+        # as hardlinks, so we re-run it (with --force) before any cargo
+        # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
+        # because the `actions-rust-lang/setup-rust-toolchain` step has
+        # already done that.
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
+          echo "Rustup proxy shims are broken; reinstalling via rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain nightly --no-modify-path \
+                       --profile minimal --force
+        fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -301,6 +364,7 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
+        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
@@ -389,17 +453,35 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
-    - name: Prefer rustup shims on PATH (macOS)
+    - name: Ensure rustup proxy shims (macOS)
       if: runner.os == 'macOS'
       run: |
-        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-        command -v cargo
-        # Verify the nightly toolchain is reachable. Use `rustup run`
-        # rather than the `+nightly` selector — the latter requires
-        # `~/.cargo/bin/cargo` to be the rustup proxy shim, but on
-        # some macOS runner images that path is `rustup-init` and
-        # the `+nightly` selector fails with "unexpected argument".
+        # The macos-15-arm64 GitHub Actions runner image ships with
+        # `~/.cargo/bin/{cargo,rustup}` as symlinks that resolve to the
+        # `rustup-init` installer (same multi-call binary, but rustup picks
+        # its mode from the resolved exe basename, so the shims behave as
+        # the installer rather than as the rustup/cargo proxies). That
+        # breaks every `cargo` / `rustup run` invocation with
+        # `error: unexpected argument 'foo' found / Usage: rustup-init…`.
+        #
+        # The official installer fixes this by recreating the proxy shims
+        # as hardlinks, so we re-run it (with --force) before any cargo
+        # call. We don't add `~/.cargo/bin` to GITHUB_PATH explicitly
+        # because the `actions-rust-lang/setup-rust-toolchain` step has
+        # already done that.
+        #
+        # Swatinem/rust-cache and other steps invoke plain `cargo` on PATH.
+        # `rustup run nightly cargo` can still work while ~/.cargo/bin/cargo
+        # is broken, so we must not use only the latter as the health check.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
+          echo "Rustup proxy shims are broken; reinstalling via rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain nightly --no-modify-path \
+                       --profile minimal --force
+        fi
+        cargo --version
         rustup run nightly cargo --version
 
     - name: Cache Zig packages
@@ -413,6 +495,7 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
+        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
@@ -473,6 +556,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: nightly
+        cache: false
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -485,6 +569,7 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
+        cache-bin: false
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
 
@@ -527,4 +612,7 @@ jobs:
         push: false  # Don't push, just build to verify
         tags: zeam:ci-${{ github.run_number }}
         cache-from: type=gha
-        cache-to: type=gha,mode=max
+        # `ignore-error=true`: cache export talks to GitHub's Actions Cache
+        # API; intermittent 502/HTML responses fail the whole job even when
+        # the image build succeeded (see docker-build ubuntu-22.04-arm on #886).
+        cache-to: type=gha,mode=max,ignore-error=true
