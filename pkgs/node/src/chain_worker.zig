@@ -140,8 +140,20 @@ pub const Message = union(enum) {
     /// Aggregated-attestation gossip. Producer is libp2p gossip handler.
     /// Owns: `proof` slices inside the aggregated attestation.
     on_gossip_aggregated_attestation: types.SignedAggregatedAttestation,
-    /// `processPendingBlocks` drain trigger. Producer is libxev clock
-    /// (`onInterval`). Heap-free (slot is a value type).
+    /// **TEST-ONLY in production today; see #863 follow-up.**
+    /// `processPendingBlocks` drain trigger. Heap-free (slot is a
+    /// value type). The libxev tick currently runs
+    /// `processPendingBlocks` inline so the returned missing-roots
+    /// can flow back into `BeamNode.fetchBlockByRoots`. Wiring a
+    /// worker producer requires plumbing those missing roots
+    /// through a worker→BeamNode backchannel (see
+    /// `imported_block_fn` for the analogous on_block path) — until
+    /// that lands, this variant is exercised ONLY by the queue
+    /// smoke tests in `chain_worker.zig` and the corresponding
+    /// thunk warns + bumps
+    /// `lean_chain_worker_process_pending_blocks_dropped_missing_roots_total`
+    /// if it ever fires with non-empty missing roots, so an
+    /// accidental re-introduction is loud in metrics.
     process_pending_blocks: struct {
         current_slot: types.Slot,
     },
@@ -165,6 +177,17 @@ pub const Message = union(enum) {
         latest_finalized: types.Checkpoint,
         prune_forkchoice: bool,
     },
+    /// Trigger an unbounded replay of the pending-attestation /
+    /// pending-aggregation buffers on the worker thread. POD payload
+    /// — the chain pulls the buffer contents itself. Issued by libxev
+    /// callers that imported a block via the disabled-worker fallback
+    /// path or that produced a block locally (`BeamNode.publishBlock`),
+    /// since neither dispatches an `on_block` message that would
+    /// auto-replay on the worker side. Coalesces naturally: if multiple
+    /// libxev paths queue a replay before the worker drains, the
+    /// worker still only reads one buffer state per dispatch — the
+    /// extra messages are harmless no-ops.
+    replay_pending_attestations: void,
 
     /// Free any heap-owned data on this message. The worker must call
     /// this on every message it pops, including in error paths from
@@ -181,6 +204,7 @@ pub const Message = union(enum) {
             .on_gossip_attestation,
             .process_pending_blocks,
             .process_finalization_followup,
+            .replay_pending_attestations,
             => {
                 // Plain-old-data; nothing to free. Listed explicitly
                 // so that a future variant added with heap fields
@@ -427,6 +451,16 @@ pub const Handlers = struct {
         latest_finalized: types.Checkpoint,
         prune_forkchoice: bool,
     ) void,
+    /// Drain the chain's pending-attestation / pending-aggregation
+    /// buffers via `BeamChain.replayPendingAttestations`. Producer is
+    /// the libxev thread (post-RPC-block-import paths and `publishBlock`)
+    /// — see `BeamChain.submitReplayPendingAttestations`. The worker's
+    /// own `on_block` thunk replays inline after every successful
+    /// import, so this variant is only needed when the libxev side
+    /// imports a block (e.g. via the inline fallback path) or when
+    /// the producer wants to nudge the worker after structural work
+    /// that may unblock buffered attestations (#863).
+    replay_pending_attestations: *const fn (ctx: *anyopaque) void,
 };
 
 /// Default capacities. Generous enough that a 30s gossip burst on
@@ -635,6 +669,45 @@ pub const ChainWorker = struct {
             .{ .queue = "attestation" },
             self.attestation_queue.outstandingDepth(),
         ) catch {};
+    }
+
+    /// Enqueue a `replay_pending_attestations` nudge on the attestation
+    /// queue. Same wake/backpressure contract as `sendAttestation` but
+    /// with its OWN drop label (`replay_pending`) so it doesn't muddy
+    /// the per-attestation-message queue-depth metric (zclawz review on
+    /// PR #890): one nudge fans out into N replays inside the worker,
+    /// so charging it against `queue="attestation"` would make
+    /// dashboards read "attestation throughput fine" while the
+    /// pending-buffer behind it sits at 800+ entries. The buffer
+    /// depth itself is already exposed via
+    /// `lean_pending_attestations_size{kind=attestation|aggregation}`
+    /// — operators looking for "how full is the replay backlog?"
+    /// should read that gauge.
+    ///
+    /// Producers (libxev fallback paths after a synchronous
+    /// `chain.onBlock`, `BeamNode.publishBlock` after publishing a
+    /// locally produced block) treat a full-queue drop as benign in
+    /// the steady-state aggregator case: the next worker `on_block`
+    /// dispatch already runs `replayPendingAttestations`, and the
+    /// buffers themselves are FIFO-bounded
+    /// (`MAX_PENDING_ATTESTATIONS`) so a missed replay just delays a
+    /// few entries by one block-cycle. Tail behaviour for an isolated
+    /// node producing in a quiet network (no inbound `on_block` to
+    /// piggy-back on): buffered attestations age behind FIFO eviction
+    /// — at the spec's 1024-cap that is ~hundreds of slots of
+    /// inbound traffic before head-of-line eviction kicks in.
+    /// Operators monitor `lean_chain_queue_dropped_total{queue=replay_pending}`
+    /// rate against `lean_pending_attestations_size` to spot a stuck
+    /// node.
+    pub fn sendReplayPending(self: *Self) AttestationQueue.TrySendError!void {
+        self.attestation_queue.trySend(.{ .replay_pending_attestations = {} }) catch |err| {
+            if (err == error.QueueFull) {
+                zeam_metrics.metrics.lean_chain_queue_dropped_total.incr(.{ .queue = "replay_pending" }) catch {};
+            }
+            return err;
+        };
+        self.recordAttestationQueueDepth();
+        self.wake();
     }
 
     /// Send an aggregated-attestation-flavored message and wake the worker.
@@ -878,6 +951,7 @@ pub const ChainWorker = struct {
                 payload.latest_finalized,
                 payload.prune_forkchoice,
             ),
+            .replay_pending_attestations => h.replay_pending_attestations(h.ctx),
         }
     }
 };
