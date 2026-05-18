@@ -230,7 +230,8 @@ pub const Mock = struct {
 
     fn pendingPublishDrainCallback(ud: ?*Mock, _: *xev.Loop, completion: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
         if (ud) |mock| {
-            defer mock.allocator.destroy(completion);
+            var completion_rearmed = false;
+            defer if (!completion_rearmed) mock.allocator.destroy(completion);
             mock.pending_publish_drain_scheduled = false;
 
             _ = r catch |err| {
@@ -243,7 +244,10 @@ pub const Mock = struct {
             };
 
             if (mock.pending_publishes.items.len > 0) {
-                mock.schedulePendingPublishDrain();
+                if (!mock.pending_publish_drain_scheduled) {
+                    mock.armPendingPublishDrain(completion);
+                    completion_rearmed = true;
+                }
             }
         }
 
@@ -382,13 +386,14 @@ pub const Mock = struct {
         self.pending_publishes.shrinkRetainingCapacity(remaining_count);
     }
 
-    fn schedulePendingPublishDrain(self: *Self) void {
+    fn schedulePendingPublishDrain(self: *Self) !void {
         if (self.pending_publish_drain_scheduled) return;
 
-        const completion = self.allocator.create(xev.Completion) catch |err| {
-            self.logger.err("mock:: failed to allocate pending publish drain completion: {any}", .{err});
-            return;
-        };
+        const completion = try self.allocator.create(xev.Completion);
+        self.armPendingPublishDrain(completion);
+    }
+
+    fn armPendingPublishDrain(self: *Self, completion: *xev.Completion) void {
         self.pending_publish_drain_scheduled = true;
 
         self.timer.run(
@@ -403,19 +408,25 @@ pub const Mock = struct {
 
     fn enqueuePublish(self: *Self, data: *const interface.GossipMessage, sender_peer_id: []const u8) !void {
         const cloned_message = try data.clone(self.allocator);
-        errdefer {
+        var message_owned_by_queue = false;
+        errdefer if (!message_owned_by_queue) {
             cloned_message.deinit();
             self.allocator.destroy(cloned_message);
-        }
+        };
 
         const sender_peer_id_copy = try self.allocator.dupe(u8, sender_peer_id);
-        errdefer self.allocator.free(sender_peer_id_copy);
+        var sender_peer_id_owned_by_queue = false;
+        errdefer if (!sender_peer_id_owned_by_queue) self.allocator.free(sender_peer_id_copy);
 
         try self.pending_publishes.append(self.allocator, .{
             .message = cloned_message,
             .sender_peer_id = sender_peer_id_copy,
         });
-        self.schedulePendingPublishDrain();
+        message_owned_by_queue = true;
+        sender_peer_id_owned_by_queue = true;
+        errdefer self.freePendingPublish(self.pending_publishes.pop().?);
+
+        try self.schedulePendingPublishDrain();
     }
 
     fn getOrCreatePeerEntry(self: *Self, owner_ptr: *anyopaque) !struct { idx: usize, peer: *Peer } {
@@ -1085,6 +1096,127 @@ test "Mock gossip drain leaves re-entrant publish for next pass" {
     try std.testing.expectEqual(@as(u32, 2), subscriber.calls);
     try std.testing.expectEqual(@as(types.Slot, 2), subscriber.received_slots[1]);
     try std.testing.expectEqual(@as(usize, 0), mock.pending_publishes.items.len);
+}
+
+test "Mock pending publish drain scheduling propagates allocation failure" {
+    const allocator = std.testing.allocator;
+
+    try detectBackendOrFail();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(.mock);
+    var mock = try Mock.init(allocator, &loop, logger, null);
+    defer mock.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const original_allocator = mock.allocator;
+    mock.allocator = failing_allocator.allocator();
+    defer mock.allocator = original_allocator;
+
+    try std.testing.expectError(error.OutOfMemory, mock.schedulePendingPublishDrain());
+    try std.testing.expect(!mock.pending_publish_drain_scheduled);
+    try std.testing.expectEqual(@as(usize, 0), mock.pending_publishes.items.len);
+}
+
+test "Mock pending publish drain callback rearms without allocation" {
+    const ReentrantSubscriber = struct {
+        mock: *Mock,
+        allocator: Allocator,
+        nested_message: *interface.GossipMessage,
+        calls: u32 = 0,
+
+        fn onGossip(ptr: *anyopaque, message: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
+            _ = sender_peer_id;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+
+            if (message.block.block.slot == 1) {
+                const cloned_message = try self.nested_message.clone(self.allocator);
+                errdefer {
+                    cloned_message.deinit();
+                    self.allocator.destroy(cloned_message);
+                }
+
+                const sender_peer_id_copy = try self.allocator.dupe(u8, "reentrant");
+                errdefer self.allocator.free(sender_peer_id_copy);
+
+                try self.mock.pending_publishes.append(self.allocator, .{
+                    .message = cloned_message,
+                    .sender_peer_id = sender_peer_id_copy,
+                });
+            }
+        }
+
+        fn getCallbackHandler(self: *@This()) interface.OnGossipCbHandler {
+            return .{
+                .ptr = self,
+                .onGossipCb = onGossip,
+            };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    try detectBackendOrFail();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(.mock);
+    var mock = try Mock.init(allocator, &loop, logger, null);
+    defer mock.deinit();
+
+    const network = mock.getNetworkInterface();
+    var nested_message = try initTestBlockMessage(allocator, 2);
+    defer nested_message.deinit();
+    var subscriber = ReentrantSubscriber{
+        .mock = &mock,
+        .allocator = allocator,
+        .nested_message = &nested_message,
+    };
+
+    var topics = [_]interface.GossipTopic{.{ .kind = .block }};
+    try network.gossip.subscribe(&topics, subscriber.getCallbackHandler());
+
+    var initial_message = try initTestBlockMessage(allocator, 1);
+    defer initial_message.deinit();
+    const initial_clone = try initial_message.clone(allocator);
+    var initial_clone_owned_by_queue = false;
+    errdefer if (!initial_clone_owned_by_queue) {
+        initial_clone.deinit();
+        allocator.destroy(initial_clone);
+    };
+    const sender_peer_id_copy = try allocator.dupe(u8, "mock_publisher");
+    var sender_peer_id_owned_by_queue = false;
+    errdefer if (!sender_peer_id_owned_by_queue) allocator.free(sender_peer_id_copy);
+    try mock.pending_publishes.append(allocator, .{
+        .message = initial_clone,
+        .sender_peer_id = sender_peer_id_copy,
+    });
+    initial_clone_owned_by_queue = true;
+    sender_peer_id_owned_by_queue = true;
+
+    const completion = try allocator.create(xev.Completion);
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const original_allocator = mock.allocator;
+    mock.allocator = failing_allocator.allocator();
+    defer mock.allocator = original_allocator;
+
+    mock.pending_publish_drain_scheduled = true;
+    const action = Mock.pendingPublishDrainCallback(&mock, &loop, completion, {});
+
+    try std.testing.expectEqual(xev.CallbackAction.disarm, action);
+    try std.testing.expectEqual(@as(u32, 1), subscriber.calls);
+    try std.testing.expectEqual(@as(usize, 1), mock.pending_publishes.items.len);
+    try std.testing.expect(mock.pending_publish_drain_scheduled);
+
+    try loop.run(.until_done);
+
+    try std.testing.expectEqual(@as(u32, 2), subscriber.calls);
+    try std.testing.expectEqual(@as(usize, 0), mock.pending_publishes.items.len);
+    try std.testing.expect(!mock.pending_publish_drain_scheduled);
 }
 
 test "Mock status RPC between peers" {
