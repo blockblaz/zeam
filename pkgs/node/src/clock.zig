@@ -164,9 +164,9 @@ pub const Clock = struct {
         // multi-second slot-driver stalls and ~96 finalized vs ~196 head
         // delta on the aggregator as a direct consequence.
         //
-        // `.once` blocks until at least one completion is ready, drains
-        // whatever the kernel has queued in that batch (up to 128 CQEs
-        // per the io_uring backend), and returns. The next-interval
+        // `.once` blocks until at least one completion is ready, then
+        // drains every CQE the kernel returns in that syscall batch (up
+        // to 128 per the io_uring backend) before returning. The next-interval
         // timer is itself a completion, so under no-flood conditions
         // we still wake every ~800ms and call `tickInterval` exactly
         // once per interval — the steady-state behaviour is unchanged.

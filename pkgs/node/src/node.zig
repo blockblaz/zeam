@@ -234,6 +234,8 @@ pub const BeamNode = struct {
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
+        chain.setImportedBlockCallback(self, handleChainImportedBlock);
+        chain.setRejectedBlockCallback(self, handleChainRejectedBlock);
 
         if (opts.loop) |loop| {
             var notifier = xev.Async.init() catch |err| {
@@ -257,8 +259,30 @@ pub const BeamNode = struct {
         self.resp_queue_mutex.unlock();
         self.batch_pending_parent_roots.deinit();
         self.network.deinit();
+        // Order matters under #890. `chain.deinit()` is what stops/
+        // joins the chain-worker thread, so any state the worker
+        // callbacks (`handleChainImportedBlock`,
+        // `handleChainRejectedBlock`) reach into MUST outlive the
+        // join. Concretely the callbacks touch:
+        //
+        //   * `self.network`            (cache removal, missing-root
+        //                                fetches, pre-finalized prune)
+        //   * `self.batch_pending_parent_roots` + its lock
+        //                                (`flushPendingParentFetches`,
+        //                                `cacheBlockAndFetchParent`)
+        //   * `self.chain.forkChoice`   (already torn down inside
+        //                                `chain.deinit` — but only
+        //                                AFTER the worker has joined,
+        //                                so still safe)
+        //
+        // Any new BeamNode field a worker callback can reach must be
+        // deinit'd AFTER `chain.deinit()` — failure surfaces as an
+        // alignment panic / UAF on the still-draining worker
+        // dispatch (zclawz review on PR #890).
         self.chain.deinit();
         self.allocator.destroy(self.chain);
+        self.batch_pending_parent_roots.deinit();
+        self.network.deinit();
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
@@ -519,6 +543,281 @@ pub const BeamNode = struct {
         };
     }
 
+    /// Imported-block backchannel handler (#890). Fires from
+    /// `BeamChain.chainWorkerOnBlockThunk` after every successful
+    /// chain-worker import. Takes ownership of `missing_roots` —
+    /// frees it before returning. May run on the chain-worker
+    /// thread, the gossip-import thread, or the libxev thread
+    /// depending on which path imported the block.
+    ///
+    /// **Thread-safety audit (zclawz round 3 review on PR #890).**
+    /// Every primitive this handler reaches is safe to call from a
+    /// non-libxev thread:
+    ///
+    ///   * `network.removeFetchedBlock` /
+    ///     `network.getChildrenOfBlock` /
+    ///     `network.hasFetchedBlock` /
+    ///     `network.pruneCachedBlocks`
+    ///                  → `LockedMap` (mutex-protected hashmap).
+    ///   * `network.hasPendingBlockRoot` /
+    ///     `network.removePendingBlockRoot` /
+    ///     `network.trackPendingBlockRoot`
+    ///                  → `LockedMap`.
+    ///   * `network.connected_peers.selectPeerCopy`
+    ///                  → `RwLock`-guarded random pick.
+    ///   * `network.pending_rpc_requests`,
+    ///     `network.blocks_by_root_inflight`
+    ///                  → `LockedMap` + atomic counter (CAS reservation).
+    ///   * `chain.forkChoice.hasBlocksBatch` /
+    ///     `chain.forkChoice.hasBlock`
+    ///                  → forkchoice `RwLock` shared/exclusive.
+    ///   * `self.batch_pending_parent_roots`
+    ///                  → its own `batch_pending_parent_roots_lock`.
+    ///   * `network.backend.reqresp.sendRequest`
+    ///                  → enqueues onto a Tokio `mpsc::Sender::try_send`
+    ///                    in the Rust libp2p glue
+    ///                    (`SwarmCommandChannel`,
+    ///                    `rust/libp2p-glue/src/lib.rs::send_swarm_command`).
+    ///                    The Rust libp2p swarm runs on its OWN
+    ///                    Tokio runtime — the Zig caller never
+    ///                    touches a libxev primitive on this path,
+    ///                    so there is no event-loop affinity to
+    ///                    violate. `try_send` is `Send + Sync`.
+    ///
+    /// Net result: this handler issues NO libxev I/O directly. It
+    /// mutates lock-protected state and queues a command across
+    /// the Zig→Rust FFI boundary; the libxev thread is unaffected.
+    /// Future BeamNode helpers that issue libxev I/O primitives
+    /// (timers, fd reads/writes via `xev.Loop`) MUST NOT be called
+    /// from this handler — they would need to be hopped back via
+    /// the chain-worker queue or a dedicated libxev wakeup.
+    ///
+    /// See `BeamChain.imported_block` / `ImportedBlockFn` for the
+    /// full contract.
+    fn handleChainImportedBlock(
+        ptr: *anyopaque,
+        block_root: types.Root,
+        missing_roots: []types.Root,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        defer self.allocator.free(missing_roots);
+
+        // If the block was previously cached (a `processCachedDescendants`
+        // submission, or a long-orphan block that arrived ahead of its
+        // parent and got buffered in `network.fetched_blocks`), the
+        // cache entry is now stale — clear it before driving descendant
+        // retry so we don't re-process the same root in a future pass.
+        // Idempotent: no-op for blocks that arrived via gossip or RPC
+        // and never sat in the cache.
+        _ = self.network.removeFetchedBlock(block_root);
+
+        // The block was just imported, so any cached descendants
+        // waiting on it can now be retried. Mirrors the post-import
+        // recursion in the inline RPC paths
+        // (`processBlockByRootChunk` / `processBlockByRangeChunk`).
+        // Internally uses cache-lock-protected helpers + chain.onBlock
+        // (mutex-guarded), so it is safe to invoke from whichever
+        // thread the worker dispatched on.
+        self.processCachedDescendants(block_root);
+
+        // Drive the missing-attestation-root fetch fan-out. Pre-#890
+        // this slice was silently dropped by the worker thunk
+        // (chain.onGossip's `.block` arm comment, and
+        // `chainWorkerProcessPendingBlocksThunk` warn) so attestation
+        // sync stalled until a re-broadcast nudged us. With the
+        // backchannel wired, RPC fetches kick off the moment the
+        // chain knows the dependency.
+        if (missing_roots.len > 0) {
+            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+                self.logger.warn(
+                    "imported-block callback: failed to fetch {d} missing block(s): {any}",
+                    .{ missing_roots.len, err },
+                );
+            };
+        }
+
+        // Coalesce any parent fetches accumulated during the
+        // descendant retry into one batched `blocks_by_root` request.
+        self.flushPendingParentFetches();
+    }
+
+    /// Rejected-block backchannel handler (#890 zclawz review). Fires
+    /// from `BeamChain.chainWorkerOnBlockThunk` ONLY when worker-side
+    /// `onBlock` returns `MissingPreState` or `PreFinalizedSlot` —
+    /// the two errors caused by a TOCTOU race between the libxev
+    /// caller's `forkChoice.hasBlock(parent)` pre-check inside
+    /// `trySubmitImportToWorker` and the worker's eventual dispatch
+    /// (finalization can prune the parent in between). Without this
+    /// hand-back the worker would silently drop the block — sync
+    /// would stall until a re-broadcast.
+    ///
+    /// The callback DOES NOT take ownership of `signed_block`; the
+    /// worker's `Message.deinit` frees it after this call returns.
+    /// `cacheBlockAndFetchParent` clones internally, matching the
+    /// inline `processBlockByRootChunk` MissingPreState arm.
+    ///
+    /// Threading: same contract as `handleChainImportedBlock`. The
+    /// reachable network/forkchoice helpers + the
+    /// `cacheBlockAndFetchParent` path that this handler walks are
+    /// audited in the doc on `handleChainImportedBlock` above —
+    /// every primitive is mutex- / atomic- / FFI-mpsc-safe; no
+    /// libxev I/O is issued from the worker thread.
+    fn handleChainRejectedBlock(
+        ptr: *anyopaque,
+        signed_block: *const types.SignedBlock,
+        block_root: types.Root,
+        reason: chainFactory.BeamChain.RejectedBlockReason,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        switch (reason) {
+            .missing_pre_state => {
+                // Mirror the inline `processBlockByRootChunk`
+                // MissingPreState arm. Use depth=1 since the libxev
+                // caller already accepted this block (depth 0); a
+                // subsequent parent fetch is the next hop.
+                if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
+                    self.logger.debug(
+                        "chain-worker rejected MissingPreState slot={d} root=0x{x}, cached + fetching parent 0x{x}",
+                        .{ signed_block.block.slot, &block_root, &parent_root },
+                    );
+                } else |cache_err| {
+                    if (cache_err == CacheBlockError.PreFinalized) {
+                        self.logger.info(
+                            "chain-worker rejected MissingPreState slot={d} root=0x{x} but block is now pre-finalized; pruning cached descendants",
+                            .{ signed_block.block.slot, &block_root },
+                        );
+                        _ = self.network.pruneCachedBlocks(block_root, null);
+                    } else if (cache_err == CacheBlockError.AlreadyCached) {
+                        self.logger.debug(
+                            "chain-worker rejected MissingPreState slot={d} root=0x{x} but block already cached (concurrent re-arrival)",
+                            .{ signed_block.block.slot, &block_root },
+                        );
+                    } else {
+                        self.logger.warn(
+                            "chain-worker rejected MissingPreState slot={d} root=0x{x}: cache failed: {any}",
+                            .{ signed_block.block.slot, &block_root, cache_err },
+                        );
+                    }
+                }
+                self.flushPendingParentFetches();
+            },
+            .pre_finalized => {
+                self.logger.info(
+                    "chain-worker rejected PreFinalizedSlot slot={d} root=0x{x}; pruning cached descendants",
+                    .{ signed_block.block.slot, &block_root },
+                );
+                _ = self.network.pruneCachedBlocks(block_root, null);
+            },
+        }
+    }
+
+    /// Producer side identification for `replayPendingAttestationsAsync`
+    /// drop log severity (zclawz round 3 review on PR #890). The
+    /// distinction matters for an isolated single-validator node:
+    /// when there is NO inbound gossip `on_block` to piggy-back on,
+    /// a `QueueFull` drop on `local_publish` means the buffered
+    /// attestations age until FIFO eviction
+    /// (`MAX_PENDING_ATTESTATIONS = 1024`) — the first occurrence is
+    /// the operator's only signal that liveness is degrading.
+    /// `gossip_or_rpc_followup` paths always have a fresh
+    /// `replayPendingAttestations` queued behind every successful
+    /// import, so a missed nudge there is provably benign within
+    /// one block-cycle.
+    const ReplayProducer = enum { local_publish, gossip_or_rpc_followup };
+
+    /// Replay the chain's pending-attestation buffers without
+    /// blocking the libxev thread (#890). Routes to the chain-worker
+    /// queue when the worker is enabled (the worker drains the
+    /// buffers off-thread in `chainWorkerReplayPendingAttestationsThunk`),
+    /// falls back to the synchronous `replayPendingAttestations` only
+    /// when the worker is disabled — in that mode libxev IS the chain
+    /// thread, so a direct call is the only option.
+    ///
+    /// `error.QueueFull` / `error.QueueClosed` from the worker submit
+    /// are non-fatal in the steady-state aggregator case: the
+    /// chain-worker's own `on_block` thunk runs `replayPendingAttestations`
+    /// after every successful import, and gossip blocks land within a
+    /// slot, so a missed nudge just delays a few buffered entries by
+    /// one block-cycle.
+    ///
+    /// Producer-aware drop severity (zclawz round 3 review on PR
+    /// #890): isolated nodes producing locally have no inbound
+    /// `on_block` to piggy-back on, so a `QueueFull` drop with
+    /// `producer == .local_publish` escalates to `warn` so the
+    /// first occurrence is visible in logs without needing the
+    /// `lean_chain_queue_dropped_total{queue="replay_pending"}`
+    /// dashboard. `gossip_or_rpc_followup` keeps the prior `debug`
+    /// level.
+    fn replayPendingAttestationsAsync(self: *Self, producer: ReplayProducer) void {
+        self.chain.submitReplayPendingAttestations() catch |err| switch (err) {
+            error.ChainWorkerDisabled => self.chain.replayPendingAttestations(),
+            error.QueueFull, error.QueueClosed => switch (producer) {
+                .local_publish => self.logger.warn(
+                    "chain-worker replay submit dropped on local-publish path: {any} (no inbound on_block to piggy-back; pending attestations age toward FIFO eviction at MAX_PENDING_ATTESTATIONS=1024 — see lean_chain_queue_dropped_total{{queue=replay_pending}} and lean_pending_attestations_size{{kind=...}})",
+                    .{err},
+                ),
+                .gossip_or_rpc_followup => self.logger.debug(
+                    "chain-worker replay submit dropped: {any} (next on_block dispatch will replay)",
+                    .{err},
+                ),
+            },
+        };
+    }
+
+    /// Try to route a block import through the chain-worker (#890).
+    /// Returns `true` when the worker accepted ownership of the block
+    /// — followup (`onBlockFollowup` + `replayPendingAttestations` +
+    /// the imported-block callback that drives `processCachedDescendants`
+    /// / `fetchBlockByRoots`) all run on the worker thread, so the
+    /// caller MUST NOT redo any of that work. Returns `false` when
+    /// the worker is disabled, the block queue is full / closed, or
+    /// the SSZ clone needed to transfer ownership failed; the caller
+    /// is then responsible for the inline fallback path.
+    ///
+    /// Caller pre-condition: the libxev caller MUST have observed
+    /// the parent under `forkChoice.hasBlock` before submitting.
+    /// The check is racy by design: finalization can advance and
+    /// prune the parent between the check and the worker's
+    /// eventual dispatch. The race is closed by the rejected-block
+    /// backchannel — `chainWorkerOnBlockThunk` invokes
+    /// `handleChainRejectedBlock` on `MissingPreState` /
+    /// `PreFinalizedSlot`, which runs the same `cacheBlockAndFetch
+    /// Parent` / `pruneCachedBlocks` path the inline
+    /// `processBlockByRootChunk` would have taken. Net effect: the
+    /// worker can never strand sync on this race.
+    fn trySubmitImportToWorker(
+        self: *Self,
+        signed_block: *const types.SignedBlock,
+        block_root: types.Root,
+    ) bool {
+        var cloned: types.SignedBlock = undefined;
+        types.sszClone(self.allocator, types.SignedBlock, signed_block.*, &cloned) catch |err| {
+            self.logger.warn(
+                "chain-worker submit: sszClone failed for slot={d} root=0x{x}: {any}, falling back to inline import",
+                .{ signed_block.block.slot, &block_root, err },
+            );
+            return false;
+        };
+        var consumed = false;
+        // `defer` (not `errdefer`): the catch arm below `return false`s
+        // on QueueFull / QueueClosed which are *normal* returns — an
+        // `errdefer` would not run and the clone would leak.
+        defer if (!consumed) cloned.deinit();
+
+        self.chain.submitBlock(cloned, true, block_root) catch |err| switch (err) {
+            error.ChainWorkerDisabled => return false,
+            error.QueueFull, error.QueueClosed => {
+                self.logger.warn(
+                    "chain-worker block queue {s} for slot={d} root=0x{x}, falling back to inline import",
+                    .{ @errorName(err), signed_block.block.slot, &block_root },
+                );
+                return false;
+            },
+        };
+        consumed = true;
+        return true;
+    }
+
     fn processCachedDescendants(self: *Self, parent_root: types.Root) void {
         // Get cached children of this parent (helper returns an owned
         // copy under the cache lock so we can iterate after release).
@@ -584,6 +883,25 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
+                // #890 note: cached-descendant retry stays inline (no
+                // chain-worker submit). Two reasons:
+                //   1. Test/caller contract: `processCachedDescendants`
+                //      is observed synchronously (assertions on
+                //      forkchoice / cache state) by the gossip-import
+                //      tests and by `processReadyCachedBlocks`'s
+                //      callers; an async submit defers the side-effect
+                //      past the return.
+                //   2. Re-entrance is safe: when the chain-worker fires
+                //      `imported_block_fn` we are POST-`onBlock` (locks
+                //      released) on the worker thread, so calling
+                //      `chain.onBlock` again here is sequential same-
+                //      thread work — exactly what the worker already
+                //      serialises.
+                // The libxev fallback paths (`processBlockByRootChunk`
+                // / `processBlockByRangeChunk`) are still off-libxev
+                // because they used `trySubmitImportToWorker` for the
+                // *primary* import; cache-retry is the cheap recursive
+                // tail.
                 const block_ssz = cached.ssz;
                 const missing_roots = self.chain.onBlock(cached_block, .{ .sszBytes = block_ssz }) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
@@ -626,7 +944,7 @@ pub const BeamNode = struct {
                 // iteration of a deep cached-block chain. Correct semantically; a future optimisation
                 // could pass false during catch-up and prune once at the end.
                 self.chain.onBlockFollowup(true, &cached_block);
-                self.chain.replayPendingAttestations();
+                self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
 
                 // Remove from cache now that it's been processed. Note:
                 // we own `cached` (clone), so this `removeFetchedBlock`
@@ -839,6 +1157,24 @@ pub const BeamNode = struct {
                 return;
             }
 
+            // #890: route to the chain-worker when the parent is
+            // already resolved. The MissingPreState / PreFinalizedSlot
+            // race against finalization is closed by the rejected-
+            // block backchannel — `handleChainRejectedBlock` runs
+            // the same cache-and-fetch / prune path the inline arm
+            // below would. See `trySubmitImportToWorker` doc.
+            if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
+                if (self.trySubmitImportToWorker(signed_block, block_root)) {
+                    // Worker takes ownership; followup (cached
+                    // descendants + missing-root fetch + replay +
+                    // parent-fetch flush) all run from the imported-
+                    // block callback. No redundant flush here.
+                    return;
+                }
+                // Submit failed (worker disabled / queue full); fall
+                // through to inline path.
+            }
+
             // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 // Check if the error is due to missing parent
@@ -915,7 +1251,7 @@ pub const BeamNode = struct {
             // Store aggregated signature proofs from this block so they can be reused
             // in future block production. This is the same followup done for gossiped blocks.
             self.chain.onBlockFollowup(true, signed_block);
-            self.chain.replayPendingAttestations();
+            self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
 
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
@@ -959,6 +1295,17 @@ pub const BeamNode = struct {
             return;
         }
 
+        // #890: route to the chain-worker when the parent is already
+        // resolved. By-range chunks arrive slot-ordered so this is
+        // the common case after the first chunk. The TOCTOU race
+        // against finalization is closed by `handleChainRejectedBlock`
+        // — see `trySubmitImportToWorker` doc.
+        if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
+            if (self.trySubmitImportToWorker(signed_block, block_root)) {
+                return;
+            }
+        }
+
         const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
             if (err == chainFactory.BlockProcessingError.MissingPreState) {
                 // Cache and try to fetch parent. Range responses arrive ordered by slot,
@@ -993,7 +1340,7 @@ pub const BeamNode = struct {
         defer self.allocator.free(missing_roots);
 
         self.chain.onBlockFollowup(true, signed_block);
-        self.chain.replayPendingAttestations();
+        self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
         self.processCachedDescendants(block_root);
         self.fetchBlockByRoots(missing_roots, 0) catch |err| {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
@@ -1101,8 +1448,10 @@ pub const BeamNode = struct {
                                 // fc_initing. Without this branch the node deadlocks: it stays in
                                 // fc_initing because no blocks arrive, and no blocks arrive because
                                 // the sync code skips fc_initing.
-                                // Treat this exactly like behind_peers: if the peer's head is ahead
-                                // of our anchor, request their head block to start the parent chain.
+                                //
+                                // Mirror the behind_peers logic: prefer blocks_by_range for large
+                                // gaps (avoids the one-round-trip-per-block parent-chain walk);
+                                // fall back to head-by-root for small gaps or on range failure.
                                 // Snapshot once: forkChoice.head is a
                                 // multi-field ProtoBlock written under
                                 // exclusive. A second raw read in the log
@@ -1110,21 +1459,49 @@ pub const BeamNode = struct {
                                 // different update's blockRoot.
                                 const head_snapshot = self.chain.forkChoice.getHead();
                                 if (status_resp.head_slot > head_snapshot.slot) {
-                                    self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
-                                        status_ctx.peer_id,
-                                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                        status_resp.head_slot,
-                                        head_snapshot.slot,
-                                        &status_resp.head_root,
-                                    });
-                                    const roots = [_]types.Root{status_resp.head_root};
-                                    self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                        self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
+                                    const gap: u64 = status_resp.head_slot - head_snapshot.slot;
+                                    if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+                                        const start_slot: types.Slot = head_snapshot.slot + 1;
+                                        const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
+                                        self.logger.info("peer {s}{f} is ahead during fc init by {d} slots, bulk-syncing via blocks_by_range start_slot={d} count={d}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            err,
+                                            gap,
+                                            start_slot,
+                                            requested_count,
                                         });
-                                    };
+                                        const handler = networks.OnReqRespResponseCbHandler{
+                                            .ptr = self,
+                                            .onReqRespResponseCb = onReqRespResponse,
+                                        };
+                                        _ = self.network.sendBlocksByRangeRequest(status_ctx.peer_id, start_slot, requested_count, handler) catch |err| {
+                                            self.logger.warn("fc_initing: blocks_by_range from peer {s}{f} failed: {any}; falling back to head-by-root", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                            const roots = [_]types.Root{status_resp.head_root};
+                                            self.fetchBlockByRoots(&roots, 0) catch |fetch_err| {
+                                                self.logger.warn("fc_initing: fallback head-by-root also failed: {any}", .{fetch_err});
+                                            };
+                                        };
+                                    } else {
+                                        self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
+                                            status_ctx.peer_id,
+                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                            status_resp.head_slot,
+                                            head_snapshot.slot,
+                                            &status_resp.head_root,
+                                        });
+                                        const roots = [_]types.Root{status_resp.head_root};
+                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                            self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                        };
+                                    }
                                 }
                             },
                             .synced, .no_peers => {},
@@ -1185,6 +1562,15 @@ pub const BeamNode = struct {
                             err_payload.code,
                             err_payload.message,
                         });
+                        // Failure means the peer did not serve any of the
+                        // requested roots. Collect them for retry BEFORE
+                        // finalizePendingRequest removes them from
+                        // pending_block_roots so a different peer can
+                        // serve them. Without this, a failed request
+                        // permanently stalls the parent-chain walk used
+                        // during fc_initing / behind_peers sync.
+                        self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
+                        return;
                     },
                     .blocks_by_range => {
                         self.logger.warn("blocks-by-range request to peer {s}{f} failed ({d}): {s}", .{
@@ -1198,6 +1584,17 @@ pub const BeamNode = struct {
                 self.network.finalizePendingRequest(request_id);
             },
             .completed => {
+                // For blocks_by_root requests: detect roots that were not
+                // served by any chunk (still in pending_block_roots after
+                // all chunks arrived) and re-schedule them with a new
+                // peer. Without this, a peer that returns EOS without
+                // fulfilling all requested roots (e.g., a mesh helper
+                // with head_slot=0) permanently stalls the parent-chain
+                // walk used during fc_initing / behind_peers sync.
+                if (snap.request_kind == .blocks_by_root) {
+                    self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
+                    return;
+                }
                 self.network.finalizePendingRequest(request_id);
             },
         }
@@ -1875,6 +2272,28 @@ pub const BeamNode = struct {
                     continue;
                 };
 
+                // Drain the future-slot `pending_blocks` queue. Runs inline
+                // on the libxev thread because `processPendingBlocks` returns
+                // missing block roots that must feed back into
+                // `BeamNode.fetchBlockByRoots`, and the chain-worker thunk has
+                // no handle to `BeamNode` to make that call. A worker → libxev
+                // backchannel for the fetch is tracked as a #863 follow-up;
+                // see the comment on `chainWorkerProcessPendingBlocksThunk`.
+                // Per-call work is bounded by `MAX_PENDING_BLOCKS` (1024) and
+                // in steady state the queue is empty / single-digit.
+                {
+                    const missing_roots = self.chain.processPendingBlocks();
+                    defer self.allocator.free(missing_roots);
+                    if (missing_roots.len > 0) {
+                        self.fetchBlockByRoots(missing_roots, 0) catch |e| {
+                            self.logger.warn(
+                                "failed to fetch {d} missing block root(s) from processPendingBlocks: {any}",
+                                .{ missing_roots.len, e },
+                            );
+                        };
+                    }
+                }
+
                 // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
                 self.sweepTimedOutRequests();
 
@@ -1995,6 +2414,56 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Collect `blocks_by_root` roots that were NOT served by any chunk
+    /// (still present in `pending_block_roots` when the request ends),
+    /// finalize the request, then re-schedule each unserved root via
+    /// `fetchBlockByRoots` so a new (hopefully different) peer can serve
+    /// it.
+    ///
+    /// Called from the `.completed` and `.failure` arms of
+    /// `handleReqRespResponse` for `blocks_by_root` requests.
+    /// Without this, a peer that returns EOS or a protocol error without
+    /// serving one or more of the requested roots permanently removes
+    /// those roots from `pending_block_roots` (via `finalizePendingRequest`)
+    /// and leaves the parent-chain-walk orphaned — the cached child
+    /// blocks sit in `block_cache` forever waiting for a parent nobody
+    /// fetches again. This manifests as a sync stall during `fc_initing`
+    /// when one of the two connected peers has `head_slot=0` and the
+    /// random peer selector (`selectPeerCopy`) occasionally routes a
+    /// parent-chain fetch to it.
+    fn retryUnservedBlockRoots(
+        self: *Self,
+        request_id: u64,
+        requested_roots: []const types.Root,
+        peer_id: []const u8,
+    ) void {
+        // Collect roots still in pending_block_roots (unserved) BEFORE
+        // finalizePendingRequest removes them.
+        var roots_to_retry: std.ArrayListUnmanaged(struct { root: types.Root, depth: u32 }) = .empty;
+        defer roots_to_retry.deinit(self.allocator);
+        for (requested_roots) |root| {
+            if (self.network.getPendingBlockRootDepth(root)) |depth| {
+                roots_to_retry.append(self.allocator, .{ .root = root, .depth = depth }) catch {};
+            }
+        }
+        if (roots_to_retry.items.len > 0) {
+            self.logger.warn(
+                "blocks-by-root request_id={d} from peer {s}: {d}/{d} root(s) unserved — scheduling retry via new peer",
+                .{ request_id, peer_id, roots_to_retry.items.len, requested_roots.len },
+            );
+        }
+        // Finalize clears pending state + releases in-flight slot.
+        self.network.finalizePendingRequest(request_id);
+        // Re-schedule each unserved root; fetchBlockByRoots will
+        // dedup against forkchoice/cache/pending and pick a new peer.
+        for (roots_to_retry.items) |item| {
+            const single = [_]types.Root{item.root};
+            self.fetchBlockByRoots(&single, item.depth) catch |err| {
+                self.logger.warn("retryUnservedBlockRoots: failed to re-fetch root after unserved EOS/failure: {any}", .{err});
+            };
+        }
+    }
+
     fn sweepTimedOutRequests(self: *Self) void {
         const current_time = zeam_utils.unixTimestampSeconds();
         const timed_out = self.network.getTimedOutRequests(current_time, constants.RPC_REQUEST_TIMEOUT_SECONDS) catch |err| {
@@ -2098,6 +2567,14 @@ pub const BeamNode = struct {
         // entry already exists, so locally produced blocks no longer leak
         // their initial post-state on the publish hop. See the design doc
         // §Resource-by-resource design / `BeamChain.states` for context.
+        //
+        // Stays inline (NOT routed through the chain-worker like the RPC
+        // paths in #890): the validator path runs on the libxev thread,
+        // and downstream callers / tests assume the block is in
+        // forkchoice by the time `publishBlock` returns. Async would
+        // surface a race where attestations produced in the same
+        // interval reference a block the chain hasn't imported yet.
+        // The replay below still goes via the worker.
         const missing_roots = try self.chain.onBlock(signed_block, .{
             .blockRoot = block_root,
         });
@@ -2129,7 +2606,7 @@ pub const BeamNode = struct {
 
         // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
-        self.chain.replayPendingAttestations();
+        self.replayPendingAttestationsAsync(.local_publish);
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: networks.AttestationGossip) !void {

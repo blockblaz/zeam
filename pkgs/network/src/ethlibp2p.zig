@@ -628,8 +628,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
     );
 
-    // TODO: figure out why scheduling on the loop is not working
-    zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice, false) catch |e| {
+    zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice) catch |e| {
         zigHandler.logger.err("onGossip handling of message failed with error e={any} from sender_peer_id={s}{f}", .{ e, sender_peer_id_slice, node_name });
     };
 }
@@ -1487,7 +1486,7 @@ pub const EthLibp2p = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, sender_peer_id, false);
+        return self.gossipHandler.onGossip(data, sender_peer_id);
     }
 
     pub fn sendRPCRequest(
