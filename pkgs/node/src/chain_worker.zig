@@ -841,6 +841,10 @@ pub const ChainWorker = struct {
                 dispatched_any = true;
             }
 
+            // Batch agg dispatch only runs `on_gossip_aggregated_attestation` on this
+            // single chain-worker thread. It does not call `forkChoice.aggregate()`
+            // (snapshot-then-release via `AggregateSnapshot`, #863/#890); committee
+            // aggregation stays on the dedicated aggregate Io.Threaded path.
             const agg_depth = self.aggregated_attestation_queue.outstandingDepth();
             const agg_batch: usize = if (agg_depth > AGGREGATED_ATTESTATION_BATCH_THRESHOLD)
                 @min(AGGREGATED_ATTESTATION_BATCH_MAX, agg_depth)

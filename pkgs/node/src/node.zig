@@ -23,55 +23,15 @@ pub const networkFactory = @import("./network.zig");
 pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
 const forkchoice = @import("./forkchoice.zig");
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
 const ZERO_HASH = types.ZERO_HASH;
 
-/// Pure gap helper for status-driven `blocks_by_range` catch-up (issue #893).
-/// Caps the peer-reported gap used for sync thresholding and pagination; per-request
-/// size is still bounded separately by `MAX_REQUEST_BLOCKS`.
-fn cappedSyncGapSlots(peer_head_slot: types.Slot, our_head_slot: types.Slot, wall_slot: types.Slot) u64 {
-    if (peer_head_slot <= our_head_slot) return 0;
-    const peer_gap: u64 = peer_head_slot - our_head_slot;
-    const wall_gap: u64 = if (wall_slot > our_head_slot) wall_slot - our_head_slot else 0;
-    return @min(peer_gap, wall_gap);
-}
-
-const BlocksByRangeSyncEndReason = enum { completed, failed, timeout };
-
-const BlocksByRangeSyncEndInput = struct {
-    aborted: bool,
-    chunks_received: u32,
-    chunks_imported: u32,
-    chunks_pre_finalized: u32,
-    range_attempt: u8,
-    max_attempts: u8,
-    end_reason: BlocksByRangeSyncEndReason,
-    has_alternate_peer: bool,
-};
-
-const BlocksByRangeSyncEndAction = enum {
-    abort_fallback,
-    pre_finalized_complete,
-    retry,
-    exhausted_fallback,
-    success_continue,
-};
-
-fn blocksByRangeSyncEndDecision(input: BlocksByRangeSyncEndInput) BlocksByRangeSyncEndAction {
-    if (input.aborted) return .abort_fallback;
-    if (input.chunks_received > 0 and input.chunks_pre_finalized == input.chunks_received) {
-        return .pre_finalized_complete;
-    }
-    const no_progress = input.chunks_imported == 0;
-    const should_retry = (input.end_reason == .failed or input.end_reason == .timeout or no_progress) and
-        input.range_attempt < input.max_attempts and input.has_alternate_peer;
-    if (should_retry) return .retry;
-    if (input.end_reason == .failed or input.end_reason == .timeout or no_progress) return .exhausted_fallback;
-    return .success_continue;
-}
+const BlocksByRangeSyncEndReason = blocks_by_range_sync.SyncEndReason;
+const BlocksByRangeSyncEndAction = blocks_by_range_sync.SyncEndAction;
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
@@ -1309,6 +1269,10 @@ pub const BeamNode = struct {
         self.flushPendingParentFetches();
     }
 
+    // --- blocks_by_range catch-up orchestration (issue #893) ---
+    // Pure gap/retry decision helpers: `blocks_by_range_sync.zig`. Dedicated sync-worker
+    // extraction is follow-up (review PR #894).
+
     const CatchUpPeerStatus = struct {
         peer_id: []const u8,
         head_slot: types.Slot,
@@ -1320,7 +1284,7 @@ pub const BeamNode = struct {
     /// decisions (per-request size is still capped by `MAX_REQUEST_BLOCKS`). Issue #893.
     fn cappedSyncGap(self: *Self, peer_head_slot: types.Slot, our_head_slot: types.Slot) u64 {
         const wall_slot = self.chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
-        return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot);
+        return blocks_by_range_sync.cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot);
     }
 
     fn shouldCatchUpFromPeerStatus(
@@ -1350,10 +1314,11 @@ pub const BeamNode = struct {
         self: *Self,
         range_sync: networkFactory.BlocksByRangeSyncParams,
     ) void {
-        if (self.network.hasBlocksByRangeInFlight()) {
+        const range_key = networkFactory.Network.blocksByRangeKey(range_sync);
+        if (self.network.isBlocksByRangeActive(range_key)) {
             self.logger.debug(
-                "skipping blocks_by_range catch-up start_slot={d}: another range request in flight",
-                .{range_sync.start_slot},
+                "skipping blocks_by_range catch-up start_slot={d} count={d}: same range already in flight",
+                .{ range_sync.start_slot, range_sync.count },
             );
             return;
         }
@@ -1387,7 +1352,7 @@ pub const BeamNode = struct {
 
         const head_snapshot = self.chain.forkChoice.getHead();
 
-        // Large gaps use one in-flight `blocks_by_range` (MAX_CONCURRENT_BLOCKS_BY_RANGE).
+        // Large gaps use `blocks_by_range` (one in-flight request per slot window).
         // Additional qualifying peers with small gaps still get head-by-root below.
         if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
             const start_slot: types.Slot = our_head_slot + 1;
@@ -1427,7 +1392,6 @@ pub const BeamNode = struct {
 
     fn maybeContinueBlocksByRangeCatchUp(self: *Self, snap: networkFactory.Network.PendingRequestSnapshot) void {
         if (snap.range_aborted) return;
-        if (self.network.hasBlocksByRangeInFlight()) return;
 
         const our_head_slot = self.chain.forkChoice.getHead().slot;
         const gap = self.cappedSyncGap(snap.peer_head_slot, our_head_slot);
@@ -1462,7 +1426,7 @@ pub const BeamNode = struct {
         defer if (next_peer_opt) |p| self.allocator.free(p);
         const has_alternate_peer = if (next_peer_opt) |p| !std.mem.eql(u8, p, snap.peer_id_copy) else false;
 
-        const action = blocksByRangeSyncEndDecision(.{
+        const action = blocks_by_range_sync.syncEndDecision(.{
             .aborted = snap.range_aborted,
             .chunks_received = snap.range_chunks_received,
             .chunks_imported = snap.range_chunks_imported,
@@ -3960,63 +3924,4 @@ test "Issue #837: last_interval commits per-iteration on a multi-interval onInte
 
     BeamNode.onInterval(@as(*anyopaque, @ptrCast(&harness.node)), 8) catch {};
     try std.testing.expectEqual(@as(isize, 8), harness.node.last_interval);
-}
-
-test "cappedSyncGapSlots limits range catch-up to wall-clock head" {
-    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(100, 100, 200));
-    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(50, 100, 200));
-    try std.testing.expectEqual(@as(u64, 50), cappedSyncGapSlots(200, 100, 150));
-    try std.testing.expectEqual(@as(u64, 100), cappedSyncGapSlots(200, 100, 250));
-    // Clock skew: our head ahead of wall slot → no wall-clock gap.
-    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(200, 150, 100));
-}
-
-test "blocksByRangeSyncEndDecision retry requires alternate peer" {
-    const base = BlocksByRangeSyncEndInput{
-        .aborted = false,
-        .chunks_received = 5,
-        .chunks_imported = 0,
-        .chunks_pre_finalized = 0,
-        .range_attempt = 1,
-        .max_attempts = 3,
-        .end_reason = .completed,
-        .has_alternate_peer = false,
-    };
-    try std.testing.expectEqual(BlocksByRangeSyncEndAction.exhausted_fallback, blocksByRangeSyncEndDecision(base));
-
-    var with_peer = base;
-    with_peer.has_alternate_peer = true;
-    try std.testing.expectEqual(BlocksByRangeSyncEndAction.retry, blocksByRangeSyncEndDecision(with_peer));
-
-    var imported = base;
-    imported.chunks_imported = 3;
-    try std.testing.expectEqual(BlocksByRangeSyncEndAction.success_continue, blocksByRangeSyncEndDecision(imported));
-}
-
-test "blocksByRangeSyncEndDecision all pre-finalized is no-op not retry" {
-    const input = BlocksByRangeSyncEndInput{
-        .aborted = false,
-        .chunks_received = 4,
-        .chunks_imported = 0,
-        .chunks_pre_finalized = 4,
-        .range_attempt = 1,
-        .max_attempts = 3,
-        .end_reason = .completed,
-        .has_alternate_peer = true,
-    };
-    try std.testing.expectEqual(BlocksByRangeSyncEndAction.pre_finalized_complete, blocksByRangeSyncEndDecision(input));
-}
-
-test "blocksByRangeSyncEndDecision fork abort" {
-    const input = BlocksByRangeSyncEndInput{
-        .aborted = true,
-        .chunks_received = 1,
-        .chunks_imported = 0,
-        .chunks_pre_finalized = 0,
-        .range_attempt = 1,
-        .max_attempts = 3,
-        .end_reason = .completed,
-        .has_alternate_peer = true,
-    };
-    try std.testing.expectEqual(BlocksByRangeSyncEndAction.abort_fallback, blocksByRangeSyncEndDecision(input));
 }

@@ -60,9 +60,24 @@ pub const BlockByRangeContext = struct {
     }
 };
 
-/// Issue #893: at most one outbound `blocks_by_range` catch-up at a time so a
-/// stuck or fork-mismatched bulk sync does not stack with gossip parent fetches.
-pub const MAX_CONCURRENT_BLOCKS_BY_RANGE: u32 = 1;
+/// Identifies an outbound `blocks_by_range` request by its slot window.
+/// Issue #893: allow many concurrent ranges, but at most one in-flight request
+/// per `(start_slot, count)` window (review PR #894).
+pub const BlocksByRangeKey = struct {
+    start_slot: types.Slot,
+    count: u64,
+
+    pub fn eql(a: BlocksByRangeKey, b: BlocksByRangeKey) bool {
+        return a.start_slot == b.start_slot and a.count == b.count;
+    }
+
+    pub fn hash(self: BlocksByRangeKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&self.start_slot));
+        hasher.update(std.mem.asBytes(&self.count));
+        return hasher.final();
+    }
+};
 
 pub const BlocksByRangeSyncParams = struct {
     peer_id: []const u8,
@@ -174,8 +189,9 @@ pub const Network = struct {
     /// path on the libxev thread don't tear it.
     blocks_by_root_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    /// Issue #893: in-flight outbound `blocks_by_range` catch-up count (max 1).
-    blocks_by_range_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Issue #893: active outbound `blocks_by_range` windows (one in-flight per key).
+    blocks_by_range_active: std.AutoHashMap(BlocksByRangeKey, void),
+    blocks_by_range_active_lock: zeam_utils.SyncMutex = .{},
 
     const Self = @This();
 
@@ -194,6 +210,9 @@ pub const Network = struct {
         var block_cache = locking.BlockCache.init(allocator);
         errdefer block_cache.deinit();
 
+        var blocks_by_range_active = std.AutoHashMap(BlocksByRangeKey, void).init(allocator);
+        errdefer blocks_by_range_active.deinit();
+
         return Self{
             .allocator = allocator,
             .backend = backend,
@@ -201,6 +220,7 @@ pub const Network = struct {
             .pending_rpc_requests = pending_rpc_requests,
             .pending_block_roots = pending_block_roots,
             .block_cache = block_cache,
+            .blocks_by_range_active = blocks_by_range_active,
         };
     }
 
@@ -231,6 +251,12 @@ pub const Network = struct {
         // so `BlockCache.deinit` (which iterates and calls `value.deinit()`
         // on each SignedBlock) is the right cleanup path.
         self.block_cache.deinit();
+
+        {
+            self.blocks_by_range_active_lock.lock();
+            self.blocks_by_range_active.deinit();
+            self.blocks_by_range_active_lock.unlock();
+        }
 
         self.connected_peers.deinit();
         self.allocator.destroy(self.connected_peers);
@@ -725,8 +751,30 @@ pub const Network = struct {
         return request_id;
     }
 
-    pub fn hasBlocksByRangeInFlight(self: *Self) bool {
-        return self.blocks_by_range_inflight.load(.monotonic) >= MAX_CONCURRENT_BLOCKS_BY_RANGE;
+    pub fn blocksByRangeKey(range_sync: BlocksByRangeSyncParams) BlocksByRangeKey {
+        return .{
+            .start_slot = range_sync.start_slot,
+            .count = range_sync.count,
+        };
+    }
+
+    pub fn isBlocksByRangeActive(self: *Self, key: BlocksByRangeKey) bool {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        return self.blocks_by_range_active.contains(key);
+    }
+
+    fn reserveBlocksByRangeActive(self: *Self, key: BlocksByRangeKey) !void {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        const gop = try self.blocks_by_range_active.getOrPut(key);
+        if (gop.found_existing) return error.BlocksByRangeAlreadyActive;
+    }
+
+    fn releaseBlocksByRangeActive(self: *Self, key: BlocksByRangeKey) void {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        _ = self.blocks_by_range_active.remove(key);
     }
 
     pub fn sendBlocksByRangeRequest(
@@ -736,19 +784,10 @@ pub const Network = struct {
     ) !u64 {
         if (range_sync.count == 0) return error.NoBlocksRequested;
 
-        while (true) {
-            const cur = self.blocks_by_range_inflight.load(.monotonic);
-            if (cur >= MAX_CONCURRENT_BLOCKS_BY_RANGE) {
-                return error.BlocksByRangeInFlightCapReached;
-            }
-            if (self.blocks_by_range_inflight.cmpxchgWeak(cur, cur + 1, .acq_rel, .monotonic) == null) {
-                break;
-            }
-        }
-        var reservation_owned = true;
-        errdefer if (reservation_owned) {
-            _ = self.blocks_by_range_inflight.fetchSub(1, .acq_rel);
-        };
+        const range_key = blocksByRangeKey(range_sync);
+        try self.reserveBlocksByRangeActive(range_key);
+        var range_key_reserved = true;
+        errdefer if (range_key_reserved) self.releaseBlocksByRangeActive(range_key);
 
         const peer_copy = try self.allocator.dupe(u8, range_sync.peer_id);
         var peer_copy_owned = true;
@@ -781,7 +820,7 @@ pub const Network = struct {
         };
 
         pending_owned = true;
-        reservation_owned = false;
+        range_key_reserved = false;
 
         return request_id;
     }
@@ -1031,8 +1070,12 @@ pub const Network = struct {
                     _ = self.blocks_by_root_inflight.fetchSub(1, .acq_rel);
                     zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
                 },
-                .blocks_by_range => {
-                    _ = self.blocks_by_range_inflight.fetchSub(1, .acq_rel);
+                .blocks_by_range => |block_ctx| {
+                    const key = BlocksByRangeKey{
+                        .start_slot = block_ctx.start_slot,
+                        .count = block_ctx.count,
+                    };
+                    self.releaseBlocksByRangeActive(key);
                 },
                 .status => {},
             }
