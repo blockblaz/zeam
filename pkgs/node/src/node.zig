@@ -274,10 +274,24 @@ pub const BeamNode = struct {
     }
 
     fn trackRangeAsyncChunkImport(self: *Self, block_root: types.Root, request_id: u64) void {
-        _ = self.network.updateBlocksByRangeRequest(request_id, .{ .record_async_submitted = true });
         self.range_async_chunk_imports_lock.lock();
-        defer self.range_async_chunk_imports_lock.unlock();
-        self.range_async_chunk_imports.put(block_root, request_id) catch {};
+        const gop = self.range_async_chunk_imports.getOrPut(block_root) catch {
+            self.range_async_chunk_imports_lock.unlock();
+            return;
+        };
+        if (gop.found_existing) {
+            if (gop.value_ptr.* != request_id) {
+                self.logger.warn(
+                    "blocks_by_range: block 0x{x} already tracked for request {d}, ignoring duplicate from {d}",
+                    .{ &block_root, gop.value_ptr.*, request_id },
+                );
+            }
+            self.range_async_chunk_imports_lock.unlock();
+            return;
+        }
+        gop.value_ptr.* = request_id;
+        self.range_async_chunk_imports_lock.unlock();
+        _ = self.network.updateBlocksByRangeRequest(request_id, .{ .record_async_submitted = true });
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
@@ -1331,9 +1345,11 @@ pub const BeamNode = struct {
         range_sync: networkFactory.BlocksByRangeSyncParams,
     ) void {
         const range_key = networkFactory.Network.blocksByRangeKey(range_sync);
-        if (self.network.isBlocksByRangeActive(range_key)) {
+        if (self.network.isBlocksByRangeActive(range_key) or
+            self.network.blocksByRangeOverlapsActive(range_sync.start_slot, range_sync.count))
+        {
             self.logger.debug(
-                "skipping blocks_by_range catch-up start_slot={d} count={d}: same range already in flight",
+                "skipping blocks_by_range catch-up start_slot={d} count={d}: overlapping range already in flight",
                 .{ range_sync.start_slot, range_sync.count },
             );
             return;
@@ -1344,19 +1360,29 @@ pub const BeamNode = struct {
             .onReqRespResponseCb = onReqRespResponse,
         };
         _ = self.network.sendBlocksByRangeRequest(range_sync, handler) catch |err| {
-            self.network.markPeerBlocksByRangeUnavailable(range_sync.peer_id);
-            self.recordRangeSyncOutcome("unavailable");
-            self.logger.warn(
-                "blocks_by_range catch-up from peer {s}{f} start_slot={d} count={d} failed: {any}; falling back to blocks_by_root",
-                .{
-                    range_sync.peer_id,
-                    self.node_registry.getNodeNameFromPeerId(range_sync.peer_id),
-                    range_sync.start_slot,
-                    range_sync.count,
-                    err,
+            switch (err) {
+                error.BlocksByRangeAlreadyActive, error.BlocksByRangeOverlap => {
+                    self.logger.debug(
+                        "skipping blocks_by_range catch-up start_slot={d} count={d}: {any}",
+                        .{ range_sync.start_slot, range_sync.count, err },
+                    );
                 },
-            );
-            self.syncFetchPeerHeadByRoot(range_sync.peer_id, range_sync.peer_head_root);
+                else => {
+                    self.network.markPeerBlocksByRangeUnavailable(range_sync.peer_id);
+                    self.recordRangeSyncOutcome("unavailable");
+                    self.logger.warn(
+                        "blocks_by_range catch-up from peer {s}{f} start_slot={d} count={d} failed: {any}; falling back to blocks_by_root",
+                        .{
+                            range_sync.peer_id,
+                            self.node_registry.getNodeNameFromPeerId(range_sync.peer_id),
+                            range_sync.start_slot,
+                            range_sync.count,
+                            err,
+                        },
+                    );
+                    self.syncFetchPeerHeadByRoot(range_sync.peer_id, range_sync.peer_head_root);
+                },
+            }
         };
     }
 
@@ -1570,20 +1596,6 @@ pub const BeamNode = struct {
             return;
         };
 
-        // First chunk must extend the head we had when this request was issued.
-        // Conservative: if our head advanced to a sibling via gossip/reorg, abort
-        // even though both branches may be valid — do not loosen without rethinking retry.
-        if (signed_block.block.slot == view.start_slot and
-            !std.mem.eql(u8, &signed_block.block.parent_root, &view.our_head_root_at_start))
-        {
-            self.logger.warn(
-                "blocks_by_range: fork mismatch at start_slot={d} (parent 0x{x} != our head-at-start 0x{x}); aborting range batch",
-                .{ view.start_slot, &signed_block.block.parent_root, &view.our_head_root_at_start },
-            );
-            _ = self.network.updateBlocksByRangeRequest(request_id, .{ .mark_aborted = true });
-            return;
-        }
-
         // Skip if already known to fork choice — same guard as processBlockByRootChunk.
         if (self.chain.forkChoice.hasBlock(block_root)) {
             self.logger.debug(
@@ -1592,6 +1604,26 @@ pub const BeamNode = struct {
             );
             self.processCachedDescendants(block_root);
             _ = self.network.updateBlocksByRangeRequest(request_id, .{ .record_imported = true });
+            return;
+        }
+
+        // First returned chunk must extend the head we had when this request was issued.
+        // Peers may skip empty slots, so the first block is not always at `start_slot`.
+        // Conservative: if our head advanced to a sibling via gossip/reorg, abort
+        // even though both branches may be valid — do not loosen without rethinking retry.
+        if (view.is_first_chunk and
+            !std.mem.eql(u8, &signed_block.block.parent_root, &view.our_head_root_at_start))
+        {
+            self.logger.warn(
+                "blocks_by_range: fork mismatch on first chunk slot={d} start_slot={d} (parent 0x{x} != our head-at-start 0x{x}); aborting range batch",
+                .{
+                    signed_block.block.slot,
+                    view.start_slot,
+                    &signed_block.block.parent_root,
+                    &view.our_head_root_at_start,
+                },
+            );
+            _ = self.network.updateBlocksByRangeRequest(request_id, .{ .mark_aborted = true });
             return;
         }
 

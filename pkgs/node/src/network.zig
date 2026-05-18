@@ -1,4 +1,5 @@
 const std = @import("std");
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 const networks = @import("@zeam/network");
 const types = @import("@zeam/types");
 const params = @import("@zeam/params");
@@ -44,7 +45,7 @@ pub const BlockByRangeContext = struct {
     peer_head_slot: types.Slot,
     /// Fallback target when range sync cannot link to our chain.
     peer_head_root: types.Root,
-    /// Our forkchoice head root at request start — first range chunk must extend this.
+    /// Our forkchoice head root at request start — the first returned chunk must extend this.
     our_head_root_at_start: types.Root,
     attempt: u8 = 1,
     chunks_received: u32 = 0,
@@ -64,8 +65,8 @@ pub const BlockByRangeContext = struct {
 };
 
 /// Identifies an outbound `blocks_by_range` request by its slot window.
-/// Issue #893: allow many concurrent ranges, but at most one in-flight request
-/// per `(start_slot, count)` window (review PR #894).
+/// Issue #893: allow many concurrent ranges, but reject overlapping slot windows
+/// (review PR #894 / zclawz: overlapping windows corrupt async import accounting).
 pub const BlocksByRangeKey = struct {
     start_slot: types.Slot,
     count: u64,
@@ -779,9 +780,27 @@ pub const Network = struct {
         return self.blocks_by_range_active.contains(key);
     }
 
+    pub fn blocksByRangeOverlapsActive(self: *Self, start_slot: types.Slot, count: u64) bool {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        var it = self.blocks_by_range_active.keyIterator();
+        while (it.next()) |active| {
+            if (blocks_by_range_sync.rangesOverlap(active.start_slot, active.count, start_slot, count)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn reserveBlocksByRangeActive(self: *Self, key: BlocksByRangeKey) !void {
         self.blocks_by_range_active_lock.lock();
         defer self.blocks_by_range_active_lock.unlock();
+        var it = self.blocks_by_range_active.keyIterator();
+        while (it.next()) |active| {
+            if (blocks_by_range_sync.rangesOverlap(active.start_slot, active.count, key.start_slot, key.count)) {
+                return error.BlocksByRangeOverlap;
+            }
+        }
         const gop = try self.blocks_by_range_active.getOrPut(key);
         if (gop.found_existing) return error.BlocksByRangeAlreadyActive;
     }
@@ -844,6 +863,8 @@ pub const Network = struct {
         start_slot: types.Slot,
         our_head_root_at_start: types.Root,
         aborted: bool,
+        /// True for the first chunk recorded on this request (before `record_received`).
+        is_first_chunk: bool = false,
     };
 
     pub const BlocksByRangeChunkUpdate = struct {
@@ -875,6 +896,7 @@ pub const Network = struct {
                 const entry = value_ptr orelse return;
                 switch (entry.request) {
                     .blocks_by_range => |*ctx| {
+                        const is_first_chunk = c.update.record_received and ctx.chunks_received == 0;
                         if (c.update.record_received) ctx.chunks_received += 1;
                         if (c.update.record_imported) ctx.chunks_imported += 1;
                         if (c.update.record_pre_finalized) ctx.chunks_pre_finalized += 1;
@@ -888,6 +910,7 @@ pub const Network = struct {
                             .start_slot = ctx.start_slot,
                             .our_head_root_at_start = ctx.our_head_root_at_start,
                             .aborted = ctx.aborted,
+                            .is_first_chunk = is_first_chunk,
                         };
                         if (ctx.sync_end_pending and ctx.chunks_async_pending == 0) {
                             c.result.run_sync_end = true;

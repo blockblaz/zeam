@@ -13,6 +13,20 @@ const constants = @import("./constants.zig");
 /// Pure gap helper for status-driven `blocks_by_range` catch-up (issue #893).
 /// Caps the peer-reported gap used for sync thresholding and pagination; per-request
 /// size is still bounded separately by `MAX_REQUEST_BLOCKS`.
+/// Conservative overlap test for concurrent `blocks_by_range` windows.
+/// Treats `count` as an upper bound on the slot span `[start_slot, start_slot + count)`.
+pub fn rangesOverlap(
+    a_start: types.Slot,
+    a_count: u64,
+    b_start: types.Slot,
+    b_count: u64,
+) bool {
+    if (a_count == 0 or b_count == 0) return false;
+    const a_end = a_start +% a_count;
+    const b_end = b_start +% b_count;
+    return a_start < b_end and b_start < a_end;
+}
+
 pub fn cappedSyncGapSlots(peer_head_slot: types.Slot, our_head_slot: types.Slot, wall_slot: types.Slot) u64 {
     if (peer_head_slot <= our_head_slot) return 0;
     const peer_gap: u64 = peer_head_slot - our_head_slot;
@@ -75,6 +89,13 @@ pub fn syncEndDecision(input: SyncEndInput) SyncEndAction {
     if (should_retry) return .retry;
     if (input.end_reason == .failed or input.end_reason == .timeout or no_progress) return .exhausted_fallback;
     return .success_continue;
+}
+
+test "rangesOverlap detects overlapping slot windows" {
+    try std.testing.expect(rangesOverlap(100, 64, 100, 32));
+    try std.testing.expect(rangesOverlap(100, 64, 150, 64));
+    try std.testing.expect(!rangesOverlap(100, 64, 164, 32));
+    try std.testing.expect(!rangesOverlap(100, 0, 100, 32));
 }
 
 test "cappedSyncGapSlots limits range catch-up to wall-clock head" {
