@@ -5720,11 +5720,11 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
 }
 
 test "produceBlock - older-but-justified source is accepted" {
-    // leanSpec commit 00556d8: build_block must accept any attestation whose
-    // source *slot* is in justified_slots, not just the most recent justified
-    // checkpoint's root. This test places an attestation whose source is an
-    // older justified slot (not the latest_justified checkpoint) and verifies
-    // it ends up in the produced block.
+    // build_block accepts any attestation whose source *slot* is in
+    // justified_slots, not just the most recent justified checkpoint's root.
+    // This test places an attestation whose source is an older justified slot
+    // (not the latest_justified checkpoint) and verifies it ends up in the
+    // produced block.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();

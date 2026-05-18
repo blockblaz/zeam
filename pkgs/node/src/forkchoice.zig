@@ -967,8 +967,7 @@ pub const ForkChoice = struct {
     };
 
     /// Checks whether `slot` is justified under the given tracking state,
-    /// matching leanSpec `build_block`'s `current_justified_slots.is_slot_justified`
-    /// (leanSpec commit 00556d8).
+    /// matching the `current_justified_slots.is_slot_justified` check in `build_block`.
     /// Returns `false` (never an error) when `slot` is beyond the current
     /// justified_slots window — those slots are simply not yet justified.
     /// Slots at or before `finalized_slot` are implicitly justified (return `true`).
@@ -984,7 +983,6 @@ pub const ForkChoice = struct {
         return justified_slots.get(idx) catch false;
     }
 
-    /// Mirrors leanSpec `_attestation_data_matches_chain` (leanSpec commit 00556d8).
     /// Checks whether `att_data`'s source and target roots are consistent with
     /// the *extended* historical block hashes view — i.e. `state.historical_block_hashes`
     /// as it would appear after `process_block_header` on the candidate block:
@@ -1054,10 +1052,10 @@ pub const ForkChoice = struct {
 
         // Fixed-point attestation collection with greedy proof selection.
         //
-        // leanSpec `build_block` (commit 00556d8): instead of filtering by a single
-        // justified root, we now accept any attestation whose *source slot* is marked
-        // justified in `current_justified_slots`. This allows older-but-still-justified
-        // sources to appear in a block, not just the latest justified checkpoint.
+        // Instead of filtering by a single justified root, we accept any attestation
+        // whose *source slot* is marked justified in `current_justified_slots`.
+        // This allows older-but-still-justified sources to appear in a block,
+        // not just the latest justified checkpoint.
         //
         // The extended historical block hashes view (pre_state hashes + parent_root +
         // zero-hashes for empty slots) is used to validate source/target roots without
@@ -1066,7 +1064,7 @@ pub const ForkChoice = struct {
         // The loop restarts whenever justification OR finalization advances so we can
         // pick up attestations that become valid only after a justification update.
         var current_finalized_slot: types.Slot = pre_state.latest_finalized.slot;
-        // Spec note (leanSpec d0c5030 / commit 00556d8): when building on top of genesis
+        // Note: when building on top of genesis
         // (pre_state.latest_block_header.slot == 0), process_block_header would set
         // latest_justified.root = parent_root. The old code applied that same derivation
         // eagerly so the source-root filter matched. With the new slot-based filter we no
