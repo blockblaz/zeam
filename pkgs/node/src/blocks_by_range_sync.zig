@@ -8,6 +8,8 @@ const std = @import("std");
 
 const types = @import("@zeam/types");
 
+const constants = @import("./constants.zig");
+
 /// Pure gap helper for status-driven `blocks_by_range` catch-up (issue #893).
 /// Caps the peer-reported gap used for sync thresholding and pagination; per-request
 /// size is still bounded separately by `MAX_REQUEST_BLOCKS`.
@@ -29,6 +31,8 @@ pub const SyncEndInput = struct {
     max_attempts: u8,
     end_reason: SyncEndReason,
     has_alternate_peer: bool,
+    /// Peer does not implement `blocks_by_range` — fall back to `blocks_by_root` immediately.
+    range_unavailable: bool = false,
 };
 
 pub const SyncEndAction = enum {
@@ -36,10 +40,31 @@ pub const SyncEndAction = enum {
     pre_finalized_complete,
     retry,
     exhausted_fallback,
+    unavailable_fallback,
     success_continue,
 };
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// True when the peer's `blocks_by_range` handler is missing or explicitly unsupported.
+pub fn isBlocksByRangeUnavailable(code: u32, message: []const u8) bool {
+    if (code == constants.RPC_ERR_INVALID_REQUEST) return true;
+    const needles = [_][]const u8{ "unsupported", "not available", "not supported", "unknown protocol" };
+    for (needles) |needle| {
+        if (containsIgnoreCase(message, needle)) return true;
+    }
+    return false;
+}
+
 pub fn syncEndDecision(input: SyncEndInput) SyncEndAction {
+    if (input.range_unavailable) return .unavailable_fallback;
     if (input.aborted) return .abort_fallback;
     if (input.chunks_received > 0 and input.chunks_pre_finalized == input.chunks_received) {
         return .pre_finalized_complete;
@@ -94,6 +119,27 @@ test "syncEndDecision all pre-finalized is no-op not retry" {
         .has_alternate_peer = true,
     };
     try std.testing.expectEqual(SyncEndAction.pre_finalized_complete, syncEndDecision(input));
+}
+
+test "isBlocksByRangeUnavailable detects unsupported responses" {
+    try std.testing.expect(isBlocksByRangeUnavailable(constants.RPC_ERR_INVALID_REQUEST, "unsupported"));
+    try std.testing.expect(isBlocksByRangeUnavailable(99, "Method not supported"));
+    try std.testing.expect(!isBlocksByRangeUnavailable(constants.RPC_ERR_RESOURCE_UNAVAILABLE, "outside history window"));
+}
+
+test "syncEndDecision unavailable skips retry" {
+    const input = SyncEndInput{
+        .aborted = false,
+        .chunks_received = 0,
+        .chunks_imported = 0,
+        .chunks_pre_finalized = 0,
+        .range_attempt = 1,
+        .max_attempts = 3,
+        .end_reason = .failed,
+        .has_alternate_peer = true,
+        .range_unavailable = true,
+    };
+    try std.testing.expectEqual(SyncEndAction.unavailable_fallback, syncEndDecision(input));
 }
 
 test "syncEndDecision fork abort" {

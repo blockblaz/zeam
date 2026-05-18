@@ -261,7 +261,7 @@ pub const BeamNode = struct {
         };
         defer snap.deinit(self.allocator);
         if (snap.request_kind != .blocks_by_range) return;
-        self.handleBlocksByRangeSyncEnd(request_id, snap, .completed);
+        self.handleBlocksByRangeSyncEnd(request_id, snap, .completed, false);
     }
 
     fn clearRangeAsyncChunkImport(self: *Self, block_root: types.Root) void {
@@ -1310,6 +1310,22 @@ pub const BeamNode = struct {
         };
     }
 
+    /// `blocks_by_root` catch-up: fetch the peer head and walk parents via the existing
+    /// batched parent-fetch path (used when `blocks_by_range` is unavailable or gap is small).
+    fn initiateCatchUpViaBlocksByRoot(self: *Self, status: CatchUpPeerStatus, our_head_slot: types.Slot) void {
+        self.logger.info(
+            "peer {s}{f} is ahead (peer_head={d} our_head={d}), catch-up via blocks_by_root from head 0x{x}",
+            .{
+                status.peer_id,
+                self.node_registry.getNodeNameFromPeerId(status.peer_id),
+                status.head_slot,
+                our_head_slot,
+                &status.head_root,
+            },
+        );
+        self.syncFetchPeerHeadByRoot(status.peer_id, status.head_root);
+    }
+
     fn initiateBlocksByRangeCatchUp(
         self: *Self,
         range_sync: networkFactory.BlocksByRangeSyncParams,
@@ -1328,8 +1344,10 @@ pub const BeamNode = struct {
             .onReqRespResponseCb = onReqRespResponse,
         };
         _ = self.network.sendBlocksByRangeRequest(range_sync, handler) catch |err| {
+            self.network.markPeerBlocksByRangeUnavailable(range_sync.peer_id);
+            self.recordRangeSyncOutcome("unavailable");
             self.logger.warn(
-                "blocks_by_range catch-up from peer {s}{f} start_slot={d} count={d} failed: {any}; falling back to head-by-root",
+                "blocks_by_range catch-up from peer {s}{f} start_slot={d} count={d} failed: {any}; falling back to blocks_by_root",
                 .{
                     range_sync.peer_id,
                     self.node_registry.getNodeNameFromPeerId(range_sync.peer_id),
@@ -1352,9 +1370,10 @@ pub const BeamNode = struct {
 
         const head_snapshot = self.chain.forkChoice.getHead();
 
-        // Large gaps use `blocks_by_range` (one in-flight request per slot window).
-        // Additional qualifying peers with small gaps still get head-by-root below.
-        if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+        // Large gaps use `blocks_by_range` when the peer supports it; otherwise `blocks_by_root`.
+        if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD and
+            self.network.peerSupportsBlocksByRange(status.peer_id))
+        {
             const start_slot: types.Slot = our_head_slot + 1;
             const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
             self.logger.info(
@@ -1376,17 +1395,17 @@ pub const BeamNode = struct {
                 .our_head_root_at_start = head_snapshot.blockRoot,
             });
         } else {
-            self.logger.info(
-                "peer {s}{f} is ahead (peer_head={d} our_head={d}), requesting head block 0x{x}",
-                .{
-                    status.peer_id,
-                    self.node_registry.getNodeNameFromPeerId(status.peer_id),
-                    status.head_slot,
-                    our_head_slot,
-                    &status.head_root,
-                },
-            );
-            self.syncFetchPeerHeadByRoot(status.peer_id, status.head_root);
+            if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+                self.logger.info(
+                    "peer {s}{f} does not support blocks_by_range (gap={d} slots), using blocks_by_root catch-up",
+                    .{
+                        status.peer_id,
+                        self.node_registry.getNodeNameFromPeerId(status.peer_id),
+                        gap,
+                    },
+                );
+            }
+            self.initiateCatchUpViaBlocksByRoot(status, our_head_slot);
         }
     }
 
@@ -1419,10 +1438,11 @@ pub const BeamNode = struct {
         request_id: u64,
         snap: networkFactory.Network.PendingRequestSnapshot,
         end_reason: BlocksByRangeSyncEndReason,
+        range_unavailable: bool,
     ) void {
         const node_name = self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy);
 
-        const next_peer_opt = self.network.selectPeerExcluding(snap.peer_id_copy) catch null;
+        const next_peer_opt = self.network.selectPeerForRangeSyncExcluding(snap.peer_id_copy) catch null;
         defer if (next_peer_opt) |p| self.allocator.free(p);
         const has_alternate_peer = if (next_peer_opt) |p| !std.mem.eql(u8, p, snap.peer_id_copy) else false;
 
@@ -1435,14 +1455,35 @@ pub const BeamNode = struct {
             .max_attempts = constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
             .end_reason = end_reason,
             .has_alternate_peer = has_alternate_peer,
+            .range_unavailable = range_unavailable,
         });
 
         switch (action) {
-            .abort_fallback => {
-                self.recordRangeSyncOutcome("abort");
+            .abort_fallback, .unavailable_fallback, .exhausted_fallback => {
+                const outcome: []const u8 = switch (action) {
+                    .abort_fallback => "abort",
+                    .unavailable_fallback => "unavailable",
+                    .exhausted_fallback => if (end_reason == .timeout) "timeout" else "exhausted",
+                    else => unreachable,
+                };
+                self.recordRangeSyncOutcome(outcome);
+                const reason_msg: []const u8 = switch (action) {
+                    .abort_fallback => "fork mismatch",
+                    .unavailable_fallback => "blocks_by_range not available on peer",
+                    .exhausted_fallback => @tagName(end_reason),
+                    else => unreachable,
+                };
                 self.logger.warn(
-                    "blocks_by_range request_id={d} from peer {s}{f} aborted (fork mismatch); falling back to head-by-root 0x{x}",
-                    .{ request_id, snap.peer_id_copy, node_name, &snap.peer_head_root },
+                    "blocks_by_range request_id={d} from peer {s}{f} ({s}, chunks={d} imported={d}); falling back to blocks_by_root 0x{x}",
+                    .{
+                        request_id,
+                        snap.peer_id_copy,
+                        node_name,
+                        reason_msg,
+                        snap.range_chunks_received,
+                        snap.range_chunks_imported,
+                        &snap.peer_head_root,
+                    },
                 );
                 self.network.finalizePendingRequest(request_id);
                 self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
@@ -1485,23 +1526,6 @@ pub const BeamNode = struct {
                     .our_head_root_at_start = snap.our_head_root_at_start,
                     .attempt = next_attempt,
                 });
-            },
-            .exhausted_fallback => {
-                self.recordRangeSyncOutcome(if (end_reason == .timeout) "timeout" else "exhausted");
-                self.logger.warn(
-                    "blocks_by_range request_id={d} from peer {s}{f} gave no usable progress ({s}, chunks={d} imported={d}); falling back to head-by-root 0x{x}",
-                    .{
-                        request_id,
-                        snap.peer_id_copy,
-                        node_name,
-                        @tagName(end_reason),
-                        snap.range_chunks_received,
-                        snap.range_chunks_imported,
-                        &snap.peer_head_root,
-                    },
-                );
-                self.network.finalizePendingRequest(request_id);
-                self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
             },
             .success_continue => {
                 self.recordRangeSyncOutcome("success");
@@ -1630,7 +1654,7 @@ pub const BeamNode = struct {
     fn completeBlocksByRangeRequest(self: *Self, request_id: u64, snap: networkFactory.Network.PendingRequestSnapshot) void {
         const pending = self.network.updateBlocksByRangeRequest(request_id, .{ .mark_sync_end_pending = true });
         if (pending.run_sync_end) {
-            self.handleBlocksByRangeSyncEnd(request_id, snap, .completed);
+            self.handleBlocksByRangeSyncEnd(request_id, snap, .completed, false);
         }
     }
 
@@ -1762,13 +1786,20 @@ pub const BeamNode = struct {
                         return;
                     },
                     .blocks_by_range => {
+                        const range_unavailable = blocks_by_range_sync.isBlocksByRangeUnavailable(
+                            err_payload.code,
+                            err_payload.message,
+                        );
                         self.logger.warn("blocks-by-range request to peer {s}{f} failed ({d}): {s}", .{
                             peer_id,
                             node_name,
                             err_payload.code,
                             err_payload.message,
                         });
-                        self.handleBlocksByRangeSyncEnd(request_id, snap, .failed);
+                        if (range_unavailable) {
+                            self.network.markPeerBlocksByRangeUnavailable(peer_id);
+                        }
+                        self.handleBlocksByRangeSyncEnd(request_id, snap, .failed, range_unavailable);
                         return;
                     },
                 }
@@ -2613,7 +2644,7 @@ pub const BeamNode = struct {
                         self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
                         constants.RPC_REQUEST_TIMEOUT_SECONDS,
                     });
-                    self.handleBlocksByRangeSyncEnd(request_id, snap, .timeout);
+                    self.handleBlocksByRangeSyncEnd(request_id, snap, .timeout, false);
                 },
             }
         }

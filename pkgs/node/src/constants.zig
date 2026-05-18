@@ -132,3 +132,7 @@ pub const MIN_SLOTS_FOR_BLOCK_REQUESTS: u64 = 3600;
 
 // RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec).
 pub const RPC_ERR_RESOURCE_UNAVAILABLE: u32 = 3;
+
+// RPC error code for INVALID_REQUEST / unsupported method (peer does not implement
+// `blocks_by_range`). Mock peers and several clients reply with code 1 + "unsupported".
+pub const RPC_ERR_INVALID_REQUEST: u32 = 1;

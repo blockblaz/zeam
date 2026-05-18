@@ -13,6 +13,9 @@ pub const PeerInfo = struct {
     peer_id: []const u8,
     connected_at: i64,
     latest_status: ?types.Status = null,
+    /// Set when a `blocks_by_range` RPC fails with an "unsupported / not available"
+    /// error so catch-up uses `blocks_by_root` instead of retrying range on this peer.
+    blocks_by_range_unavailable: bool = false,
 };
 
 pub const StatusRequestContext = struct {
@@ -333,7 +336,19 @@ pub const Network = struct {
     }
 
     pub fn selectPeerExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
-        return self.connected_peers.selectPeerExcluding(self.allocator, exclude);
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, false);
+    }
+
+    pub fn selectPeerForRangeSyncExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, true);
+    }
+
+    pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
+        return self.connected_peers.peerSupportsBlocksByRange(peer_id);
+    }
+
+    pub fn markPeerBlocksByRangeUnavailable(self: *Self, peer_id: []const u8) void {
+        self.connected_peers.markBlocksByRangeUnavailable(peer_id);
     }
 
     pub fn getPeerCount(self: *Self) usize {

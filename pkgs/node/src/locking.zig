@@ -970,12 +970,34 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// freshly-allocated copy of the peer id so the caller can use
         /// it after the lock is released. Caller frees with `allocator`.
         pub fn selectPeerCopy(self: *Self, allocator: Allocator) !?[]u8 {
-            return self.selectPeerExcluding(allocator, null);
+            return self.selectPeerExcluding(allocator, null, false);
+        }
+
+        pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
+            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return true;
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
+            const entry = self.map.get(peer_id) orelse return false;
+            return !entry.blocks_by_range_unavailable;
+        }
+
+        pub fn markBlocksByRangeUnavailable(self: *Self, peer_id: []const u8) void {
+            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return;
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
+            const entry = self.map.getPtr(peer_id) orelse return;
+            entry.blocks_by_range_unavailable = true;
         }
 
         /// Pick a random connected peer, optionally excluding one id (for RPC retry).
+        /// When `range_capable_only`, skips peers that reported `blocks_by_range` unavailable.
         /// Returns null when every connected peer is excluded (e.g. single-peer devnet).
-        pub fn selectPeerExcluding(self: *Self, allocator: Allocator, exclude: ?[]const u8) !?[]u8 {
+        pub fn selectPeerExcluding(
+            self: *Self,
+            allocator: Allocator,
+            exclude: ?[]const u8,
+            range_capable_only: bool,
+        ) !?[]u8 {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
@@ -989,6 +1011,9 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             while (it.next()) |entry| {
                 if (exclude) |ex| {
                     if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
+                }
+                if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
+                    if (entry.value_ptr.blocks_by_range_unavailable) continue;
                 }
                 try candidates.append(allocator, entry.value_ptr.peer_id);
             }
