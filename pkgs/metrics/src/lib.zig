@@ -227,6 +227,16 @@ const Metrics = struct {
     lean_chain_queue_dropped_total: LeanChainQueueDroppedCounter,
     lean_chain_queue_depth: LeanChainQueueDepthGauge,
     lean_chain_worker_loop_iters_total: LeanChainWorkerLoopItersCounter,
+    /// Tripwire counter (zclawz review on PR #890): bumped from
+    /// `chainWorkerProcessPendingBlocksThunk` whenever it returns a
+    /// non-empty `missing_roots` slice. The thunk has no production
+    /// caller today (the libxev tick runs `processPendingBlocks`
+    /// inline), so this metric MUST stay at 0 in steady state. A
+    /// non-zero value is a regression signal: a future worker
+    /// producer was wired up without first plumbing the missing-
+    /// roots backchannel and is silently stranding sync — the
+    /// thunk would otherwise just log a warn that's easy to miss.
+    lean_chain_worker_process_pending_blocks_dropped_missing_roots_total: LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter,
     // Slice c-2b commit 5 of #803: distribution of refcount values across
     // map-resident BeamState entries at scrape time. Sampled by the chain
     // via `recordChainStateRefcountDistribution` registered as a
@@ -413,6 +423,7 @@ const Metrics = struct {
     const LeanChainQueueDroppedCounter = metrics_lib.CounterVec(u64, struct { queue: []const u8 });
     const LeanChainQueueDepthGauge = metrics_lib.GaugeVec(u64, struct { queue: []const u8 });
     const LeanChainWorkerLoopItersCounter = metrics_lib.Counter(u64);
+    const LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter = metrics_lib.Counter(u64);
     // Refcount-distribution buckets [1, 2, 4, 8, 16, 32, +Inf]. Typical
     // value is 1 (writer-only); transient 2-4 under reader concurrency;
     // values >16 indicate leaked acquires (a reader forgot to release
@@ -912,9 +923,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_blocks_replayed_total = try Metrics.LeanPendingBlocksReplayedCounter.init(allocator, io, "lean_pending_blocks_replayed_total", .{ .help = "Total number of replays from pending_blocks, by terminal result (issue #788)." }, .{}),
         .lean_blocks_future_slot_dropped_total = Metrics.LeanBlocksFutureSlotDroppedCounter.init("lean_blocks_future_slot_dropped_total", .{ .help = "Total number of gossip blocks hard-rejected as FutureSlot beyond the queueable window (issue #788)." }, .{}),
         // Chain-worker queue + loop metrics (slice c-1 of #803).
-        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
+        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation|replay_pending). The `replay_pending` label is a single nudge that drains the in-process pending-attestation buffers — buffer depth itself is exposed via `lean_pending_attestations_size{kind}`." }, .{}),
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed or explicitly discarded during shutdown, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
+        .lean_chain_worker_process_pending_blocks_dropped_missing_roots_total = Metrics.LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter.init("lean_chain_worker_process_pending_blocks_dropped_missing_roots_total", .{ .help = "Tripwire (#890): non-zero only if a future worker producer dispatches `process_pending_blocks` without wiring the missing-roots backchannel. MUST stay 0 in steady state." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
