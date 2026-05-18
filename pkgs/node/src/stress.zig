@@ -108,6 +108,7 @@ const StressConfig = struct {
     borrow_threads: usize,
     cache_churn_threads: usize,
     watchdog_stall_secs: u64,
+    skip_verify: bool,
 
     fn readEnvU64(name: [*:0]const u8, default: u64) u64 {
         const ptr = std.c.getenv(name) orelse return default;
@@ -121,6 +122,12 @@ const StressConfig = struct {
         return std.fmt.parseInt(usize, slice, 10) catch default;
     }
 
+    fn readEnvBool(name: [*:0]const u8, default: bool) bool {
+        const ptr = std.c.getenv(name) orelse return default;
+        const slice = std.mem.sliceTo(ptr, 0);
+        return std.mem.eql(u8, slice, "1") or std.mem.eql(u8, slice, "true");
+    }
+
     fn fromEnv(allocator: Allocator) !StressConfig {
         _ = allocator;
         return StressConfig{
@@ -132,12 +139,13 @@ const StressConfig = struct {
             .borrow_threads = readEnvUsize("ZEAM_STRESS_BORROW_THREADS", 2),
             .cache_churn_threads = readEnvUsize("ZEAM_STRESS_CACHE_THREADS", 1),
             .watchdog_stall_secs = readEnvU64("ZEAM_STRESS_WATCHDOG_SECS", 60),
+            .skip_verify = readEnvBool("ZEAM_STRESS_SKIP_VERIFY", false),
         };
     }
 
     fn dump(self: StressConfig) void {
         std.debug.print(
-            "stress config: duration={d}s num_blocks={d} gossip={d} rpc={d} attn={d} borrow={d} cache={d} watchdog={d}s\n",
+            "stress config: duration={d}s num_blocks={d} gossip={d} rpc={d} attn={d} borrow={d} cache={d} watchdog={d}s skip_verify={}\n",
             .{
                 self.duration_secs,
                 self.num_blocks,
@@ -147,6 +155,7 @@ const StressConfig = struct {
                 self.borrow_threads,
                 self.cache_churn_threads,
                 self.watchdog_stall_secs,
+                self.skip_verify,
             },
         );
     }
@@ -193,6 +202,8 @@ const StressCtx = struct {
     fatal: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     fatal_msg: [256]u8 = undefined,
     fatal_msg_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    // skip XMSS signature verifications, used for stress testing only
+    skip_verify: bool = false,
 
     fn totalOps(self: *StressCtx) u64 {
         return self.gossip_ops.load(.monotonic) +
@@ -232,7 +243,7 @@ fn gossipFloodWorker(ctx: *StressCtx, thread_id: usize) void {
         const block_idx = (i % (ctx.blocks.len - 1)) + 1;
         const block = ctx.blocks[block_idx];
 
-        const missing = ctx.chain.onBlock(block, .{ .pruneForkchoice = false }) catch |err| {
+        const missing = ctx.chain.onBlock(block, .{ .pruneForkchoice = false, .skipVerify = ctx.skip_verify }) catch |err| {
             // The design doc (`docs/threading_refactor_slice_a.md`
             // §Stress test plan) names the merge-gate invariants:
             //   * no `MissingPreState` (state-map race)
@@ -660,6 +671,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
             std.time.ns_per_s,
         .watchdog_stall_secs = cfg.watchdog_stall_secs,
         .last_imported_slot = mock_chain.blocks[mock_chain.blocks.len - 1].block.slot,
+        .skip_verify = cfg.skip_verify,
     };
 
     const total_threads = cfg.gossip_threads + cfg.rpc_threads + cfg.attestation_threads +
