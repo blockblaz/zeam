@@ -121,6 +121,12 @@ pub const SignaturesMap = struct {
 pub const StoredAggregatedPayload = struct {
     slot: Slot,
     proof: aggregation.AggregatedSignatureProof,
+    /// Validators in `proof` that entered this aggregate through child payloads.
+    /// Null for externally supplied/legacy payloads where source attribution is unknown.
+    source_payload_participants: ?attestation.AggregationBits = null,
+    /// Validators in `proof` that entered this aggregate as raw gossiped signatures.
+    /// Null for externally supplied/legacy payloads where source attribution is unknown.
+    source_gossip_participants: ?attestation.AggregationBits = null,
 };
 
 /// List of aggregated payloads for a single key
