@@ -278,6 +278,8 @@ const Metrics = struct {
     //     review followup). The benign TOCTOU window is documented
     //     in `BeamNode.fetchBlockByRoots`.
     lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
+    // Issue #893: `blocks_by_range` catch-up outcomes (retry, abort, success, …). zeam-specific.
+    zeam_blocks_by_range_sync_total: ZeamBlocksByRangeSyncCounter,
     // Issue #863 P2: gossip attestation/aggregation drops on the libxev
     // main thread BEFORE they are routed to the chain-worker. Bumped by
     // `chain.onGossip` for raw attestations and aggregations. zeam-
@@ -490,6 +492,7 @@ const Metrics = struct {
     // Slice (d)/(e) of #803.
     const LeanBlockRootComputeSkippedCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
+    const ZeamBlocksByRangeSyncCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
     // Issue #863 P2/P3 metric types.
     const ZeamGossipAttsDroppedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
     const ZeamBlocksByRootInflightGauge = metrics_lib.Gauge(u64);
@@ -931,11 +934,12 @@ pub fn init(allocator: std.mem.Allocator) !void {
         // Slice (d)/(e) of #803 — see field doc for label semantics.
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
         .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race, inflight_cap." }, .{}),
+        .zeam_blocks_by_range_sync_total = try Metrics.ZeamBlocksByRangeSyncCounter.init(allocator, io, "zeam_blocks_by_range_sync_total", .{ .help = "Total number of `blocks_by_range` catch-up request outcomes (issue #893). zeam-specific. Labeled by outcome: success, retry, exhausted, abort, timeout, pre_finalized_noop." }, .{}),
         // Issue #863 P2/P3/P4 — see field doc for label semantics.
         .zeam_gossip_atts_dropped_total = try Metrics.ZeamGossipAttsDroppedCounter.init(allocator, io, "zeam_gossip_atts_dropped_total", .{ .help = "Total number of gossip attestations/aggregations dropped on the libxev main thread before chain-worker dispatch. Labeled by kind={attestation,aggregation} and reason={syncing,future_slot,worker_validation_failed}. zeam-specific. See blockblaz/zeam#863." }, .{}),
         .zeam_blocks_by_root_inflight = Metrics.ZeamBlocksByRootInflightGauge.init("zeam_blocks_by_root_inflight", .{ .help = "Instantaneous count of outbound `BlocksByRoot` RPCs that have been dispatched but not yet finalized via `finalizePendingRequest`. Capped at MAX_CONCURRENT_BLOCKS_BY_ROOT (8) to bound per-flood dispatch fan-out. zeam-specific. See blockblaz/zeam#863." }, .{}),
         .zeam_xev_clock_drain_passes_total = Metrics.ZeamXevClockDrainPassesCounter.init("zeam_xev_clock_drain_passes_total", .{ .help = "Cumulative passes through `Clock.run`'s libxev drain (one io_uring CQE batch per pass via `events.run(.once)`). Compare scrape deltas against the expected ~1.25 Hz at 4s slots / 5 intervals to detect slot-driver wedges independent of `lean_tick_interval_duration_seconds`. See blockblaz/zeam#863." }, .{}),
-        .lean_pending_attestations_buffered_total = try Metrics.LeanPendingAttsBufferedCounter.init(allocator, io, "lean_pending_attestations_buffered_total", .{ .help = "Gossip attestations / aggregations buffered for replay after a future onBlock import. Mirrors leanSpec subspecs/sync/service.py::_pending_attestations buffer push. Labeled by kind={attestation,aggregation} and reason={unknown_block,future_slot}." }, .{}),
+        .lean_pending_attestations_buffered_total = try Metrics.LeanPendingAttsBufferedCounter.init(allocator, io, "lean_pending_attestations_buffered_total", .{ .help = "Gossip attestations / aggregations buffered for replay after a future onBlock import. Mirrors leanSpec subspecs/sync/service.py::_pending_attestations buffer push. Labeled by kind={attestation,aggregation} and reason={unknown_block,future_slot,queue_full}." }, .{}),
         .lean_pending_attestations_evicted_total = try Metrics.LeanPendingAttsEvictedCounter.init(allocator, io, "lean_pending_attestations_evicted_total", .{ .help = "Pending-attestation buffer FIFO evictions when MAX_PENDING_ATTESTATIONS (1024, leanSpec subspecs/sync/config.py) is reached. Labeled by kind={attestation,aggregation}." }, .{}),
         .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts (mirrors leanSpec _replay_pending_attestations). Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
         .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),

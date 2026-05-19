@@ -32,6 +32,7 @@ const networks = @import("@zeam/network");
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
 test "get tests" {
+    _ = @import("./blocks_by_range_sync.zig");
     _ = @import("./forkchoice.zig");
     _ = @import("./chain.zig");
     _ = @import("./utils.zig");

@@ -275,6 +275,23 @@ pub fn LockedMap(comptime K: type, comptime V: type) type {
                 try each(ctx, null);
             }
         }
+
+        /// Mutable variant of `withValueLocked`. The mutex is held exclusively
+        /// for the callback duration; callers may mutate `*V` in place.
+        pub fn withMutableValueLocked(
+            self: *Self,
+            key: K,
+            ctx: anytype,
+            comptime each: fn (@TypeOf(ctx), ?*V) anyerror!void,
+        ) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.map.getPtr(key)) |p| {
+                try each(ctx, p);
+            } else {
+                try each(ctx, null);
+            }
+        }
     };
 }
 
@@ -953,25 +970,60 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// freshly-allocated copy of the peer id so the caller can use
         /// it after the lock is released. Caller frees with `allocator`.
         pub fn selectPeerCopy(self: *Self, allocator: Allocator) !?[]u8 {
+            return self.selectPeerExcluding(allocator, null, false);
+        }
+
+        pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
+            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return true;
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
+            const entry = self.map.get(peer_id) orelse return false;
+            return !entry.blocks_by_range_unavailable;
+        }
+
+        pub fn markBlocksByRangeUnavailable(self: *Self, peer_id: []const u8) void {
+            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return;
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
+            const entry = self.map.getPtr(peer_id) orelse return;
+            entry.blocks_by_range_unavailable = true;
+        }
+
+        /// Pick a random connected peer, optionally excluding one id (for RPC retry).
+        /// When `range_capable_only`, skips peers that reported `blocks_by_range` unavailable.
+        /// Returns null when every connected peer is excluded (e.g. single-peer devnet).
+        pub fn selectPeerExcluding(
+            self: *Self,
+            allocator: Allocator,
+            exclude: ?[]const u8,
+            range_capable_only: bool,
+        ) !?[]u8 {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
             const n = self.map.count();
             if (n == 0) return null;
 
+            var candidates: std.ArrayList([]const u8) = .empty;
+            defer candidates.deinit(allocator);
+
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                if (exclude) |ex| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
+                }
+                if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
+                    if (entry.value_ptr.blocks_by_range_unavailable) continue;
+                }
+                try candidates.append(allocator, entry.value_ptr.peer_id);
+            }
+            if (candidates.items.len == 0) return null;
+
             const io = std.Io.Threaded.global_single_threaded.io();
             var random_source = std.Random.IoSource{ .io = io };
             const random = random_source.interface();
-            const target_index = random.uintLessThan(usize, n);
-
-            var it = self.map.iterator();
-            var current_index: usize = 0;
-            while (it.next()) |entry| : (current_index += 1) {
-                if (current_index == target_index) {
-                    return try allocator.dupe(u8, entry.value_ptr.peer_id);
-                }
-            }
-            return null;
+            const pick = random.uintLessThan(usize, candidates.items.len);
+            return try allocator.dupe(u8, candidates.items[pick]);
         }
     };
 }
