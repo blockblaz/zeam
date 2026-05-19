@@ -477,6 +477,7 @@ pub const AggregatedAttestationsResult = struct {
         signatures_map: *const SignaturesMap,
         new_payloads: ?*const AggregatedPayloadsMap,
         known_payloads: ?*const AggregatedPayloadsMap,
+        slot_filter: ?Slot,
     ) !void {
         const allocator = self.allocator;
 
@@ -487,12 +488,18 @@ pub const AggregatedAttestationsResult = struct {
         {
             var it = signatures_map.iterator();
             while (it.next()) |entry| {
+                if (slot_filter) |slot| {
+                    if (entry.key_ptr.slot != slot) continue;
+                }
                 try att_data_set.put(entry.key_ptr.*, {});
             }
         }
         if (new_payloads) |np| {
             var it = np.iterator();
             while (it.next()) |entry| {
+                if (slot_filter) |slot| {
+                    if (entry.key_ptr.slot != slot) continue;
+                }
                 try att_data_set.put(entry.key_ptr.*, {});
             }
         }

@@ -2032,7 +2032,7 @@ pub const ForkChoice = struct {
     /// `submitAggregateOnInterval` already gates concurrent
     /// `aggregate()` calls via `aggregate_group.concurrent`
     /// (concurrent_limit=1), so two aggregations cannot race here.
-    fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+    fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState, slot_filter: ?types.Slot) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
         const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
         defer _ = agg_timer.observe();
@@ -2046,7 +2046,9 @@ pub const ForkChoice = struct {
         // AggregatedSignatureProof (Rust-allocated XMSS handle, refcount
         // bump via FFI). Per-entry clone is sub-ms; total snapshot
         // typically O(10 ms) on a healthy aggregator.
+        const snapshot_start_ns = zeam_utils.monotonicTimestampNs();
         var snap = try AggregateSnapshot.takeUnderLock(self);
+        observeAggregateBuildPhase("snapshot", snapshot_start_ns);
         defer snap.deinit(self.allocator);
 
         // ─── Phase 2: compute (no lock held) ────────────────────────
@@ -2062,12 +2064,15 @@ pub const ForkChoice = struct {
             agg.attestation_signatures.deinit();
         };
 
+        const compute_start_ns = zeam_utils.monotonicTimestampNs();
         try agg.computeAggregatedSignatures(
             &state.validators,
             &snap.signatures,
             &snap.new_payloads,
             &snap.known_payloads,
+            slot_filter,
         );
+        observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 
         // Build the per-att_data map of fresh aggregations and the
         // result slice while no lock is held. SSZ-clone per proof
@@ -2143,6 +2148,7 @@ pub const ForkChoice = struct {
         // ─── Phase 3: commit (signatures_mutex held briefly) ────────
         var new_payloads_count: usize = 0;
         var gossip_sigs_count: usize = 0;
+        const commit_start_ns = zeam_utils.monotonicTimestampNs();
         {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
@@ -2209,6 +2215,7 @@ pub const ForkChoice = struct {
             new_payloads_count = self.latest_new_aggregated_payloads.count();
             gossip_sigs_count = self.attestation_signatures.count();
         }
+        observeAggregateBuildPhase("commit", commit_start_ns);
 
         // Phase 2 cleanup: free the AggregatedAttestationsResult
         // local now that ownership of every cloned proof has either
@@ -2249,7 +2256,16 @@ pub const ForkChoice = struct {
     /// `aggregate()` invocations via `aggregate_group.concurrent`
     /// (concurrent_limit=1), so two aggregations cannot race here.
     pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
-        return self.aggregateUnlocked(state_opt);
+        return self.aggregateUnlocked(state_opt, null);
+    }
+
+    /// Produce aggregations only for the slot currently being aggregated.
+    ///
+    /// The aggregate worker is scheduled for one slot at a time. Filtering here
+    /// prevents stale/future AttestationData retained in the gossip/new maps from
+    /// forcing extra recursive proof builds, which was the dominant cost in #899.
+    pub fn aggregateForSlot(self: *Self, state_opt: ?*const types.BeamState, slot: types.Slot) ![]types.SignedAggregatedAttestation {
+        return self.aggregateUnlocked(state_opt, slot);
     }
 
     /// Remove attestation data that can no longer influence fork choice.
@@ -3790,6 +3806,16 @@ fn countSeen(seen: []const bool) usize {
         if (is_seen) count += 1;
     }
     return count;
+}
+
+fn observeAggregateBuildPhase(comptime phase: []const u8, start_ns: i128) void {
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    zeam_metrics.metrics.zeam_pq_sig_aggregated_signatures_building_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_s,
+    ) catch {};
 }
 
 fn recordAggregateCoverageMetrics(section: []const u8, seen: []const bool, has_subnet: []const bool) void {
