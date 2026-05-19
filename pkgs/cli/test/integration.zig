@@ -525,31 +525,21 @@ const SSEClient = struct {
 
         // The SSE stream is intentionally long-lived, so a plain blocking read
         // can hang forever when the simulator stops emitting events before the
-        // test's outer deadline is reached (observed on macOS CI in #900). Poll
-        // first and let the caller re-check its deadline when no bytes arrive.
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = self.connection.socket.handle,
-            .events = std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP,
-            .revents = 0,
-        }};
-        const ready = try std.posix.poll(&poll_fds, 50);
-        if (ready == 0) return null;
-        if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0) return null;
-
-        // Read new data from network
+        // test's outer deadline is reached (observed on macOS CI in #900). Use
+        // the std.Io timeout path directly rather than poll+Reader: on macOS CI
+        // the stream reader can still block after readiness, preventing the
+        // outer deadline from being checked.
         var temp_buffer: [4096]u8 = undefined;
-        const bytes_read = self.stream_reader.interface.readSliceShort(&temp_buffer) catch |err| switch (err) {
-            error.ReadFailed => {
-                if (self.stream_reader.err) |e| switch (e) {
-                    error.Timeout => {
-                        zeam_utils.sleepNs(50 * std.time.ns_per_ms);
-                        return null;
-                    },
-                    else => return e,
-                };
-                return err;
+        const msg = self.connection.socket.receiveTimeout(std.testing.io, &temp_buffer, .{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(50),
+                .clock = .awake,
             },
+        }) catch |err| switch (err) {
+            error.Timeout => return null,
+            else => return err,
         };
+        const bytes_read = msg.data.len;
 
         if (bytes_read == 0) {
             zeam_utils.sleepNs(50 * std.time.ns_per_ms);
