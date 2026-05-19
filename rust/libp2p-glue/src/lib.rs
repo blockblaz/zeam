@@ -31,9 +31,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 use crate::req_resp::{
-    configurations::REQUEST_TIMEOUT,
-    configurations::RESPONSE_CHANNEL_IDLE_TIMEOUT,
-    varint::{encode_varint, MAX_VARINT_BYTES},
+    configurations::REQUEST_TIMEOUT, configurations::RESPONSE_CHANNEL_IDLE_TIMEOUT,
     LeanSupportedProtocol, ProtocolId, ReqResp, ReqRespMessage, ReqRespMessageError,
     ReqRespMessageReceived, RequestMessage, ResponseMessage,
 };
@@ -1034,52 +1032,57 @@ pub unsafe extern "C" fn send_rpc_end_of_stream(network_id: u32, channel_id: u64
 }
 
 /// # Safety
-/// The caller must ensure `message_ptr` points to a valid null-terminated C string.
+/// The caller must ensure `frame_ptr` points to valid memory of `frame_len` bytes.
+///
+/// `frame` is the complete error-response frame — result-code byte,
+/// uncompressed-size varint, and snappy-framed message — already assembled on
+/// the Zig side by `buildResponseFrame`. This FFI only relays the bytes and
+/// closes the stream; mirrors `send_rpc_response_chunk` for success chunks.
 #[no_mangle]
 pub unsafe extern "C" fn send_rpc_error_response(
     network_id: u32,
     channel_id: u64,
-    message_ptr: *const c_char,
+    frame_ptr: *const u8,
+    frame_len: usize,
 ) {
     let _ = catch_ffi(|| {
-        send_rpc_error_response_inner(network_id, channel_id, message_ptr);
+        send_rpc_error_response_inner(network_id, channel_id, frame_ptr, frame_len);
     });
 }
 
 unsafe fn send_rpc_error_response_inner(
     network_id: u32,
     channel_id: u64,
-    message_ptr: *const c_char,
+    frame_ptr: *const u8,
+    frame_len: usize,
 ) {
-    if message_ptr.is_null() {
+    if frame_ptr.is_null() && frame_len != 0 {
         logger::rustLogger.error(
             network_id,
             &format!(
-                "Attempted to send RPC error response with null message pointer for channel {}",
+                "null frame_ptr with non-zero len in send_rpc_error_response for channel {}",
                 channel_id
             ),
         );
         return;
     }
 
-    let message = CStr::from_ptr(message_ptr).to_string_lossy().to_string();
-    let message_bytes = message.as_bytes();
-
-    if message_bytes.len() > crate::req_resp::configurations::max_message_size() {
+    if frame_len > crate::req_resp::configurations::max_message_size() {
         logger::rustLogger.error(
             network_id,
             &format!(
-                "Attempted to send RPC error payload exceeding maximum size on channel {}",
+                "Attempted to send RPC error frame exceeding maximum size on channel {}",
                 channel_id
             ),
         );
         return;
     }
 
-    let mut payload = Vec::with_capacity(1 + MAX_VARINT_BYTES + message_bytes.len());
-    payload.push(2);
-    encode_varint(message_bytes.len(), &mut payload);
-    payload.extend_from_slice(message_bytes);
+    let payload = if frame_len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(frame_ptr, frame_len).to_vec()
+    };
 
     send_swarm_command(
         network_id,

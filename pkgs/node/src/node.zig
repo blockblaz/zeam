@@ -1278,6 +1278,56 @@ pub const BeamNode = struct {
         self.flushPendingParentFetches();
     }
 
+    fn continueBlocksByRangeSync(self: *Self, peer_id: []const u8, completed_start_slot: types.Slot, completed_count: u64) void {
+        const peer_status = self.network.getPeerLatestStatus(peer_id) orelse {
+            self.logger.debug("blocks_by_range: no latest status for peer {s}{f}; not scheduling follow-up range", .{
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+            });
+            return;
+        };
+
+        const next_start_slot: types.Slot = completed_start_slot + completed_count;
+        const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+
+        if (peer_status.finalized_slot <= our_finalized_slot or next_start_slot > peer_status.finalized_slot) {
+            self.logger.debug("blocks_by_range: catch-up complete for peer {s}{f} (next_start={d}, peer_finalized={d}, our_finalized={d})", .{
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                next_start_slot,
+                peer_status.finalized_slot,
+                our_finalized_slot,
+            });
+            return;
+        }
+
+        const remaining: u64 = peer_status.finalized_slot - next_start_slot + 1;
+        const requested_count: u64 = @min(remaining, params.MAX_REQUEST_BLOCKS);
+        const handler = networks.OnReqRespResponseCbHandler{
+            .ptr = self,
+            .onReqRespResponseCb = onReqRespResponse,
+        };
+
+        self.logger.info("blocks_by_range: continuing catch-up from peer {s}{f} start_slot={d} count={d} peer_finalized={d} our_finalized={d}", .{
+            peer_id,
+            self.node_registry.getNodeNameFromPeerId(peer_id),
+            next_start_slot,
+            requested_count,
+            peer_status.finalized_slot,
+            our_finalized_slot,
+        });
+
+        _ = self.network.sendBlocksByRangeRequest(peer_id, next_start_slot, requested_count, handler) catch |err| {
+            self.logger.warn("blocks_by_range: failed to schedule follow-up range from peer {s}{f} start_slot={d} count={d}: {any}", .{
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                next_start_slot,
+                requested_count,
+                err,
+            });
+        };
+    }
+
     fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
         const request_id = event.request_id;
         // Snapshot the pending entry so we don't hold the
@@ -1525,7 +1575,15 @@ pub const BeamNode = struct {
                     self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
                     return;
                 }
+                const range_start_slot = snap.start_slot;
+                const range_count = snap.count;
+                const is_blocks_by_range = snap.request_kind == .blocks_by_range;
+
                 self.network.finalizePendingRequest(request_id);
+
+                if (is_blocks_by_range) {
+                    self.continueBlocksByRangeSync(peer_id, range_start_slot, range_count);
+                }
             },
         }
     }
@@ -1562,6 +1620,16 @@ pub const BeamNode = struct {
             .blocks_by_root => |request| {
                 const roots = request.roots.constSlice();
 
+                // Reject over-limit requests per spec (INVALID_REQUEST, code 1).
+                if (roots.len > params.MAX_REQUEST_BLOCKS) {
+                    self.logger.warn(
+                        "node-{d}:: blocks_by_root: requested {d} roots exceeds MAX_REQUEST_BLOCKS={d}, sending INVALID_REQUEST",
+                        .{ self.nodeId, roots.len, params.MAX_REQUEST_BLOCKS },
+                    );
+                    try responder.sendError(constants.RPC_ERR_INVALID_REQUEST, "too many roots requested");
+                    return;
+                }
+
                 self.logger.debug(
                     "node-{d}:: Handling blocks_by_root request for {d} roots",
                     .{ self.nodeId, roots.len },
@@ -1590,12 +1658,30 @@ pub const BeamNode = struct {
             .blocks_by_range => |request| {
                 const start_slot = request.start_slot;
                 const requested_count = request.count;
-                // Cap count at MAX_REQUEST_BLOCKS to bound work per request
-                const count = @min(requested_count, params.MAX_REQUEST_BLOCKS);
+
+                // Reject invalid counts per spec (INVALID_REQUEST, code 1).
+                if (requested_count == 0) {
+                    self.logger.warn(
+                        "node-{d}:: blocks_by_range: count=0 is invalid, sending INVALID_REQUEST",
+                        .{self.nodeId},
+                    );
+                    try responder.sendError(constants.RPC_ERR_INVALID_REQUEST, "count must not be zero");
+                    return;
+                }
+                if (requested_count > params.MAX_REQUEST_BLOCKS) {
+                    self.logger.warn(
+                        "node-{d}:: blocks_by_range: count={d} exceeds MAX_REQUEST_BLOCKS={d}, sending INVALID_REQUEST",
+                        .{ self.nodeId, requested_count, params.MAX_REQUEST_BLOCKS },
+                    );
+                    try responder.sendError(constants.RPC_ERR_INVALID_REQUEST, "count exceeds MAX_REQUEST_BLOCKS");
+                    return;
+                }
+
+                const count = requested_count;
 
                 self.logger.debug(
-                    "node-{d}:: Handling blocks_by_range request start_slot={d} count={d} (capped from {d})",
-                    .{ self.nodeId, start_slot, count, requested_count },
+                    "node-{d}:: Handling blocks_by_range request start_slot={d} count={d}",
+                    .{ self.nodeId, start_slot, count },
                 );
 
                 // Enforce MIN_SLOTS_FOR_BLOCK_REQUESTS history window.
