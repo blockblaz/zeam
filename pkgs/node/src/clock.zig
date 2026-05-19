@@ -78,6 +78,23 @@ pub const Clock = struct {
         return if (v == NEVER_TICKED_MS) null else v;
     }
 
+    /// Host wall-clock slot derived directly from `unixTimestampMillis()` and
+    /// `genesis_time_ms`, independent of the libxev tick / forkchoice
+    /// `slot_clock.timeSlots` counter.
+    ///
+    /// Use this when sync-gating decisions must remain correct even while
+    /// the libxev slot driver is stalled or forkchoice ticks are blocked
+    /// behind a long-running mutator (#863). Reading `slot_clock.timeSlots`
+    /// in those decisions self-reinforces stalls: a starved counter caps
+    /// the sync gap to zero, catch-up is skipped, the node stays stuck.
+    ///
+    /// Returns 0 when wall clock is at or before genesis.
+    pub fn wallSlotNow(self: *const Self) u64 {
+        const now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
+        const slot_ms: u64 = @intCast(constants.SECONDS_PER_INTERVAL_MS * constants.INTERVALS_PER_SLOT);
+        return wallSlotNowImpl(now_ms, self.genesis_time_ms, slot_ms);
+    }
+
     pub fn deinit(self: *Self, allocator: Allocator) void {
         self.timer.deinit();
         for (self.on_interval_cbs.items) |cbWrapper| {
@@ -223,3 +240,30 @@ pub const Clock = struct {
         try self.on_interval_cbs.append(self.allocator, cb);
     }
 };
+
+// Pure helper extracted for unit testing. `Clock.wallSlotNow` is just this
+// function applied to live `unixTimestampMillis()` and the clock's stored
+// `genesis_time_ms`; tests exercise the math here without spinning up xev.
+fn wallSlotNowImpl(now_ms: isize, genesis_time_ms: isize, slot_ms: u64) u64 {
+    if (now_ms <= genesis_time_ms) return 0;
+    if (slot_ms == 0) return 0;
+    const elapsed_ms: u64 = @intCast(now_ms - genesis_time_ms);
+    return elapsed_ms / slot_ms;
+}
+
+test "wallSlotNowImpl returns 0 before/at genesis" {
+    const slot_ms: u64 = @intCast(constants.SECONDS_PER_INTERVAL_MS * constants.INTERVALS_PER_SLOT);
+    try std.testing.expectEqual(@as(u64, 0), wallSlotNowImpl(1000, 5000, slot_ms));
+    try std.testing.expectEqual(@as(u64, 0), wallSlotNowImpl(5000, 5000, slot_ms));
+}
+
+test "wallSlotNowImpl advances independently of any tick counter" {
+    const slot_ms: u64 = @intCast(constants.SECONDS_PER_INTERVAL_MS * constants.INTERVALS_PER_SLOT);
+    // 31 slots after genesis, regardless of whether libxev has ticked even once.
+    const now_ms: isize = @as(isize, 0) + @as(isize, @intCast(slot_ms)) * 31 + @as(isize, 200);
+    try std.testing.expectEqual(@as(u64, 31), wallSlotNowImpl(now_ms, 0, slot_ms));
+}
+
+test "wallSlotNowImpl handles zero slot_ms defensively" {
+    try std.testing.expectEqual(@as(u64, 0), wallSlotNowImpl(123_000, 0, 0));
+}
