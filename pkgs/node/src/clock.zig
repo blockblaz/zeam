@@ -12,11 +12,24 @@ const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 
 const CLOCK_DISPARITY_MS: isize = 100;
 
+/// Sentinel for `last_tick_time_ms_atomic` meaning "tickInterval has
+/// not run yet". Real timestamps are unix-epoch milliseconds (positive
+/// and large), so any negative value is unambiguous; using `minInt`
+/// avoids any chance of collision with a clock-skew artifact.
+const NEVER_TICKED_MS: i64 = std.math.minInt(i64);
+
 pub const Clock = struct {
     genesis_time_ms: isize,
     current_interval_time_ms: isize,
     current_interval: isize,
-    last_tick_time_ms: ?isize,
+    /// Wall-clock millis at the most recent `tickInterval()` call, or
+    /// `NEVER_TICKED_MS` before the first tick. Read concurrently by
+    /// `SlotDriverWatchdog` (#863) — kept atomic so the watchdog
+    /// thread never observes a torn value. Writers must use
+    /// `release` ordering, readers `acquire` (or `monotonic` when the
+    /// reader doesn't need to synchronise with anything else the
+    /// writer published).
+    last_tick_time_ms_atomic: std.atomic.Value(i64),
     events: utils.EventLoop,
     // track those who subscribed for on slot callbacks
     on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
@@ -48,13 +61,38 @@ pub const Clock = struct {
             .genesis_time_ms = genesis_time_ms,
             .current_interval_time_ms = current_interval_time_ms,
             .current_interval = current_interval,
-            .last_tick_time_ms = null,
+            .last_tick_time_ms_atomic = std.atomic.Value(i64).init(NEVER_TICKED_MS),
             .events = events,
             .timer = timer,
             .on_interval_cbs = .empty,
             .allocator = allocator,
             .logger = logger_config.logger(.clock),
         };
+    }
+
+    /// Snapshot of the most recent `tickInterval()` wall-clock time, or
+    /// `null` if `tickInterval()` has not run yet. Single atomic
+    /// `acquire` load — safe to call from any thread.
+    pub fn lastTickMs(self: *const Self) ?i64 {
+        const v = self.last_tick_time_ms_atomic.load(.acquire);
+        return if (v == NEVER_TICKED_MS) null else v;
+    }
+
+    /// Host wall-clock slot derived directly from `unixTimestampMillis()` and
+    /// `genesis_time_ms`, independent of the libxev tick / forkchoice
+    /// `slot_clock.timeSlots` counter.
+    ///
+    /// Use this when sync-gating decisions must remain correct even while
+    /// the libxev slot driver is stalled or forkchoice ticks are blocked
+    /// behind a long-running mutator (#863). Reading `slot_clock.timeSlots`
+    /// in those decisions self-reinforces stalls: a starved counter caps
+    /// the sync gap to zero, catch-up is skipped, the node stays stuck.
+    ///
+    /// Returns 0 when wall clock is at or before genesis.
+    pub fn wallSlotNow(self: *const Self) u64 {
+        const now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
+        const slot_ms: u64 = @intCast(constants.SECONDS_PER_INTERVAL_MS * constants.INTERVALS_PER_SLOT);
+        return wallSlotNowImpl(now_ms, self.genesis_time_ms, slot_ms);
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
@@ -67,12 +105,19 @@ pub const Clock = struct {
 
     pub fn tickInterval(self: *Self) void {
         const time_now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
-        if (self.last_tick_time_ms) |last| {
-            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
+        // Single-writer (libxev thread); monotonic load is sufficient here
+        // — we only race the watchdog reader, which uses acquire on its load.
+        const last_atomic = self.last_tick_time_ms_atomic.load(.monotonic);
+        if (last_atomic != NEVER_TICKED_MS) {
+            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - @as(isize, @intCast(last_atomic)))) / 1000.0;
             zeam_metrics.lean_tick_interval_duration_seconds.record(elapsed_s);
             self.logger.info("slot_interval={d} duration={d:.3}s", .{ @mod(self.current_interval, constants.INTERVALS_PER_SLOT), elapsed_s });
         }
-        self.last_tick_time_ms = time_now_ms;
+        // Release ordering pairs with the watchdog's acquire load in
+        // `lastTickMs`, ensuring any writes the libxev thread did before
+        // the tick are visible to the watchdog when it observes the new
+        // timestamp.
+        self.last_tick_time_ms_atomic.store(@intCast(time_now_ms), .release);
         while (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS) {
             self.current_interval_time_ms += constants.SECONDS_PER_INTERVAL_MS;
             self.current_interval += 1;
@@ -116,17 +161,77 @@ pub const Clock = struct {
     }
 
     pub fn run(self: *Self) !void {
+        // Issue #863 P4: bound each xev drain pass to ONE io_uring CQE
+        // batch via `.once` rather than `.until_done`.
+        //
+        // The pre-#863 shape called `events.run(.until_done)` per pass,
+        // which loops until `loop.active == 0`. Under sustained gossip
+        // pressure (especially on a 4-subnet aggregator that sees 4×
+        // attestation traffic, with ~74% of those attestations referring
+        // to head blocks the node hadn't imported yet — see the issue
+        // for the full trace), every callback enqueues additional work
+        // (chain submits, peer-event broadcasts, RPC retries) so the
+        // active-completion count never reaches zero and `tickInterval`
+        // doesn't run again until the storm subsides. Devnet-4 saw
+        // multi-second slot-driver stalls and ~96 finalized vs ~196 head
+        // delta on the aggregator as a direct consequence.
+        //
+        // `.once` blocks until at least one completion is ready, then
+        // drains every CQE the kernel returns in that syscall batch (up
+        // to 128 per the io_uring backend) before returning. The next-interval
+        // timer is itself a completion, so under no-flood conditions
+        // we still wake every ~800ms and call `tickInterval` exactly
+        // once per interval — the steady-state behaviour is unchanged.
+        // Under flood the loop returns to the body of this function
+        // after each batch; we re-tick `tickInterval` only when wall
+        // clock has actually crossed the next interval boundary so
+        // the per-tick log line and `lean_tick_interval_duration_seconds`
+        // histogram retain their interval-cadence semantics (and don't
+        // get spammed at the CQE-batch rate).
+        //
+        // The existing `zeam_xev_clock_until_done_drain_seconds`
+        // histogram is repurposed: each pass is now bounded by one
+        // batch, so values are expected to drop sharply (sub-ms median
+        // under steady load). The two slow-drain counters
+        // (>=500ms / >=1s) now flag pathologically large single CQE
+        // batches rather than unbounded drain queues — still a useful
+        // signal but rarely fires now. `zeam_xev_clock_drain_passes_total`
+        // is the new pass-rate liveness counter.
+
+        // Bootstrap: register the first interval timer so `.once` has
+        // something to wait on. Subscribers must have called
+        // `subscribeOnSlot` before `run`; if none did, `.once` would
+        // block forever (which is the same observable behaviour the
+        // pre-P4 `.until_done` loop produced — the busy-while exited
+        // each pass with `loop.active == 0`).
+        self.tickInterval();
         while (true) {
-            self.tickInterval();
             const drain_timer = zeam_metrics.zeam_xev_clock_until_done_drain_seconds.start();
-            try self.events.run(.until_done);
+            try self.events.run(.once);
+            zeam_metrics.metrics.zeam_xev_clock_drain_passes_total.incr();
             const drain_s = drain_timer.observe();
             if (drain_s >= 0.5) {
                 zeam_metrics.metrics.zeam_xev_clock_until_done_slow_ge_500ms_total.incr();
             }
             if (drain_s >= 1.0) {
                 zeam_metrics.metrics.zeam_xev_clock_until_done_slow_ge_1s_total.incr();
-                self.logger.warn("xev until_done drain took {d:.3}s (slot driver backlog; see #863)", .{drain_s});
+                self.logger.warn("xev .once drain batch took {d:.3}s (slot driver backlog; see #863)", .{drain_s});
+            }
+
+            // Only re-tick when wall clock has reached the next interval
+            // boundary — **without** `CLOCK_DISPARITY_MS` slack on this
+            // outer trigger. The inner `tickInterval` while-loop still
+            // applies disparity for multi-interval catch-up once we enter
+            // `tickInterval`. Using `+ CLOCK_DISPARITY_MS` here matched the
+            // inner inequality and could fire a full `tickInterval()` up to
+            // ~`CLOCK_DISPARITY_MS` early while the interval timer was still
+            // legitimately pending; `tickInterval` then re-armed/canceled that
+            // timer and the canceled completion does not run `onInterval`,
+            // so gossip-heavy `.once` batches could skip slot duties (#886
+            // review).
+            const time_now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
+            if (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS <= time_now_ms) {
+                self.tickInterval();
             }
         }
     }
@@ -135,3 +240,30 @@ pub const Clock = struct {
         try self.on_interval_cbs.append(self.allocator, cb);
     }
 };
+
+// Pure helper extracted for unit testing. `Clock.wallSlotNow` is just this
+// function applied to live `unixTimestampMillis()` and the clock's stored
+// `genesis_time_ms`; tests exercise the math here without spinning up xev.
+fn wallSlotNowImpl(now_ms: isize, genesis_time_ms: isize, slot_ms: u64) u64 {
+    if (now_ms <= genesis_time_ms) return 0;
+    if (slot_ms == 0) return 0;
+    const elapsed_ms: u64 = @intCast(now_ms - genesis_time_ms);
+    return elapsed_ms / slot_ms;
+}
+
+test "wallSlotNowImpl returns 0 before/at genesis" {
+    const slot_ms: u64 = @intCast(constants.SECONDS_PER_INTERVAL_MS * constants.INTERVALS_PER_SLOT);
+    try std.testing.expectEqual(@as(u64, 0), wallSlotNowImpl(1000, 5000, slot_ms));
+    try std.testing.expectEqual(@as(u64, 0), wallSlotNowImpl(5000, 5000, slot_ms));
+}
+
+test "wallSlotNowImpl advances independently of any tick counter" {
+    const slot_ms: u64 = @intCast(constants.SECONDS_PER_INTERVAL_MS * constants.INTERVALS_PER_SLOT);
+    // 31 slots after genesis, regardless of whether libxev has ticked even once.
+    const now_ms: isize = @as(isize, 0) + @as(isize, @intCast(slot_ms)) * 31 + @as(isize, 200);
+    try std.testing.expectEqual(@as(u64, 31), wallSlotNowImpl(now_ms, 0, slot_ms));
+}
+
+test "wallSlotNowImpl handles zero slot_ms defensively" {
+    try std.testing.expectEqual(@as(u64, 0), wallSlotNowImpl(123_000, 0, 0));
+}

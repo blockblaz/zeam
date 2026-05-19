@@ -19,6 +19,7 @@ const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
+const SlotDriverWatchdog = node_lib.SlotDriverWatchdog;
 const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
@@ -153,6 +154,9 @@ pub const Node = struct {
     anchor_state: *types.BeamState,
     /// Shared worker pool for CPU-bound chain work (attestation signature verification).
     thread_pool: *ThreadPool,
+    /// Background watchdog that monitors libxev slot-driver liveness (#863).
+    /// `null` until `run()` spawns it; `stop()` joins it.
+    slot_driver_watchdog: ?SlotDriverWatchdog = null,
 
     const Self = @This();
 
@@ -398,7 +402,8 @@ pub const Node = struct {
         const cpu_count = std.Thread.getCpuCount() catch 2;
         const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
         const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
-        const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+        const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
+        const worker_count = @min(zig_worker_budget, @as(usize, ThreadPool.max_thread_count));
         self.thread_pool = try ThreadPool.init(.{
             .allocator = allocator,
             .io = std.Io.Threaded.global_single_threaded.io(),
@@ -406,13 +411,24 @@ pub const Node = struct {
         });
         errdefer self.thread_pool.deinit();
 
+        // Coordinate the Zig worker pool and the rayon pool used by the XMSS
+        // aggregate prover from the same post-system-thread budget so they do
+        // not independently claim every remaining CPU. Prefer the Zig pool for
+        // the extra worker on odd counts since aggregate verification enters
+        // rayon from Zig workers. Both pools still keep a minimum of one worker
+        // so tiny/cgroup-limited systems remain functional.
+        // Must be called before setupProver/setupVerifier since rayon’s global
+        // pool is initialized lazily on first use.
+        const rayon_threads = @max(@as(usize, 1), desired_workers -| worker_count);
+        xmss.setRayonThreads(rayon_threads);
+
         // Pre-warm the XMSS verifier on the main thread before any worker can
         // call `verifyAggregatedPayload`. The Rust-side verifier setup is
         // documented as idempotent but is not hardened against first-time-init
         // races between concurrent callers; doing it once here removes that
         // race regardless of the Rust implementation.
         xmss.setupVerifier() catch |err| {
-            self.thread_pool.deinit();
+            // Do not call `thread_pool.deinit()` here — `errdefer` below already tears it down.
             return err;
         };
 
@@ -482,6 +498,9 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.slot_driver_watchdog) |*wd| {
+            wd.stop();
+        }
         if (self.api_server_handle) |handle| {
             handle.stop();
         }
@@ -563,6 +582,32 @@ pub const Node = struct {
         self.logger.info("  Listening on QUIC port: {?d}", .{quic_port});
         self.logger.info("  ENR: {s}", .{encoded_txt});
         self.logger.info("────────────────────────────────────────────────────────", .{});
+
+        // Spawn the slot-driver stall watchdog (#863) so multi-second
+        // libxev stalls surface in the log + metrics even if the main
+        // loop is stuck inside one completion or syscall. Failure to
+        // spawn is non-fatal — log and continue without it.
+        //
+        // The stall callback flips an atomic flag on `BeamNode` that the
+        // next libxev tick observes and acts on, forcing a peer status
+        // refresh outside the normal 8-slot cadence. This bootstraps
+        // catch-up as soon as the slot driver resumes.
+        self.slot_driver_watchdog = SlotDriverWatchdog.init(
+            &self.clock,
+            self.options.logger_config.logger(.clock),
+            .{
+                .on_stall = .{
+                    .ptr = &self.beam_node,
+                    .onStall = BeamNode.onSlotDriverStall,
+                },
+            },
+        );
+        if (self.slot_driver_watchdog) |*wd| {
+            wd.start() catch |err| {
+                self.logger.warn("failed to start slot-driver watchdog: {any}", .{err});
+                self.slot_driver_watchdog = null;
+            };
+        }
 
         try self.clock.run();
     }

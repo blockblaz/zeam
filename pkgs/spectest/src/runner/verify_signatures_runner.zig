@@ -253,12 +253,18 @@ fn verifyBodyAttestations(
 
     const signature_obj = try expect_mod.expectObject(FixtureError, signed_block_obj, &.{"signature"}, ctx, "signedBlock.signature");
     const att_sigs_obj = try expect_mod.expectObject(FixtureError, signature_obj, &.{ "attestationSignatures", "attestation_signatures" }, ctx, "signedBlock.signature.attestationSignatures");
+    // Structural malformations (missing data field, length mismatch with body
+    // attestations) are valid representations of network-level rejections —
+    // they exercise the verifier's input-validation path, not a corrupt
+    // fixture. Surface them as "verification rejected" (return true) so the
+    // expectException check at the call site can match. Matches the HTTP
+    // test driver's behavior in pkgs/cli/src/test_driver.zig.
     const att_sigs_data = att_sigs_obj.get("data") orelse {
         std.debug.print(
             "fixture {s} case {s}: attestationSignatures missing data\n",
             .{ ctx.fixture_label, ctx.case_name },
         );
-        return FixtureError.InvalidFixture;
+        return true;
     };
     const sig_arr = try expect_mod.expectArrayValue(FixtureError, att_sigs_data, ctx, "attestationSignatures.data");
 
@@ -267,7 +273,7 @@ fn verifyBodyAttestations(
             "fixture {s} case {s}: body attestations ({d}) != attestationSignatures ({d})\n",
             .{ ctx.fixture_label, ctx.case_name, attestations.len, sig_arr.items.len },
         );
-        return FixtureError.InvalidFixture;
+        return true;
     }
 
     const validators_slice = state.validators.constSlice();

@@ -118,7 +118,7 @@ extern fn hashsig_test_verify_ssz(
     signature_len: usize,
 ) callconv(.c) i32;
 
-pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory };
+pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory, ValidatorIndexOutOfRange };
 
 /// Verify signature using SSZ-encoded bytes
 pub fn verifySsz(

@@ -1,8 +1,10 @@
 const std = @import("std");
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 const networks = @import("@zeam/network");
 const types = @import("@zeam/types");
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 const ssz = @import("ssz");
 const locking = @import("./locking.zig");
 
@@ -12,6 +14,9 @@ pub const PeerInfo = struct {
     peer_id: []const u8,
     connected_at: i64,
     latest_status: ?types.Status = null,
+    /// Set when a `blocks_by_range` RPC fails with an "unsupported / not available"
+    /// error so catch-up uses `blocks_by_root` instead of retrying range on this peer.
+    blocks_by_range_unavailable: bool = false,
 };
 
 pub const StatusRequestContext = struct {
@@ -36,10 +41,56 @@ pub const BlockByRangeContext = struct {
     peer_id: []const u8,
     start_slot: types.Slot,
     count: u64,
+    /// Peer head when this catch-up was scheduled (pagination + gap sanity).
+    peer_head_slot: types.Slot,
+    /// Fallback target when range sync cannot link to our chain.
+    peer_head_root: types.Root,
+    /// Our forkchoice head root at request start — the first returned chunk must extend this.
+    our_head_root_at_start: types.Root,
+    attempt: u8 = 1,
+    chunks_received: u32 = 0,
+    chunks_imported: u32 = 0,
+    /// Chunks rejected at or below our finalized slot (peer served stale history).
+    chunks_pre_finalized: u32 = 0,
+    /// Chunks queued on the chain-worker; sync-end runs after this hits zero.
+    chunks_async_pending: u32 = 0,
+    /// RPC stream finished; defer `handleBlocksByRangeSyncEnd` until async imports drain.
+    sync_end_pending: bool = false,
+    /// Set when the first chunk cannot attach to `our_head_root_at_start`; further chunks are ignored.
+    aborted: bool = false,
 
     pub fn deinit(self: *BlockByRangeContext, allocator: Allocator) void {
         allocator.free(self.peer_id);
     }
+};
+
+/// Identifies an outbound `blocks_by_range` request by its slot window.
+/// Issue #893: allow many concurrent ranges, but reject overlapping slot windows
+/// (review PR #894 / zclawz: overlapping windows corrupt async import accounting).
+pub const BlocksByRangeKey = struct {
+    start_slot: types.Slot,
+    count: u64,
+
+    pub fn eql(a: BlocksByRangeKey, b: BlocksByRangeKey) bool {
+        return a.start_slot == b.start_slot and a.count == b.count;
+    }
+
+    pub fn hash(self: BlocksByRangeKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&self.start_slot));
+        hasher.update(std.mem.asBytes(&self.count));
+        return hasher.final();
+    }
+};
+
+pub const BlocksByRangeSyncParams = struct {
+    peer_id: []const u8,
+    start_slot: types.Slot,
+    count: u64,
+    peer_head_slot: types.Slot,
+    peer_head_root: types.Root,
+    our_head_root_at_start: types.Root,
+    attempt: u8 = 1,
 };
 
 pub const PendingRPC = union(enum) {
@@ -95,6 +146,23 @@ pub const BlocksByRootRequestResult = struct {
     }
 };
 
+/// Issue #863 P3: cap on outbound `BlocksByRoot` RPCs in flight at any
+/// given moment. The pre-#863 path issued one RPC per attestation that
+/// referenced an unknown head, multiplied by 4× subnet fanout for an
+/// aggregator — under flood the libxev thread fanned hundreds of
+/// concurrent RPCs that themselves timed out (8s default per
+/// `RPC_REQUEST_TIMEOUT_SECONDS`) and retried, saturating the loop and
+/// the timed-out-requests sweep.
+///
+/// 8 is empirically generous: each RPC fetches up to MAX_BLOCKS_BY_ROOT
+/// roots in one batch, so 8 in-flight covers ~64 missing roots
+/// concurrently — comfortably above the worst observed sustained
+/// missing-root rate while keeping the RPC dispatch fan-out bounded.
+/// Tune by watching `zeam_blocks_by_root_inflight` saturate at this
+/// value combined with `lean_block_fetch_dedup_total{outcome="inflight_cap"}`
+/// climbing — under healthy operation neither should be hot.
+pub const MAX_CONCURRENT_BLOCKS_BY_ROOT: u32 = 8;
+
 pub const Network = struct {
     allocator: Allocator,
     backend: networks.NetworkInterface,
@@ -114,6 +182,21 @@ pub const Network = struct {
     timed_out_requests: std.ArrayList(u64) = .empty,
     timed_out_requests_lock: zeam_utils.SyncMutex = .{},
 
+    /// Issue #863 P3: in-flight outbound `BlocksByRoot` RPC count.
+    /// Incremented by `ensureBlocksByRootRequest` after a successful
+    /// dispatch, decremented by `finalizePendingRequest` regardless of
+    /// success / timeout / peer disconnect. Read by
+    /// `ensureBlocksByRootRequest` to enforce
+    /// `MAX_CONCURRENT_BLOCKS_BY_ROOT` and exported as
+    /// `zeam_blocks_by_root_inflight`. Atomic so the timeout sweep
+    /// thread (`processTimedOutRequests`) and the gossip dispatch
+    /// path on the libxev thread don't tear it.
+    blocks_by_root_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// Issue #893: active outbound `blocks_by_range` windows (one in-flight per key).
+    blocks_by_range_active: std.AutoHashMap(BlocksByRangeKey, void),
+    blocks_by_range_active_lock: zeam_utils.SyncMutex = .{},
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, backend: networks.NetworkInterface) !Self {
@@ -131,6 +214,9 @@ pub const Network = struct {
         var block_cache = locking.BlockCache.init(allocator);
         errdefer block_cache.deinit();
 
+        var blocks_by_range_active = std.AutoHashMap(BlocksByRangeKey, void).init(allocator);
+        errdefer blocks_by_range_active.deinit();
+
         return Self{
             .allocator = allocator,
             .backend = backend,
@@ -138,6 +224,7 @@ pub const Network = struct {
             .pending_rpc_requests = pending_rpc_requests,
             .pending_block_roots = pending_block_roots,
             .block_cache = block_cache,
+            .blocks_by_range_active = blocks_by_range_active,
         };
     }
 
@@ -168,6 +255,12 @@ pub const Network = struct {
         // so `BlockCache.deinit` (which iterates and calls `value.deinit()`
         // on each SignedBlock) is the right cleanup path.
         self.block_cache.deinit();
+
+        {
+            self.blocks_by_range_active_lock.lock();
+            self.blocks_by_range_active.deinit();
+            self.blocks_by_range_active_lock.unlock();
+        }
 
         self.connected_peers.deinit();
         self.allocator.destroy(self.connected_peers);
@@ -243,6 +336,22 @@ pub const Network = struct {
         return self.connected_peers.selectPeerCopy(self.allocator);
     }
 
+    pub fn selectPeerExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, false);
+    }
+
+    pub fn selectPeerForRangeSyncExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, true);
+    }
+
+    pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
+        return self.connected_peers.peerSupportsBlocksByRange(peer_id);
+    }
+
+    pub fn markPeerBlocksByRangeUnavailable(self: *Self, peer_id: []const u8) void {
+        self.connected_peers.markBlocksByRangeUnavailable(peer_id);
+    }
+
     pub fn getPeerCount(self: *Self) usize {
         return self.connected_peers.count();
     }
@@ -253,6 +362,18 @@ pub const Network = struct {
 
     pub fn setPeerLatestStatus(self: *Self, peer_id: []const u8, status: types.Status) bool {
         return self.connected_peers.setLatestStatus(peer_id, status);
+    }
+
+    pub fn getPeerLatestStatus(self: *Self, peer_id: []const u8) ?types.Status {
+        var guard = self.connected_peers.iterateLocked();
+        defer guard.deinit();
+
+        while (guard.iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, peer_id)) {
+                return entry.value_ptr.latest_status;
+            }
+        }
+        return null;
     }
 
     pub fn connectPeer(self: *Self, peer_id: []const u8) !void {
@@ -658,31 +779,81 @@ pub const Network = struct {
         return request_id;
     }
 
+    pub fn blocksByRangeKey(range_sync: BlocksByRangeSyncParams) BlocksByRangeKey {
+        return .{
+            .start_slot = range_sync.start_slot,
+            .count = range_sync.count,
+        };
+    }
+
+    pub fn isBlocksByRangeActive(self: *Self, key: BlocksByRangeKey) bool {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        return self.blocks_by_range_active.contains(key);
+    }
+
+    pub fn blocksByRangeOverlapsActive(self: *Self, start_slot: types.Slot, count: u64) bool {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        var it = self.blocks_by_range_active.keyIterator();
+        while (it.next()) |active| {
+            if (blocks_by_range_sync.rangesOverlap(active.start_slot, active.count, start_slot, count)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn reserveBlocksByRangeActive(self: *Self, key: BlocksByRangeKey) !void {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        var it = self.blocks_by_range_active.keyIterator();
+        while (it.next()) |active| {
+            if (blocks_by_range_sync.rangesOverlap(active.start_slot, active.count, key.start_slot, key.count)) {
+                return error.BlocksByRangeOverlap;
+            }
+        }
+        const gop = try self.blocks_by_range_active.getOrPut(key);
+        if (gop.found_existing) return error.BlocksByRangeAlreadyActive;
+    }
+
+    fn releaseBlocksByRangeActive(self: *Self, key: BlocksByRangeKey) void {
+        self.blocks_by_range_active_lock.lock();
+        defer self.blocks_by_range_active_lock.unlock();
+        _ = self.blocks_by_range_active.remove(key);
+    }
+
     pub fn sendBlocksByRangeRequest(
         self: *Self,
-        peer_id: []const u8,
-        start_slot: types.Slot,
-        count: u64,
+        range_sync: BlocksByRangeSyncParams,
         handler: networks.OnReqRespResponseCbHandler,
     ) !u64 {
-        if (count == 0) return error.NoBlocksRequested;
+        if (range_sync.count == 0) return error.NoBlocksRequested;
 
-        const peer_copy = try self.allocator.dupe(u8, peer_id);
+        const range_key = blocksByRangeKey(range_sync);
+        try self.reserveBlocksByRangeActive(range_key);
+        var range_key_reserved = true;
+        errdefer if (range_key_reserved) self.releaseBlocksByRangeActive(range_key);
+
+        const peer_copy = try self.allocator.dupe(u8, range_sync.peer_id);
         var peer_copy_owned = true;
         errdefer if (peer_copy_owned) self.allocator.free(peer_copy);
 
         var pending = PendingRPC{ .blocks_by_range = .{
             .peer_id = peer_copy,
-            .start_slot = start_slot,
-            .count = count,
+            .start_slot = range_sync.start_slot,
+            .count = range_sync.count,
+            .peer_head_slot = range_sync.peer_head_slot,
+            .peer_head_root = range_sync.peer_head_root,
+            .our_head_root_at_start = range_sync.our_head_root_at_start,
+            .attempt = range_sync.attempt,
         } };
         var pending_owned = false;
         errdefer if (!pending_owned) pending.deinit(self.allocator);
 
-        // ownership transferred to pending
         peer_copy_owned = false;
 
-        const request_id = self.requestBlocksByRange(peer_id, start_slot, count, handler) catch |err| {
+        const request_id = self.requestBlocksByRange(range_sync.peer_id, range_sync.start_slot, range_sync.count, handler) catch |err| {
             return err;
         };
 
@@ -695,9 +866,84 @@ pub const Network = struct {
         };
 
         pending_owned = true;
+        range_key_reserved = false;
 
         return request_id;
     }
+
+    pub const BlocksByRangeChunkView = struct {
+        start_slot: types.Slot,
+        our_head_root_at_start: types.Root,
+        aborted: bool,
+        /// True for the first chunk recorded on this request (before `record_received`).
+        is_first_chunk: bool = false,
+    };
+
+    pub const BlocksByRangeChunkUpdate = struct {
+        record_received: bool = false,
+        record_imported: bool = false,
+        record_pre_finalized: bool = false,
+        record_async_submitted: bool = false,
+        record_async_finished: bool = false,
+        mark_aborted: bool = false,
+        mark_sync_end_pending: bool = false,
+    };
+
+    pub const BlocksByRangeRequestUpdate = struct {
+        view: ?BlocksByRangeChunkView = null,
+        /// True when the RPC stream has ended and all async imports have drained.
+        run_sync_end: bool = false,
+    };
+
+    /// Single lock acquisition for range-chunk bookkeeping (issue #893).
+    pub fn updateBlocksByRangeRequest(
+        self: *Self,
+        request_id: u64,
+        update: BlocksByRangeChunkUpdate,
+    ) BlocksByRangeRequestUpdate {
+        const Ctx = struct {
+            update: BlocksByRangeChunkUpdate,
+            result: BlocksByRangeRequestUpdate = .{},
+            fn each(c: *@This(), value_ptr: ?*PendingRPCEntry) anyerror!void {
+                const entry = value_ptr orelse return;
+                switch (entry.request) {
+                    .blocks_by_range => |*ctx| {
+                        const is_first_chunk = c.update.record_received and ctx.chunks_received == 0;
+                        if (c.update.record_received) ctx.chunks_received += 1;
+                        if (c.update.record_imported) ctx.chunks_imported += 1;
+                        if (c.update.record_pre_finalized) ctx.chunks_pre_finalized += 1;
+                        if (c.update.record_async_submitted) ctx.chunks_async_pending += 1;
+                        if (c.update.record_async_finished) {
+                            if (ctx.chunks_async_pending > 0) ctx.chunks_async_pending -= 1;
+                        }
+                        if (c.update.mark_aborted) ctx.aborted = true;
+                        if (c.update.mark_sync_end_pending) ctx.sync_end_pending = true;
+                        c.result.view = .{
+                            .start_slot = ctx.start_slot,
+                            .our_head_root_at_start = ctx.our_head_root_at_start,
+                            .aborted = ctx.aborted,
+                            .is_first_chunk = is_first_chunk,
+                        };
+                        if (ctx.sync_end_pending and ctx.chunks_async_pending == 0) {
+                            c.result.run_sync_end = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        };
+        var ctx = Ctx{ .update = update };
+        self.pending_rpc_requests.withMutableValueLocked(request_id, &ctx, Ctx.each) catch {};
+        return ctx.result;
+    }
+
+    /// Issue #863 P3: errors that signal "request would exceed the
+    /// in-flight cap" so the caller can bucket them as a soft-rejection
+    /// rather than a hard error. This is intentionally a separate error
+    /// from `error.NoPeersAvailable` because the calling code in
+    /// `BeamNode.fetchBlockByRoots` accounts for both in different
+    /// `lean_block_fetch_dedup_total{outcome=…}` buckets.
+    pub const EnsureBlocksByRootError = error{InFlightCapReached};
 
     pub fn ensureBlocksByRootRequest(
         self: *Self,
@@ -709,12 +955,43 @@ pub const Network = struct {
 
         if (!self.shouldRequestBlocksByRoot(roots)) return null;
 
+        // Issue #863 P3: enforce the in-flight cap BEFORE `selectPeer`
+        // so a saturated cap doesn't burn a peer-selection round trip.
+        // The compare-and-set loop is monotonic; under contention each
+        // attempt observes the latest count, so a concurrent finalize
+        // (decrement) is reflected on the next iteration.
+        while (true) {
+            const cur = self.blocks_by_root_inflight.load(.monotonic);
+            if (cur >= MAX_CONCURRENT_BLOCKS_BY_ROOT) {
+                return error.InFlightCapReached;
+            }
+            if (self.blocks_by_root_inflight.cmpxchgWeak(cur, cur + 1, .acq_rel, .monotonic) == null) {
+                // Reservation succeeded — we now own one in-flight slot
+                // until either (a) the dispatch path below errors and we
+                // release explicitly, or (b) the request completes and
+                // `finalizePendingRequest` releases it.
+                break;
+            }
+        }
+
+        // Reservation released on any error path before the request_id
+        // is recorded in `pending_rpc_requests`. After dispatch, the
+        // slot stays held until `finalizePendingRequest` runs.
+        var reservation_owned = true;
+        errdefer if (reservation_owned) {
+            _ = self.blocks_by_root_inflight.fetchSub(1, .acq_rel);
+            zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
+        };
+
         const peer = (try self.selectPeer()) orelse return error.NoPeersAvailable;
         var peer_owned = true;
         errdefer if (peer_owned) self.allocator.free(peer);
 
         const request_id = try self.sendBlocksByRootRequest(peer, roots, depth, handler);
         peer_owned = false; // ownership transferred to result
+        reservation_owned = false; // ownership transferred to pending_rpc_requests
+
+        zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
 
         return BlocksByRootRequestResult{
             .peer_id = peer,
@@ -732,6 +1009,14 @@ pub const Network = struct {
         requested_roots_copy: []types.Root = &[_]types.Root{},
         start_slot: types.Slot = 0,
         count: u64 = 0,
+        peer_head_slot: types.Slot = 0,
+        peer_head_root: types.Root = types.ZERO_HASH,
+        our_head_root_at_start: types.Root = types.ZERO_HASH,
+        range_attempt: u8 = 1,
+        range_chunks_received: u32 = 0,
+        range_chunks_imported: u32 = 0,
+        range_chunks_pre_finalized: u32 = 0,
+        range_aborted: bool = false,
         created_at: i64,
 
         pub fn deinit(self: *PendingRequestSnapshot, allocator: Allocator) void {
@@ -783,6 +1068,14 @@ pub const Network = struct {
                             .peer_id_copy = peer_id_copy,
                             .start_slot = r.start_slot,
                             .count = r.count,
+                            .peer_head_slot = r.peer_head_slot,
+                            .peer_head_root = r.peer_head_root,
+                            .our_head_root_at_start = r.our_head_root_at_start,
+                            .range_attempt = r.attempt,
+                            .range_chunks_received = r.chunks_received,
+                            .range_chunks_imported = r.chunks_imported,
+                            .range_chunks_pre_finalized = r.chunks_pre_finalized,
+                            .range_aborted = r.aborted,
                             .created_at = entry.created_at,
                         };
                     },
@@ -820,8 +1113,20 @@ pub const Network = struct {
                     for (block_ctx.requested_roots) |root| {
                         _ = self.removePendingBlockRoot(root);
                     }
+                    // Issue #863 P3: release the in-flight slot reserved by
+                    // `ensureBlocksByRootRequest`. Decrement is unconditional
+                    // (success / timeout / disconnect / cancellation all flow
+                    // through here).
+                    _ = self.blocks_by_root_inflight.fetchSub(1, .acq_rel);
+                    zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
                 },
-                .blocks_by_range => {},
+                .blocks_by_range => |block_ctx| {
+                    const key = BlocksByRangeKey{
+                        .start_slot = block_ctx.start_slot,
+                        .count = block_ctx.count,
+                    };
+                    self.releaseBlocksByRangeActive(key);
+                },
                 .status => {},
             }
             rpc_entry.deinit(self.allocator);

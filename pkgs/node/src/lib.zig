@@ -1,6 +1,9 @@
 const clockFactory = @import("./clock.zig");
 pub const Clock = clockFactory.Clock;
 
+pub const slot_driver_watchdog = @import("./slot_driver_watchdog.zig");
+pub const SlotDriverWatchdog = slot_driver_watchdog.SlotDriverWatchdog;
+
 const nodeFactory = @import("./node.zig");
 pub const BeamNode = nodeFactory.BeamNode;
 
@@ -29,11 +32,13 @@ const networks = @import("@zeam/network");
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
 test "get tests" {
+    _ = @import("./blocks_by_range_sync.zig");
     _ = @import("./forkchoice.zig");
     _ = @import("./chain.zig");
     _ = @import("./utils.zig");
     _ = @import("./locking.zig");
     _ = @import("./chain_worker.zig");
     _ = @import("./rc_beam_state.zig");
+    _ = @import("./slot_driver_watchdog.zig");
     @import("std").testing.refAllDecls(@This());
 }

@@ -70,6 +70,17 @@ pub const MAX_FUTURE_SLOT_QUEUE_TOLERANCE: u64 = 256;
 // can find the spec source when leanSpec test vectors land.
 pub const MAX_PENDING_BLOCKS: usize = 1024;
 
+// Maximum buffered gossip attestations / aggregations awaiting their
+// referenced block to be processed. Direct mirror of leanSpec
+// `subspecs/sync/config.py::MAX_PENDING_ATTESTATIONS` (also 1024).
+//
+// The buffer underwrites the spec's "validate, on AssertionError buffer
+// for replay" lifecycle (`subspecs/sync/service.py::on_gossip_attestation`,
+// retried on every successful `on_gossip_block`). Keeping the bound in
+// sync with the spec value ensures replay churn stays within spec test
+// vectors. FIFO eviction matches the spec's "drop oldest" policy.
+pub const MAX_PENDING_ATTESTATIONS: usize = 1024;
+
 // Maximum depth for recursive block fetching
 // When fetching parent blocks, we stop after this many levels to avoid infinite loops
 pub const MAX_BLOCK_FETCH_DEPTH = 512;
@@ -109,11 +120,18 @@ pub const SYNC_STATUS_REFRESH_INTERVAL_SLOTS: u64 = 8;
 // than chasing the parent chain one block at a time.
 pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 64;
 
+// Maximum `blocks_by_range` catch-up attempts (peer rotation + fallback) before
+// switching to head-by-root parent walk. Issue #893.
+pub const MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS: u8 = 3;
+
 // Minimum number of recent slots that a blocksByRange responder MUST keep available.
 // Derived from leanSpec networking/config.py MIN_SLOTS_FOR_BLOCK_REQUESTS.
 // Requests whose start_slot falls before (head_slot - MIN_SLOTS_FOR_BLOCK_REQUESTS)
 // receive a RESOURCE_UNAVAILABLE error (code 3).
 pub const MIN_SLOTS_FOR_BLOCK_REQUESTS: u64 = 3600;
 
-// RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec).
+/// RPC error code for INVALID_REQUEST (per the ReqResp spec, code 1).
+/// Peers that do not implement `blocks_by_range` often reply with code 1 + "unsupported".
+pub const RPC_ERR_INVALID_REQUEST: u32 = 1;
+/// RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec, code 3).
 pub const RPC_ERR_RESOURCE_UNAVAILABLE: u32 = 3;

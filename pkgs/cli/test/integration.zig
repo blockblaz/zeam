@@ -71,9 +71,12 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 
     std.debug.print("INFO: Process spawned successfully with PID\n", .{});
 
-    // Wait for server to be ready
+    // Wait for both API (9667) and metrics (9668) listeners. Integration tests
+    // hit `/metrics` on the metrics port immediately after this returns; only
+    // probing the API port caused flaky `ConnectionRefused` on slow/loaded CI.
     const start_time = zeam_utils.unixTimestampMillis();
-    var server_ready = false;
+    var api_ready = false;
+    var metrics_ready = false;
     var retry_count: u32 = 0;
 
     while (zeam_utils.unixTimestampMillis() - start_time < constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS) {
@@ -82,34 +85,58 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         // Print progress every 10 retries
         if (retry_count % 10 == 0) {
             const elapsed = @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000);
-            std.debug.print("INFO: Still waiting for server... ({} seconds, {} retries)\n", .{ elapsed, retry_count });
+            std.debug.print("INFO: Still waiting for beam sim (api={any} metrics={any})... ({}s, {} retries)\n", .{
+                api_ready,
+                metrics_ready,
+                elapsed,
+                retry_count,
+            });
         }
 
-        // Try to connect to the metrics server
-        const address = net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT) catch {
+        const port: u16 = if (!api_ready) constants.DEFAULT_API_PORT else constants.DEFAULT_METRICS_PORT;
+
+        const address = net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, port) catch {
             zeam_utils.sleepNs(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
 
         var connection = address.connect(io, .{ .mode = .stream }) catch |err| {
-            // Only print error details on certain intervals to avoid spam
             if (retry_count % 20 == 0) {
-                std.debug.print("DEBUG: Connection attempt {} failed: {}\n", .{ retry_count, err });
+                std.debug.print("DEBUG: TCP {d} attempt {} failed: {}\n", .{ port, retry_count, err });
             }
             zeam_utils.sleepNs(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
-
-        // Test if we can actually send/receive data
         connection.close(io);
-        server_ready = true;
-        std.debug.print("SUCCESS: Server ready after {} seconds ({} retries)\n", .{ @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000), retry_count });
+
+        if (!api_ready) {
+            api_ready = true;
+            std.debug.print("SUCCESS: API port {d} accepting after {}s ({} retries)\n", .{
+                constants.DEFAULT_API_PORT,
+                @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000),
+                retry_count,
+            });
+            continue;
+        }
+        metrics_ready = true;
+        std.debug.print("SUCCESS: Metrics port {d} accepting after {}s ({} retries)\n", .{
+            constants.DEFAULT_METRICS_PORT,
+            @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000),
+            retry_count,
+        });
         break;
     }
 
+    const server_ready = api_ready and metrics_ready;
+
     // If server didn't start, try to get process output for debugging
     if (!server_ready) {
-        std.debug.print("ERROR: Metrics server not ready after {} seconds ({} retries)\n", .{ @divTrunc(constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS, 1000), retry_count });
+        std.debug.print("ERROR: Beam sim not ready after {}s (api={any} metrics={any}, retries={})\n", .{
+            @divTrunc(constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS, 1000),
+            api_ready,
+            metrics_ready,
+            retry_count,
+        });
 
         // Try to read any output from the process
         if (cli_process.stdout) |stdout| {
@@ -496,20 +523,23 @@ const SSEClient = struct {
             return self.parsed_events_queue.orderedRemove(0);
         }
 
-        // Read new data from network
+        // The SSE stream is intentionally long-lived, so a plain blocking read
+        // can hang forever when the simulator stops emitting events before the
+        // test's outer deadline is reached (observed on macOS CI in #900). Use
+        // the std.Io timeout path directly rather than poll+Reader: on macOS CI
+        // the stream reader can still block after readiness, preventing the
+        // outer deadline from being checked.
         var temp_buffer: [4096]u8 = undefined;
-        const bytes_read = self.stream_reader.interface.readSliceShort(&temp_buffer) catch |err| switch (err) {
-            error.ReadFailed => {
-                if (self.stream_reader.err) |e| switch (e) {
-                    error.Timeout => {
-                        zeam_utils.sleepNs(50 * std.time.ns_per_ms);
-                        return null;
-                    },
-                    else => return e,
-                };
-                return err;
+        const msg = self.connection.socket.receiveTimeout(std.testing.io, &temp_buffer, .{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(50),
+                .clock = .awake,
             },
+        }) catch |err| switch (err) {
+            error.Timeout => return null,
+            else => return err,
         };
+        const bytes_read = msg.data.len;
 
         if (bytes_read == 0) {
             zeam_utils.sleepNs(50 * std.time.ns_per_ms);

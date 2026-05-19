@@ -805,48 +805,6 @@ pub const ReqRespRequestHandler = struct {
     }
 };
 
-const MessagePublishWrapper = struct {
-    allocator: Allocator,
-    handler: OnGossipCbHandler,
-    data: *GossipMessage,
-    sender_peer_id: []const u8,
-    networkId: u32,
-    logger: zeam_utils.ModuleLogger,
-
-    const Self = @This();
-
-    pub fn format(self: Self, writer: anytype) !void {
-        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={f}, sender={s} }}", .{
-            self.networkId,
-            self.data.getGossipTopic(),
-            self.sender_peer_id,
-        });
-    }
-
-    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
-        const cloned_data = try data.clone(allocator);
-        const sender_peer_id_copy = try allocator.dupe(u8, sender_peer_id);
-
-        const self = try allocator.create(Self);
-        self.* = MessagePublishWrapper{
-            .allocator = allocator,
-            .handler = handler,
-            .data = cloned_data,
-            .sender_peer_id = sender_peer_id_copy,
-            .networkId = networkId,
-            .logger = logger,
-        };
-        return self;
-    }
-
-    fn deinit(self: *Self) void {
-        self.allocator.free(self.sender_peer_id);
-        self.data.deinit();
-        self.allocator.destroy(self.data);
-        self.allocator.destroy(self);
-    }
-};
-
 pub const OnPeerConnectedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection) anyerror!void;
 pub const OnPeerDisconnectedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void;
 pub const OnPeerConnectionFailedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void;
@@ -931,7 +889,6 @@ pub const PeerEventHandler = struct {
 
 pub const GenericGossipHandler = struct {
     loop: *xev.Loop,
-    timer: xev.Timer,
     allocator: Allocator,
     onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)),
     networkId: u32,
@@ -940,9 +897,6 @@ pub const GenericGossipHandler = struct {
 
     const Self = @This();
     pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger, registry: *const NodeNameRegistry) !Self {
-        const timer = try xev.Timer.init();
-        errdefer timer.deinit();
-
         var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)) = .empty;
         errdefer {
             var it = onGossipHandlers.iterator();
@@ -955,7 +909,6 @@ pub const GenericGossipHandler = struct {
         return Self{
             .allocator = allocator,
             .loop = loop,
-            .timer = timer,
             .onGossipHandlers = onGossipHandlers,
             .networkId = networkId,
             .logger = logger,
@@ -964,7 +917,6 @@ pub const GenericGossipHandler = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.timer.deinit();
         var it = self.onGossipHandlers.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -972,7 +924,7 @@ pub const GenericGossipHandler = struct {
         self.onGossipHandlers.deinit(self.allocator);
     }
 
-    pub fn onGossip(self: *Self, data: *const GossipMessage, sender_peer_id: []const u8, scheduleOnLoop: bool) anyerror!void {
+    pub fn onGossip(self: *Self, data: *const GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic) orelse {
             const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
@@ -982,50 +934,10 @@ pub const GenericGossipHandler = struct {
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
         self.logger.debug("network-{d}:: ongossip handlers={d} topic={f} from peer={s}{f}", .{ self.networkId, handlerArr.items.len, gossip_topic, sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
-
-            // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
-            // remove this option once resolved
-            if (scheduleOnLoop) {
-                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
-
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={f}", .{ self.networkId, publishWrapper, gossip_topic });
-
-                // Create a separate completion object for each handler to avoid conflicts
-                const completion = try self.allocator.create(xev.Completion);
-                completion.* = undefined;
-
-                self.timer.run(
-                    self.loop,
-                    completion,
-                    1,
-                    MessagePublishWrapper,
-                    publishWrapper,
-                    (struct {
-                        fn callback(
-                            ud: ?*MessagePublishWrapper,
-                            _: *xev.Loop,
-                            c: *xev.Completion,
-                            r: xev.Timer.RunError!void,
-                        ) xev.CallbackAction {
-                            _ = r catch unreachable;
-                            if (ud) |pwrap| {
-                                pwrap.logger.debug("network-{d}:: ONGOSSIP PUBLISH callback executed", .{pwrap.networkId});
-                                _ = pwrap.handler.onGossip(pwrap.data, pwrap.sender_peer_id) catch void;
-                                defer pwrap.deinit();
-                                // Clean up the completion object
-                                pwrap.allocator.destroy(c);
-                            }
-                            return .disarm;
-                        }
-                    }).callback,
-                );
-            } else {
-                handler.onGossip(data, sender_peer_id) catch |e| {
-                    self.logger.err("network-{d}:: onGossip handler error={any}", .{ self.networkId, e });
-                };
-            }
+            handler.onGossip(data, sender_peer_id) catch |e| {
+                self.logger.err("network-{d}:: onGossip handler error={any}", .{ self.networkId, e });
+            };
         }
-        // we don't need to run the loop as this is a shared loop and is already being run by the clock
     }
 
     pub fn subscribe(self: *Self, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
