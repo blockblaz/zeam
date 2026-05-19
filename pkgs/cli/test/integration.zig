@@ -523,6 +523,19 @@ const SSEClient = struct {
             return self.parsed_events_queue.orderedRemove(0);
         }
 
+        // The SSE stream is intentionally long-lived, so a plain blocking read
+        // can hang forever when the simulator stops emitting events before the
+        // test's outer deadline is reached (observed on macOS CI in #900). Poll
+        // first and let the caller re-check its deadline when no bytes arrive.
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = self.connection.socket.handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(&poll_fds, 50);
+        if (ready == 0) return null;
+        if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0) return null;
+
         // Read new data from network
         var temp_buffer: [4096]u8 = undefined;
         const bytes_read = self.stream_reader.interface.readSliceShort(&temp_buffer) catch |err| switch (err) {
