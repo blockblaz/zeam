@@ -127,4 +127,7 @@ pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 64;
 pub const MIN_SLOTS_FOR_BLOCK_REQUESTS: u64 = 3600;
 
 // RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec).
+/// RPC error code for INVALID_REQUEST (per the ReqResp spec, code 1).
+pub const RPC_ERR_INVALID_REQUEST: u32 = 1;
+// RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec).
 pub const RPC_ERR_RESOURCE_UNAVAILABLE: u32 = 3;
