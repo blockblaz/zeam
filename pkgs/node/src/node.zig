@@ -1307,9 +1307,14 @@ pub const BeamNode = struct {
         our_head_slot: types.Slot,
         our_finalized_slot: types.Slot,
     ) bool {
-        if (status.finalized_slot > our_finalized_slot) return true;
-        const gap = self.cappedSyncGap(status.head_slot, our_head_slot);
-        return gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD;
+        const wall_slot = self.chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        return blocks_by_range_sync.shouldCatchUpFromPeerStatus(
+            status.head_slot,
+            our_head_slot,
+            status.finalized_slot,
+            our_finalized_slot,
+            wall_slot,
+        );
     }
 
     fn syncFetchPeerHeadByRoot(self: *Self, peer_id: []const u8, head_root: types.Root) void {
@@ -1749,7 +1754,20 @@ pub const BeamNode = struct {
                                     self.initiateCatchUpFromPeerStatus(catch_up_status, head_snapshot.slot);
                                 }
                             },
-                            .synced, .no_peers => {},
+                            .synced, .no_peers => {
+                                // Belt-and-suspenders: getSyncStatus can lag a single status update
+                                // on early devnet (all finalized zero). Never skip catch-up when the
+                                // responding peer's head is strictly ahead of ours.
+                                const our_head_slot = self.chain.forkChoice.getHead().slot;
+                                const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+                                if (self.shouldCatchUpFromPeerStatus(
+                                    catch_up_status,
+                                    our_head_slot,
+                                    our_finalized_slot,
+                                )) {
+                                    self.initiateCatchUpFromPeerStatus(catch_up_status, our_head_slot);
+                                }
+                            },
                         }
                         break :blk;
                     },

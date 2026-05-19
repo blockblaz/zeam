@@ -34,6 +34,19 @@ pub fn cappedSyncGapSlots(peer_head_slot: types.Slot, our_head_slot: types.Slot,
     return @min(peer_gap, wall_gap);
 }
 
+/// Whether a peer status should trigger proactive catch-up (issue #893 / PR #894).
+/// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` only selects range vs by-root inside `initiateCatchUpFromPeerStatus`.
+pub fn shouldCatchUpFromPeerStatus(
+    peer_head_slot: types.Slot,
+    our_head_slot: types.Slot,
+    peer_finalized_slot: types.Slot,
+    our_finalized_slot: types.Slot,
+    wall_slot: types.Slot,
+) bool {
+    if (peer_finalized_slot > our_finalized_slot) return true;
+    return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot) > 0;
+}
+
 pub const SyncEndReason = enum { completed, failed, timeout };
 
 pub const SyncEndInput = struct {
@@ -104,6 +117,22 @@ test "cappedSyncGapSlots limits range catch-up to wall-clock head" {
     try std.testing.expectEqual(@as(u64, 50), cappedSyncGapSlots(200, 100, 150));
     try std.testing.expectEqual(@as(u64, 100), cappedSyncGapSlots(200, 100, 250));
     try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(200, 150, 100));
+}
+
+test "shouldCatchUpFromPeerStatus triggers on head gap before finalization" {
+    // Early devnet: both finalized at 0, peer head ahead — must catch up via blocks_by_root.
+    try std.testing.expect(shouldCatchUpFromPeerStatus(31, 0, 0, 0, 40));
+    try std.testing.expect(!shouldCatchUpFromPeerStatus(0, 0, 0, 0, 40));
+    try std.testing.expect(shouldCatchUpFromPeerStatus(31, 0, 0, 0, 10)); // wall caps gap but still > 0
+    try std.testing.expect(!shouldCatchUpFromPeerStatus(5, 0, 0, 0, 0)); // wall not ahead of us
+    // Finalized ahead still triggers even when head gap is zero.
+    try std.testing.expect(shouldCatchUpFromPeerStatus(100, 100, 10, 0, 200));
+}
+
+test "shouldCatchUpFromPeerStatus small gaps use by-root not threshold gate" {
+    const gap = cappedSyncGapSlots(50, 0, 100);
+    try std.testing.expect(gap < constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD);
+    try std.testing.expect(shouldCatchUpFromPeerStatus(50, 0, 0, 0, 100));
 }
 
 test "syncEndDecision retry requires alternate peer" {

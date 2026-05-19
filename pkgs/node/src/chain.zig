@@ -4621,8 +4621,9 @@ pub const BeamChain = struct {
         const our_head_slot = self.forkChoice.getHead().slot;
         const our_finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
-        // Find the maximum finalized slot reported by any peer
+        // Find the maximum finalized and head slots reported by any peer.
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
+        var max_peer_head_slot: types.Slot = our_head_slot;
 
         var peer_guard = self.connected_peers.iterateLocked();
         defer peer_guard.deinit();
@@ -4632,6 +4633,9 @@ pub const BeamChain = struct {
             if (peer_info.latest_status) |status| {
                 if (status.finalized_slot > max_peer_finalized_slot) {
                     max_peer_finalized_slot = status.finalized_slot;
+                }
+                if (status.head_slot > max_peer_head_slot) {
+                    max_peer_head_slot = status.head_slot;
                 }
             }
         }
@@ -4647,6 +4651,15 @@ pub const BeamChain = struct {
 
         // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
         if (our_finalized_slot < max_peer_finalized_slot) {
+            return .{ .behind_peers = .{
+                .head_slot = our_head_slot,
+                .finalized_slot = our_finalized_slot,
+                .max_peer_finalized_slot = max_peer_finalized_slot,
+            } };
+        }
+
+        // Check 3: early devnet / pre-finalization — peer head ahead while finalized still zero.
+        if (our_head_slot < max_peer_head_slot) {
             return .{ .behind_peers = .{
                 .head_slot = our_head_slot,
                 .finalized_slot = our_finalized_slot,
