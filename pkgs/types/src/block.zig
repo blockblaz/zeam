@@ -445,6 +445,14 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
     };
 }
 
+fn slotAllowed(slot: Slot, slot_filter: ?[]const Slot) bool {
+    const slots = slot_filter orelse return true;
+    for (slots) |allowed| {
+        if (slot == allowed) return true;
+    }
+    return false;
+}
+
 pub const AggregatedAttestationsResult = struct {
     attestations: AggregatedAttestations,
     attestation_signatures: AttestationSignatures,
@@ -467,7 +475,8 @@ pub const AggregatedAttestationsResult = struct {
     }
 
     /// Compute aggregated signatures using recursive aggregation:
-    /// Step 1: Derive AttestationData keys from signatures_map ∪ new_payloads
+    /// Step 1: Derive AttestationData keys from signatures_map ∪ new_payloads,
+    ///         optionally restricted to the supplied attestation slots.
     /// Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
     /// Step 3: Collect individual gossip signatures not covered by children
     /// Step 4: Recursive aggregate — combine selected children + remaining gossip sigs
@@ -477,7 +486,7 @@ pub const AggregatedAttestationsResult = struct {
         signatures_map: *const SignaturesMap,
         new_payloads: ?*const AggregatedPayloadsMap,
         known_payloads: ?*const AggregatedPayloadsMap,
-        slot_filter: ?Slot,
+        slot_filter: ?[]const Slot,
     ) !void {
         const allocator = self.allocator;
 
@@ -488,18 +497,14 @@ pub const AggregatedAttestationsResult = struct {
         {
             var it = signatures_map.iterator();
             while (it.next()) |entry| {
-                if (slot_filter) |slot| {
-                    if (entry.key_ptr.slot != slot) continue;
-                }
+                if (!slotAllowed(entry.key_ptr.slot, slot_filter)) continue;
                 try att_data_set.put(entry.key_ptr.*, {});
             }
         }
         if (new_payloads) |np| {
             var it = np.iterator();
             while (it.next()) |entry| {
-                if (slot_filter) |slot| {
-                    if (entry.key_ptr.slot != slot) continue;
-                }
+                if (!slotAllowed(entry.key_ptr.slot, slot_filter)) continue;
                 try att_data_set.put(entry.key_ptr.*, {});
             }
         }
@@ -1274,6 +1279,129 @@ pub const ExecutionPayloadHeader = struct {
         return utils.jsonToString(allocator, json_value);
     }
 };
+
+fn testAttestationData(slot: Slot) attestation.AttestationData {
+    return .{
+        .slot = slot,
+        .head = .{ .root = ZERO_HASH, .slot = slot },
+        .target = .{ .root = ZERO_HASH, .slot = slot },
+        .source = .{ .root = ZERO_HASH, .slot = 0 },
+    };
+}
+
+fn testDeinitPayloadsMap(allocator: Allocator, payloads: *AggregatedPayloadsMap) void {
+    var it = payloads.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.items) |*stored| {
+            stored.proof.deinit();
+            if (stored.source_payload_participants) |*bits| bits.deinit();
+            if (stored.source_gossip_participants) |*bits| bits.deinit();
+        }
+        entry.value_ptr.deinit(allocator);
+    }
+    payloads.deinit();
+}
+
+fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloadsMap, data: attestation.AttestationData, validator_index: usize) !void {
+    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    errdefer proof.deinit();
+    try attestation.aggregationBitsSet(&proof.participants, validator_index, true);
+
+    const gop = try payloads.getOrPut(data);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(allocator, .{
+        .slot = data.slot,
+        .proof = proof,
+    });
+}
+
+test "computeAggregatedSignatures filters attestation data by slot list" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures = SignaturesMap.init(allocator);
+    defer signatures.deinit();
+
+    var payloads = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads);
+
+    const slot_10 = testAttestationData(10);
+    const slot_11 = testAttestationData(11);
+    try testPutSingleChildPayload(allocator, &payloads, slot_10, 0);
+    try testPutSingleChildPayload(allocator, &payloads, slot_11, 1);
+
+    var result = try AggregatedAttestationsResult.init(allocator);
+    defer result.deinit();
+
+    const allowed_slots = [_]Slot{10};
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+
+    try std.testing.expectEqual(@as(usize, 1), result.attestations.len());
+    const aggregated = try result.attestations.get(0);
+    try std.testing.expectEqual(@as(Slot, 10), aggregated.data.slot);
+}
+
+test "computeAggregatedSignatures slot filter matches unfiltered for same-slot input" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures_a = SignaturesMap.init(allocator);
+    defer signatures_a.deinit();
+    var payloads_a = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads_a);
+
+    var signatures_b = SignaturesMap.init(allocator);
+    defer signatures_b.deinit();
+    var payloads_b = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads_b);
+
+    const data = testAttestationData(12);
+    try testPutSingleChildPayload(allocator, &payloads_a, data, 0);
+    try testPutSingleChildPayload(allocator, &payloads_b, data, 0);
+
+    var unfiltered = try AggregatedAttestationsResult.init(allocator);
+    defer unfiltered.deinit();
+    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null);
+
+    var filtered = try AggregatedAttestationsResult.init(allocator);
+    defer filtered.deinit();
+    const allowed_slots = [_]Slot{12};
+    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..]);
+
+    try std.testing.expectEqual(unfiltered.attestations.len(), filtered.attestations.len());
+    try std.testing.expectEqual(unfiltered.attestation_signatures.len(), filtered.attestation_signatures.len());
+    try std.testing.expectEqual(@as(usize, 1), filtered.attestations.len());
+    const filtered_att = try filtered.attestations.get(0);
+    try std.testing.expectEqual(@as(Slot, 12), filtered_att.data.slot);
+}
+
+test "computeAggregatedSignatures empty slot filter result is clean" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures = SignaturesMap.init(allocator);
+    defer signatures.deinit();
+
+    var payloads = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads);
+
+    try testPutSingleChildPayload(allocator, &payloads, testAttestationData(13), 0);
+
+    var result = try AggregatedAttestationsResult.init(allocator);
+    defer result.deinit();
+
+    const allowed_slots = [_]Slot{14};
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+
+    try std.testing.expectEqual(@as(usize, 0), result.attestations.len());
+    try std.testing.expectEqual(@as(usize, 0), result.attestation_signatures.len());
+}
 
 test "ssz seralize/deserialize signed beam block" {
     var attestations = try AggregatedAttestations.init(std.testing.allocator);

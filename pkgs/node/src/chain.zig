@@ -4380,7 +4380,16 @@ pub const BeamChain = struct {
         // Log subnet-wise coverage of current new payloads before starting aggregation.
         chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
 
-        const aggregations = chain.forkChoice.aggregateForSlot(snapshot, @intCast(slot)) catch |err| {
+        var slot_window_buf: [2]types.Slot = undefined;
+        var slot_window_len: usize = 0;
+        if (slot > 0) {
+            slot_window_buf[slot_window_len] = @intCast(slot - 1);
+            slot_window_len += 1;
+        }
+        slot_window_buf[slot_window_len] = @intCast(slot);
+        slot_window_len += 1;
+
+        const aggregations = chain.forkChoice.aggregateForSlots(snapshot, slot_window_buf[0..slot_window_len]) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return;
         };

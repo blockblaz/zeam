@@ -2032,7 +2032,7 @@ pub const ForkChoice = struct {
     /// `submitAggregateOnInterval` already gates concurrent
     /// `aggregate()` calls via `aggregate_group.concurrent`
     /// (concurrent_limit=1), so two aggregations cannot race here.
-    fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState, slot_filter: ?types.Slot) ![]types.SignedAggregatedAttestation {
+    fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState, slot_filter: ?[]const types.Slot) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
         const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
         defer _ = agg_timer.observe();
@@ -2253,19 +2253,32 @@ pub const ForkChoice = struct {
     /// `aggregateUnlocked` for the three-phase contract.
     ///
     /// `submitAggregateOnInterval` already gates concurrent
-    /// `aggregate()` invocations via `aggregate_group.concurrent`
+    /// `aggregateForSlots()` invocations via `aggregate_group.concurrent`
     /// (concurrent_limit=1), so two aggregations cannot race here.
+    ///
+    /// Unfiltered aggregation is retained for tests and explicit defensive backfills
+    /// only. Production slot workers should pass a bounded slot window via
+    /// `aggregateForSlots` so stale/future retained map entries cannot reintroduce
+    /// the #899 recursive-aggregation tail.
     pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         return self.aggregateUnlocked(state_opt, null);
     }
 
-    /// Produce aggregations only for the slot currently being aggregated.
+    /// Produce aggregations only for the caller-supplied attestation slots.
     ///
-    /// The aggregate worker is scheduled for one slot at a time. Filtering here
-    /// prevents stale/future AttestationData retained in the gossip/new maps from
-    /// forcing extra recursive proof builds, which was the dominant cost in #899.
+    /// The aggregate worker is scheduled with `aggregate_group.concurrent`
+    /// (concurrent_limit=1), so a busy worker can skip an interval. Callers should
+    /// pass a small backfill window, e.g. `{current_slot - 1, current_slot}`, to
+    /// recover late or skipped-slot attestations without walking every stale/future
+    /// `AttestationData` key retained in the maps.
+    pub fn aggregateForSlots(self: *Self, state_opt: ?*const types.BeamState, slots: []const types.Slot) ![]types.SignedAggregatedAttestation {
+        return self.aggregateUnlocked(state_opt, slots);
+    }
+
+    /// Convenience wrapper for tests or callers that intentionally want strict
+    /// single-slot aggregation. Production should prefer `aggregateForSlots`.
     pub fn aggregateForSlot(self: *Self, state_opt: ?*const types.BeamState, slot: types.Slot) ![]types.SignedAggregatedAttestation {
-        return self.aggregateUnlocked(state_opt, slot);
+        return self.aggregateForSlots(state_opt, &.{slot});
     }
 
     /// Remove attestation data that can no longer influence fork choice.
@@ -3811,6 +3824,10 @@ fn countSeen(seen: []const bool) usize {
 fn observeAggregateBuildPhase(comptime phase: []const u8, start_ns: i128) void {
     const end_ns = zeam_utils.monotonicTimestampNs();
     const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    // Histogram seconds are f32; precision below roughly 100 ns is intentionally
+    // irrelevant for these phase buckets. The existing total histogram still
+    // wraps only the recursive proof build inside compute, so phase sums are an
+    // attribution view rather than an exact replacement for that metric.
     const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
     zeam_metrics.metrics.zeam_pq_sig_aggregated_signatures_building_phase_seconds.observe(
         .{ .phase = phase },
