@@ -813,33 +813,53 @@ pub const BeamNode = struct {
         self: *Self,
         signed_block: *const types.SignedBlock,
         block_root: types.Root,
-    ) bool {
+    ) blocks_by_range_sync.ImportSubmitOutcome {
         var cloned: types.SignedBlock = undefined;
         types.sszClone(self.allocator, types.SignedBlock, signed_block.*, &cloned) catch |err| {
             self.logger.warn(
                 "chain-worker submit: sszClone failed for slot={d} root=0x{x}: {any}, falling back to inline import",
                 .{ signed_block.block.slot, &block_root, err },
             );
-            return false;
+            return .failed;
         };
         var consumed = false;
-        // `defer` (not `errdefer`): the catch arm below `return false`s
-        // on QueueFull / QueueClosed which are *normal* returns — an
-        // `errdefer` would not run and the clone would leak.
+        // `defer` (not `errdefer`): the catch arm below returns a
+        // non-`.submitted` outcome — i.e. a *normal* return — on
+        // QueueFull / QueueClosed / ChainWorkerDisabled, so `errdefer`
+        // would not run and the clone would leak.
         defer if (!consumed) cloned.deinit();
 
         self.chain.submitBlock(cloned, true, block_root) catch |err| switch (err) {
-            error.ChainWorkerDisabled => return false,
-            error.QueueFull, error.QueueClosed => {
+            error.ChainWorkerDisabled => return .worker_disabled,
+            error.QueueFull => {
+                // #894 regression fix: do NOT fall through to inline
+                // import on libxev. The caller MUST drop the chunk
+                // (catch-up RPC will refetch). Inline `chain.onBlock`
+                // here is the path that starved libxev for ~9.7s on
+                // aggregator zeam_8 and made it miss its slot 64
+                // proposal. See `ImportSubmitOutcome` in
+                // `blocks_by_range_sync.zig` for the rationale.
+                //
+                // `sendBlock` already incremented
+                // `lean_chain_queue_dropped_total{queue="block"}`
+                // (see `chain_worker.zig::sendBlock`); we don't
+                // double-count here.
                 self.logger.warn(
-                    "chain-worker block queue {s} for slot={d} root=0x{x}, falling back to inline import",
-                    .{ @errorName(err), signed_block.block.slot, &block_root },
+                    "chain-worker block queue full for RPC chunk slot={d} root=0x{x}; dropping (catch-up will refetch)",
+                    .{ signed_block.block.slot, &block_root },
                 );
-                return false;
+                return .queue_full;
+            },
+            error.QueueClosed => {
+                self.logger.warn(
+                    "chain-worker block queue closed for RPC chunk slot={d} root=0x{x}; dropping",
+                    .{ signed_block.block.slot, &block_root },
+                );
+                return .failed;
             },
         };
         consumed = true;
-        return true;
+        return .submitted;
     }
 
     fn processCachedDescendants(self: *Self, parent_root: types.Root) void {
@@ -1187,16 +1207,23 @@ pub const BeamNode = struct {
             // block backchannel — `handleChainRejectedBlock` runs
             // the same cache-and-fetch / prune path the inline arm
             // below would. See `trySubmitImportToWorker` doc.
+            //
+            // #894 regression fix: on `queue_full` we MUST drop the
+            // chunk instead of falling through to inline. Inline
+            // `chain.onBlock` on libxev is the path that wedged
+            // aggregator zeam_8 for 9.7s under a 3.4 MB
+            // `blocks_by_root` burst; the next status-driven catch-up
+            // cycle will refetch.
             if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
-                if (self.trySubmitImportToWorker(signed_block, block_root)) {
-                    // Worker takes ownership; followup (cached
-                    // descendants + missing-root fetch + replay +
-                    // parent-fetch flush) all run from the imported-
-                    // block callback. No redundant flush here.
-                    return;
+                const outcome = self.trySubmitImportToWorker(signed_block, block_root);
+                switch (blocks_by_range_sync.classifyChunkImport(outcome)) {
+                    .handled => return,
+                    .drop_backpressure => {
+                        // Already logged + metric-bumped in trySubmitImportToWorker.
+                        return;
+                    },
+                    .fallback_inline => {},
                 }
-                // Submit failed (worker disabled / queue full); fall
-                // through to inline path.
             }
 
             // Try to add the block to the chain
@@ -1662,10 +1689,26 @@ pub const BeamNode = struct {
         // the common case after the first chunk. Import accounting
         // (`chunks_imported`) is bumped in `handleChainImportedBlock` /
         // `handleChainRejectedBlock` after `onBlock` completes — not here.
+        //
+        // #894 regression fix: on `queue_full` drop the chunk.
+        // See the matching comment in `processBlockByRootChunk` and
+        // `ImportSubmitOutcome` in `blocks_by_range_sync.zig`.
         if (self.chain.forkChoice.hasBlock(signed_block.block.parent_root)) {
-            if (self.trySubmitImportToWorker(signed_block, block_root)) {
-                self.trackRangeAsyncChunkImport(block_root, request_id);
-                return;
+            const outcome = self.trySubmitImportToWorker(signed_block, block_root);
+            switch (blocks_by_range_sync.classifyChunkImport(outcome)) {
+                .handled => {
+                    self.trackRangeAsyncChunkImport(block_root, request_id);
+                    return;
+                },
+                .drop_backpressure => {
+                    // Already logged + metric-bumped in
+                    // `trySubmitImportToWorker`. We deliberately do
+                    // NOT update the by-range request progress: the
+                    // chunk timeout / status-driven retry will
+                    // refetch once the worker queue drains.
+                    return;
+                },
+                .fallback_inline => {},
             }
         }
 

@@ -47,6 +47,62 @@ pub fn shouldCatchUpFromPeerStatus(
     return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot) > 0;
 }
 
+/// Result of a non-blocking attempt to hand a block off to the chain-worker
+/// from an RPC chunk handler (`processBlockByRootChunk` /
+/// `processBlockByRangeChunk`). Distinguishes the four outcomes the libxev
+/// caller cares about. Defined here so the disposition is unit-testable
+/// without spinning up a `BeamNode`.
+///
+/// Background (#894 regression discovered on devnet aggregator zeam_8):
+/// when the chain-worker is enabled but its block queue is full (typically
+/// because the aggregator is also draining a flood of attestations), a
+/// `blocks_by_root` / `blocks_by_range` response burst MUST NOT fall back
+/// to inline `chain.onBlock` on the libxev thread. Each inline import
+/// costs ~0.5s of XMSS verification; one 3.4 MB response burst was observed
+/// to wedge libxev for 9.7s, missing block-production duty for the
+/// proposing slot. The gossip path already drops on QueueFull
+/// (`chain.zig::onGossip`); the RPC chunk paths used to fall through.
+pub const ImportSubmitOutcome = enum {
+    /// Worker accepted the block. Caller returns immediately.
+    submitted,
+    /// Worker is configured but its block queue is at capacity. Caller
+    /// MUST NOT fall back to inline `chain.onBlock` — that's the path
+    /// that starves libxev under aggregator load. Drop with a metric
+    /// bump; the next status-driven catch-up cycle will refetch.
+    queue_full,
+    /// Chain-worker is not configured (test / single-thread mode).
+    /// Caller falls through to the inline path — that path is the
+    /// legitimate import flow when no worker exists.
+    worker_disabled,
+    /// `sszClone` or other allocator failure pre-submission. Caller
+    /// falls through to inline as a last-resort best effort.
+    failed,
+};
+
+/// Disposition for the libxev RPC chunk handler after an
+/// `ImportSubmitOutcome`. Pure decision logic so it can be exercised in
+/// unit tests without a chain-worker. Matches the contract callers in
+/// `node.zig::processBlockByRootChunk` / `processBlockByRangeChunk` rely on.
+pub const ChunkImportDisposition = enum {
+    /// Block handed off; caller returns from the RPC chunk handler.
+    handled,
+    /// Apply backpressure — drop this chunk, do NOT inline-import on
+    /// libxev. The catch-up RPC cycle will refetch on the next status
+    /// round.
+    drop_backpressure,
+    /// Worker is not available (or sszClone failed). Fall through to
+    /// the inline `chain.onBlock` path.
+    fallback_inline,
+};
+
+pub fn classifyChunkImport(outcome: ImportSubmitOutcome) ChunkImportDisposition {
+    return switch (outcome) {
+        .submitted => .handled,
+        .queue_full => .drop_backpressure,
+        .worker_disabled, .failed => .fallback_inline,
+    };
+}
+
 pub const SyncEndReason = enum { completed, failed, timeout };
 
 pub const SyncEndInput = struct {
@@ -204,4 +260,51 @@ test "syncEndDecision fork abort" {
         .has_alternate_peer = true,
     };
     try std.testing.expectEqual(SyncEndAction.abort_fallback, syncEndDecision(input));
+}
+
+test "classifyChunkImport: queue_full drops, never falls back to inline (#894 regression guard)" {
+    // The regression: under aggregator load the chain-worker block queue
+    // saturates, `trySubmitImportToWorker` returns `queue_full`, and
+    // (pre-fix) `processBlockByRootChunk` / `processBlockByRangeChunk`
+    // fall through to `chain.onBlock` on libxev. Each inline import
+    // costs ~0.5s of XMSS verification; one 3.4 MB `blocks_by_root`
+    // burst was observed to wedge libxev for 9.7s on devnet aggregator
+    // zeam_8, which then missed its slot 64 block-production duty.
+    //
+    // The contract under test: `queue_full` MUST classify as
+    // `drop_backpressure`, never `fallback_inline`. If a future change
+    // re-introduces the inline fallback for this outcome, this test
+    // fails before the regression hits production again.
+    try std.testing.expectEqual(ChunkImportDisposition.drop_backpressure, classifyChunkImport(.queue_full));
+}
+
+test "classifyChunkImport: submitted is handled" {
+    try std.testing.expectEqual(ChunkImportDisposition.handled, classifyChunkImport(.submitted));
+}
+
+test "classifyChunkImport: worker_disabled and failed fall back to inline" {
+    // `worker_disabled`: legitimate test / single-thread mode, no
+    // worker exists so inline `chain.onBlock` IS the import path.
+    // `failed`: sszClone or allocator failure pre-submission — last-
+    // resort best-effort inline. Both must NOT be confused with
+    // `queue_full`, which is the load-shedding case.
+    try std.testing.expectEqual(ChunkImportDisposition.fallback_inline, classifyChunkImport(.worker_disabled));
+    try std.testing.expectEqual(ChunkImportDisposition.fallback_inline, classifyChunkImport(.failed));
+}
+
+test "classifyChunkImport: every ImportSubmitOutcome variant has a defined disposition" {
+    // Exhaustiveness guard — adding a new `ImportSubmitOutcome` value
+    // without updating `classifyChunkImport` is caught by the inline
+    // switch in `classifyChunkImport`, but explicitly enumerating
+    // the variants here documents the intent and keeps reviewer eyes
+    // on the disposition table when the enum grows.
+    inline for (std.meta.fields(ImportSubmitOutcome)) |field| {
+        const outcome: ImportSubmitOutcome = @field(ImportSubmitOutcome, field.name);
+        const disposition = classifyChunkImport(outcome);
+        switch (outcome) {
+            .submitted => try std.testing.expectEqual(ChunkImportDisposition.handled, disposition),
+            .queue_full => try std.testing.expectEqual(ChunkImportDisposition.drop_backpressure, disposition),
+            .worker_disabled, .failed => try std.testing.expectEqual(ChunkImportDisposition.fallback_inline, disposition),
+        }
+    }
 }
