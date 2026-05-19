@@ -103,6 +103,17 @@ pub const BeamNode = struct {
     test_inject_validator_error_at_intervals: []const usize = &.{},
     test_inject_aggregator_error_at_intervals: []const usize = &.{},
 
+    /// Set by `SlotDriverWatchdog` (different OS thread) when a stall
+    /// is detected. Observed and cleared by the next libxev tick which
+    /// then forces a `refreshSyncFromPeers` outside the normal cadence.
+    /// We deliberately do NOT call `refreshSyncFromPeers` from the
+    /// watchdog thread itself: `network.sendStatusToPeer` mutates
+    /// `pending_rpc_requests` map state shared with the libp2p bridge,
+    /// and the existing serialization assumes a single producer per
+    /// libxev tick. A flag flip is the cheapest cross-thread signal
+    /// that preserves that invariant.
+    sync_refresh_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     const Self = @This();
 
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
@@ -1294,10 +1305,19 @@ pub const BeamNode = struct {
         finalized_slot: types.Slot,
     };
 
-    /// Gap to a peer head, capped by wall-clock slot for threshold/pagination
+    /// Gap to a peer head, capped by host wall-clock slot for threshold/pagination
     /// decisions (per-request size is still capped by `MAX_REQUEST_BLOCKS`). Issue #893.
+    ///
+    /// Wall slot comes from `Clock.wallSlotNow()` — a direct
+    /// `unixTimestampMillis() - genesis_time_ms` derivation, NOT from
+    /// `forkchoice.slot_clock.timeSlots`. Reading the forkchoice counter
+    /// here would self-reinforce slot-driver stalls (#863): when libxev
+    /// is starved, `timeSlots` lags real time, the cap pulls the gap to
+    /// zero, status-driven catch-up is skipped, and the node stays stuck.
+    /// Using the host wall clock breaks that loop: catch-up still triggers
+    /// on a real lag and pulls the node forward independent of tick liveness.
     fn cappedSyncGap(self: *Self, peer_head_slot: types.Slot, our_head_slot: types.Slot) u64 {
-        const wall_slot = self.chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        const wall_slot = self.clock.wallSlotNow();
         return blocks_by_range_sync.cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot);
     }
 
@@ -1307,7 +1327,10 @@ pub const BeamNode = struct {
         our_head_slot: types.Slot,
         our_finalized_slot: types.Slot,
     ) bool {
-        const wall_slot = self.chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        // Same rationale as `cappedSyncGap`: gating must use the host wall
+        // clock, not the forkchoice tick counter, so a stalled slot driver
+        // doesn't suppress the very catch-up that would unstall it (#863).
+        const wall_slot = self.clock.wallSlotNow();
         return blocks_by_range_sync.shouldCatchUpFromPeerStatus(
             status.head_slot,
             our_head_slot,
@@ -2581,6 +2604,17 @@ pub const BeamNode = struct {
 
             const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
 
+            // Forced refresh requested by the slot-driver watchdog after a
+            // stall (#863). The watchdog runs on a separate OS thread and
+            // cannot safely emit RPCs itself; it only flips this atomic
+            // flag. The first tick after stall recovery picks it up here
+            // and runs a status round-trip outside the normal 8-slot
+            // cadence so catch-up resumes immediately.
+            if (self.sync_refresh_pending.swap(false, .acquire)) {
+                self.logger.warn("slot-driver stall recovery: forcing peer status refresh", .{});
+                self.refreshSyncFromPeers();
+            }
+
             // Periodically re-send status to all connected peers when not synced.
             // This recovers from the case where peers were already connected when
             // the node was in fc_initing and the status-exchange-triggered sync
@@ -2608,6 +2642,23 @@ pub const BeamNode = struct {
                 }
             }
         }
+    }
+
+    /// Schedule a peer status refresh on the next libxev tick. Safe to
+    /// call from any thread — only flips an atomic flag. Used by
+    /// `SlotDriverWatchdog` to bootstrap recovery once the slot driver
+    /// resumes after a stall (#863).
+    pub fn scheduleSyncRefresh(self: *Self) void {
+        self.sync_refresh_pending.store(true, .release);
+    }
+
+    /// `SlotDriverWatchdog.StallCallback` adapter. Cheap, non-blocking;
+    /// runs on the watchdog thread. Defers the actual peer-status RPCs
+    /// to the next libxev tick via `scheduleSyncRefresh`.
+    pub fn onSlotDriverStall(ptr: *anyopaque, stall_s: f32) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        _ = stall_s;
+        self.scheduleSyncRefresh();
     }
 
     /// Re-send our status to every connected peer.
