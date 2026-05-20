@@ -527,13 +527,13 @@ const SSEClient = struct {
         var temp_buffer: [4096]u8 = undefined;
         const bytes_read = self.stream_reader.interface.readSliceShort(&temp_buffer) catch |err| switch (err) {
             error.ReadFailed => {
-                if (self.stream_reader.err) |e| switch (e) {
-                    error.Timeout => {
+                if (self.stream_reader.err) |e| {
+                    if (std.mem.eql(u8, @errorName(e), "Timeout")) {
                         zeam_utils.sleepNs(50 * std.time.ns_per_ms);
                         return null;
-                    },
-                    else => return e,
-                };
+                    }
+                    return e;
+                }
                 return err;
             },
         };

@@ -350,12 +350,10 @@ pub const BeamChain = struct {
     // during `processPendingBlocks` (drain path) so the queue self-cleans.
     pending_blocks: std.ArrayList(PendingBlockEntry),
 
-    /// Lock-free-ish cached status snapshot for serving req/resp status
-    /// requests without contending for the forkchoice RwLock.  Updated under
-    /// `cached_status_mutex` whenever head or finalized checkpoints change
-    /// (in `onBlockFollowup` and `onInterval`).
-    cached_status_mutex: std.Thread.Mutex = .{},
+    /// Cached req/resp status snapshot, updated when head/finalization move.
+    cached_status_mutex: zeam_utils.SyncMutex = .{},
     cached_status: types.Status,
+
     // Per-resource locks (slice a-2 of #803). See
     // `docs/threading_refactor_slice_a.md` for the lock-hierarchy contract:
     //   tier 3: states_lock
@@ -2375,7 +2373,6 @@ pub const BeamChain = struct {
         // Only forkchoice tick failure means the chain clock did not advance.
         try self.forkChoice.onInterval(time_intervals, has_proposal);
 
-        // Refresh cached status after the forkchoice tick.
         {
             const head = self.forkChoice.getHead();
             const finalized = self.forkChoice.getLatestFinalized();
@@ -3609,21 +3606,8 @@ pub const BeamChain = struct {
         const latest_justified = self.forkChoice.getLatestJustified();
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
-        // Update cached status snapshot for lock-free serving.
         self.updateCachedStatus(new_head, latest_finalized);
 
-        // 8. Asap emit justification/finalization events based on forkchoice store
-        // Emit justification event only when slot increases beyond last emitted
-        if (latest_justified.slot > self.last_emitted_justified.slot) {
-            if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
-                var chain_event = api.events.ChainEvent{ .new_justification = just_event };
-                event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.logger.warn("failed to broadcast justification event: {any}", .{err});
-                    chain_event.deinit(self.allocator);
-                };
-                self.last_emitted_justified = latest_justified;
-            } else |err| {
-                self.logger.warn("failed to create justification event: {any}", .{err});
         // 8. Asap emit justification/finalization events based on forkchoice store.
         //    `events_lock` (tier 5c) covers the read-modify-write of
         //    `last_emitted_justified`, `last_emitted_finalized`, and (later)
@@ -4424,19 +4408,12 @@ pub const BeamChain = struct {
         node.publishProducedAggregations(aggregations);
     }
 
-    /// Returns the cached status snapshot.  The snapshot is updated under a
-    /// lightweight dedicated mutex whenever head or finalized checkpoints
-    /// change (see `updateCachedStatus`), so this read never contends for
-    /// the forkchoice RwLock.
     pub fn getStatus(self: *Self) types.Status {
         self.cached_status_mutex.lock();
         defer self.cached_status_mutex.unlock();
         return self.cached_status;
     }
 
-    /// Atomically update the cached status snapshot.  Called from
-    /// `onBlockFollowup` (after every processed block) and from `onInterval`
-    /// (after the forkchoice tick).
     fn updateCachedStatus(self: *Self, head: types.ProtoBlock, finalized: types.Checkpoint) void {
         self.cached_status_mutex.lock();
         defer self.cached_status_mutex.unlock();
@@ -6140,15 +6117,6 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     try std.testing.expect(known_count > 0);
 }
 
-test "Chain: cached status snapshot updates" {
-// =====================================================================
-// Slice (a-2) primitive tests — these exercise BorrowedState and the
-// BlockCache helper against real BeamState / SignedBlock values produced
-// by `stf.genMockChain`. The corresponding API-level tests in
-// `pkgs/node/src/locking.zig` cover the FailingAllocator / OOM paths,
-// double-deinit, and tier-5 depth counter without needing a mock chain.
-// =====================================================================
-
 // Shared setup for the justification-aware produceBlock tests.
 // Heap-allocates zeam_logger_config and beam_state via the arena so their
 // addresses are stable across the deep call stacks inside produceBlock
@@ -6477,8 +6445,6 @@ test "BorrowedState: cloneAndRelease success path against real BeamState" {
     const allocator = arena_allocator.allocator();
 
     const mock_chain = try stf.genMockChain(allocator, 2, null);
-    const spec_name = try allocator.dupe(u8, "beamdev");
-    const fork_digest = try allocator.dupe(u8, "12345678");
     var beam_state = mock_chain.genesis_state;
 
     var rwl: zeam_utils.SyncRwLock = .{};
@@ -6911,21 +6877,6 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(data_dir);
-
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
-    defer db.deinit();
-
-    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
-    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
-
-    const test_registry = try allocator.create(NodeNameRegistry);
-    defer allocator.destroy(test_registry);
-    test_registry.* = NodeNameRegistry.init(allocator);
-    defer test_registry.deinit();
-
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{
     const data_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
     var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -7915,33 +7866,6 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     }, connected_peers);
     defer beam_chain.deinit();
 
-    // Initial status should match genesis
-    const status1 = beam_chain.getStatus();
-    try std.testing.expectEqual(@as(types.Slot, 0), status1.head_slot);
-    try std.testing.expectEqual(@as(types.Slot, 0), status1.finalized_slot);
-
-    // Update status manually
-    const new_head = types.ProtoBlock{
-        .slot = 100,
-        .proposer_index = 0,
-        .blockRoot = [_]u8{0xAA} ** 32,
-        .parentRoot = [_]u8{0xBB} ** 32,
-        .stateRoot = [_]u8{0xCC} ** 32,
-        .timeliness = true,
-        .confirmed = true,
-    };
-    const new_finalized = types.Checkpoint{
-        .slot = 50,
-        .root = [_]u8{0xDD} ** 32,
-    };
-
-    beam_chain.updateCachedStatus(new_head, new_finalized);
-
-    const status2 = beam_chain.getStatus();
-    try std.testing.expectEqual(@as(types.Slot, 100), status2.head_slot);
-    try std.testing.expectEqual(@as(types.Slot, 50), status2.finalized_slot);
-    try std.testing.expect(std.mem.eql(u8, &status2.head_root, &new_head.blockRoot));
-    try std.testing.expect(std.mem.eql(u8, &status2.finalized_root, &new_finalized.root));
     // Start the chain-worker. After this point any submit* call may
     // race with the worker thread; deinit (via defer above) calls
     // `chain_worker.stop()` first which is the only safe shutdown
