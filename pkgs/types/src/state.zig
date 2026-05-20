@@ -495,7 +495,9 @@ pub const BeamState = struct {
                 const end_slot_usize: usize = @intCast(target_slot);
                 for (start_slot_usize..end_slot_usize) |slot_usize| {
                     const slot: Slot = @intCast(slot_usize);
-                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
+                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot) and
+                        !(try utils.isSlotJustified(finalized_slot, &self.justified_slots, slot)))
+                    {
                         can_target_finalize = false;
                         break;
                     }

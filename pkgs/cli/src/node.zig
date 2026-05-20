@@ -588,10 +588,20 @@ pub const Node = struct {
         // libxev stalls surface in the log + metrics even if the main
         // loop is stuck inside one completion or syscall. Failure to
         // spawn is non-fatal — log and continue without it.
+        //
+        // The stall callback flips an atomic flag on `BeamNode` that the
+        // next libxev tick observes and acts on, forcing a peer status
+        // refresh outside the normal 8-slot cadence. This bootstraps
+        // catch-up as soon as the slot driver resumes.
         self.slot_driver_watchdog = SlotDriverWatchdog.init(
             &self.clock,
             self.options.logger_config.logger(.clock),
-            .{},
+            .{
+                .on_stall = .{
+                    .ptr = &self.beam_node,
+                    .onStall = BeamNode.onSlotDriverStall,
+                },
+            },
         );
         if (self.slot_driver_watchdog) |*wd| {
             wd.start() catch |err| {

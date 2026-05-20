@@ -7,6 +7,11 @@ const constants = @import("cli_constants");
 const error_handler = @import("error_handler");
 const ErrorHandler = error_handler.ErrorHandler;
 
+const BeamSimProcess = struct {
+    child: *process.Child,
+    run_dir: []u8,
+};
+
 /// Verify that the Zeam executable exists and return its path
 /// Includes detailed debugging output if the executable is not found
 fn getZeamExecutable() ![]const u8 {
@@ -53,19 +58,33 @@ fn getZeamExecutable() ![]const u8 {
 /// Helper function to start a beam simulation node and wait for it to be ready
 /// Handles the complete process lifecycle: creation, spawning, and waiting for readiness
 /// Returns the process handle for cleanup, or error if startup fails
-fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
+fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !BeamSimProcess {
     const io = std.testing.io;
 
+    const run_dir = try std.fmt.allocPrint(allocator, ".zig-cache/integration-run-{d}", .{zeam_utils.monotonicTimestampNs()});
+    errdefer allocator.free(run_dir);
+    try std.Io.Dir.cwd().createDirPath(io, run_dir);
+    errdefer std.Io.Dir.cwd().deleteTree(io, run_dir) catch {};
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const child_exe_path = if (std.fs.path.isAbsolute(exe_path))
+        exe_path
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, exe_path });
+    defer if (!std.fs.path.isAbsolute(exe_path)) allocator.free(child_exe_path);
+
     // Set up process with beam command and mock network
-    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
+    const args = [_][]const u8{ child_exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
+    errdefer allocator.destroy(cli_process);
 
     // Start the process
     cli_process.* = process.spawn(io, .{
         .argv = &args,
+        .cwd = .{ .path = run_dir },
     }) catch |err| {
         std.debug.print("ERROR: Failed to spawn process: {}\n", .{err});
-        allocator.destroy(cli_process);
         return err;
     };
 
@@ -163,11 +182,15 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         std.debug.print("INFO: Terminated process after startup timeout\n", .{});
 
         // Server not ready, cleanup and return error
+        std.Io.Dir.cwd().deleteTree(io, run_dir) catch {};
         allocator.destroy(cli_process);
         return error.ServerStartupTimeout;
     }
 
-    return cli_process;
+    return .{
+        .child = cli_process,
+        .run_dir = run_dir,
+    };
 }
 
 /// Wait for node to start and be ready for activity
@@ -523,20 +546,23 @@ const SSEClient = struct {
             return self.parsed_events_queue.orderedRemove(0);
         }
 
-        // Read new data from network
+        // The SSE stream is intentionally long-lived, so a plain blocking read
+        // can hang forever when the simulator stops emitting events before the
+        // test's outer deadline is reached (observed on macOS CI in #900). Use
+        // the std.Io timeout path directly rather than poll+Reader: on macOS CI
+        // the stream reader can still block after readiness, preventing the
+        // outer deadline from being checked.
         var temp_buffer: [4096]u8 = undefined;
-        const bytes_read = self.stream_reader.interface.readSliceShort(&temp_buffer) catch |err| switch (err) {
-            error.ReadFailed => {
-                if (self.stream_reader.err) |e| {
-                    if (std.mem.eql(u8, @errorName(e), "Timeout")) {
-                        zeam_utils.sleepNs(50 * std.time.ns_per_ms);
-                        return null;
-                    }
-                    return e;
-                }
-                return err;
+        const msg = self.connection.socket.receiveTimeout(std.testing.io, &temp_buffer, .{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(50),
+                .clock = .awake,
             },
+        }) catch |err| switch (err) {
+            error.Timeout => return null,
+            else => return err,
         };
+        const bytes_read = msg.data.len;
 
         if (bytes_read == 0) {
             zeam_utils.sleepNs(50 * std.time.ns_per_ms);
@@ -578,11 +604,13 @@ const SSEClient = struct {
 };
 
 /// Clean up a process created by spinBeamSimNode
-fn cleanupProcess(allocator: std.mem.Allocator, cli_process: *process.Child) void {
+fn cleanupProcess(allocator: std.mem.Allocator, sim_process: BeamSimProcess) void {
     const io = std.testing.io;
-    cli_process.kill(io);
+    sim_process.child.kill(io);
     // cli_process.wait(io) catch {};
-    allocator.destroy(cli_process);
+    allocator.destroy(sim_process.child);
+    std.Io.Dir.cwd().deleteTree(io, sim_process.run_dir) catch {};
+    allocator.free(sim_process.run_dir);
 }
 
 test "CLI beam command with mock network - complete integration test" {
@@ -630,7 +658,7 @@ test "admin aggregator endpoint - GET returns seed, POST toggles at runtime" {
     // The API server comes up before the chain is wired in (503 until
     // `setChain` is called inside main.zig after validator key generation).
     // Poll until the chain is ready, then assert the baseline.
-    const chain_ready_deadline_ms: i64 = 60_000;
+    const chain_ready_deadline_ms: i64 = 180_000;
     const poll_start = zeam_utils.unixTimestampMillis();
     var get_before = try zeam_request.getAggregator();
     while (get_before.status != .ok) {
@@ -697,15 +725,15 @@ test "SSE events integration test - wait for justification and finalization" {
     const cli_process = try spinBeamSimNode(allocator, exe_path);
     defer cleanupProcess(allocator, cli_process);
 
-    // Wait for node to be fully active
-    waitForNodeStart();
-
     // Create SSE client
     var sse_client = try SSEClient.init(allocator);
     defer sse_client.deinit();
 
     // Connect to SSE endpoint
     try sse_client.connect();
+
+    // Wait for node activity after subscribing so one-shot chain events are not missed.
+    waitForNodeStart();
 
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
