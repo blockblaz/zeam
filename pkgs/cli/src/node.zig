@@ -447,6 +447,20 @@ pub const Node = struct {
                 if (options.rayon_threads != null) " (rayon override via --rayon-threads)" else "",
             },
         );
+        // Operator-typo guard for --rayon-threads (review feedback on #903).
+        // Rayon tolerates over-subscription, but values like `--rayon-threads 160`
+        // on a 4-vCPU box silently degrade throughput. Warn (don't reject) so the
+        // operator notices in startup logs without blocking deliberate edge cases
+        // (e.g. fractional cgroup quotas where `getCpuCount` reports more CPUs
+        // than the container can actually use).
+        if (options.rayon_threads) |override| {
+            if (@as(usize, override) > cpu_count) {
+                self.logger.warn(
+                    "--rayon-threads {d} exceeds detected cpu_count={d}; rayon over-subscription typically reduces throughput. Verify this is intentional.",
+                    .{ override, cpu_count },
+                );
+            }
+        }
         xmss.setRayonThreads(rayon_threads);
 
         // Pre-warm the XMSS verifier on the main thread before any worker can
