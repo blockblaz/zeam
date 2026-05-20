@@ -82,6 +82,28 @@ pub const NodeCommand = struct {
     /// worker path is the supported prod path; the synchronous path
     /// stays in place as a kill-switch via `--chain-worker false`.
     @"chain-worker": bool = true,
+    /// Drop gossip attestations older than this many slots before the current
+    /// slot. `0` (default) keeps the current behaviour and accepts any age
+    /// the spec permits. Symmetric to the implicit future-side bound
+    /// `GOSSIP_DISPARITY_INTERVALS`. Useful on stuck devnets where stale
+    /// peers re-broadcast attestations from finalisation-orphaned slots and
+    /// pile them into the aggregator input set (#899).
+    @"gossip-attestation-max-age-slots": u64 = 0,
+    /// Periodically evict attestation_signatures + aggregated_payloads
+    /// entries whose `data.slot` is more than this many slots behind the
+    /// current head, even when finalisation has not advanced. `0` (default)
+    /// leaves pruning gated on finalisation as before. The existing
+    /// `pruneStaleAttestationData(finalized_slot)` is unchanged; this is a
+    /// supplementary memory cap for chains where finalisation is stuck so
+    /// retained maps cannot grow unboundedly (#899).
+    @"max-unfinalized-attestation-age-slots": u64 = 0,
+    /// Maximum in-flight aggregate FFI worker tasks. Default `1` matches the
+    /// pre-existing `aggregate_group.concurrent_limit = .limited(1)`
+    /// invariant from #873 and keeps behaviour identical. On hosts where the
+    /// per-pass build is well under one slot (e.g. after PR #900's slot
+    /// window + ThinLTO + a larger rayon pool), operators can raise this so
+    /// a slow pass does not skip the next slot's aggregation.
+    @"aggregate-concurrent-limit": u32 = 1,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -107,6 +129,9 @@ pub const NodeCommand = struct {
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
+        .@"gossip-attestation-max-age-slots" = "Drop gossip attestations older than this many slots (0 = off, default). Symmetric to the future-slot bound GOSSIP_DISPARITY_INTERVALS. Useful on stuck devnets to stop stale peers re-injecting old slots into the aggregator input set.",
+        .@"max-unfinalized-attestation-age-slots" = "Periodically evict attestation_signatures + aggregated_payloads entries older than this many slots behind head, even when finalisation has not advanced (0 = off, default; finalised-slot pruning is unchanged). Memory cap for stuck-chain operation.",
+        .@"aggregate-concurrent-limit" = "Maximum in-flight aggregate FFI worker tasks (default 1, matches the existing #873 invariant). Operators can raise this when per-pass build is well under one slot so a slow pass does not skip the next slot's aggregation.",
         .help = "Show help information for the node command",
     };
 };
@@ -842,6 +867,9 @@ fn mainInner(init: std.process.Init) !void {
                 .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
                 .db_backend = leancmd.@"db-backend",
+                .gossip_attestation_max_age_slots = leancmd.@"gossip-attestation-max-age-slots",
+                .max_unfinalized_attestation_age_slots = leancmd.@"max-unfinalized-attestation-age-slots",
+                .aggregate_concurrent_limit = leancmd.@"aggregate-concurrent-limit",
             };
 
             defer start_options.deinit(allocator);

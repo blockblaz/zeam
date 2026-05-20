@@ -103,6 +103,17 @@ pub const NodeOptions = struct {
     /// `--chain-worker false` as the kill-switch for the legacy
     /// synchronous path.
     chain_worker_enabled: bool = true,
+    /// Drop gossip attestations whose `data.slot + N < current_slot`.
+    /// `0` (default) disables the cutoff. Operator tunable for stuck-chain
+    /// scenarios (#899).
+    gossip_attestation_max_age_slots: u64 = 0,
+    /// Periodically evict attestation_signatures + aggregated_payloads
+    /// entries with `data.slot + N < head_slot` even when finalisation
+    /// has not advanced. `0` (default) disables the cap.
+    max_unfinalized_attestation_age_slots: u64 = 0,
+    /// Maximum in-flight aggregate FFI worker tasks. Default `1`
+    /// preserves the existing #873 invariant.
+    aggregate_concurrent_limit: u32 = 1,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -447,6 +458,9 @@ pub const Node = struct {
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
+            .gossip_attestation_max_age_slots = options.gossip_attestation_max_age_slots,
+            .max_unfinalized_attestation_age_slots = options.max_unfinalized_attestation_age_slots,
+            .aggregate_concurrent_limit = options.aggregate_concurrent_limit,
         });
         errdefer self.beam_node.deinit();
 

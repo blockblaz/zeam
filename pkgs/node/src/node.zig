@@ -59,6 +59,15 @@ const NodeOpts = struct {
     /// `--chain-worker` (bool); `--chain-worker false` is the
     /// kill-switch for the legacy synchronous path.
     chain_worker_enabled: bool = true,
+    /// Plumbed to `ChainOpts.gossip_attestation_max_age_slots`. `0`
+    /// keeps current behaviour (no too-old gossip cutoff). See #899.
+    gossip_attestation_max_age_slots: u64 = 0,
+    /// Plumbed to `ChainOpts.max_unfinalized_attestation_age_slots`.
+    /// `0` keeps current behaviour (no non-finalisation prune). #899.
+    max_unfinalized_attestation_age_slots: u64 = 0,
+    /// Plumbed to `ChainOpts.aggregate_concurrent_limit`. `1`
+    /// preserves the historical #873 invariant.
+    aggregate_concurrent_limit: u32 = 1,
 };
 
 pub const BeamNode = struct {
@@ -138,6 +147,9 @@ pub const BeamNode = struct {
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
                 .thread_pool = opts.thread_pool,
+                .gossip_attestation_max_age_slots = opts.gossip_attestation_max_age_slots,
+                .max_unfinalized_attestation_age_slots = opts.max_unfinalized_attestation_age_slots,
+                .aggregate_concurrent_limit = opts.aggregate_concurrent_limit,
             },
             network.connected_peers,
         ) catch |init_err| {

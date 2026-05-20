@@ -2325,6 +2325,57 @@ pub const ForkChoice = struct {
         );
     }
 
+    /// Operator-tunable companion to `pruneStaleAttestationData` for chains
+    /// where finalisation has stalled. Removes attestation_signatures and
+    /// aggregated_payloads entries with `data.slot + max_age_slots < head_slot`,
+    /// regardless of whether their target has been finalised.
+    ///
+    /// Without this cap, a chain that never finalises (devnet partition, gossip
+    /// drop, validator-set issue) accumulates `AttestationData` entries
+    /// forever, slowing every aggregate pass and bloating memory (#899).
+    ///
+    /// No-op when `max_age_slots == 0` (the default) — callers are expected to
+    /// gate this method on the operator flag.
+    pub fn pruneStaleAttestationDataByHeadAge(self: *Self, head_slot: types.Slot, max_age_slots: u64) !void {
+        if (max_age_slots == 0) return;
+        if (head_slot <= max_age_slots) return;
+        const cutoff_slot: types.Slot = head_slot - max_age_slots;
+
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
+        var att_sig_keys_to_remove: std.ArrayList(types.AttestationData) = .empty;
+        defer att_sig_keys_to_remove.deinit(self.allocator);
+
+        var att_sig_it = self.attestation_signatures.iterator();
+        while (att_sig_it.next()) |entry| {
+            if (entry.key_ptr.slot < cutoff_slot) {
+                try att_sig_keys_to_remove.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (att_sig_keys_to_remove.items) |data| {
+            self.attestation_signatures.removeAndDeinit(data);
+        }
+
+        const removed_known = try prunePayloadMapByDataSlot(self.allocator, &self.latest_known_aggregated_payloads, cutoff_slot);
+        const removed_new = try prunePayloadMapByDataSlot(self.allocator, &self.latest_new_aggregated_payloads, cutoff_slot);
+
+        if (att_sig_keys_to_remove.items.len + removed_known + removed_new > 0) {
+            self.logger.debug(
+                "pruned non-finalized attestation data: gossip={d} payloads_known={d} payloads_new={d} head_slot={d} cutoff_slot={d} max_age_slots={d}",
+                .{
+                    att_sig_keys_to_remove.items.len,
+                    removed_known,
+                    removed_new,
+                    head_slot,
+                    cutoff_slot,
+                    max_age_slots,
+                },
+            );
+        }
+    }
+
     fn prunePayloadMapBySlot(
         allocator: Allocator,
         payloads: *AggregatedPayloadsMap,
@@ -2337,6 +2388,37 @@ pub const ForkChoice = struct {
         var it = payloads.iterator();
         while (it.next()) |entry| {
             if (entry.key_ptr.target.slot > finalized_slot) continue;
+
+            removed_total += entry.value_ptr.items.len;
+            try keys_to_remove.append(allocator, entry.key_ptr.*);
+        }
+
+        for (keys_to_remove.items) |data| {
+            if (payloads.fetchRemove(data)) |kv| {
+                var mutable_val = kv.value;
+                deinitAggregatedPayloadsList(allocator, &mutable_val);
+            }
+        }
+        return removed_total;
+    }
+
+    /// Same as `prunePayloadMapBySlot` but filters by `entry.key_ptr.slot`
+    /// (`AttestationData.slot`) rather than `target.slot`. Used by the
+    /// non-finalisation, head-age-based prune which evicts everything whose
+    /// vote slot is older than the configured window — independent of where
+    /// the chain's target checkpoint sits.
+    fn prunePayloadMapByDataSlot(
+        allocator: Allocator,
+        payloads: *AggregatedPayloadsMap,
+        cutoff_slot: types.Slot,
+    ) !usize {
+        var keys_to_remove: std.ArrayList(types.AttestationData) = .empty;
+        defer keys_to_remove.deinit(allocator);
+
+        var removed_total: usize = 0;
+        var it = payloads.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.slot >= cutoff_slot) continue;
 
             removed_total += entry.value_ptr.items.len;
             try keys_to_remove.append(allocator, entry.key_ptr.*);

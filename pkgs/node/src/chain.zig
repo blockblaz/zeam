@@ -66,6 +66,17 @@ pub const ChainOpts = struct {
     // Optional shared worker pool for CPU-bound work (signature verification).
     // When null, the chain falls back to the serial code paths.
     thread_pool: ?*ThreadPool = null,
+    /// Drop gossip attestations whose `data.slot + N < current_slot`.
+    /// `0` keeps current behaviour (no cutoff). See #899.
+    gossip_attestation_max_age_slots: u64 = 0,
+    /// On every aggregator interval, also prune attestation_signatures /
+    /// aggregated_payloads entries with `data.slot + N < head_slot`. `0`
+    /// disables (finalisation-based pruning still runs). See #899.
+    max_unfinalized_attestation_age_slots: u64 = 0,
+    /// Maximum in-flight aggregate FFI worker tasks. `1` preserves the
+    /// existing #873 invariant; larger values let a slow pass not skip
+    /// the next interval.
+    aggregate_concurrent_limit: u32 = 1,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -379,6 +390,14 @@ pub const BeamChain = struct {
     /// Long-lived group hosting submitted aggregate tasks.
     aggregate_group: std.Io.Group = .init,
 
+    /// Drop gossip attestations older than this many slots before current
+    /// (`data.slot + N < current_slot`). `0` disables (default). #899.
+    gossip_attestation_max_age_slots: u64 = 0,
+    /// Periodic non-finalization prune threshold. Evict
+    /// attestation_signatures + aggregated_payloads entries with
+    /// `data.slot + N < head_slot`. `0` disables (default). #899.
+    max_unfinalized_attestation_age_slots: u64 = 0,
+
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -524,12 +543,21 @@ pub const BeamChain = struct {
         try states.put(fork_choice.head.blockRoot, anchor_rc);
 
         // Issue #873: dedicated Io.Threaded for aggregate FFI worker.
-        // concurrent_limit = .limited(1) ensures at most one in-flight aggregate task.
+        //
+        // `concurrent_limit` defaults to `.limited(1)` to preserve the
+        // historical "at most one in-flight aggregate task" invariant from
+        // #873 (a second submit returns `error.ConcurrencyUnavailable` and
+        // increments `zeam_aggregate_skip_total{reason="in_flight"}`).
+        // Operators on hosts where a single pass is comfortably under one
+        // slot (e.g. after PR #900's slot window + ThinLTO + larger rayon
+        // pool) can raise it via `--aggregate-concurrent-limit` so a slow
+        // pass does not cause the next interval to be skipped (#899).
+        const agg_concurrency: usize = @max(@as(usize, 1), @as(usize, opts.aggregate_concurrent_limit));
         const agg_io = try allocator.create(std.Io.Threaded);
         errdefer allocator.destroy(agg_io);
         agg_io.* = std.Io.Threaded.init(allocator, .{
             .async_limit = .nothing,
-            .concurrent_limit = .limited(1),
+            .concurrent_limit = .limited(agg_concurrency),
         });
         errdefer agg_io.deinit();
 
@@ -578,6 +606,8 @@ pub const BeamChain = struct {
             // aggregate_io: dedicated Io.Threaded for aggregate FFI worker (issue #873).
             .aggregate_io = agg_io,
             .aggregate_group = .init,
+            .gossip_attestation_max_age_slots = opts.gossip_attestation_max_age_slots,
+            .max_unfinalized_attestation_age_slots = opts.max_unfinalized_attestation_age_slots,
             // leanSpec _pending_attestations / _pending_aggregated_attestations
             // buffers — empty at init; FIFO-bounded by
             // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
@@ -4069,6 +4099,27 @@ pub const BeamChain = struct {
         return attestation_start_interval > max_allowed_interval;
     }
 
+    /// Operator-tunable past-side bound for gossip attestations, symmetric to
+    /// `attestationIsTooFarInFuture`. Returns `true` iff
+    /// `gossip_attestation_max_age_slots > 0` and
+    /// `data.slot + gossip_attestation_max_age_slots < current_slot`.
+    ///
+    /// `0` (the default) keeps current behaviour and accepts every age the
+    /// spec permits. Enabled only by operators on stuck devnets where stale
+    /// peers re-broadcast attestations from finalisation-orphaned slots and
+    /// pile them into the aggregator input set (#899). The bound is in
+    /// whole slots — unlike the future bound it does not need
+    /// interval-granularity, because the spec already requires
+    /// `target.slot <= current_slot` and the latency we are protecting
+    /// against here is gossip-bus age (multiple slots), not boundary timing.
+    pub fn attestationIsTooOld(self: *Self, data: types.AttestationData) bool {
+        const cutoff_slots = self.gossip_attestation_max_age_slots;
+        if (cutoff_slots == 0) return false;
+        const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+        const current_slot: u64 = @divFloor(current_time, constants.INTERVALS_PER_SLOT);
+        return data.slot + cutoff_slots < current_slot;
+    }
+
     pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
@@ -4097,6 +4148,21 @@ pub const BeamChain = struct {
                 self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
             });
             return AttestationValidationError.AttestationTooFarInFuture;
+        }
+
+        // Operator-tunable past-side cutoff (`--gossip-attestation-max-age-slots`).
+        // Off by default; when enabled it is symmetric to the future bound and
+        // applies only to gossip — block-included attestations are trusted under
+        // the block's own validation. Hard drop (no pending-buffer replay):
+        // unlike the future-slot case there is no expected near-term event that
+        // would make the attestation valid again.
+        if (!is_from_block and self.attestationIsTooOld(data)) {
+            self.logger.debug("attestation validation failed: too old slot={d} time={d} max_age_slots={d}", .{
+                data.slot,
+                self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
+                self.gossip_attestation_max_age_slots,
+            });
+            return AttestationValidationError.AttestationTooOld;
         }
 
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
@@ -4309,6 +4375,20 @@ pub const BeamChain = struct {
     /// skipped and the skip metric is incremented.
     pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+
+        // Operator-tunable non-finalisation prune (`--max-unfinalized-attestation-age-slots`).
+        // Runs once per aggregator interval — on aggregators only, because the
+        // map growth that motivates the cap is aggregator-driven. No-op when
+        // the flag is `0` (default) or when head is younger than the configured
+        // window. Pruning is best-effort: a failure must not stop the aggregator
+        // tick. See #899.
+        if (self.max_unfinalized_attestation_age_slots > 0) {
+            const head = self.forkChoice.getHead();
+            self.forkChoice.pruneStaleAttestationDataByHeadAge(head.slot, self.max_unfinalized_attestation_age_slots) catch |err| {
+                self.logger.warn("failed to prune non-finalized attestation data at slot={d}: {any}", .{ slot, err });
+            };
+        }
+
         if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
             zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_aggregator" }) catch {};
             return;
@@ -4699,6 +4779,10 @@ const AttestationValidationError = error{
     HeadCheckpointSlotMismatch,
     HeadOlderThanTarget,
     AttestationTooFarInFuture,
+    /// Operator-tunable (`--gossip-attestation-max-age-slots`). Hard drop
+    /// for gossip attestations older than the configured slot window.
+    /// Never raised when the flag is left at its `0` default.
+    AttestationTooOld,
 };
 pub const BlockValidationError = error{
     UnknownParentBlock,
