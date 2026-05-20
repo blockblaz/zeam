@@ -18,6 +18,24 @@ lto = false  # Set to true for single-prover builds to reduce binary size from 1
 strip = "symbols"
 codegen-units = 16  # Multiple units keep risc0 and openvm code separate
 
+# Optimized profile for the multisig-only (dummy prover) build. This is the
+# image used by production aggregators on the devnet; the leanMultisig prover
+# is the per-slot hot path and benefits noticeably from cross-crate inlining
+# (ThinLTO) and single-codegen-unit compilation. Because this build excludes
+# both risc0 and openvm via `--no-default-features --features
+# libp2p,hashsig,multisig`, there are no `sys_alloc_aligned`-style symbol
+# collisions to worry about — the constraint that forces `lto = false,
+# codegen-units = 16` on the shared `[profile.release]` does not apply.
+#
+# Keep opt-level at the inherited `3`. Do NOT switch to `opt-level = "z"`
+# (or `"s"`) here: combined with `codegen-units = 1` they miscompile
+# leanMultisig's prover on x86_64 Linux (rustc >= 1.95) — see the comment on
+# `[profile.openvm-release]` and zeam#734 / leanEthereum/leanMultisig#198.
+[profile.multisig-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
 # Optimized profile for OpenVM-only builds (size reduction, but see opt-level note).
 [profile.openvm-release]
 inherits = "release"
