@@ -4,9 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
-backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
+# leanMultisig devnet4 head (2026-05-12). Includes:
+#   - 7a71c0f: eq_mle base-case correctness fix
+#               (was using packing_width instead of log_packing_width)
+#   - 939a767: removed superfluous `#[inline]` in eq_mle — measured +10%
+#               on AVX-512 (Hetzner AX42-U), neutral on NEON. This is the
+#               same hardware class as the devnet aggregator hosts.
+#   - 5fbd5bf: Plonky3 PR #1600 NEON dot-product regression coverage
+#   - e5c2183: leanSig dep flipped to `main` (devnet4 merged into main)
+#   - 5eba3b1: rec_aggregation BenchmarkReport (API-additive, source of
+#               the per-node breakdown that lean-bench / op tooling read)
+# Devnet operators reported ~16 sig/s on 2eb4b9d (Apr 17) vs ~37 sig/s on
+# leanMultisig benchmarks against 5eba3b1 — the 939a767 inline removal is
+# the dominant contributor on the prod hardware.
+rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa" }
+leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa" }
+backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa" }
 rayon = "1"
 
 [lib]
