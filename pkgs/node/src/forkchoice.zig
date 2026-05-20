@@ -1407,9 +1407,9 @@ pub const ForkChoice = struct {
             }
         }
 
-        recordAggregateCoverageMetrics("proposal_payloads", proposal_payload_seen, proposal_payload_has_subnet);
-        recordAggregateCoverageMetrics("proposal_gossip", proposal_gossip_seen, proposal_gossip_has_subnet);
-        recordAggregateCoverageMetrics("proposal_combined", final_seen, final_has_subnet);
+        recordAggregateCoverageMetrics("proposal_payloads", proposal_payload_seen, proposal_payload_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("proposal_gossip", proposal_gossip_seen, proposal_gossip_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("proposal_combined", final_seen, final_has_subnet, committee_count_u32);
 
         if (!has_any) {
             self.logger.info("block proposal slot={d}: attestation aggregate coverage=none", .{slot});
@@ -1871,12 +1871,12 @@ pub const ForkChoice = struct {
             if (pn and !b) prev_new_not_block += 1;
         }
 
-        recordAggregateCoverageMetrics("timely", prev_new_seen, prev_new_has_subnet);
-        recordAggregateCoverageMetrics("late", late_seen, late_has_subnet);
-        recordAggregateCoverageMetrics("block", block_seen, block_has_subnet);
-        recordAggregateCoverageMetrics("combined", combined_seen, combined_has_subnet);
-        zeam_metrics.metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, @intCast(block_not_prev_new)) catch {};
-        zeam_metrics.metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, @intCast(prev_new_not_block)) catch {};
+        recordAggregateCoverageMetrics("timely", prev_new_seen, prev_new_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("late", late_seen, late_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("block", block_seen, block_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("combined", combined_seen, combined_has_subnet, committee_count_u32);
+        zeam_metrics.metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, @intCast(block_not_prev_new)) catch {};
+        zeam_metrics.metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, @intCast(prev_new_not_block)) catch {};
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -1942,12 +1942,12 @@ pub const ForkChoice = struct {
         }
 
         if (!has_any) {
-            recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet);
+            recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet, committee_count_u32);
             self.logger.info("agg start slot={d}: new payloads coverage=none", .{slot});
             return;
         }
 
-        recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet);
+        recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet, committee_count_u32);
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
@@ -3835,15 +3835,29 @@ fn observeAggregateBuildPhase(comptime phase: []const u8, start_ns: i128) void {
     ) catch {};
 }
 
-fn recordAggregateCoverageMetrics(section: []const u8, seen: []const bool, has_subnet: []const bool) void {
-    zeam_metrics.metrics.zeam_attestation_aggregate_coverage_validators.set(
-        .{ .section = section },
+fn recordAggregateCoverageMetrics(
+    section: []const u8,
+    seen: []const bool,
+    has_subnet: []const bool,
+    committee_count: types.SubnetId,
+) void {
+    zeam_metrics.metrics.lean_attestation_aggregate_coverage_validators.set(
+        .{ .section = section, .subnet = "combined" },
         @intCast(countSeen(seen)),
     ) catch {};
-    zeam_metrics.metrics.zeam_attestation_aggregate_coverage_subnets.set(
+    zeam_metrics.metrics.lean_attestation_aggregate_coverage_subnets.set(
         .{ .section = section },
         @intCast(countSeen(has_subnet)),
     ) catch {};
+
+    for (has_subnet, 0..) |_, subnet_index| {
+        var subnet_label_buf: [32]u8 = undefined;
+        const subnet_label = std.fmt.bufPrint(&subnet_label_buf, "subnet_{d}", .{subnet_index}) catch continue;
+        zeam_metrics.metrics.lean_attestation_aggregate_coverage_validators.set(
+            .{ .section = section, .subnet = subnet_label },
+            @intCast(countSubnetSeen(seen, @intCast(subnet_index), committee_count)),
+        ) catch {};
+    }
 }
 
 fn countSubnetSeen(seen: []const bool, subnet_id: types.SubnetId, committee_count: types.SubnetId) usize {
