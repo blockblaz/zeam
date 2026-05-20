@@ -1897,8 +1897,23 @@ pub const ForkChoice = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    /// Log subnet-wise coverage of the current new payloads before starting aggregation.
-    /// Called from aggregateImpl just before fork-choice aggregation runs.
+    /// Log subnet-wise coverage of the aggregation input set before the FFI runs.
+    /// Called from aggregateImpl just before fork-choice aggregation.
+    ///
+    /// The aggregator's input is the **union** of two maps:
+    ///   - `latest_new_aggregated_payloads`: cross-subnet aggregations received
+    ///     from peers since the last accept-merge (reported as `new_payloads`).
+    ///   - `attestation_signatures`: individual gossip signatures from this
+    ///     node's subscribed subnets (reported as `gossip_sigs`).
+    ///
+    /// Earlier this function looked only at `latest_new_aggregated_payloads` and
+    /// reported `coverage=none` whenever it was empty, even when dozens of
+    /// individual gossip sigs were waiting on the local duty subnet (#899).
+    /// Operators misread the "none" line as "we have no input"; the input was
+    /// in fact a different map. Reporting both sections separately removes the
+    /// ambiguity and surfaces "we have raw sigs from subnet 0 but no
+    /// cross-subnet aggregations yet" — the common steady-state on a single-
+    /// subnet aggregator.
     pub fn logNewPayloadsCoverageForAggregation(self: *Self, slot: types.Slot) void {
         const validator_count: usize = @intCast(self.config.genesis.numValidators());
         if (validator_count == 0) return;
@@ -1910,6 +1925,10 @@ pub const ForkChoice = struct {
         defer self.allocator.free(new_seen);
         const new_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
         defer self.allocator.free(new_has_subnet);
+        const gossip_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(gossip_seen);
+        const gossip_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
+        defer self.allocator.free(gossip_has_subnet);
         const dummy_seen = self.allocator.alloc(bool, validator_count) catch return;
         defer self.allocator.free(dummy_seen);
         const dummy_has = self.allocator.alloc(bool, committee_count) catch return;
@@ -1917,6 +1936,8 @@ pub const ForkChoice = struct {
 
         @memset(new_seen, false);
         @memset(new_has_subnet, false);
+        @memset(gossip_seen, false);
+        @memset(gossip_has_subnet, false);
         @memset(dummy_seen, false);
         @memset(dummy_has, false);
 
@@ -1933,26 +1954,48 @@ pub const ForkChoice = struct {
             dummy_has,
         );
 
-        var has_any = false;
-        for (new_has_subnet) |h| {
-            if (h) {
-                has_any = true;
-                break;
-            }
-        }
+        collectGossipSigCoverageForSlot(
+            &self.attestation_signatures,
+            slot,
+            committee_count_u32,
+            validator_count,
+            gossip_seen,
+            gossip_has_subnet,
+        );
 
-        if (!has_any) {
-            recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet, committee_count_u32);
-            self.logger.info("agg start slot={d}: new payloads coverage=none", .{slot});
-            return;
-        }
+        var new_has_any = false;
+        for (new_has_subnet) |h| if (h) {
+            new_has_any = true;
+            break;
+        };
+        var gossip_has_any = false;
+        for (gossip_has_subnet) |h| if (h) {
+            gossip_has_any = true;
+            break;
+        };
 
         recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("agg_start_gossip", gossip_seen, gossip_has_subnet, committee_count_u32);
+
+        if (!new_has_any and !gossip_has_any) {
+            self.logger.info("agg start slot={d}: new_payloads=none gossip_sigs=none", .{slot});
+            return;
+        }
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         appendFmt(self.allocator, &out, "agg start slot={d}: ", .{slot}) catch return;
-        appendCoverageSection(self.allocator, &out, "new", new_seen, new_has_subnet, validator_count, committee_count_u32) catch return;
+        if (new_has_any) {
+            appendCoverageSection(self.allocator, &out, "new_payloads", new_seen, new_has_subnet, validator_count, committee_count_u32) catch return;
+        } else {
+            appendFmt(self.allocator, &out, "new_payloads=none", .{}) catch return;
+        }
+        appendFmt(self.allocator, &out, " | ", .{}) catch return;
+        if (gossip_has_any) {
+            appendCoverageSection(self.allocator, &out, "gossip_sigs", gossip_seen, gossip_has_subnet, validator_count, committee_count_u32) catch return;
+        } else {
+            appendFmt(self.allocator, &out, "gossip_sigs=none", .{}) catch return;
+        }
         self.logger.info("{s}", .{out.items});
     }
 
@@ -3755,6 +3798,36 @@ fn collectCoverageFromSignaturesForData(
         if (std.mem.eql(u8, &entry.value_ptr.signature, &ZERO_SIGBYTES)) continue;
         _ = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
         seen[validator_index] = true;
+    }
+}
+
+/// Aggregate validator/subnet coverage of every individual gossip signature
+/// in `map` whose `AttestationData.slot == slot`. Used by
+/// `logNewPayloadsCoverageForAggregation` to surface the local-subnet input
+/// that `latest_new_aggregated_payloads` alone does not see (#899).
+fn collectGossipSigCoverageForSlot(
+    map: *const SignaturesMap,
+    slot: types.Slot,
+    committee_count: types.SubnetId,
+    validator_count: usize,
+    seen: []bool,
+    has_subnet: []bool,
+) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.slot != slot) continue;
+        var vid_it = entry.value_ptr.iterator();
+        while (vid_it.next()) |sig_entry| {
+            const validator_index: usize = @intCast(sig_entry.key_ptr.*);
+            if (validator_index >= validator_count) continue;
+            if (validator_index >= seen.len) continue;
+            if (std.mem.eql(u8, &sig_entry.value_ptr.signature, &ZERO_SIGBYTES)) continue;
+            const subnet_id = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+            const subnet_index: usize = @intCast(subnet_id);
+            if (subnet_index >= has_subnet.len) continue;
+            seen[validator_index] = true;
+            has_subnet[subnet_index] = true;
+        }
     }
 }
 
