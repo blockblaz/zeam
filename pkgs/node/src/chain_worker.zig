@@ -467,12 +467,18 @@ pub const Handlers = struct {
 /// devnet4 (~3 attestations/slot × 32 validators × 8 slots ≈ 800) does
 /// not saturate. Tuned by the slice c-2 stress harness. Aggregated
 /// attestations get a separate 512-message burst budget: under current
-/// devnet load they arrive below raw-attestation volume, and the worker
-/// drains one raw + one aggregated item per loop so neither class can
-/// indefinitely starve the other.
+/// devnet load they arrive below raw-attestation volume. The worker
+/// drains one raw attestation per loop; aggregated attestations use
+/// `AGGREGATED_ATTESTATION_BATCH_*` when the queue is deep.
 pub const DEFAULT_BLOCK_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_ATTESTATION_QUEUE_CAPACITY: usize = 1024;
 pub const DEFAULT_AGGREGATED_ATTESTATION_QUEUE_CAPACITY: usize = 512;
+
+/// When outstanding aggregated-attestation depth exceeds this, the
+/// worker drains up to `AGGREGATED_ATTESTATION_BATCH_MAX` per loop
+/// iteration instead of one (reduces backlog under devnet bursts).
+pub const AGGREGATED_ATTESTATION_BATCH_THRESHOLD: usize = 16;
+pub const AGGREGATED_ATTESTATION_BATCH_MAX: usize = 32;
 
 /// Owns the chain-worker thread, the bounded queues, and a stop flag.
 ///
@@ -793,10 +799,11 @@ pub const ChainWorker = struct {
     }
 
     /// Worker thread main loop. Each iteration attempts one block, one
-    /// raw-attestation, and one aggregated-attestation dispatch before
-    /// parking. That keeps block work highest priority while preventing a
-    /// hot raw-attestation queue from indefinitely starving aggregated
-    /// attestations. When all queues are empty, the worker parks on the
+    /// raw-attestation, and one or more aggregated-attestation dispatches
+    /// (batched when the agg queue is deep) before parking. That keeps
+    /// block work highest priority while preventing a hot raw-attestation
+    /// queue from indefinitely starving aggregated attestations. When all
+    /// queues are empty, the worker parks on the
     /// shared `wake_cond`, which any producer signals via `sendBlock` /
     /// `sendAttestation` / `sendAggregatedAttestation`, and `stop` signals
     /// after closing the queues.
@@ -834,7 +841,18 @@ pub const ChainWorker = struct {
                 dispatched_any = true;
             }
 
-            if (self.aggregated_attestation_queue.tryRecv()) |msg| {
+            // Batch agg dispatch only runs `on_gossip_aggregated_attestation` on this
+            // single chain-worker thread. It does not call `forkChoice.aggregate()`
+            // (snapshot-then-release via `AggregateSnapshot`, #863/#890); committee
+            // aggregation stays on the dedicated aggregate Io.Threaded path.
+            const agg_depth = self.aggregated_attestation_queue.outstandingDepth();
+            const agg_batch: usize = if (agg_depth > AGGREGATED_ATTESTATION_BATCH_THRESHOLD)
+                @min(AGGREGATED_ATTESTATION_BATCH_MAX, agg_depth)
+            else
+                1;
+            var agg_drained: usize = 0;
+            while (agg_drained < agg_batch) : (agg_drained += 1) {
+                const msg = self.aggregated_attestation_queue.tryRecv() orelse break;
                 self.dispatch(msg);
                 self.aggregated_attestation_queue.markProcessed();
                 self.recordAggregatedAttestationQueueDepth();

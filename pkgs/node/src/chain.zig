@@ -3124,11 +3124,16 @@ pub const BeamChain = struct {
                     defer if (!cloned_consumed) cloned.deinit();
                     self.submitGossipAggregatedAttestation(cloned) catch |err| switch (err) {
                         error.QueueFull => {
-                            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
-                            self.logger.warn(
-                                "chain-worker: aggregated attestation queue full, dropping slot={d}",
+                            // leanSpec buffers retryable gossip; mirror that on
+                            // worker backpressure instead of dropping (#863).
+                            self.enqueuePendingAggregation(cloned, "queue_full");
+                            cloned_consumed = true;
+                            zeam_metrics.metrics.lean_pending_attestations_buffered_total.incr(.{ .kind = "aggregation", .reason = "queue_full" }) catch {};
+                            self.logger.debug(
+                                "chain-worker: aggregated attestation queue full, buffered slot={d} for replay",
                                 .{signed_aggregation.data.slot},
                             );
+                            self.submitReplayPendingAttestations() catch {};
                             return .{};
                         },
                         error.QueueClosed => {
@@ -4211,19 +4216,14 @@ pub const BeamChain = struct {
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
         try self.validateAttestationData(signedAggregation.data, false);
 
-        try self.verifyAggregatedAttestation(signedAggregation);
-
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
-        var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-        defer self.allocator.free(validator_ids);
-        for (validator_indices.items, 0..) |vi, i| {
-            validator_ids[i] = @intCast(vi);
-        }
+        try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
 
         // Update attestation trackers for gossip attestations so fork choice sees these votes
-        for (validator_ids) |validator_id| {
+        for (validator_indices.items) |vi| {
+            const validator_id: types.ValidatorIndex = @intCast(vi);
             const attestation = types.Attestation{
                 .validator_id = validator_id,
                 .data = signedAggregation.data,
@@ -4238,19 +4238,20 @@ pub const BeamChain = struct {
         try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
     }
 
-    fn verifyAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
+    fn verifyAggregatedAttestation(
+        self: *Self,
+        signedAggregation: types.SignedAggregatedAttestation,
+        validator_indices: []const usize,
+    ) !void {
         const data = signedAggregation.data;
         const proof = signedAggregation.proof;
-
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-        defer validator_indices.deinit(self.allocator);
 
         // Borrow-only: short read of `state.validators` to look up pubkey
         // bytes. Drop the borrow before the XMSS verify since the borrow
         // only protects the validator-list pointer.
         var borrow = self.statesGet(data.target.root) orelse return error.MissingState;
         defer borrow.assertReleasedOrPanic();
-        var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(self.allocator, validator_indices.items.len);
+        var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(self.allocator, validator_indices.len);
         defer public_keys.deinit(self.allocator);
 
         {
@@ -4261,7 +4262,7 @@ pub const BeamChain = struct {
             // mutex acquisition needed. See `xmss.PublicKeyCache`
             // for the per-slot CAS protocol.
 
-            for (validator_indices.items) |validator_index| {
+            for (validator_indices) |validator_index| {
                 if (validator_index >= validators.len) {
                     return error.InvalidValidatorId;
                 }
@@ -4379,7 +4380,16 @@ pub const BeamChain = struct {
         // Log subnet-wise coverage of current new payloads before starting aggregation.
         chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
 
-        const aggregations = chain.forkChoice.aggregate(snapshot) catch |err| {
+        var slot_window_buf: [2]types.Slot = undefined;
+        var slot_window_len: usize = 0;
+        if (slot > 0) {
+            slot_window_buf[slot_window_len] = @intCast(slot - 1);
+            slot_window_len += 1;
+        }
+        slot_window_buf[slot_window_len] = @intCast(slot);
+        slot_window_len += 1;
+
+        const aggregations = chain.forkChoice.aggregateForSlots(snapshot, slot_window_buf[0..slot_window_len]) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return;
         };
@@ -4634,6 +4644,19 @@ pub const BeamChain = struct {
                 }
             }
         }
+
+        // `behind_peers` maps to leanSpec **SYNCING** ("deep sync"). It must
+        // ONLY fire on a finalization gap; a 1-slot head delta is normal
+        // gossip latency, not deep sync, and `behind_peers` consumers
+        // (`validator_client.maybeDoProposal` / `mayBeDoAttestation`) skip
+        // proposer/attestation duties — gating those on transient head
+        // lag would silently disable validators near the head.
+        //
+        // Status-driven catch-up for the head-only-gap case is handled
+        // outside this state: the `.synced` arm of `handleReqRespResponse`
+        // calls `shouldCatchUpFromPeerStatus` directly so a peer that
+        // reports a higher head triggers catch-up without changing the
+        // node's high-level sync state.
 
         // Check 1: our head is behind peer finalization — we don't even have finalized blocks
         if (our_head_slot < max_peer_finalized_slot) {
