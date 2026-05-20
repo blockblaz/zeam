@@ -59,6 +59,9 @@ const NodeOpts = struct {
     /// `--chain-worker` (bool); `--chain-worker false` is the
     /// kill-switch for the legacy synchronous path.
     chain_worker_enabled: bool = true,
+    /// Event loop for registering the xev.Async watcher that wakes the main
+    /// loop when the Rust bridge thread enqueues a ReqRespResponseEvent.
+    loop: ?*xev.Loop = null,
 };
 
 pub const BeamNode = struct {
@@ -94,6 +97,13 @@ pub const BeamNode = struct {
     batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
     batch_pending_parent_roots_lock: zeam_utils.SyncMutex = .{},
 
+    // The Rust bridge thread enqueues ReqRespResponseEvent values here and
+    // wakes the main libxev loop through async_notifier.
+    resp_queue: RespQueue = .{},
+    resp_queue_mutex: zeam_utils.SyncMutex = .{},
+    async_notifier: ?xev.Async = null,
+    async_completion: xev.Completion = .{},
+
     /// Range chunks handed to the chain-worker before `onBlock` completes (#893).
     /// Maps block_root → blocks_by_range request_id for post-import accounting.
     range_async_chunk_imports: std.AutoHashMap(types.Root, u64),
@@ -113,6 +123,35 @@ pub const BeamNode = struct {
     /// libxev tick. A flag flip is the cheapest cross-thread signal
     /// that preserves that invariant.
     sync_refresh_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    const RespQueue = BoundedQueue(networks.ReqRespResponseEvent, 256);
+
+    fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
+        return struct {
+            buf: [capacity]T = undefined,
+            head: usize = 0,
+            tail: usize = 0,
+            len: usize = 0,
+
+            const BQ = @This();
+
+            fn push(self: *BQ, item: T) bool {
+                if (self.len == capacity) return false;
+                self.buf[self.tail] = item;
+                self.tail = (self.tail + 1) % capacity;
+                self.len += 1;
+                return true;
+            }
+
+            fn pop(self: *BQ) ?T {
+                if (self.len == 0) return null;
+                const item = self.buf[self.head];
+                self.head = (self.head + 1) % capacity;
+                self.len -= 1;
+                return item;
+            }
+        };
+    }
 
     const Self = @This();
 
@@ -206,10 +245,27 @@ pub const BeamNode = struct {
         chain.setImportedBlockCallback(self, handleChainImportedBlock);
         chain.setRejectedBlockCallback(self, handleChainRejectedBlock);
 
+        if (opts.loop) |loop| {
+            var notifier = xev.Async.init() catch |err| {
+                opts.logger_config.logger(.node).err("failed to init xev.Async notifier: {any}", .{err});
+                return err;
+            };
+            notifier.wait(loop, &self.async_completion, Self, self, drainRespQueueCb);
+            self.async_notifier = notifier;
+        }
+
         network_init_cleanup = false;
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.async_notifier) |*notifier| notifier.deinit();
+        self.resp_queue_mutex.lock();
+        while (self.resp_queue.pop()) |event| {
+            var owned_event = event;
+            owned_event.deinit(self.allocator);
+        }
+        self.resp_queue_mutex.unlock();
+
         // Order matters under #890. `chain.deinit()` is what stops/
         // joins the chain-worker thread, so any state the worker
         // callbacks (`handleChainImportedBlock`,
@@ -1983,14 +2039,119 @@ pub const BeamNode = struct {
         }
     }
 
+    fn cloneRespEvent(self: *Self, event: *const networks.ReqRespResponseEvent) !networks.ReqRespResponseEvent {
+        switch (event.payload) {
+            .success => |resp| switch (resp) {
+                .blocks_by_root => |block| {
+                    var cloned: networks.ReqRespResponse = .{ .blocks_by_root = undefined };
+                    try types.sszClone(self.allocator, types.SignedBlock, block, &cloned.blocks_by_root);
+                    return .{
+                        .method = event.method,
+                        .request_id = event.request_id,
+                        .payload = .{ .success = cloned },
+                    };
+                },
+                .blocks_by_range => |block| {
+                    var cloned: networks.ReqRespResponse = .{ .blocks_by_range = undefined };
+                    try types.sszClone(self.allocator, types.SignedBlock, block, &cloned.blocks_by_range);
+                    return .{
+                        .method = event.method,
+                        .request_id = event.request_id,
+                        .payload = .{ .success = cloned },
+                    };
+                },
+                .status => |status| {
+                    return .{
+                        .method = event.method,
+                        .request_id = event.request_id,
+                        .payload = .{ .success = .{ .status = status } },
+                    };
+                },
+            },
+            .failure => |err_payload| {
+                const owned_msg = try self.allocator.dupe(u8, err_payload.message);
+                return .{
+                    .method = event.method,
+                    .request_id = event.request_id,
+                    .payload = .{ .failure = .{ .code = err_payload.code, .message = owned_msg } },
+                };
+            },
+            .completed => {
+                return .{
+                    .method = event.method,
+                    .request_id = event.request_id,
+                    .payload = .completed,
+                };
+            },
+        }
+    }
+
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+
+        if (self.async_notifier != null) {
+            const cloned = self.cloneRespEvent(event) catch |err| {
+                self.logger.warn("failed to clone ReqRespResponseEvent for async queue: {any}", .{err});
+                return err;
+            };
+
+            self.resp_queue_mutex.lock();
+            const pushed = self.resp_queue.push(cloned);
+            self.resp_queue_mutex.unlock();
+
+            if (!pushed) {
+                self.logger.warn("resp_queue full (256), dropping ReqRespResponseEvent request_id={d}", .{event.request_id});
+                var to_free = cloned;
+                to_free.deinit(self.allocator);
+                return;
+            }
+
+            self.async_notifier.?.notify() catch |err| {
+                self.logger.warn("xev.Async.notify() failed: {any}", .{err});
+            };
+            return;
+        }
+
         // Slice (a-3): no outer mutex. `handleReqRespResponse` snapshots
         // the pending request entry under the pending_rpc_requests lock,
         // then calls `chain.onBlock` (per-resource locks) for the
         // blocks_by_root branch. Network mutations go through
         // `Network`'s LockedMap / BlockCache helpers.
         try self.handleReqRespResponse(event);
+    }
+
+    fn drainRespQueueCb(
+        ud: ?*Self,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        r catch |err| {
+            if (ud) |self| {
+                self.logger.err("xev.Async wait error: {any}", .{err});
+            }
+            return .rearm;
+        };
+
+        const self = ud orelse return .rearm;
+
+        while (true) {
+            self.resp_queue_mutex.lock();
+            const maybe_event = self.resp_queue.pop();
+            self.resp_queue_mutex.unlock();
+
+            if (maybe_event) |ev| {
+                var event = ev;
+                defer event.deinit(self.allocator);
+                self.handleReqRespResponse(&event) catch |err| {
+                    self.logger.warn("drainRespQueue: handleReqRespResponse failed: {any}", .{err});
+                };
+            } else break;
+        }
+
+        self.flushPendingParentFetches();
+
+        return .rearm;
     }
 
     pub fn getOnGossipCbHandler(self: *Self) !networks.OnGossipCbHandler {

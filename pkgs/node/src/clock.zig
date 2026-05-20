@@ -36,6 +36,7 @@ pub const Clock = struct {
     allocator: Allocator,
 
     timer: xev.Timer,
+    tick_completion: xev.Completion = .{},
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
@@ -123,41 +124,45 @@ pub const Clock = struct {
             self.current_interval += 1;
         }
 
+        for (0..self.on_interval_cbs.items.len) |i| {
+            const cbWrapper = self.on_interval_cbs.items[i];
+            cbWrapper.interval = self.current_interval;
+            cbWrapper.onInterval() catch |err| {
+                self.logger.err("failed to call onInterval subscriber: {any}", .{err});
+            };
+        }
+
+        self.scheduleNextTick(time_now_ms);
+    }
+
+    fn scheduleNextTick(self: *Self, time_now_ms: isize) void {
         const next_interval_time_ms: isize = self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS;
         const time_to_next_interval_ms: usize = @intCast(next_interval_time_ms - time_now_ms);
 
-        for (0..self.on_interval_cbs.items.len) |i| {
-            const cbWrapper = self.on_interval_cbs.items[i];
-            cbWrapper.interval = self.current_interval + 1;
-
-            self.timer.run(
-                self.events.loop,
-                &cbWrapper.c,
-                time_to_next_interval_ms,
-                OnIntervalCbWrapper,
-                cbWrapper,
-                (struct {
-                    fn callback(
-                        ud: ?*OnIntervalCbWrapper,
-                        _: *xev.Loop,
-                        _: *xev.Completion,
-                        r: xev.Timer.RunError!void,
-                    ) xev.CallbackAction {
-                        r catch |err| {
-                            // Canceled is expected when tickInterval re-arms a still-pending
-                            // completion (the old fire arrives with Canceled).  Swallow it
-                            // silently; the new timer is already scheduled.
-                            if (err != error.Canceled) std.debug.panic("unexpected xev timer error: {}", .{err});
-                            return .disarm;
-                        };
-                        if (ud) |cb_wrapper| {
-                            _ = cb_wrapper.onInterval() catch void;
-                        }
+        self.timer.run(
+            self.events.loop,
+            &self.tick_completion,
+            time_to_next_interval_ms,
+            Self,
+            self,
+            (struct {
+                fn callback(
+                    ud: ?*Self,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    r: xev.Timer.RunError!void,
+                ) xev.CallbackAction {
+                    r catch |err| {
+                        if (err != error.Canceled) std.debug.panic("unexpected xev timer error: {}", .{err});
                         return .disarm;
+                    };
+                    if (ud) |clock| {
+                        clock.tickInterval();
                     }
-                }).callback,
-            );
-        }
+                    return .disarm;
+                }
+            }).callback,
+        );
     }
 
     pub fn run(self: *Self) !void {

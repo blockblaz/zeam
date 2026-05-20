@@ -350,6 +350,10 @@ pub const BeamChain = struct {
     // during `processPendingBlocks` (drain path) so the queue self-cleans.
     pending_blocks: std.ArrayList(PendingBlockEntry),
 
+    /// Cached req/resp status snapshot, updated when head/finalization move.
+    cached_status_mutex: zeam_utils.SyncMutex = .{},
+    cached_status: types.Status,
+
     // Per-resource locks (slice a-2 of #803). See
     // `docs/threading_refactor_slice_a.md` for the lock-hierarchy contract:
     //   tier 3: states_lock
@@ -557,6 +561,12 @@ pub const BeamChain = struct {
             .public_key_cache = try xmss.PublicKeyCache.init(allocator, @intCast(opts.config.genesis.numValidators())),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .thread_pool = opts.thread_pool,
+            .cached_status = .{
+                .finalized_root = fork_choice.fcStore.latest_finalized.root,
+                .finalized_slot = fork_choice.fcStore.latest_finalized.slot,
+                .head_root = fork_choice.head.blockRoot,
+                .head_slot = fork_choice.head.slot,
+            },
             // pending_blocks is the future-slot queue (issue #788). It's an
             // unmanaged ArrayList, so default-init to `.empty`; the lock
             // below guards mutation. Required field — without it the
@@ -2363,6 +2373,12 @@ pub const BeamChain = struct {
         // Only forkchoice tick failure means the chain clock did not advance.
         try self.forkChoice.onInterval(time_intervals, has_proposal);
 
+        {
+            const head = self.forkChoice.getHead();
+            const finalized = self.forkChoice.getLatestFinalized();
+            self.updateCachedStatus(head, finalized);
+        }
+
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
@@ -3595,6 +3611,8 @@ pub const BeamChain = struct {
         const latest_justified = self.forkChoice.getLatestJustified();
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
+        self.updateCachedStatus(new_head, latest_finalized);
+
         // 8. Asap emit justification/finalization events based on forkchoice store.
         //    `events_lock` (tier 5c) covers the read-modify-write of
         //    `last_emitted_justified`, `last_emitted_finalized`, and (later)
@@ -4401,10 +4419,15 @@ pub const BeamChain = struct {
     }
 
     pub fn getStatus(self: *Self) types.Status {
-        const finalized = self.forkChoice.getLatestFinalized();
-        const head = self.forkChoice.getHead();
+        self.cached_status_mutex.lock();
+        defer self.cached_status_mutex.unlock();
+        return self.cached_status;
+    }
 
-        return .{
+    fn updateCachedStatus(self: *Self, head: types.ProtoBlock, finalized: types.Checkpoint) void {
+        self.cached_status_mutex.lock();
+        defer self.cached_status_mutex.unlock();
+        self.cached_status = .{
             .finalized_root = finalized.root,
             .finalized_slot = finalized.slot,
             .head_root = head.blockRoot,

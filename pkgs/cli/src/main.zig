@@ -673,6 +673,7 @@ fn mainInner(init: std.process.Init) !void {
                 .node_registry = registry_1,
                 .is_aggregator = beamcmd.@"is-aggregator",
                 .thread_pool = thread_pool,
+                .loop = loop,
             });
 
             if (api_server_handle) |handle| {
@@ -694,6 +695,7 @@ fn mainInner(init: std.process.Init) !void {
                 .node_registry = registry_2,
                 .is_aggregator = false,
                 .thread_pool = thread_pool,
+                .loop = loop,
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -713,6 +715,7 @@ fn mainInner(init: std.process.Init) !void {
                 .node_registry = registry_3,
                 .is_aggregator = false,
                 .thread_pool = thread_pool,
+                .loop = loop,
             });
 
             // Delayed runner - starts both network3 and node3 together
@@ -730,7 +733,7 @@ fn mainInner(init: std.process.Init) !void {
                     if (self.started) return;
 
                     // Wait until finalization has advanced beyond genesis on the reference node
-                    const finalized_slot = self.reference_node.chain.forkChoice.fcStore.latest_finalized.slot;
+                    const finalized_slot = self.reference_node.chain.forkChoice.getLatestFinalized().slot;
                     if (finalized_slot == 0) return;
 
                     std.debug.print("\n=== STARTING NODE 3 (delayed sync node) at interval {d} ===\n", .{interval});
