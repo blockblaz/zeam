@@ -20,6 +20,17 @@
 - "Read first" steps are real actions (the executor must see current code before editing a large existing file); they are not placeholders.
 - Zig has no per-function test runner like pytest; tests are `test "name" {}` blocks compiled into the package test binary. "Run it to verify it fails" means the test binary fails to compile or the assertion fails.
 
+**Commit & pre-commit convention (overrides every inline `git commit` example below — per AGENTS.md, codex P3):**
+- The inline commit examples use shorthand like `feat(...)`. IGNORE that prefix style. AGENTS.md requires `<package(s)>: description` (lowercase, comma-separated packages, no `feat`/`chore`). E.g. `xmss, multisig-glue: Type-1/Type-2 FFI surface`, `node: deconstruct block Type-2 into proof pool`.
+- Before EVERY commit, run the full AGENTS.md pre-commit checklist and ensure it passes:
+  - `cargo fmt --manifest-path rust/Cargo.toml --all -- --check`
+  - `cargo clippy --manifest-path rust/Cargo.toml --workspace -- -D warnings`
+  - `zig fmt --check .`
+  - `ASDF_ZIG_VERSION=0.16.0 zig build test --summary all`
+  - `ASDF_ZIG_VERSION=0.16.0 zig build simtest --summary all`
+- Do not commit if any check fails. Fix first. (The per-task "run the test" steps are the fast inner loop; the full checklist is the commit gate.)
+- Keep changes minimal and focused per AGENTS.md — no unrelated refactors bundled in.
+
 ---
 
 ## Phase 0 — Gating investigation (blocks build graph)
@@ -76,7 +87,13 @@ backend          = { git = "https://github.com/anshalshukla/leanMultisig.git", r
 rayon = "1"
 ```
 
-If Task 0 chose (B1), add `[features] test-config = ["rec_aggregation/test-config", "leansig_wrapper/test-config"]`.
+**If Task 0 chose (B1) — dual-build (codex P2):** a cargo feature alone builds only ONE variant; B1 needs BOTH prod and test bytecode in the final binary. That requires more than a feature line:
+- Add `[features] test-config = ["rec_aggregation/test-config", "leansig_wrapper/test-config"]` to `multisig-glue/Cargo.toml`.
+- Build `multisig-glue` TWICE in `build.zig` (one default, one with `--features test-config`), producing two distinct staticlibs/object sets.
+- Namespace the test build's exported symbols (`xmss_aggregate_type_1_test`, `xmss_verify_type_2_test`, …) so they don't collide with the prod symbols — either via a cfg-gated `#[no_mangle]` name in `lib.rs` (`#[cfg_attr(feature="test-config", export_name="..._test")]`) or a separate wrapper crate.
+- Wire BOTH symbol sets through `rust/zeam-glue` and link both in `build.zig:44-79`.
+- Zig side (Task 3) dispatches by `leanEnv` to prod vs `_test` symbols, mirroring `hashsig.zig` `verifySsz`/`verifySszTest`.
+If Task 0 chose (B2) lib-level dual-export: skip the double build; expose both schemes from one build. If (A-fallback): no test-scheme symbols at all; the `verify_signatures_runner` skip stays (Task 13).
 
 - [ ] **Step 2: Verify the new API surface resolves**
 
@@ -458,7 +475,7 @@ test "SignedBlock { block, proof } SSZ round-trips" { ... }
 
 - [ ] **Step 3: Apply the surgery**
 
-`SignedBlock { block: BeamBlock, proof: aggregation.ByteList512KiB }` with updated `deinit/toJson` (proof as hex). Delete `BlockSignatures`, `AttestationSignatures`, `createBlockSignatures`. Update `AttestationSignatures` const at `block.zig:20`. Rename `AggregatedAttestationsResult.attestation_signatures` field to `attestation_type1s: std.ArrayList(TypeOneMultiSignature)` — use this name everywhere (Tasks 7/8 depend on it; do NOT introduce a separate `BlockProductionProofs` type). Migrate `AggregateInnerMap` (block.zig:140) to produce a `TypeOneMultiSignature` via `aggregateType1`.
+`SignedBlock { block: BeamBlock, proof: aggregation.ByteList512KiB }` with updated `deinit/toJson` (proof as hex). DELETE `BlockSignatures`, `AttestationSignatures` (the `ssz.utils.List(...)` const at `block.zig:20`), and `createBlockSignatures` — do NOT "update" the `AttestationSignatures` const, remove it entirely (the deletion sweep in Task 15 expects zero references; codex P2). Rename `AggregatedAttestationsResult.attestation_signatures` field to `attestation_type1s: std.ArrayList(TypeOneMultiSignature)` — use this name everywhere (Tasks 7/8 depend on it; do NOT introduce a separate `BlockProductionProofs` type). Migrate `AggregateInnerMap` (block.zig:140) to produce a `TypeOneMultiSignature` via `aggregateType1`.
 
 - [ ] **Step 4: Run, expect pass. Commit.**
 
@@ -513,15 +530,17 @@ test "verifySignatures rejects duplicate AttestationData in body" {
 
 - [ ] **Step 3: Rewrite `verifySignatures`** per design §5.1
 
-Add `assertUniqueAndCappedAttestationData` (unique + ≤ `MAX_ATTESTATIONS_DATA`). Build `pks_per_message` (N atts in body order + proposer last) and `messages` (att-data-root,slot then block-root,block.slot). Call `xmss.verifyType2`. Use the `pubkey_cache` for pubkey resolution. Delete the per-attestation loop and the participant cross-check. Delete `verifySignaturesParallel`, `AggregatedPayloadVerifyBatch` task prep. Rename metrics to `lean_pq_sig_block_proof_*`.
+Add `assertUniqueAndCappedAttestationData` (unique + ≤ `MAX_ATTESTATIONS_DATA`). **Add explicit `aggregation_bits` validation (codex P2 — Type-2 has no `participants` field, so the bits are the SOLE binding to pubkeys; the old per-attestation participant cross-check is gone):** for each attestation reject if bits are empty, any set index ≥ `len(validators)` (out-of-range), or the bitlist length is invalid. Do these cheap checks BEFORE calling the prover. Build `pks_per_message` (N atts in body order + proposer last, canonical order §2.x) and `messages` (att-data-root,slot then block-root,block.slot). Call `xmss.verifyType2`. Use the `pubkey_cache` for pubkey resolution. Delete the per-attestation loop and the participant cross-check. Delete `verifySignaturesParallel`, `AggregatedPayloadVerifyBatch` task prep. Rename metrics to `lean_pq_sig_block_proof_*`.
 
-- [ ] **Step 4: Add the order + cap tests**
+- [ ] **Step 4: Add the order + cap + bitlist tests**
 
 ```zig
 test "verifySignatures rejects > MAX_ATTESTATIONS_DATA distinct entries" { ... }
 test "verifySignatures rejects swapped proposer/attestation order" {
     // build Type-2 with proposer NOT last; EXPECT verify failure
 }
+test "verifySignatures rejects empty aggregation_bits" { ... }
+test "verifySignatures rejects out-of-range validator bit" { ... }
 test "verifySignatures happy path verifies a well-formed block" { ... }
 ```
 
@@ -535,7 +554,7 @@ git commit -m "feat(stf): single Type-2 verify_signatures with structural checks
 ### Task 8: Block production — produceBlock + validator_client signing
 
 **Files:**
-- Modify: `pkgs/node/src/chain.zig` (`ProducedBlock`, `produceBlock`, new `borrowStateForSigning`, `mergeBlockProof`)
+- Modify: `pkgs/node/src/chain.zig` (`ProducedBlock`, `produceBlock`, new `resolveSigningPubkeys`, `mergeBlockProof`)
 - Modify: `pkgs/node/src/forkchoice.zig` (`getProposalAttestations` return field rename)
 - Modify: `pkgs/node/src/validator_client.zig` (`_sign_block` equivalent)
 - Modify: `pkgs/key-manager/src/lib.zig` (none — `signBlockRoot` returns `SIGBYTES`; lift at callsite)
@@ -556,13 +575,13 @@ test "validator_client produced block carries a verifiable Type-2 proof" {
 
 `ProducedBlock { block, blockRoot, attestation_type1s: std.ArrayList(TypeOneMultiSignature) }`. Rename `getProposalAttestations` result field to `attestation_type1s` (forkchoice.zig:1330,3637 and the `.signatures` reads at 1269/2070/2201 — read those first, they may be unrelated SignaturesMap uses; only the block-production result rename applies). Update `produceBlock`'s body (chain.zig:2516-2560) to carry the renamed list, no proposer/merge here.
 
-- [ ] **Step 4: Add `borrowStateForSigning` + `mergeBlockProof` to chain**
+- [ ] **Step 4: Add `resolveSigningPubkeys` + `mergeBlockProof` to chain**
 
-`borrowStateForSigning(root) !StateBorrow` (RAII over `states_lock.shared`, mirror `statesGet`). `mergeBlockProof(parts, pks_per_part) !ByteList512KiB` — dispatches `xmss.mergeType1ToType2` on the chain worker (mirror `submitGossipAttestation` dispatch). Read the chain-worker dispatch pattern first.
+`resolveSigningPubkeys(root) ![]OwnedPubkeyBytes` — takes `states_lock.shared`, COPIES OUT the small pubkey-byte arrays needed (proposer proposal pubkey + each attestation's participant attestation pubkeys, in canonical Type-2 order §2.x), RELEASES the lock, returns owned bytes. Do NOT return a live `*BeamState` borrow held across the merge — mirror `produceBlock`'s `cloneAndRelease` snapshot-then-release (chain.zig:2468-2486). Holding `states_lock` across the prover would stall block import on `states_lock.exclusive` (the #863 stall). `mergeBlockProof(parts, pks_per_part) !ByteList512KiB` — dispatches `xmss.mergeType1ToType2` on the chain worker (mirror `submitGossipAttestation` dispatch), lock-free. Read the chain-worker dispatch pattern first.
 
 - [ ] **Step 5: Rewrite validator_client block path** per design §4.2
 
-Replace the `SignedBlock{ .signature = ... }` literal (validator_client.zig:151-157) with: lift `signBlockRoot` bytes via `xmss.Signature.fromBytes`; build proposer singleton Type-1 (`participants` = only proposer index); build `pks_per_part` (`buildPubkeysPerPart`); `chain.mergeBlockProof([*attestation_type1s, proposer_type1], pks_per_part)`; `SignedBlock{ .block, .proof }`. Proposer entry LAST.
+Replace the `SignedBlock{ .signature = ... }` literal (validator_client.zig:151-157) with: lift `signBlockRoot` bytes via `xmss.Signature.fromBytes`; build proposer singleton Type-1 (`participants` = only proposer index); get owned pubkey bytes via `chain.resolveSigningPubkeys(blockRoot)`; build `pks_per_part` (`buildPubkeysPerPart`, canonical order §2.x — attestations in body order, proposer LAST); `chain.mergeBlockProof([*attestation_type1s, proposer_type1], pks_per_part)`; `SignedBlock{ .block, .proof }`. Proposer entry LAST.
 
 - [ ] **Step 6: Run test, expect pass. Commit.**
 
@@ -571,38 +590,45 @@ git add pkgs/node/src/chain.zig pkgs/node/src/forkchoice.zig pkgs/node/src/valid
 git commit -m "feat(node): produce blocks with merged Type-2 proof"
 ```
 
-### Task 9: chain.onBlock — stamp empty keys, drop eager proof writes
+### Task 9: chain.onBlock — keep eager tracker weight, drop the proof-write loop
+
+**CORRECTED after codex review.** zeam fork-choice weight comes from `AttestationTracker`
+(`self.attestations`), fed by `onAttestationUnlocked(att, is_from_block=true)` — NOT from the
+payload maps. So block votes get weight EAGERLY at import (unchanged from devnet4). There is no
+deferral and no empty-key stamping. The only thing that changes here: the old
+`storeAggregatedPayload(is_from_block=true)` loop (which consumed per-attestation proofs that no
+longer exist on the block) is removed; proof recovery moves to deconstruction (Task 12).
 
 **Files:**
-- Modify: `pkgs/node/src/chain.zig` (onBlock; verify call site 3273-3277)
-- Modify: `pkgs/node/src/forkchoice.zig` (new `stampKnownAttestationDataKey`; delete `storeAggregatedPayload(is_from_block=true)` path)
+- Modify: `pkgs/node/src/chain.zig` (onBlock; verify call site 3273-3277; the post-STF attestation loop ~3450-3470)
+- Modify: `pkgs/node/src/forkchoice.zig` (delete the `is_from_block=true` branch of `storeAggregatedPayload`; KEEP `onAttestationUnlocked`)
 - Test: `pkgs/node/src/chain.zig` in-file
 
-- [ ] **Step 1: Failing test — onBlock stamps empty keys, no eager proof**
+- [ ] **Step 1: Failing test — block votes get tracker weight at import**
 
 ```zig
-test "onBlock stamps AttestationData keys with empty proof sets" {
-    // import a block with body attestations; assert latest_known has the
-    // data keys present but with empty proof lists (proofs arrive via
-    // deconstruction, Task 11).
+test "onBlock applies block-attestation weight to the tracker at import" {
+    // import a block with body attestations whose votes were NOT seen via gossip;
+    // assert the participating validators' AttestationTracker.latestKnown is updated
+    // immediately (head weight reflects the block votes without waiting for a tick).
 }
 ```
 
-- [ ] **Step 2: Run, expect failure.**
+- [ ] **Step 2: Run, expect failure** (block built with `.signature`; old proof loop present).
 
 - [ ] **Step 3: Collapse the verify call site**
 
 chain.zig:3273-3277 → `try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);`. Remove the `if (self.thread_pool)` parallel branch for verify only.
 
-- [ ] **Step 4: Replace the post-STF attestation-proof loop**
+- [ ] **Step 4: Keep the eager tracker update; remove only the proof-write loop**
 
-Add `forkChoice.stampKnownAttestationDataKey(&data)` (ensures key exists in `latest_known_aggregated_payloads` with empty list). Replace the old `storeAggregatedPayload(..., is_from_block=true)` loop with the stamping loop. Delete the `is_from_block=true` code path in `storeAggregatedPayload`. Update the `chain.zig:3337` `proof_data` comment to `proof`.
+Read chain.zig:3440-3475 first. The per-validator `forkChoice.onAttestation(att_for_validator, is_from_block=true)` calls (subsystem A — fork-choice weight) STAY exactly as they are; they use the trusted `aggregation_bits`, need no proof. KEEP the existing log-and-continue on `InvalidAttestation`/unknown-head there (documented exception — an unknown head during sync is not a malformed block; see design §5 hard-error policy). REMOVE only the `storeAggregatedPayload(..., is_from_block=true)` calls (subsystem B — they required per-attestation proofs that no longer exist). Do NOT add empty-key stamping. Delete the `is_from_block=true` branch in `forkchoice.zig:storeAggregatedPayload`. Update the `chain.zig:3337` `proof_data` comment to `proof`. (Proof recovery is wired in Task 12.)
 
 - [ ] **Step 5: Run test, expect pass. Commit.**
 
 ```bash
 git add pkgs/node/src/chain.zig pkgs/node/src/forkchoice.zig
-git commit -m "feat(node): onBlock stamps empty AttestationData keys (deferred weight)"
+git commit -m "node, forkchoice: keep eager block-vote tracker weight; drop per-attestation proof writes"
 ```
 
 ---
@@ -655,11 +681,11 @@ test "deconstruct: mixed golden — covered + unseen + below-justified in one bl
 
 - [ ] **Step 3: Implement the active path** per §6.3
 
-`splitType2ByMessage` → restore participants from att bits → if local partials: `aggregateType1(component + partials)` else use as-is → mutate `latest_new_aggregated_payloads` under exclusive lock (remove superseded across all keys sharing the data_root, insert combined under the block's `data` key via `sszClone`) → append `SignedAggregatedAttestation` to result. Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
+`splitType2ByMessage` → restore participants from att bits → if local partials: `aggregateType1(component + partials)` else use as-is → mutate `latest_new_aggregated_payloads` under `signatures_mutex` (remove superseded across all keys sharing the data_root, insert combined under the block's `data` key via `sszClone`) → append `SignedAggregatedAttestation` to result. Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
 
-- [ ] **Step 4: Implement the lock dance + race handling** per §6.4
+- [ ] **Step 4: Implement the lock dance + race handling** per §6.4 (CORRECTED lock)
 
-Shared-lock snapshot of partials → release → heavy split/merge → exclusive-lock re-check → mutate; retry once on race, then `error.RaceDuringDeconstruct`.
+Use `forkChoice.signatures_mutex` (the payload-map lock), NOT the main `forkChoice.mutex` (codex P2 — that one guards the protoarray + tracker). `SyncMutex` is exclusive-only: under `signatures_mutex`, copy out the local partials snapshot → release → heavy split/merge (lock-free prover calls) → re-acquire `signatures_mutex`, re-check the snapshot still holds → mutate; retry once on race, then `error.RaceDuringDeconstruct`. Never hold the main `mutex` across the prover calls.
 
 - [ ] **Step 5: Add error-path tests**
 
@@ -682,12 +708,14 @@ git commit -m "feat(node): deconstruct split+merge+store mutation with race hand
 - Modify: `pkgs/node/src/chain.zig` (onBlock; call after STF, before updateHead)
 - Test: `pkgs/node/src/chain.zig` in-file
 
-- [ ] **Step 1: Failing test — block votes count only after next rotation**
+- [ ] **Step 1: Failing test — deconstruction recovers proofs into latest_new (not weight)**
 
 ```zig
-test "block-imported votes contribute to head only after acceptNewAttestations" {
-    // import a block carrying a vote not seen via gossip; assert head weight
-    // unchanged immediately; tick to interval 4; assert weight now applied.
+test "onBlock deconstruction recovers Type-1 proofs into latest_new_aggregated_payloads" {
+    // import a block carrying an attestation whose proof was NOT seen via gossip;
+    // assert latest_new_aggregated_payloads now holds a recovered Type-1 for that
+    // AttestationData. (Fork-choice weight is already covered by Task 9's tracker
+    // test — this test is about PROOF availability for block building, not weight.)
 }
 ```
 
@@ -695,7 +723,7 @@ test "block-imported votes contribute to head only after acceptNewAttestations" 
 
 - [ ] **Step 3: Wire it in** per §6.6
 
-After `apply_transition`, before `updateHead`: call `deconstruct.deconstructBlockIntoStore(...)` (obtain `parent_state` via `statesGet(block.parent_root)`); if `is_aggregator_enabled`, `self.node.publishProducedAggregations(recovered.aggregates.items)`. No fallback — propagate errors.
+After `apply_transition`, before `updateHead`: call `deconstruct.deconstructBlockIntoStore(...)` (obtain `parent_state` via `statesGet(block.parent_root)`); if `is_aggregator_enabled`, `self.node.publishProducedAggregations(recovered.aggregates.items)`. No fallback — propagate errors (deconstruction failure → whole-block reject, per design §5 hard-error policy).
 
 - [ ] **Step 4: Run test, expect pass. Commit.**
 
@@ -850,5 +878,5 @@ git commit -m "docs: devnet5 release notes (fresh datadir required)"
 ## Self-review notes
 
 - **Spec coverage:** every design §1-8 maps to a task (FFI→T1-3, types→T4-6, verify/import→T7-9, deconstruct→T10-12, spectest/hive/serial→T13-15, validation→T16-17, test-config gate→T0).
-- **Type consistency:** `TypeOneMultiSignature`/`TypeTwoMultiSignature`/`ByteList512KiB`/`MessageBinding`/`attestation_type1s`/`stampKnownAttestationDataKey`/`borrowStateForSigning`/`mergeBlockProof`/`deconstructBlockIntoStore`/`DeconstructResult` used consistently across tasks.
+- **Type consistency:** `TypeOneMultiSignature`/`TypeTwoMultiSignature`/`ByteList512KiB`/`MessageBinding`/`attestation_type1s`/`resolveSigningPubkeys`/`mergeBlockProof`/`deconstructBlockIntoStore`/`DeconstructResult` used consistently across tasks. (Corrected after codex review: removed `stampKnownAttestationDataKey` — no empty-key stamping; renamed `borrowStateForSigning` → `resolveSigningPubkeys` — copy-out-and-release, no held borrow across the prover.)
 - **Known soft spots (flagged inline, not placeholders):** exact `rec_aggregation` Rust signatures (arg order, Result vs panic, message-binding shape) must be confirmed against rev `f33a0775` during Task 2 — the leanMultisig-py v0.0.5 wrapper is the reference. These are real "confirm against upstream" actions, not vague TODOs.
