@@ -35,6 +35,9 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
             return true;
         }
 
+        fn subscribeGossip(_: *anyopaque, _: []networks.GossipTopic, _: networks.OnGossipCbHandler) anyerror!void {}
+        fn onGossip(_: *anyopaque, _: *networks.GossipMessage, _: []const u8) anyerror!void {}
+
         fn sendRequest(
             ptr: *anyopaque,
             peer_id: []const u8,
@@ -61,7 +64,12 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
     defer ctx.deinit();
 
     var network = try Network.init(allocator, .{
-        .gossip = .{ .ptr = &ctx, .publishFn = Ctx.publish },
+        .gossip = .{
+            .ptr = &ctx,
+            .publishFn = Ctx.publish,
+            .subscribeFn = Ctx.subscribeGossip,
+            .onGossipFn = Ctx.onGossip,
+        },
         .reqresp = .{
             .ptr = &ctx,
             .sendRequestFn = Ctx.sendRequest,
