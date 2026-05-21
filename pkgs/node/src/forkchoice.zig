@@ -1291,7 +1291,7 @@ pub const ForkChoice = struct {
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
             zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
-            observeProposalBuildPhase("compact_ffi", compact_start_ns);
+            observeProposalBuildPhase("compact", compact_start_ns);
 
             const stf_start_ns = zeam_utils.monotonicTimestampNs();
 
