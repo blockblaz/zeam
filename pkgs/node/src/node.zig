@@ -58,6 +58,10 @@ const NodeOpts = struct {
     /// `--chain-worker` (bool); `--chain-worker false` is the
     /// kill-switch for the legacy synchronous path.
     chain_worker_enabled: bool = true,
+    /// CLI knob (`--min-aggregation-inputs`) for the per-att_data
+    /// aggregation threshold; see
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 };
 
 pub const BeamNode = struct {
@@ -137,6 +141,7 @@ pub const BeamNode = struct {
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
                 .thread_pool = opts.thread_pool,
+                .min_aggregation_inputs = opts.min_aggregation_inputs,
             },
             network.connected_peers,
         ) catch |init_err| {

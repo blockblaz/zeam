@@ -65,6 +65,11 @@ pub const ChainOpts = struct {
     is_aggregator: bool = false,
     // Shared worker pool for CPU-bound work (signature verification).
     thread_pool: *ThreadPool,
+    /// Surfaces the `--min-aggregation-inputs` CLI flag to the
+    /// per-`ForkChoice` aggregation threshold. See
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs` for the
+    /// default and `isTrivialAggregationInput` for the predicate semantics.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -501,6 +506,7 @@ pub const BeamChain = struct {
             .anchorState = opts.anchorState,
             .logger = logger_config.logger(.forkchoice),
             .thread_pool = opts.thread_pool,
+            .min_aggregation_inputs = opts.min_aggregation_inputs,
         });
 
         var states = std.AutoHashMap(types.Root, *RcBeamState).init(allocator);
