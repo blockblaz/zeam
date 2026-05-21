@@ -479,7 +479,14 @@ pub const AggregatedAttestationsResult = struct {
     ///         optionally restricted to the supplied attestation slots.
     /// Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
     /// Step 3: Collect individual gossip signatures not covered by children
-    /// Step 4: Recursive aggregate — combine selected children + remaining gossip sigs
+    /// Step 4: Skip recursion entirely on trivially-shaped inputs:
+    ///         - `0 gossip + 1 child` clones the lone child as the result.
+    ///         - `1 gossip + 0 children` skips this att_data (the raw sig is
+    ///           already on the gossip topic; a 1-validator "aggregate"
+    ///           produces no consensus value over what peers already see,
+    ///           and the recursive STARK prover is constant-cost regardless
+    ///           of input size — see issue #907 finding 4).
+    /// Step 5: Recursive aggregate — combine selected children + remaining gossip sigs.
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
@@ -612,6 +619,20 @@ pub const AggregatedAttestationsResult = struct {
             const has_children = selected_children.items.len > 0;
 
             if (!has_gossip and !has_children) continue;
+
+            // Fast path: 1 gossip sig + 0 children is trivial — there is
+            // nothing to aggregate. The lone gossip sig is already on the
+            // attestation_signatures gossip topic, so peers can fold it into
+            // their own aggregations directly. Building a recursive STARK
+            // proof for a single signature would cost the full prover budget
+            // (constant-cost in input size) and produce a 1-validator
+            // "aggregate" that cannot move any quorum. Leave the sig in
+            // `signatures_map` so a future aggregation pass — once a peer
+            // payload arrives or another local sig is added — can fold it
+            // in as a non-trivial input. See issue #907 finding 4.
+            if (isTrivialAggregationInput(selected_children.items.len, sigmap_sigs.items.len)) {
+                continue;
+            }
 
             // Build gossip participants bitfield and handle arrays
             var xmss_participants: ?attestation.AggregationBits = null;
@@ -748,6 +769,35 @@ pub const AggregatedAttestationsResult = struct {
         self.attestation_signatures.deinit();
     }
 };
+
+/// Returns true when an `(att_data, num_children, num_gossip_sigs)` shape
+/// is trivially-equivalent to the raw gossip sig already on the network:
+/// exactly one gossip sig and zero child payloads. In that case the
+/// aggregator should NOT invoke the recursive STARK prover — see issue #907
+/// finding 4. Extracted from `computeAggregatedSignatures` so the predicate
+/// is unit-testable independently of XMSS key/sig setup.
+fn isTrivialAggregationInput(num_children: usize, num_gossip_sigs: usize) bool {
+    return num_children == 0 and num_gossip_sigs == 1;
+}
+
+test "isTrivialAggregationInput: 1 gossip + 0 children is trivial" {
+    try std.testing.expect(isTrivialAggregationInput(0, 1));
+}
+
+test "isTrivialAggregationInput: 2+ gossip sigs are not trivial" {
+    try std.testing.expect(!isTrivialAggregationInput(0, 2));
+    try std.testing.expect(!isTrivialAggregationInput(0, 8));
+}
+
+test "isTrivialAggregationInput: any child makes it non-trivial" {
+    try std.testing.expect(!isTrivialAggregationInput(1, 1));
+    try std.testing.expect(!isTrivialAggregationInput(2, 1));
+    try std.testing.expect(!isTrivialAggregationInput(1, 0));
+}
+
+test "isTrivialAggregationInput: empty input is not flagged trivial (handled by earlier branch)" {
+    try std.testing.expect(!isTrivialAggregationInput(0, 0));
+}
 
 /// Greedy proof selection: pick proofs from `payloads_map` for `att_data` that cover
 /// the most uncovered validators. Appends selected proofs to `selected` and marks

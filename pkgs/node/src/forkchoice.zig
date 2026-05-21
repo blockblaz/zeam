@@ -2982,17 +2982,25 @@ test "aggregate prunes attestation signatures" {
             .slot = 0,
         },
     };
-    const attestation = types.Attestation{
-        .validator_id = 0,
-        .data = attestation_data,
-    };
-    const signature = try key_manager.signAttestation(&attestation, allocator);
-
-    try fork_choice.onSignedAttestation(.{
-        .validator_id = 0,
-        .message = attestation_data,
-        .signature = signature,
-    });
+    // Two signatures from distinct validators on the same AttestationData.
+    // A single sig with no peer payloads now hits the trivial-input fast
+    // path in `computeAggregatedSignatures` (issue #907 finding 4 — see
+    // `pkgs/types/src/block.zig isTrivialAggregationInput`) and is left in
+    // `attestation_signatures` for a future non-trivial pass. Two sigs is
+    // the minimum non-trivial shape that exercises the aggregation +
+    // pruning path this test is asserting.
+    inline for ([_]u32{ 0, 1 }) |validator_id| {
+        const attestation = types.Attestation{
+            .validator_id = validator_id,
+            .data = attestation_data,
+        };
+        const signature = try key_manager.signAttestation(&attestation, allocator);
+        try fork_choice.onSignedAttestation(.{
+            .validator_id = validator_id,
+            .message = attestation_data,
+            .signature = signature,
+        });
+    }
 
     const aggregations = try fork_choice.aggregate(&mock_chain.genesis_state);
     defer {
@@ -3072,22 +3080,28 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
     });
     defer fork_choice.deinit();
 
-    // Seed one signature so `aggregate` has work to do (otherwise an
-    // empty-input return path could pass without ever touching the
-    // mutex even before the fix).
+    // Seed two signatures so `aggregate` has work to do (otherwise an
+    // empty-input or trivial-input return path could pass without ever
+    // touching the mutex even before the fix). Two distinct validators
+    // is the minimum non-trivial shape after the issue #907 finding 4
+    // fast path was added — a single sig with no peer payloads is now
+    // skipped, so it would not exercise the FFI-bearing path this
+    // mutex-contract test is guarding.
     const attestation_data = types.AttestationData{
         .slot = 0,
         .head = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
         .target = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
         .source = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
     };
-    const attestation = types.Attestation{ .validator_id = 0, .data = attestation_data };
-    const signature = try key_manager.signAttestation(&attestation, allocator);
-    try fork_choice.onSignedAttestation(.{
-        .validator_id = 0,
-        .message = attestation_data,
-        .signature = signature,
-    });
+    inline for ([_]u32{ 0, 1 }) |validator_id| {
+        const attestation = types.Attestation{ .validator_id = validator_id, .data = attestation_data };
+        const signature = try key_manager.signAttestation(&attestation, allocator);
+        try fork_choice.onSignedAttestation(.{
+            .validator_id = validator_id,
+            .message = attestation_data,
+            .signature = signature,
+        });
+    }
 
     // Hold the forkchoice main mutex exclusive on the test thread for
     // the entire aggregator-thread lifetime. If `aggregate` (still)
