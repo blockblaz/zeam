@@ -19,6 +19,85 @@ pub const PeerInfo = struct {
     blocks_by_range_unavailable: bool = false,
 };
 
+test "Network: preferred blocks_by_root peer is a hint with fallback" {
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        allocator: Allocator,
+        last_peer: ?[]u8 = null,
+        next_request_id: u64 = 1,
+
+        fn deinit(self: *@This()) void {
+            if (self.last_peer) |peer| self.allocator.free(peer);
+        }
+
+        fn publish(_: *anyopaque, _: *const networks.GossipMessage) anyerror!bool {
+            return true;
+        }
+
+        fn sendRequest(
+            ptr: *anyopaque,
+            peer_id: []const u8,
+            _: *const networks.ReqRespRequest,
+            _: ?networks.OnReqRespResponseCbHandler,
+        ) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.last_peer) |old| self.last_peer = blk: {
+                self.allocator.free(old);
+                break :blk null;
+            };
+            self.last_peer = try self.allocator.dupe(u8, peer_id);
+            const id = self.next_request_id;
+            self.next_request_id += 1;
+            return id;
+        }
+
+        fn onReqRespRequest(_: *anyopaque, _: *networks.ReqRespRequest, _: networks.ReqRespServerStream) anyerror!void {}
+        fn subscribeReqResp(_: *anyopaque, _: networks.OnReqRespRequestCbHandler) anyerror!void {}
+        fn subscribePeers(_: *anyopaque, _: networks.OnPeerEventCbHandler) anyerror!void {}
+    };
+
+    var ctx = Ctx{ .allocator = allocator };
+    defer ctx.deinit();
+
+    var network = try Network.init(allocator, .{
+        .gossip = .{ .ptr = &ctx, .publishFn = Ctx.publish },
+        .reqresp = .{
+            .ptr = &ctx,
+            .sendRequestFn = Ctx.sendRequest,
+            .onReqRespRequestFn = Ctx.onReqRespRequest,
+            .subscribeFn = Ctx.subscribeReqResp,
+        },
+        .peers = .{ .ptr = &ctx, .subscribeFn = Ctx.subscribePeers },
+    });
+    defer network.deinit();
+
+    try network.connectPeer("serving-peer");
+    try network.connectPeer("fallback-peer");
+
+    const root_a: types.Root = [_]u8{0xaa} ** 32;
+    const handler: networks.OnReqRespResponseCbHandler = .{
+        .ptr = &ctx,
+        .onReqRespResponseCb = struct {
+            fn cb(_: *anyopaque, _: *const networks.ReqRespResponseEvent) anyerror!void {}
+        }.cb,
+    };
+
+    var pinned = (try network.ensureBlocksByRootRequestToPeer(&[_]types.Root{root_a}, 0, handler, "serving-peer")).?;
+    defer pinned.deinit(allocator);
+    try std.testing.expectEqualStrings("serving-peer", pinned.peer_id);
+    try std.testing.expectEqualStrings("serving-peer", ctx.last_peer.?);
+    network.finalizePendingRequest(pinned.request_id);
+
+    try std.testing.expect(network.disconnectPeer("serving-peer"));
+
+    const root_b: types.Root = [_]u8{0xbb} ** 32;
+    var fallback = (try network.ensureBlocksByRootRequestToPeer(&[_]types.Root{root_b}, 0, handler, "serving-peer")).?;
+    defer fallback.deinit(allocator);
+    try std.testing.expectEqualStrings("fallback-peer", fallback.peer_id);
+    try std.testing.expectEqualStrings("fallback-peer", ctx.last_peer.?);
+}
+
 pub const StatusRequestContext = struct {
     peer_id: []const u8,
 
@@ -1003,9 +1082,16 @@ pub const Network = struct {
             zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
         };
 
+        // `preferred_peer` is a routing hint, not a hard requirement. It keeps
+        // checkpoint/parent walks on the peer that just proved it can serve the
+        // chain, but if that peer disconnects before the next request, fall
+        // back to normal peer selection instead of stalling the walk.
+        // There is still an unavoidable TOCTOU window between this check and
+        // the transport dispatch below; in that case sendBlocksByRootRequest
+        // returns the backend error and the existing retry paths handle it.
         const peer = if (preferred_peer) |peer_id| blk: {
-            if (!self.hasPeer(peer_id)) return error.NoPeersAvailable;
-            break :blk try self.allocator.dupe(u8, peer_id);
+            if (self.hasPeer(peer_id)) break :blk try self.allocator.dupe(u8, peer_id);
+            break :blk (try self.selectPeer()) orelse return error.NoPeersAvailable;
         } else (try self.selectPeer()) orelse return error.NoPeersAvailable;
         var peer_owned = true;
         errdefer if (peer_owned) self.allocator.free(peer);
