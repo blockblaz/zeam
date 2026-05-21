@@ -279,6 +279,12 @@ pub const ForkChoiceParams = struct {
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
     thread_pool: ?*ThreadPool = null,
+    /// Minimum (children + gossip-sig) inputs required to invoke the
+    /// recursive STARK prover for an `AttestationData`. Threaded through
+    /// from the `--min-aggregation-inputs` CLI flag; see
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs` and
+    /// `isTrivialAggregationInput` for the predicate semantics.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 };
 
 // Use shared signature map types from types package
@@ -334,6 +340,11 @@ pub const ForkChoice = struct {
     status: ForkChoiceStatus,
     // Optional shared worker pool used for CPU-heavy attestation compaction.
     thread_pool: ?*ThreadPool = null,
+    /// Threshold passed into `computeAggregatedSignatures` on every
+    /// `aggregate*` call. See `ForkChoiceParams.min_aggregation_inputs`.
+    /// Defaulted to the post-#908 value here so test struct literals
+    /// that don't care about the threshold can omit it.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     last_node_tick_time_ms: ?i64,
 
     const Self = @This();
@@ -426,6 +437,7 @@ pub const ForkChoice = struct {
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
             .thread_pool = opts.thread_pool,
+            .min_aggregation_inputs = opts.min_aggregation_inputs,
             .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
@@ -2114,6 +2126,7 @@ pub const ForkChoice = struct {
             &snap.new_payloads,
             &snap.known_payloads,
             slot_filter,
+            self.min_aggregation_inputs,
         );
         observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 

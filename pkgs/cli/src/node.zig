@@ -110,6 +110,14 @@ pub const NodeOptions = struct {
     /// parallelism without rebuilding (#899). Surfaced as `--rayon-threads`
     /// on the `zeam node` CLI.
     rayon_threads: ?u32 = null,
+    /// Minimum (children + gossip-sig) inputs required before the
+    /// aggregator invokes the recursive STARK prover for an
+    /// `AttestationData`. Threaded through to `ForkChoice` →
+    /// `computeAggregatedSignatures`. Surfaced as
+    /// `--min-aggregation-inputs` on the `zeam node` CLI; default is
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
+    /// issue #907 finding 4.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -463,6 +471,21 @@ pub const Node = struct {
         }
         xmss.setRayonThreads(rayon_threads);
 
+        // Log the aggregator threshold on startup so operators can see
+        // exactly how `--min-aggregation-inputs` was resolved (default vs
+        // override). The threshold is enforced inside
+        // `computeAggregatedSignatures` via `ForkChoice.min_aggregation_inputs`.
+        self.logger.info(
+            "aggregator threshold: min_aggregation_inputs={d}{s}",
+            .{
+                options.min_aggregation_inputs,
+                if (options.min_aggregation_inputs != types.default_min_aggregation_inputs)
+                    " (override via --min-aggregation-inputs)"
+                else
+                    "",
+            },
+        );
+
         // Pre-warm the XMSS verifier on the main thread before any worker can
         // call `verifyAggregatedPayload`. The Rust-side verifier setup is
         // documented as idempotent but is not hardened against first-time-init
@@ -488,6 +511,7 @@ pub const Node = struct {
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
+            .min_aggregation_inputs = options.min_aggregation_inputs,
         });
         errdefer self.beam_node.deinit();
 

@@ -33,6 +33,15 @@ const json = std.json;
 
 const freeJsonValue = utils.freeJsonValue;
 
+/// Default `min_aggregation_inputs` for `computeAggregatedSignatures`.
+///
+/// Surfaced on the CLI as `--min-aggregation-inputs` (see
+/// `pkgs/cli/src/main.zig`). Default `2`: skip the no-children +
+/// single-gossip-sig case (#907 finding 4). `1` reverts to pre-#908
+/// behavior (always aggregate ≥1 sig). Higher values trade slot
+/// latency for fewer sub-threshold aggregates on chatty subnets.
+pub const default_min_aggregation_inputs: u32 = 2;
+
 // signatures_map types for aggregation
 
 /// Stored signatures_map entry: per-validator signature + slot metadata.
@@ -481,12 +490,22 @@ pub const AggregatedAttestationsResult = struct {
     /// Step 3: Collect individual gossip signatures not covered by children
     /// Step 4: Skip recursion entirely on trivially-shaped inputs:
     ///         - `0 gossip + 1 child` clones the lone child as the result.
-    ///         - `1 gossip + 0 children` skips this att_data (the raw sig is
-    ///           already on the gossip topic; a 1-validator "aggregate"
-    ///           produces no consensus value over what peers already see,
-    ///           and the recursive STARK prover is constant-cost regardless
-    ///           of input size — see issue #907 finding 4).
+    ///         - In the no-children case, fewer than `min_aggregation_inputs`
+    ///           gossip signatures is treated as trivial and skipped (the
+    ///           raw sigs are already on the gossip topic; a sub-threshold
+    ///           "aggregate" produces no consensus value over what peers
+    ///           already see, and the recursive STARK prover is
+    ///           constant-cost regardless of input size — see issue #907
+    ///           finding 4).
     /// Step 5: Recursive aggregate — combine selected children + remaining gossip sigs.
+    ///
+    /// `min_aggregation_inputs` is the operator-set threshold from
+    /// `--min-aggregation-inputs` (default `2`). It only gates the
+    /// no-children branch; once any child is selected the prover is
+    /// invoked unconditionally, and the lone-child clone fast path
+    /// (`0 sigs + 1 child`) is unaffected. Setting `1` reverts to the
+    /// pre-#908 behavior of always aggregating ≥1 sig; higher values
+    /// trade slot latency for fewer sub-threshold aggregates.
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
@@ -494,6 +513,7 @@ pub const AggregatedAttestationsResult = struct {
         new_payloads: ?*const AggregatedPayloadsMap,
         known_payloads: ?*const AggregatedPayloadsMap,
         slot_filter: ?[]const Slot,
+        min_aggregation_inputs: u32,
     ) !void {
         const allocator = self.allocator;
 
@@ -620,17 +640,21 @@ pub const AggregatedAttestationsResult = struct {
 
             if (!has_gossip and !has_children) continue;
 
-            // Fast path: 1 gossip sig + 0 children is trivial — there is
-            // nothing to aggregate. The lone gossip sig is already on the
-            // attestation_signatures gossip topic, so peers can fold it into
-            // their own aggregations directly. Building a recursive STARK
-            // proof for a single signature would cost the full prover budget
-            // (constant-cost in input size) and produce a 1-validator
-            // "aggregate" that cannot move any quorum. Leave the sig in
-            // `signatures_map` so a future aggregation pass — once a peer
-            // payload arrives or another local sig is added — can fold it
-            // in as a non-trivial input. See issue #907 finding 4.
-            if (isTrivialAggregationInput(selected_children.items.len, sigmap_sigs.items.len)) {
+            // Fast path: in the no-children case, fewer than
+            // `min_aggregation_inputs` gossip sigs is trivial — the raw
+            // sigs are already on the per-subnet attestation_signatures
+            // gossip topic, so peers can fold them into their own
+            // aggregations directly. Building a recursive STARK proof
+            // here would cost the full prover budget (constant-cost in
+            // input size) and produce a sub-threshold "aggregate" that
+            // cannot move any quorum on its own. Leave the sigs in
+            // `signatures_map` so a future aggregation pass — once a
+            // peer payload arrives or more local sigs accumulate — can
+            // fold them in as non-trivial input. The lone-child clone
+            // fast path below handles `0 sigs + 1 child` separately and
+            // is intentionally not gated by this threshold. See issue
+            // #907 finding 4.
+            if (isTrivialAggregationInput(selected_children.items.len, sigmap_sigs.items.len, min_aggregation_inputs)) {
                 continue;
             }
 
@@ -770,33 +794,54 @@ pub const AggregatedAttestationsResult = struct {
     }
 };
 
-/// Returns true when an `(att_data, num_children, num_gossip_sigs)` shape
-/// is trivially-equivalent to the raw gossip sig already on the network:
-/// exactly one gossip sig and zero child payloads. In that case the
-/// aggregator should NOT invoke the recursive STARK prover — see issue #907
-/// finding 4. Extracted from `computeAggregatedSignatures` so the predicate
-/// is unit-testable independently of XMSS key/sig setup.
-fn isTrivialAggregationInput(num_children: usize, num_gossip_sigs: usize) bool {
-    return num_children == 0 and num_gossip_sigs == 1;
+/// Returns true when the `(num_children, num_gossip_sigs)` shape is
+/// below the operator-set `min_inputs` threshold and the recursive STARK
+/// prover should be skipped for this `att_data`. See issue #907 finding 4.
+///
+/// The threshold only fires in the no-children case: once any child is
+/// selected the prover provides genuine consensus value regardless of
+/// gossip-sig count, and the lone-child clone fast path
+/// (`num_children == 1 and num_gossip_sigs == 0`) is handled separately
+/// without invoking the prover, so it must not be flagged trivial here.
+///
+/// `min_inputs == 1` reverts to pre-#908 behavior (always aggregate ≥1
+/// sig). `min_inputs == 2` (default) is post-#908: skip the lone-sig
+/// case. Higher values trade slot latency for fewer sub-threshold
+/// aggregates on chatty subnets.
+///
+/// Extracted from `computeAggregatedSignatures` so the predicate is
+/// unit-testable independently of XMSS key/sig setup.
+fn isTrivialAggregationInput(num_children: usize, num_gossip_sigs: usize, min_inputs: u32) bool {
+    if (num_children > 0) return false;
+    return num_gossip_sigs < @as(usize, min_inputs);
 }
 
-test "isTrivialAggregationInput: 1 gossip + 0 children is trivial" {
-    try std.testing.expect(isTrivialAggregationInput(0, 1));
+test "isTrivialAggregationInput default threshold (2): 1 gossip + 0 children is trivial" {
+    try std.testing.expect(isTrivialAggregationInput(0, 1, 2));
 }
 
-test "isTrivialAggregationInput: 2+ gossip sigs are not trivial" {
-    try std.testing.expect(!isTrivialAggregationInput(0, 2));
-    try std.testing.expect(!isTrivialAggregationInput(0, 8));
+test "isTrivialAggregationInput default threshold (2): 2+ gossip sigs are not trivial" {
+    try std.testing.expect(!isTrivialAggregationInput(0, 2, 2));
+    try std.testing.expect(!isTrivialAggregationInput(0, 8, 2));
 }
 
-test "isTrivialAggregationInput: any child makes it non-trivial" {
-    try std.testing.expect(!isTrivialAggregationInput(1, 1));
-    try std.testing.expect(!isTrivialAggregationInput(2, 1));
-    try std.testing.expect(!isTrivialAggregationInput(1, 0));
+test "isTrivialAggregationInput: any child makes it non-trivial regardless of threshold" {
+    try std.testing.expect(!isTrivialAggregationInput(1, 1, 2));
+    try std.testing.expect(!isTrivialAggregationInput(2, 1, 2));
+    try std.testing.expect(!isTrivialAggregationInput(1, 0, 2));
+    try std.testing.expect(!isTrivialAggregationInput(1, 0, 5));
 }
 
-test "isTrivialAggregationInput: empty input is not flagged trivial (handled by earlier branch)" {
-    try std.testing.expect(!isTrivialAggregationInput(0, 0));
+test "isTrivialAggregationInput: threshold=1 reverts to pre-#908 (only 0+0 trivial)" {
+    try std.testing.expect(isTrivialAggregationInput(0, 0, 1));
+    try std.testing.expect(!isTrivialAggregationInput(0, 1, 1));
+    try std.testing.expect(!isTrivialAggregationInput(0, 2, 1));
+}
+
+test "isTrivialAggregationInput: higher thresholds skip more no-children inputs" {
+    try std.testing.expect(isTrivialAggregationInput(0, 1, 3));
+    try std.testing.expect(isTrivialAggregationInput(0, 2, 3));
+    try std.testing.expect(!isTrivialAggregationInput(0, 3, 3));
 }
 
 /// Greedy proof selection: pick proofs from `payloads_map` for `att_data` that cover
@@ -1386,7 +1431,7 @@ test "computeAggregatedSignatures filters attestation data by slot list" {
     defer result.deinit();
 
     const allowed_slots = [_]Slot{10};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], default_min_aggregation_inputs);
 
     try std.testing.expectEqual(@as(usize, 1), result.attestations.len());
     const aggregated = try result.attestations.get(0);
@@ -1415,12 +1460,12 @@ test "computeAggregatedSignatures slot filter matches unfiltered for same-slot i
 
     var unfiltered = try AggregatedAttestationsResult.init(allocator);
     defer unfiltered.deinit();
-    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null);
+    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, default_min_aggregation_inputs);
 
     var filtered = try AggregatedAttestationsResult.init(allocator);
     defer filtered.deinit();
     const allowed_slots = [_]Slot{12};
-    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..]);
+    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..], default_min_aggregation_inputs);
 
     try std.testing.expectEqual(unfiltered.attestations.len(), filtered.attestations.len());
     try std.testing.expectEqual(unfiltered.attestation_signatures.len(), filtered.attestation_signatures.len());
@@ -1447,7 +1492,7 @@ test "computeAggregatedSignatures empty slot filter result is clean" {
     defer result.deinit();
 
     const allowed_slots = [_]Slot{14};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], default_min_aggregation_inputs);
 
     try std.testing.expectEqual(@as(usize, 0), result.attestations.len());
     try std.testing.expectEqual(@as(usize, 0), result.attestation_signatures.len());
