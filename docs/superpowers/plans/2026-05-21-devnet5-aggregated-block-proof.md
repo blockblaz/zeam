@@ -35,36 +35,18 @@
 
 ## Phase 0 — Gating investigation (blocks build graph)
 
-### Task 0: Resolve test-config aggregation build architecture
+### Task 0: test-config aggregation build path — RESOLVED (investigation done 2026-05-21)
 
-**Why first:** `rec_aggregation`'s `test-config` is a crate-level cargo feature (recompiles bytecode for the test scheme), not a lib-level dual export. Whether prod+test aggregation can coexist in one binary determines the entire build graph for Phases 1 and 7. Decision §8.1 was "consistent with spec" (run test-scheme fixtures) but it is conditioned on this being feasible.
+**Findings (recorded in design §8.1):**
+- `leansig_wrapper` selects scheme via compile-time `#[cfg(feature="test-config")]` consts (`V` 4/46, `LOG_LIFETIME` 8/32, `TARGET_SUM` 6/200) → ONE scheme per build. **B2 (lib dual-export) impossible.**
+- Production = prod scheme (`LOG_LIFETIME=32`); leanSpec fixtures = test scheme (`LOG_LIFETIME=8`). Two-scheme need is real.
+- The `spectests` binary is a separate `b.addTest` and currently does NOT link the rust glue (`addRustGlueLib` is on cli/node/unit-tests, not spectests) — that's why devnet4 skips test-scheme aggregation fixtures.
 
-**Files:**
-- Read: `rust/hashsig-glue/src/lib.rs:558-610` (how dual scheme works today)
-- Read: `rust/multisig-glue/Cargo.toml`, `rust/zeam-glue/src/lib.rs`, `build.zig:44-79`
-- Investigate (remote): `anshalshukla/leanMultisig@devnet5-patched` `leansig_wrapper` and `rec_aggregation` — does the bytecode/scheme switch on a compile-time const or a runtime parameter?
+**DECISION (pending user confirm — B3 vs A-fallback):**
+- **(B3) per-binary scheme [recommended].** `build.zig` builds the rust workspace twice: prod (no feature, existing `rust/target/release/libzeam_glue.a`) for cli/node/unit-tests, and test-config (`cargo build --features test-config`, e.g. `rust/target/test-config-release/libzeam_glue.a`) linked ONLY into the `spectests` binary via `addRustGlueLib`. Each binary links exactly one staticlib → no symbol collision (separate binaries), no feature-unification (separate cargo invocations/target dirs), no `export_name` games. Test scheme compiles faster than prod. Then drop the `verify_signatures_runner` test-scheme skip. Avoids B1's single-binary dual-link entirely.
+- **(A-fallback) minimal.** Keep skipping test-scheme aggregation fixtures (devnet4 status quo). Zig Type-1/Type-2 logic still covered by prod-scheme unit tests; lose only end-to-end conformance against leanSpec test-scheme fixture bytes.
 
-- [ ] **Step 1: Determine coexistence feasibility**
-
-Answer concretely (write findings into the design doc's §8 open-risk section):
-- Does `aggregate_type_1` / `verify_type_2` take the scheme as a runtime parameter, or is it baked at compile time via `leansig_wrapper/test-config`?
-- Can both the prod and test aggregation bytecode be linked into one binary with distinct symbols?
-
-- [ ] **Step 2: Pick the build path and record it**
-
-Decide one of:
-- **(B1)** Two `multisig-glue` builds with symbol-namespaced wrappers (`xmss_*` prod, `xmss_*_test`), both linked through `zeam-glue`.
-- **(B2)** leanMultisig dual-export confirmed → single build exposes both, mirror hashsig's `mod test_scheme`.
-- **(A-fallback)** Coexistence infeasible without major effort → keep skipping test-scheme aggregation fixtures (devnet4 status quo); update §8.1 decision and the `verify_signatures_runner` skip stays.
-
-- [ ] **Step 3: Commit the decision**
-
-```bash
-git add docs/superpowers/specs/2026-05-21-devnet5-aggregated-block-proof-design.md
-git commit -m "docs: resolve devnet5 test-config aggregation build path"
-```
-
-**Gate:** Phases 1 and 7's build-graph steps assume the path chosen here. If (A-fallback), all "test-scheme" sub-steps in Task 13 and Task 23 are skipped.
+**Gate:** if **B3**, add the second rust build to `build.zig` and wire `spectests` to the test-config glue (new sub-task in Phase 5 / Task 13). If **A-fallback**, the `verify_signatures_runner` skip stays and no build-graph change is needed. Either way, the FFI/types/import/deconstruction work (Phases 1-4) is UNAFFECTED — it all targets the prod glue.
 
 ---
 
@@ -87,13 +69,7 @@ backend          = { git = "https://github.com/anshalshukla/leanMultisig.git", r
 rayon = "1"
 ```
 
-**If Task 0 chose (B1) — dual-build (codex P2):** a cargo feature alone builds only ONE variant; B1 needs BOTH prod and test bytecode in the final binary. That requires more than a feature line:
-- Add `[features] test-config = ["rec_aggregation/test-config", "leansig_wrapper/test-config"]` to `multisig-glue/Cargo.toml`.
-- Build `multisig-glue` TWICE in `build.zig` (one default, one with `--features test-config`), producing two distinct staticlibs/object sets.
-- Namespace the test build's exported symbols (`xmss_aggregate_type_1_test`, `xmss_verify_type_2_test`, …) so they don't collide with the prod symbols — either via a cfg-gated `#[no_mangle]` name in `lib.rs` (`#[cfg_attr(feature="test-config", export_name="..._test")]`) or a separate wrapper crate.
-- Wire BOTH symbol sets through `rust/zeam-glue` and link both in `build.zig:44-79`.
-- Zig side (Task 3) dispatches by `leanEnv` to prod vs `_test` symbols, mirroring `hashsig.zig` `verifySsz`/`verifySszTest`.
-If Task 0 chose (B2) lib-level dual-export: skip the double build; expose both schemes from one build. If (A-fallback): no test-scheme symbols at all; the `verify_signatures_runner` skip stays (Task 13).
+**If Task 0 chose (B3) — per-binary scheme [recommended, resolved]:** add `[features] test-config = ["rec_aggregation/test-config", "leansig_wrapper/test-config"]` to `multisig-glue/Cargo.toml`. The SAME `#[no_mangle]` symbol names are reused (no namespacing) — the two builds go into separate target dirs and link into separate Zig binaries, so they never collide. The build-graph wiring (second `cargo build --features test-config` into its own target dir, linked only into the `spectests` binary) is done in Phase 5 / Task 13, NOT here. This Task only adds the feature declaration. If **(A-fallback)**: don't even add the feature; no test-scheme glue; the `verify_signatures_runner` skip stays (Task 13).
 
 - [ ] **Step 2: Verify the new API surface resolves**
 
@@ -771,16 +747,20 @@ cd leanSpec && git fetch origin && git checkout <devnet5-fixture-commit> && cd .
 
 - [ ] **Step 2: Rewrite verify_signatures_runner** per §7.2
 
-Parse `signedBlock.proof` → `ByteList512KiB`, then **SSZ-decode it to `TypeTwoMultiSignature` and pass the INNER `container.proof` (raw wire) to `xmss.verifyType2` (codex P2 — mirror Task 7's §2.y container decode; devnet5 fixtures are SSZ-framed, so passing the outer bytes directly makes `decompress_without_pubkeys` reject valid fixtures)**; build `pks_per_message` + `messages` (mirror Task 7); pass/fail == fixture expectation. Delete `parseAggregatedSignatureProof`, attestation-signature + proposer-signature parsing. If Task 0 = (B1/B2), dispatch test-scheme via `leanEnv` and drop the `:134` skip; if (A-fallback), keep the skip.
+Parse `signedBlock.proof` → `ByteList512KiB`, then **SSZ-decode it to `TypeTwoMultiSignature` and pass the INNER `container.proof` (raw wire) to `xmss.verifyType2` (codex P2 — mirror Task 7's §2.y container decode; devnet5 fixtures are SSZ-framed, so passing the outer bytes directly makes `decompress_without_pubkeys` reject valid fixtures)**; build `pks_per_message` + `messages` (mirror Task 7); pass/fail == fixture expectation. Delete `parseAggregatedSignatureProof`, attestation-signature + proposer-signature parsing. If Task 0 = (B3), drop the `:134` test-scheme skip; if (A-fallback), keep the skip.
 
 - [ ] **Step 3: Update ssz_runner + fork_choice_runner + networking_codec_runner** per §7.3/7.4/7.6
 
 Add `TypeTwoMultiSignature` SSZ case; update `SignedBlock` shape + 512 KiB cap; shared block parser → new envelope; container-binding swaps.
 
+- [ ] **Step 3b: (B3 only) wire the test-config glue into the spectest binary** per design §8.1
+
+If Task 0 = B3: in `build.zig`, add a second rust build of the workspace with `cargo build --features test-config` into a distinct target dir (e.g. `rust/target/test-config-release/libzeam_glue.a`), and link THAT into the `spectests` binary via a `addRustGlueLib`-style call (spectests currently links no glue). cli/node/unit-tests keep the prod glue unchanged. The `multisig-glue` `test-config` feature was declared in Task 1. Reuse the same `#[no_mangle]` symbol names (no namespacing — separate binaries). If A-fallback: skip this step entirely.
+
 - [ ] **Step 4: Regenerate + run spectest**
 
 Run: `ASDF_ZIG_VERSION=0.16.0 zig build spectest 2>&1 | tail -40`
-Expected: devnet5 verify_signatures / ssz / fork_choice / networking_codec fixtures pass (test-scheme aggregation fixtures pass if B-path, else skipped).
+Expected: devnet5 verify_signatures / ssz / fork_choice / networking_codec fixtures pass (test-scheme aggregation fixtures pass under B3, else skipped under A-fallback).
 
 - [ ] **Step 5: Commit**
 

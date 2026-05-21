@@ -411,24 +411,32 @@ Deletion sweep must reach zero: `AggregatedSignatureProof`, `proof_data`, `ByteL
 
 ### 8. Cross-cutting
 
-- **test-config (open risk):** chosen option B (run test-scheme aggregation fixtures). BUT
-  `rec_aggregation`'s `test-config` is a crate-level cargo feature (`leansig_wrapper/test-config`)
-  that recompiles the whole aggregation bytecode for the test scheme — NOT a lib-level dual
-  export like `leansig` (which lets hashsig-glue compile both `hashsig_verify_ssz` and
-  `hashsig_test_verify_ssz` in one binary). So prod + test aggregation cannot trivially coexist.
-  **Resolution needed before implementation (resolve FIRST — codex P2):**
-  - **(B1) two-build link.** Enabling the `test-config` cargo feature only produces ONE
-    `multisig-glue` variant. B1 requires building the crate TWICE (prod + `test-config`),
-    each exporting symbols namespaced (`xmss_aggregate_type_1` vs `xmss_aggregate_type_1_test`),
-    then wiring BOTH into `zeam-glue` and `build.zig` so the final binary links both bytecodes.
-    Zig dispatches by `leanEnv` to the right symbol (mirror hashsig.zig `verifySsz`/`verifySszTest`).
-    Just flipping a feature flag is insufficient and will either call the wrong scheme or fail to link.
-  - **(B2) lib-level dual-export.** Confirm whether `anshalshukla/leanMultisig@devnet5-patched`
-    exposes both schemes at the lib level (like `leansig` does for hashsig). If so, one build
-    exports both — far simpler than B1.
-  - **(A-fallback)** if neither is feasible without major effort, revert to skipping test-scheme
-    aggregation fixtures (devnet4 status quo) and keep the `verify_signatures_runner` skip.
-  This blocks the build-graph part of the plan; it is Task 0 in the implementation plan.
+- **test-config — RESOLVED (Task 0 investigation, 2026-05-21).** Findings:
+  - `leansig_wrapper` selects the scheme via compile-time `#[cfg(feature = "test-config")]`
+    constants (`V` 4/46, `LOG_LIFETIME` 8/32, `TARGET_SUM` 6/200) and derives a SINGLE
+    `XmssPublicKey`/`XmssSignature`/`LeanSigScheme` from them. So **(B2) lib-level dual-export is
+    IMPOSSIBLE** — unlike `leansig` (which exposes both schemes as distinct types, enabling
+    hashsig-glue's dual `verifySsz`/`verifySszTest`), the aggregation wrapper is one scheme per build.
+  - Production runs the prod scheme (`LOG_LIFETIME=32`); leanSpec fixtures are generated with the
+    test scheme (`LOG_LIFETIME=8`). leanSpec's `mode` param only switches `log_inv_rate`, NOT the
+    scheme dimensions — those are baked at the leanMultisig-py build. So the two-scheme need is real.
+  - The spectest runner is its OWN Zig test binary (`b.addTest`), and today it does NOT even link
+    the rust glue (`addRustGlueLib` is called on cli/node/unit-tests but NOT `spectests`) — which is
+    why devnet4 skips test-scheme aggregation fixtures.
+  - **DECISION: (B3) per-binary scheme.** Build the rust workspace twice into separate target dirs:
+    prod (no feature → existing `rust/target/release/libzeam_glue.a`, linked by cli/node/unit-tests)
+    and test-config (`--features test-config` → e.g. `rust/target/test-config-release/libzeam_glue.a`).
+    Link the test-config glue ONLY into the spectest binary. Each Zig binary links exactly one
+    staticlib → no symbol collision (separate binaries), no cargo feature-unification (separate
+    `cargo build` invocations / target dirs), no `export_name` namespacing. This is far cleaner than
+    (B1) "both in one binary". The test scheme (`LOG_LIFETIME=8`) compiles much faster than prod, so
+    the extra build cost is the smaller of the two. Then drop the `verify_signatures_runner` skip.
+  - **(A-fallback)** remains available if the user prefers minimal build change: keep skipping
+    test-scheme aggregation fixtures (devnet4 status quo). Zig-side Type-1/Type-2 logic is still
+    covered by prod-scheme unit tests; what's lost is end-to-end conformance against leanSpec's
+    test-scheme fixture bytes. **(User to confirm B3 vs A-fallback — see Task 0.)**
+  - Unit tests (`xmss_tests`, `transition_tests`) keep linking the prod glue (real scheme); the
+    test-config glue is specifically for matching leanSpec test-scheme FIXTURES in the spectest binary.
 - **Build:** dep-rev bump forces a cold Rust rebuild (CI slow first run). `LOG_INV_RATE_PROD=2`
   stays. Zig 0.16.0 (`ASDF_ZIG_VERSION=0.16.0`).
 - **Rollout:** fresh datadir; document in `RELEASE.md`; `lean-quickstart` genesis/config bump at
@@ -461,5 +469,8 @@ gate: `just check` grep-clean compile after the deletion sweep.
    `lean_block_deconstruct_seconds` in shadow-testing.
 4. **Prover throughput** — production (merge + per-att aggregate) and deconstruction
    (split + aggregate) both on the worker; shadow-test under load before declaring done.
-5. **test-config build architecture (8.1)** — must resolve prod/test aggregation coexistence
-   before the build-graph work; may force a fallback to skipping test-scheme fixtures.
+5. **test-config build architecture (8.1) — RESOLVED:** B2 (lib dual-export) impossible;
+   decision is B3 (per-binary scheme — spectest binary links a separate `--features test-config`
+   glue; cli/node/unit-tests keep the prod glue). A-fallback (skip test-scheme fixtures) remains
+   if the user prefers minimal build change. No longer blocks the build graph. (User to confirm
+   B3 vs A-fallback.)
