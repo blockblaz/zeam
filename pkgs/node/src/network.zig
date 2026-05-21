@@ -83,7 +83,7 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
         }.cb,
     };
 
-    var pinned = (try network.ensureBlocksByRootRequestToPeer(&[_]types.Root{root_a}, 0, handler, "serving-peer")).?;
+    var pinned = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_a}, 0, handler, "serving-peer")).?;
     defer pinned.deinit(allocator);
     try std.testing.expectEqualStrings("serving-peer", pinned.peer_id);
     try std.testing.expectEqualStrings("serving-peer", ctx.last_peer.?);
@@ -92,7 +92,7 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
     try std.testing.expect(network.disconnectPeer("serving-peer"));
 
     const root_b: types.Root = [_]u8{0xbb} ** 32;
-    var fallback = (try network.ensureBlocksByRootRequestToPeer(&[_]types.Root{root_b}, 0, handler, "serving-peer")).?;
+    var fallback = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_b}, 0, handler, "serving-peer")).?;
     defer fallback.deinit(allocator);
     try std.testing.expectEqualStrings("fallback-peer", fallback.peer_id);
     try std.testing.expectEqualStrings("fallback-peer", ctx.last_peer.?);
@@ -1024,26 +1024,11 @@ pub const Network = struct {
     /// `lean_block_fetch_dedup_total{outcome=…}` buckets.
     pub const EnsureBlocksByRootError = error{InFlightCapReached};
 
+    /// Issue #909 review #5: single public entry-point for blocks-by-root
+    /// requests.  `preferred_peer` is a **hint**, not a hard requirement
+    /// (see TOCTOU contract below): when the preferred peer is still
+    /// connected it will be used; otherwise we fall back to `selectPeer()`.
     pub fn ensureBlocksByRootRequest(
-        self: *Self,
-        roots: []const types.Root,
-        depth: u32,
-        handler: networks.OnReqRespResponseCbHandler,
-    ) !?BlocksByRootRequestResult {
-        return self.ensureBlocksByRootRequestWithPeer(roots, depth, handler, null);
-    }
-
-    pub fn ensureBlocksByRootRequestToPeer(
-        self: *Self,
-        roots: []const types.Root,
-        depth: u32,
-        handler: networks.OnReqRespResponseCbHandler,
-        peer_id: []const u8,
-    ) !?BlocksByRootRequestResult {
-        return self.ensureBlocksByRootRequestWithPeer(roots, depth, handler, peer_id);
-    }
-
-    fn ensureBlocksByRootRequestWithPeer(
         self: *Self,
         roots: []const types.Root,
         depth: u32,

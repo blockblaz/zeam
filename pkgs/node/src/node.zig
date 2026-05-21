@@ -2200,6 +2200,13 @@ pub const BeamNode = struct {
     /// stream, causing 300+ sequential round-trips when a peer walks a long parent chain.
     /// Collecting roots here and flushing them in one request reduces that to a single
     /// round-trip for the same burst of missing parents.
+    ///
+    /// **Throughput trade-off (review #3):** when `preferred_peer` is non-null, all
+    /// roots in this batch are sent to a single peer.  This keeps checkpoint /
+    /// parent walks fast (the peer already proved it can serve the chain), but
+    /// concentrates load and loses parallelism that random peer selection would
+    /// provide.  If the peer's bandwidth becomes a bottleneck, callers can pass
+    /// `null` (gossip and cached-descendant paths already do) to spread load.
     fn flushPendingParentFetches(self: *Self, preferred_peer: ?[]const u8) void {
         // Drain under the dedicated lock so the gossip / req-resp paths
         // can keep enqueueing while we issue the batched fetch.
@@ -2341,10 +2348,7 @@ pub const BeamNode = struct {
         if (missing_roots.items.len == 0) return;
 
         const handler = self.getReqRespResponseHandler();
-        const maybe_request = (if (preferred_peer) |peer_id|
-            self.network.ensureBlocksByRootRequestToPeer(missing_roots.items, depth, handler, peer_id)
-        else
-            self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler)) catch |err| blk: {
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer) catch |err| blk: {
             switch (err) {
                 error.NoPeersAvailable => {
                     // PR #842 review #1: previously this path bumped
