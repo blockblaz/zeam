@@ -951,6 +951,26 @@ pub const Network = struct {
         depth: u32,
         handler: networks.OnReqRespResponseCbHandler,
     ) !?BlocksByRootRequestResult {
+        return self.ensureBlocksByRootRequestWithPeer(roots, depth, handler, null);
+    }
+
+    pub fn ensureBlocksByRootRequestToPeer(
+        self: *Self,
+        roots: []const types.Root,
+        depth: u32,
+        handler: networks.OnReqRespResponseCbHandler,
+        peer_id: []const u8,
+    ) !?BlocksByRootRequestResult {
+        return self.ensureBlocksByRootRequestWithPeer(roots, depth, handler, peer_id);
+    }
+
+    fn ensureBlocksByRootRequestWithPeer(
+        self: *Self,
+        roots: []const types.Root,
+        depth: u32,
+        handler: networks.OnReqRespResponseCbHandler,
+        preferred_peer: ?[]const u8,
+    ) !?BlocksByRootRequestResult {
         if (roots.len == 0) return null;
 
         if (!self.shouldRequestBlocksByRoot(roots)) return null;
@@ -983,7 +1003,10 @@ pub const Network = struct {
             zeam_metrics.metrics.zeam_blocks_by_root_inflight.set(self.blocks_by_root_inflight.load(.monotonic));
         };
 
-        const peer = (try self.selectPeer()) orelse return error.NoPeersAvailable;
+        const peer = if (preferred_peer) |peer_id| blk: {
+            if (!self.hasPeer(peer_id)) return error.NoPeersAvailable;
+            break :blk try self.allocator.dupe(u8, peer_id);
+        } else (try self.selectPeer()) orelse return error.NoPeersAvailable;
         var peer_owned = true;
         errdefer if (peer_owned) self.allocator.free(peer);
 
