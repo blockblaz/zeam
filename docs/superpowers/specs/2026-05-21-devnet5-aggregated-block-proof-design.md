@@ -423,7 +423,14 @@ Deletion sweep must reach zero: `AggregatedSignatureProof`, `proof_data`, `ByteL
   - The spectest runner is its OWN Zig test binary (`b.addTest`), and today it does NOT even link
     the rust glue (`addRustGlueLib` is called on cli/node/unit-tests but NOT `spectests`) — which is
     why devnet4 skips test-scheme aggregation fixtures.
-  - **DECISION: (B3) per-binary scheme.** Build the rust workspace twice into separate target dirs:
+  - **DECISION (user, 2026-05-21): (A-fallback) — maintain status quo.** Keep devnet4's
+    `verify_signatures_runner` skip for `leanEnv=test` fixtures with body attestations (the existing
+    `:127-140` skip + the `:126` "parallel test-scheme leanMultisig FFI is the right fix; tracked
+    separately" TODO stays). zeam's Type-1/Type-2 logic is covered by prod-scheme unit tests; what's
+    deferred is end-to-end conformance against leanSpec's test-scheme aggregation fixture bytes. No
+    build-graph change. **B3 (below) is the eventual fix — deferred, revisit later.** Do NOT add the
+    `multisig-glue` `test-config` feature or the second rust build for this branch.
+  - **(B3) per-binary scheme [deferred — the eventual right fix].** Build the rust workspace twice into separate target dirs:
     prod (no feature → existing `rust/target/release/libzeam_glue.a`, linked by cli/node/unit-tests)
     and test-config (`--features test-config` → e.g. `rust/target/test-config-release/libzeam_glue.a`).
     Link the test-config glue ONLY into the spectest binary. Each Zig binary links exactly one
@@ -434,7 +441,7 @@ Deletion sweep must reach zero: `AggregatedSignatureProof`, `proof_data`, `ByteL
   - **(A-fallback)** remains available if the user prefers minimal build change: keep skipping
     test-scheme aggregation fixtures (devnet4 status quo). Zig-side Type-1/Type-2 logic is still
     covered by prod-scheme unit tests; what's lost is end-to-end conformance against leanSpec's
-    test-scheme fixture bytes. **(User to confirm B3 vs A-fallback — see Task 0.)**
+    test-scheme fixture bytes. **(CHOSEN by user 2026-05-21 — see the DECISION line above.)**
   - Unit tests (`xmss_tests`, `transition_tests`) keep linking the prod glue (real scheme); the
     test-config glue is specifically for matching leanSpec test-scheme FIXTURES in the spectest binary.
 - **Build:** dep-rev bump forces a cold Rust rebuild (CI slow first run). `LOG_INV_RATE_PROD=2`
@@ -469,8 +476,7 @@ gate: `just check` grep-clean compile after the deletion sweep.
    `lean_block_deconstruct_seconds` in shadow-testing.
 4. **Prover throughput** — production (merge + per-att aggregate) and deconstruction
    (split + aggregate) both on the worker; shadow-test under load before declaring done.
-5. **test-config build architecture (8.1) — RESOLVED:** B2 (lib dual-export) impossible;
-   decision is B3 (per-binary scheme — spectest binary links a separate `--features test-config`
-   glue; cli/node/unit-tests keep the prod glue). A-fallback (skip test-scheme fixtures) remains
-   if the user prefers minimal build change. No longer blocks the build graph. (User to confirm
-   B3 vs A-fallback.)
+5. **test-config build architecture (8.1) — RESOLVED + DECIDED:** B2 (lib dual-export) impossible.
+   User chose **A-fallback** (2026-05-21): keep devnet4's test-scheme aggregation-fixture skip; no
+   build-graph change. B3 (per-binary scheme) is the eventual fix but is **deferred**. No longer
+   blocks anything.
