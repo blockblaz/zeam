@@ -63,9 +63,8 @@ pub const ChainOpts = struct {
     // via `setAggregator`; the CLI `--is-aggregator` flag only supplies the
     // initial value. See `BeamChain.is_aggregator_enabled`.
     is_aggregator: bool = false,
-    // Optional shared worker pool for CPU-bound work (signature verification).
-    // When null, the chain falls back to the serial code paths.
-    thread_pool: ?*ThreadPool = null,
+    // Shared worker pool for CPU-bound work (signature verification).
+    thread_pool: *ThreadPool,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -249,7 +248,7 @@ pub const BeamChain = struct {
     ///      longer applies.
     ///
     /// New consumers of `thread_pool` should preserve all three invariants.
-    thread_pool: ?*ThreadPool = null,
+    thread_pool: *ThreadPool,
 
     // Callback for pruning cached blocks after finalization advances
     prune_cached_blocks_ctx: ?*anyopaque = null,
@@ -802,70 +801,62 @@ pub const BeamChain = struct {
         // covers the chain-worker test rigs that don't wire a pool
         // and the disabled-worker case where the libxev thread
         // already serialized everything.
-        if (self.thread_pool) |pool| {
-            // Bound the fan-out so a 1024-entry buffer doesn't
-            // allocate 1024 task wrappers up front. The pool's
-            // worker count is what limits real parallelism anyway;
-            // any more than ~thread_count outstanding tasks just
-            // queues. Pre-#890 measurements on aggregator-heavy
-            // devnet bursts showed 90%+ of replay calls have ≤ 64
-            // entries — keep the simple "spawn each" shape.
-            var wg: WaitGroup = .{};
-            for (atts.items) |gossip| {
-                pool.spawnWg(&wg, replayOneAttestationTask, .{ self, gossip, is_agg }) catch {
-                    // Allocator exhaustion on the task wrapper — fall
-                    // back to running this entry serially so we don't
-                    // strand it. Subsequent entries still try the pool.
-                    self.replayOneAttestation(gossip, is_agg);
-                };
-            }
-            for (aggs.items) |*agg| {
-                // Pointer-stability invariant for the spawned task
-                // (zclawz reviews on PR #890):
-                //
-                // The `*SignedAggregatedAttestation` we hand to
-                // `replayOneAggregationTask` is a borrow into
-                // `aggs.items`. It must remain valid for the full
-                // task lifetime, which extends past this loop body
-                // until `pool.waitAndWork(&wg)` returns. Two things
-                // keep that invariant true:
-                //
-                //   1. THIS LOOP NEVER MUTATES `aggs`. There are no
-                //      `append` / `swapRemove` / `resize` calls
-                //      between `pool.spawnWg` and `waitAndWork`. A
-                //      future refactor that moves entries mid-loop
-                //      would invalidate every outstanding `agg`
-                //      pointer and silently UAF in the worker
-                //      threads.
-                //   2. `aggs.deinit(allocator)` runs via the outer
-                //      `defer` AFTER `waitAndWork` joins all tasks
-                //      — guaranteeing the buffer outlives every
-                //      borrow.
-                //
-                // The asserts below are a SPAWN-TIME range check on
-                // the calling thread only; they do NOT guard the
-                // task's runtime invariant (by the time the task
-                // body runs, the assert has already fired and the
-                // pointer-stability claim is what protects the
-                // borrow). Their value is regression detection: if
-                // a future loop hoists a mutation between iterations,
-                // the spawn-side range will be obviously wrong on
-                // the next entry and trip in debug.
-                std.debug.assert(@intFromPtr(agg) >= @intFromPtr(aggs.items.ptr));
-                std.debug.assert(@intFromPtr(agg) < @intFromPtr(aggs.items.ptr) + aggs.items.len * @sizeOf(types.SignedAggregatedAttestation));
-                pool.spawnWg(&wg, replayOneAggregationTask, .{ self, agg }) catch {
-                    self.replayOneAggregation(agg);
-                };
-            }
-            pool.waitAndWork(&wg);
-        } else {
-            for (atts.items) |gossip| {
+
+        // Bound the fan-out so a 1024-entry buffer doesn't
+        // allocate 1024 task wrappers up front. The pool's
+        // worker count is what limits real parallelism anyway;
+        // any more than ~thread_count outstanding tasks just
+        // queues. Pre-#890 measurements on aggregator-heavy
+        // devnet bursts showed 90%+ of replay calls have ≤ 64
+        // entries — keep the simple "spawn each" shape.
+        var wg: WaitGroup = .{};
+        for (atts.items) |gossip| {
+            self.thread_pool.spawnWg(&wg, replayOneAttestationTask, .{ self, gossip, is_agg }) catch {
+                // Allocator exhaustion on the task wrapper — fall
+                // back to running this entry serially so we don't
+                // strand it. Subsequent entries still try the pool.
                 self.replayOneAttestation(gossip, is_agg);
-            }
-            for (aggs.items) |*agg| {
-                self.replayOneAggregation(agg);
-            }
+            };
         }
+        for (aggs.items) |*agg| {
+            // Pointer-stability invariant for the spawned task
+            // (zclawz reviews on PR #890):
+            //
+            // The `*SignedAggregatedAttestation` we hand to
+            // `replayOneAggregationTask` is a borrow into
+            // `aggs.items`. It must remain valid for the full
+            // task lifetime, which extends past this loop body
+            // until `self.thread_pool.waitAndWork(&wg)` returns. Two things
+            // keep that invariant true:
+            //
+            //   1. THIS LOOP NEVER MUTATES `aggs`. There are no
+            //      `append` / `swapRemove` / `resize` calls
+            //      between `self.thread_pool.spawnWg` and `waitAndWork`. A
+            //      future refactor that moves entries mid-loop
+            //      would invalidate every outstanding `agg`
+            //      pointer and silently UAF in the worker
+            //      threads.
+            //   2. `aggs.deinit(allocator)` runs via the outer
+            //      `defer` AFTER `self.thread_pool.waitAndWork` joins all tasks
+            //      — guaranteeing the buffer outlives every
+            //      borrow.
+            //
+            // The asserts below are a SPAWN-TIME range check on
+            // the calling thread only; they do NOT guard the
+            // task's runtime invariant (by the time the task
+            // body runs, the assert has already fired and the
+            // pointer-stability claim is what protects the
+            // borrow). Their value is regression detection: if
+            // a future loop hoists a mutation between iterations,
+            // the spawn-side range will be obviously wrong on
+            // the next entry and trip in debug.
+            std.debug.assert(@intFromPtr(agg) >= @intFromPtr(aggs.items.ptr));
+            std.debug.assert(@intFromPtr(agg) < @intFromPtr(aggs.items.ptr) + aggs.items.len * @sizeOf(types.SignedAggregatedAttestation));
+            self.thread_pool.spawnWg(&wg, replayOneAggregationTask, .{ self, agg }) catch {
+                self.replayOneAggregation(agg);
+            };
+        }
+        self.thread_pool.waitAndWork(&wg);
     }
 
     /// Static thunk so `ThreadPool.spawnWg` can take a function
@@ -3270,11 +3261,8 @@ pub const BeamChain = struct {
             // atomic and the loser frees its handle. The previous
             // mutex around this block was the dominant contributor
             // to the ~78ms mean lock hold reported in #863.
-            if (self.thread_pool) |pool| {
-                try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
-            } else {
-                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
-            }
+            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool);
+
             step_watch.lap("verify_signatures");
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify).
@@ -4283,26 +4271,6 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn aggregate(self: *Self) ![]types.SignedAggregatedAttestation {
-        // forkChoice.head is a multi-field ProtoBlock written under
-        // forkChoice.mutex (exclusive). Snapshot once via the shared-
-        // locked accessor; reading `.blockRoot` directly would tear
-        // against a concurrent updateHead. PR #820 / #803.
-        const head_root = self.forkChoice.getHead().blockRoot;
-        // Snapshot-then-release: forkChoice.aggregate runs an FFI window
-        // (~700ms) over `state.validators`. Holding `states_lock.shared`
-        // for that window would force any STF commit to wait. Clone first,
-        // release the lock, then run the FFI on the owned snapshot.
-        var borrow = self.statesGet(head_root) orelse return error.MissingState;
-        defer borrow.assertReleasedOrPanic();
-        const snapshot = try borrow.cloneAndRelease(self.allocator);
-        defer {
-            snapshot.deinit();
-            self.allocator.destroy(snapshot);
-        }
-        return self.forkChoice.aggregate(snapshot);
-    }
-
     /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
     /// Returns within microseconds; the worker calls `publishProducedAggregations`
     /// itself. If the previous aggregate is still in-flight, the submit is
@@ -4757,6 +4725,14 @@ pub const BlockValidationError = error{
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
+fn initTestThreadPool() !*ThreadPool {
+    return ThreadPool.init(.{
+        .allocator = std.testing.allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .thread_count = 1,
+    });
+}
+
 test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
@@ -4799,7 +4775,10 @@ test "process and add mock blocks into a node's chain" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
     defer beam_chain.deinit();
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &mock_chain.blockRoots[0]));
@@ -4888,7 +4867,10 @@ test "printSlot output demonstration" {
     defer test_registry.deinit();
 
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, blk: {
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, blk: {
         const cp = try allocator.create(ConnectedPeers);
         cp.* = ConnectedPeers.init(allocator);
         break :blk cp;
@@ -4968,7 +4950,10 @@ test "buildTreeVisualization integration test" {
     defer test_registry.deinit();
 
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, blk: {
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, blk: {
         const cp = try allocator.create(ConnectedPeers);
         cp.* = ConnectedPeers.init(allocator);
         break :blk cp;
@@ -5062,7 +5047,10 @@ test "attestation validation - comprehensive" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
     defer beam_chain.deinit();
 
     // Add blocks to chain (slots 1 and 2)
@@ -5356,7 +5344,10 @@ test "attestation validation - gossip future-slot bound" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
     defer beam_chain.deinit();
 
     // Add one block (slot 1). Forkchoice ticks to time = INTERVALS_PER_SLOT (slot 1, interval 0).
@@ -5448,6 +5439,7 @@ const FutureSlotTestFixture = struct {
     connected_peers: *ConnectedPeers,
     test_registry: *NodeNameRegistry,
     beam_chain: *BeamChain,
+    thread_pool: *ThreadPool,
 
     fn init(parent_allocator: std.mem.Allocator) !*FutureSlotTestFixture {
         const fx = try parent_allocator.create(FutureSlotTestFixture);
@@ -5481,6 +5473,8 @@ const FutureSlotTestFixture = struct {
         fx.test_registry = try fx.allocator.create(NodeNameRegistry);
         fx.test_registry.* = NodeNameRegistry.init(fx.allocator);
 
+        fx.thread_pool = try initTestThreadPool();
+
         fx.beam_chain = try fx.allocator.create(BeamChain);
         fx.beam_chain.* = try BeamChain.init(fx.allocator, ChainOpts{
             .config = fx.chain_config,
@@ -5489,12 +5483,14 @@ const FutureSlotTestFixture = struct {
             .logger_config = &fx.zeam_logger_config,
             .db = fx.db,
             .node_registry = fx.test_registry,
+            .thread_pool = fx.thread_pool,
         }, fx.connected_peers);
         return fx;
     }
 
     fn deinit(fx: *FutureSlotTestFixture, parent_allocator: std.mem.Allocator) void {
         fx.beam_chain.deinit();
+        fx.thread_pool.deinit();
         fx.test_registry.deinit();
         fx.db.deinit();
         fx.tmp_dir.cleanup();
@@ -5962,7 +5958,10 @@ test "attestation processing - valid block attestation" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
     defer beam_chain.deinit();
 
     // Add blocks to chain
@@ -6064,7 +6063,10 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
     defer beam_chain.deinit();
 
     // Process blocks at slots 1 and 2
@@ -6163,6 +6165,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
     test_registry: *NodeNameRegistry,
     db: database.Db,
     tmp_dir: std.testing.TmpDir,
+    thread_pool: *ThreadPool,
 } {
     const mock_chain = try stf.genMockChain(allocator, n_blocks, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
@@ -6200,6 +6203,8 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
     const test_registry = try allocator.create(NodeNameRegistry);
     test_registry.* = NodeNameRegistry.init(allocator);
 
+    const thread_pool = try initTestThreadPool();
+
     const beam_chain = try allocator.create(BeamChain);
     beam_chain.* = try BeamChain.init(allocator, ChainOpts{
         .config = chain_config.*,
@@ -6208,6 +6213,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
         .logger_config = zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
 
     return .{
@@ -6217,6 +6223,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
         .test_registry = test_registry,
         .db = db,
         .tmp_dir = tmp_dir,
+        .thread_pool = thread_pool,
     };
 }
 
@@ -6234,6 +6241,7 @@ test "produceBlock - older-but-justified source is accepted" {
     var fx = try setupJustifiedSourceTestChain(allocator, 8);
     defer {
         fx.beam_chain.deinit();
+        fx.thread_pool.deinit();
         fx.test_registry.deinit();
         fx.db.deinit();
         fx.tmp_dir.cleanup();
@@ -6304,6 +6312,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     var fx = try setupJustifiedSourceTestChain(allocator, 6);
     defer {
         fx.beam_chain.deinit();
+        fx.thread_pool.deinit();
         fx.test_registry.deinit();
         fx.db.deinit();
         fx.tmp_dir.cleanup();
@@ -6395,6 +6404,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
     var fx = try setupJustifiedSourceTestChain(allocator, 6);
     defer {
         fx.beam_chain.deinit();
+        fx.thread_pool.deinit();
         fx.test_registry.deinit();
         fx.db.deinit();
         fx.tmp_dir.cleanup();
@@ -6926,6 +6936,9 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -6933,6 +6946,7 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -7118,6 +7132,9 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -7125,6 +7142,7 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -7281,6 +7299,9 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
         test_registry.* = NodeNameRegistry.init(std.testing.allocator);
         defer test_registry.deinit();
 
+        const thread_pool = try initTestThreadPool();
+        defer thread_pool.deinit();
+
         var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
             .config = chain_config,
             .anchorState = &beam_state,
@@ -7288,6 +7309,7 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
             .logger_config = &zeam_logger_config,
             .db = db,
             .node_registry = test_registry,
+            .thread_pool = thread_pool,
         }, connected_peers);
         defer beam_chain.deinit();
 
@@ -7437,6 +7459,9 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
         test_registry.* = NodeNameRegistry.init(std.testing.allocator);
         defer test_registry.deinit();
 
+        const thread_pool = try initTestThreadPool();
+        defer thread_pool.deinit();
+
         var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
             .config = chain_config,
             .anchorState = &beam_state,
@@ -7444,6 +7469,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
             .logger_config = &zeam_logger_config,
             .db = db,
             .node_registry = test_registry,
+            .thread_pool = thread_pool,
         }, connected_peers);
         defer beam_chain.deinit();
 
@@ -7668,6 +7694,9 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -7675,6 +7704,7 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -7890,6 +7920,9 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -7897,6 +7930,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -8010,6 +8044,9 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     registry_2.* = NodeNameRegistry.init(std.testing.allocator);
     defer registry_2.deinit();
 
+    const thread_pool_2 = try initTestThreadPool();
+    defer thread_pool_2.deinit();
+
     var beam_chain_off = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config_2,
         .anchorState = &beam_state_2,
@@ -8017,6 +8054,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
         .logger_config = &zeam_logger_config,
         .db = db2,
         .node_registry = registry_2,
+        .thread_pool = thread_pool_2,
     }, connected_peers_2);
     defer beam_chain_off.deinit();
 
@@ -8168,6 +8206,9 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -8175,6 +8216,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -8281,6 +8323,9 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -8288,6 +8333,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -8388,6 +8434,9 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -8395,6 +8444,7 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -8496,6 +8546,9 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -8503,6 +8556,7 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 
@@ -8595,6 +8649,9 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
+    const thread_pool = try initTestThreadPool();
+    defer thread_pool.deinit();
+
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
         .config = chain_config,
         .anchorState = &beam_state,
@@ -8602,6 +8659,7 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
         .logger_config = &zeam_logger_config,
         .db = db,
         .node_registry = test_registry,
+        .thread_pool = thread_pool,
     }, connected_peers);
     defer beam_chain.deinit();
 

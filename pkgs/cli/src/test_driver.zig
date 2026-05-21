@@ -23,6 +23,7 @@ const state_transition = @import("@zeam/state-transition");
 const node_constants = node.constants;
 const params = @import("@zeam/params");
 const xmss = @import("@zeam/xmss");
+const thread_pool = @import("@zeam/thread-pool");
 
 pub const read_max_bytes: usize = 16 * 1024 * 1024;
 
@@ -50,9 +51,11 @@ pub const ForkChoiceDriverState = struct {
     label_map: LabelMap,
     block_attestations: BlockAttestationList,
     chain_config: configs.ChainConfig,
+    thread_pool: *thread_pool.ThreadPool,
 
     pub fn deinit(self: *@This()) void {
         self.fork_choice.deinit();
+        self.thread_pool.deinit();
         for (self.allocated_states.items) |s| {
             s.deinit();
             self.allocator.destroy(s);
@@ -463,11 +466,19 @@ pub fn initForkChoiceDriver(
     zeam_utils.hashTreeRoot(types.BeamBlock, anchor_block, &anchor_block_root, driver_allocator) catch
         return error.HashFailed;
 
+    var test_thread_pool = try thread_pool.ThreadPool.init(.{
+        .allocator = driver_allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .thread_count = 1,
+    });
+    errdefer test_thread_pool.deinit();
+
     // Init fork choice (uses anchor_state_ptr for anchorState)
     var fork_choice = try forkchoice.ForkChoice.init(driver_allocator, .{
         .config = chain_config,
         .anchorState = anchor_state_ptr,
         .logger = logger,
+        .thread_pool = test_thread_pool,
     });
     errdefer fork_choice.deinit();
 
@@ -503,6 +514,7 @@ pub fn initForkChoiceDriver(
         .label_map = label_map,
         .block_attestations = block_attestations,
         .chain_config = chain_config,
+        .thread_pool = test_thread_pool,
     };
     return driver;
 }
