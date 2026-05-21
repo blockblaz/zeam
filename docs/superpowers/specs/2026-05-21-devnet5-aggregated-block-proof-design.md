@@ -68,34 +68,41 @@ recovered. zeam reads the tracker, so **block votes get weight eagerly and there
 
 ```
 on_block:
-  decode SignedBlock (SSZ); decode Type-2 from .proof
+  decode SignedBlock (SSZ)
+  SSZ-decode SignedBlock.proof → TypeTwoMultiSignature container (inner .proof = raw type2 wire)
   verify_signatures: single verify_type_2 over all attestations + proposer
+                     (FFI consumes the INNER raw type2 wire, NOT the SSZ-framed bytes — see §2.y)
                      + reject malformed/duplicate/out-of-range aggregation_bits (see §5.1)
   state_transition
-  # ORDER MATTERS (codex P1): the fallible, hard-reject step (B) runs BEFORE the
-  # tracker mutation (C). Otherwise a deconstruction failure would reject the block
-  # AFTER its votes were already written to the tracker — corrupting fork choice with
-  # a rejected block's votes.
-  # (B) Proof recovery — fallible, hard error → whole-block reject. Reads the payload
-  #     pool + justified checkpoint only; does NOT touch the tracker.
-  deconstruct_block_into_store (mandatory, hard error on failure):
+  # ORDER MATTERS (codex P1, two rounds): the per-validator tracker loop AND the
+  # protoarray insert (forkChoice.onBlock at chain.zig:3362) are BOTH fork-choice
+  # mutations, and the insert happens FIRST. So the fallible/hard-reject part of
+  # deconstruction must complete BEFORE forkChoice.onBlock — otherwise a deconstruction
+  # error rejects a block that is already in protoarray + tracker. Use compute/commit:
+  #
+  # (B1) Deconstruction COMPUTE — fallible, hard error → whole-block reject.
+  #      Runs BEFORE forkChoice.onBlock. Produces staged combined Type-1s in memory.
+  #      Reads payload pool (snapshot under signatures_mutex) + justified checkpoint; no
+  #      fork-choice mutation yet.
+  deconstruct_compute:
      for each att where target.slot > justified.slot AND block_participants ⊄ local_union:
-        split_type_2_by_msg → Type-1 component; restore participants from att bits
+        split_type_2_by_msg(inner type2 wire, ...) → Type-1 component; restore participants from att bits
         # Only merge local partials DISJOINT from the block component (codex P2) — a
         # validator must not appear in two children of one aggregate_type_1 call.
         disjoint = local partials whose validators ∩ block_participants = ∅
         if disjoint non-empty: aggregate_type_1(component + disjoint) → combined
         else: combined = component
-        write combined → latest_new_aggregated_payloads (under signatures_mutex); drop superseded
-        if aggregator: collect combined into the returned aggregates list
+        stage (combined, superseded-partials) for commit
+  forkChoice.onBlock(block, post_state)        # protoarray insert (first fc mutation)
   # (C) Fork-choice weight — EAGER, unchanged from devnet4. Uses trusted bits, no proof.
-  #     Runs only after (B) succeeded, so a rejected block never mutates the tracker.
   for each body attestation, for each validator in aggregation_bits:
         onAttestationUnlocked(att_for_validator, is_from_block=true)   → latestKnown
+  # (B2) Deconstruction COMMIT — infallible. Only reached once all hard-reject steps passed.
+  commit staged proofs → latest_new_aggregated_payloads (under signatures_mutex); drop superseded
   update_head
   # (D) Publishing happens at the node layer (which owns the BeamNode pointer), NOT in
   #     chain.onBlock (BeamChain has no node field — codex P2). onBlock returns / surfaces
-  #     the recovered aggregates; the node layer publishes them when aggregator.
+  #     the staged aggregates; the node layer publishes them when aggregator.
   if aggregator: node publishes recovered aggregates
 ```
 
@@ -170,6 +177,32 @@ MUST use one canonical layout or they will each be "locally correct" yet disagre
   Duplicate or out-of-range bits are rejected (see §5.1). The proposer component always has exactly
   one participant.
 
+#### 2.y Two byte layers — SSZ container vs raw prover wire (codex P1 — avoid double-encode bug)
+
+There are TWO distinct byte representations; conflating them breaks verification:
+
+1. **Raw type2 wire** — what `mergeType1ToType2` (Rust `merge_many_type_1` → `compress_without_pubkeys`)
+   returns and what `verifyType2`/`splitType2ByMessage` (Rust `verify_type_2`/`split_type_2_by_msg`
+   → `decompress_without_pubkeys`) consume. lz4+postcard, NO SSZ framing.
+2. **SSZ-framed `TypeTwoMultiSignature` container** — `SignedBlock.proof: ByteList512KiB` holds
+   `ssz_encode(TypeTwoMultiSignature{ proof: <raw type2 wire> })`. This adds the SSZ list-offset
+   framing (~4 bytes). **This is the leanSpec wire format** (`SignedBlock.proof.data =
+   TypeTwoMultiSignature.encode_bytes()`; verify does `TypeTwoMultiSignature.decode_bytes(...)`),
+   so zeam MUST match it byte-for-byte for interop.
+
+Rules:
+- **Produce:** `raw = mergeType1ToType2(...)` → `container = TypeTwoMultiSignature{proof: ByteList(raw)}`
+  → `SignedBlock.proof = ByteList(ssz_encode(container))`.
+- **Verify / split:** `container = ssz_decode(TypeTwoMultiSignature, SignedBlock.proof.data)` → pass
+  `container.proof` (the RAW wire) to the Zig FFI wrapper. NEVER pass `SignedBlock.proof.data`
+  (SSZ-framed) directly to `verifyType2`/`splitType2ByMessage` — the Rust `decompress_without_pubkeys`
+  would choke on the offset bytes and a locally-produced block would fail its own verification.
+- **Disagreement with codex's remedy:** codex suggested storing the RAW wire directly in
+  `SignedBlock.proof`. That removes the +4 SSZ offset and would DIVERGE from leanSpec's wire format,
+  breaking interop. We keep the SSZ container (interop) and instead fix the decode path. The Zig FFI
+  wrappers take the raw inner wire; the SSZ-decode of the container happens in verifySignatures /
+  deconstruction.
+
 ### 3. FFI — `rust/multisig-glue/src/lib.rs`, `pkgs/xmss/src/aggregation.zig`
 
 Cargo: pin `rec_aggregation`/`leansig_wrapper`/`backend` to `rev = f33a0775`.
@@ -213,15 +246,20 @@ import path. New policy:
 - `produceBlock` returns `{ block, blockRoot, attestation_type1s: ArrayList(TypeOneMultiSignature),
   post_state }` — per-attestation Type-1s, no merge. Mirrors `produce_block_with_signatures`.
 - `validator_client._sign_block` equivalent: sign block root (proposal key) → wrap as singleton
-  Type-1 → `mergeType1ToType2([*attestation_type1s, proposer_type1], pks_per_part)` →
-  SSZ-encode → `SignedBlock.proof`. Proposer entry **last**.
-- Pubkey resolution must NOT hold the state lock across the heavy merge (codex P2). Mirror
-  `produceBlock`'s existing snapshot-then-release pattern (chain.zig:2468-2486 `cloneAndRelease`):
-  `chain.resolveSigningPubkeys(root)` takes `states_lock.shared`, copies out the small pubkey-byte
-  arrays it needs (proposer proposal pubkey + per-attestation attestation pubkeys), releases the
-  lock, and returns owned bytes. The prover `mergeType1ToType2` then runs lock-free. Do NOT hold a
+  Type-1 → `raw = mergeType1ToType2([*attestation_type1s, proposer_type1], pks_per_part)` →
+  `SignedBlock.proof = ssz_encode(TypeTwoMultiSignature{proof: raw})` (§2.y layering — wrap the raw
+  wire in the SSZ container, do NOT store raw). Proposer entry **last**.
+- Pubkey resolution must NOT hold the state lock across the heavy merge (codex P2), and the resolver
+  needs the BLOCK LAYOUT, not just the root (codex P2 round 3 — a state lookup gives validators but
+  not the body's `aggregation_bits`/participants/order). Signature:
+  `chain.resolveSigningPubkeys(block, attestation_type1s, proposer_index)` — takes the produced block
+  (or its participant layout) so it knows exactly which small set to copy. It takes `states_lock.shared`,
+  copies out the proposer PROPOSAL pubkey + each attestation component's participant ATTESTATION
+  pubkeys (canonical order §2.x; proposer key resolved outside any attestation cache per §5), releases
+  the lock, returns owned bytes. The prover `mergeType1ToType2` then runs lock-free. Do NOT hold a
   live `*BeamState` borrow across the merge — that would block block-import waiting on
-  `states_lock.exclusive` behind the prover, the exact stall #863 fixed.
+  `states_lock.exclusive` behind the prover, the exact stall #863 fixed. Do NOT copy all validator
+  keys under the lock — only the participant set the block actually references.
 - `validator_client.buildPubkeysPerPart(...)` builds the parallel pubkey arrays from those copied
   bytes (lifting to `xmss.PublicKey` handles), in the canonical Type-2 order (§2.x).
 - The heavy `mergeType1ToType2` runs on the chain worker via a thin `chain.mergeBlockProof(...)`
@@ -230,8 +268,9 @@ import path. New policy:
 
 ### 5. Block import & verify — `pkgs/state-transition/src/transition.zig`, `chain.zig`
 
-- `verifySignatures` collapses to: structural checks → build `pks_per_message` + `messages`
-  (canonical order §2.x) → single `verifyType2`.
+- `verifySignatures` collapses to: SSZ-decode `SignedBlock.proof` → `TypeTwoMultiSignature` container
+  (§2.y) → structural checks → build `pks_per_message` + `messages` (canonical order §2.x) → single
+  `verifyType2(container.proof, ...)` passing the INNER raw wire (not the SSZ-framed bytes).
 - **Proposer key must bypass the attestation pubkey cache (codex P1).** `xmss.PublicKeyCache` is
   keyed by validator index and stores ATTESTATION pubkeys. The proposer component (last) needs the
   validator's PROPOSAL pubkey. If a proposer also attested earlier, the cache holds their attestation
@@ -248,20 +287,25 @@ import path. New policy:
   - reject if any of these fail BEFORE calling the prover (cheap rejection, avoids a wasted verify).
 - Delete `verifySignaturesParallel` (per-attestation fan-out is gone; Type-2 is one call,
   internally rayon-parallel). `chain.onBlock` calls `verifySignatures` directly.
-- `chain.onBlock` (corrected — see "Two independent subsystems"; ORDER per codex P1):
-  - **First** run `deconstructBlockIntoStore` (subsystem B — proof recovery into `latest_new`,
-    fallible/hard-reject). It must run BEFORE the tracker mutation so a deconstruction failure
-    rejects the block without having already written its votes. Replaces the old
-    `storeAggregatedPayload(is_from_block=true)` loop. No empty-key stamping (dropped — point 3).
-  - **Then** the eager per-validator `onAttestationUnlocked(att, is_from_block=true)` tracker
-    updates (subsystem A — fork-choice weight, unchanged from devnet4). Only reached if (B) succeeded.
+- `chain.onBlock` (corrected — see "Two independent subsystems"; ORDER per codex P1, two rounds —
+  the protoarray insert `forkChoice.onBlock` at chain.zig:3362 is the FIRST fork-choice mutation):
+  - **(B1) deconstruction COMPUTE** runs BEFORE `forkChoice.onBlock`. Fallible/hard-reject; produces
+    staged combined Type-1s in memory; reads the payload pool snapshot + justified checkpoint; makes
+    NO fork-choice mutation. Replaces the old `storeAggregatedPayload(is_from_block=true)` loop. No
+    empty-key stamping (dropped — point 3).
+  - `forkChoice.onBlock` (protoarray insert) → then the eager per-validator
+    `onAttestationUnlocked(att, is_from_block=true)` tracker updates (subsystem A — fork-choice weight,
+    unchanged from devnet4).
+  - **(B2) deconstruction COMMIT** runs after the above succeed: write staged proofs into
+    `latest_new_aggregated_payloads` (infallible). A hard-reject in B1 happens before any fork-choice
+    mutation, so a rejected block is never left in protoarray/tracker.
   - **Publishing is NOT done inside `chain.onBlock`** (codex P2 — `BeamChain` has no `node` field).
-    `deconstructBlockIntoStore` returns the recovered aggregates; the node layer that owns the
-    `BeamNode` pointer publishes them (see §6).
+    `onBlock` surfaces the staged aggregates; the node layer that owns the `BeamNode` pointer
+    publishes them (see §6).
 - **Hard-error policy (codex P2 — specify which current log-and-continue become rejection):**
   - `verifySignatures` failure (structural or crypto) → whole-block REJECT (already the case).
-  - `deconstructBlockIntoStore` failure → whole-block REJECT (new; no fallback). Runs before the
-    tracker update, so a reject leaves the tracker untouched.
+  - deconstruction COMPUTE (B1) failure → whole-block REJECT (new; no fallback). Runs before any
+    fork-choice mutation, so a reject leaves protoarray AND tracker untouched.
   - The eager `onAttestationUnlocked(is_from_block=true)` calls: today these can log-and-continue on
     `InvalidAttestation` (unknown head index). Post-`verifySignatures` the bits are trusted, but the
     head block may legitimately be unknown locally (sync gap). Keep log-and-continue HERE
@@ -272,17 +316,24 @@ import path. New policy:
 
 ### 6. Deconstruction — new `pkgs/node/src/deconstruct.zig`
 
-`deconstructBlockIntoStore(allocator, fork_choice, pubkey_cache, signed_block, parent_state)
--> DeconstructResult { aggregates: ArrayList(SignedAggregatedAttestation) }`. Direct port of
-`_deconstruct_block_into_store` (Section 6.3 algorithm). Runs on the chain worker.
+Split into two functions (codex P1 — compute before fork-choice mutation, commit after):
+- `deconstructCompute(allocator, fork_choice, signed_block, parent_state) !StagedDeconstruct` —
+  fallible; runs BEFORE `forkChoice.onBlock`. Returns staged combined Type-1s + the partials each
+  supersedes. No pool mutation.
+- `deconstructCommit(fork_choice, staged) StagedAggregates` — infallible; runs AFTER the fork-choice
+  mutations succeed. Writes staged proofs into `latest_new_aggregated_payloads`, drops superseded,
+  returns the `SignedAggregatedAttestation` list for the node layer to publish.
+
+Direct port of `_deconstruct_block_into_store` (Section 6.3) but phase-split.
 
 Locking (codex P2 — corrected): the payload maps are guarded by `forkChoice.signatures_mutex`
-(NOT the main `forkChoice.mutex`, which guards the protoarray + `AttestationTracker`). Take
-`signatures_mutex` to snapshot local partials, release for the heavy split+aggregate prover calls,
-re-acquire `signatures_mutex` for the map mutation. `SyncMutex` is exclusive (no shared mode), so
-snapshot copies out what it needs and drops the lock before the FFI. Retry-once-then-fail on a
-rotation race (`error.RaceDuringDeconstruct`) — a strict bound, not a fallback. Do NOT also hold
-the main `mutex` across the prover calls.
+(NOT the main `forkChoice.mutex`, which guards the protoarray + `AttestationTracker`). COMPUTE takes
+`signatures_mutex` only to snapshot local partials, releases it for the heavy split+aggregate prover
+calls. COMMIT re-takes `signatures_mutex`, re-checks the snapshot still holds, and mutates.
+`SyncMutex` is exclusive (no shared mode), so snapshot copies out what it needs and drops the lock
+before the FFI. Retry-once-then-fail on a rotation race between compute and commit
+(`error.RaceDuringDeconstruct`) — a strict bound, not a fallback. Do NOT hold the main `mutex`
+across the prover calls.
 
 Index local partials by `hash_tree_root(AttestationData)` (spec-mandated: equivalent data from
 different code paths may not share a Zig map key). Memory: `sszClone` the combined proof into
@@ -301,8 +352,8 @@ validators the block adds) without double-counting. Add a unit test for the `{A}
 the proposer component must use the PROPOSAL pubkey, not the attestation-keyed cache (same caveat as
 §5). Resolve it directly.
 
-**Publishing path (codex P2).** `deconstructBlockIntoStore` does NOT publish — `BeamChain` has no
-`BeamNode` pointer. It returns the recovered aggregates in `DeconstructResult.aggregates`. The node
+**Publishing path (codex P2).** `deconstructCommit` does NOT publish — `BeamChain` has no
+`BeamNode` pointer. It returns the recovered aggregates (`StagedAggregates`). The node
 layer (which owns `BeamNode`, e.g. the same place `submitAggregateOnInterval` hands a `BeamNode*` to
 the aggregate worker) drains that list to `node.publishProducedAggregations(...)` when this node is
 an aggregator. The plan must thread the aggregates from `chain.onBlock`'s caller up to the node

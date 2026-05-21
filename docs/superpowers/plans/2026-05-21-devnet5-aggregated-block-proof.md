@@ -530,7 +530,7 @@ test "verifySignatures rejects duplicate AttestationData in body" {
 
 - [ ] **Step 3: Rewrite `verifySignatures`** per design §5.1
 
-Add `assertUniqueAndCappedAttestationData` (unique + ≤ `MAX_ATTESTATIONS_DATA`). **Add explicit `aggregation_bits` validation (codex P2 — Type-2 has no `participants` field, so the bits are the SOLE binding to pubkeys; the old per-attestation participant cross-check is gone):** for each attestation reject if bits are empty, any set index ≥ `len(validators)` (out-of-range), or the bitlist length is invalid. Do these cheap checks BEFORE calling the prover. Build `pks_per_message` (N atts in body order + proposer last, canonical order §2.x) and `messages` (att-data-root,slot then block-root,block.slot). **Use the attestation `pubkey_cache` for the N attestation components, but resolve the proposer (last) component's PROPOSAL pubkey OUTSIDE that cache (codex P1) — the cache is keyed by validator index and holds attestation keys; a proposer who also attested would otherwise verify with the wrong key and the valid block would be rejected.** Call `xmss.verifyType2`. Delete the per-attestation loop and the participant cross-check. Delete `verifySignaturesParallel`, `AggregatedPayloadVerifyBatch` task prep. Rename metrics to `lean_pq_sig_block_proof_*`.
+**First SSZ-decode the container (codex P1 — §2.y two byte layers):** `container = ssz_decode(TypeTwoMultiSignature, signed_block.proof.data)`. The FFI consumes `container.proof` (raw lz4+postcard wire); NEVER pass `signed_block.proof.data` (SSZ-framed) directly to `xmss.verifyType2` or it chokes on the offset bytes. Add `assertUniqueAndCappedAttestationData` (unique + ≤ `MAX_ATTESTATIONS_DATA`). **Add explicit `aggregation_bits` validation (codex P2 — Type-2 has no `participants` field, so the bits are the SOLE binding to pubkeys; the old per-attestation participant cross-check is gone):** for each attestation reject if bits are empty, any set index ≥ `len(validators)` (out-of-range), or the bitlist length is invalid. Do these cheap checks BEFORE calling the prover. Build `pks_per_message` (N atts in body order + proposer last, canonical order §2.x) and `messages` (att-data-root,slot then block-root,block.slot). **Use the attestation `pubkey_cache` for the N attestation components, but resolve the proposer (last) component's PROPOSAL pubkey OUTSIDE that cache (codex P1) — the cache is keyed by validator index and holds attestation keys; a proposer who also attested would otherwise verify with the wrong key and the valid block would be rejected.** Call `xmss.verifyType2(container.proof, pks_per_message, messages)`. Delete the per-attestation loop and the participant cross-check. Delete `verifySignaturesParallel`, `AggregatedPayloadVerifyBatch` task prep. Rename metrics to `lean_pq_sig_block_proof_*`.
 
 - [ ] **Step 4: Add the order + cap + bitlist tests**
 
@@ -577,11 +577,11 @@ test "validator_client produced block carries a verifiable Type-2 proof" {
 
 - [ ] **Step 4: Add `resolveSigningPubkeys` + `mergeBlockProof` to chain**
 
-`resolveSigningPubkeys(root) ![]OwnedPubkeyBytes` — takes `states_lock.shared`, COPIES OUT the small pubkey-byte arrays needed (proposer proposal pubkey + each attestation's participant attestation pubkeys, in canonical Type-2 order §2.x), RELEASES the lock, returns owned bytes. Do NOT return a live `*BeamState` borrow held across the merge — mirror `produceBlock`'s `cloneAndRelease` snapshot-then-release (chain.zig:2468-2486). Holding `states_lock` across the prover would stall block import on `states_lock.exclusive` (the #863 stall). `mergeBlockProof(parts, pks_per_part) !ByteList512KiB` — dispatches `xmss.mergeType1ToType2` on the chain worker (mirror `submitGossipAttestation` dispatch), lock-free. Read the chain-worker dispatch pattern first.
+`resolveSigningPubkeys(block, attestation_type1s, proposer_index) ![]OwnedPubkeyBytes` — takes the produced BLOCK / participant layout (codex P2 round 3 — a root/state lookup gives validators but NOT the body's `aggregation_bits`/participants/order, so the resolver can't know which keys to copy from the root alone). Takes `states_lock.shared`, COPIES OUT only the needed small set (proposer PROPOSAL pubkey + each attestation component's participant ATTESTATION pubkeys, canonical Type-2 order §2.x), RELEASES the lock, returns owned bytes. Do NOT copy all validator keys; do NOT return a live `*BeamState` borrow held across the merge — mirror `produceBlock`'s `cloneAndRelease` snapshot-then-release (chain.zig:2468-2486). Holding `states_lock` across the prover would stall block import on `states_lock.exclusive` (the #863 stall). `mergeBlockProof(parts, pks_per_part) ![]u8` — dispatches `xmss.mergeType1ToType2` on the chain worker (mirror `submitGossipAttestation` dispatch), lock-free, returns the RAW type2 wire (lz4+postcard, no SSZ framing). Read the chain-worker dispatch pattern first.
 
 - [ ] **Step 5: Rewrite validator_client block path** per design §4.2
 
-Replace the `SignedBlock{ .signature = ... }` literal (validator_client.zig:151-157) with: lift `signBlockRoot` bytes via `xmss.Signature.fromBytes`; build proposer singleton Type-1 (`participants` = only proposer index); get owned pubkey bytes via `chain.resolveSigningPubkeys(blockRoot)`; build `pks_per_part` (`buildPubkeysPerPart`, canonical order §2.x — attestations in body order, proposer LAST); `chain.mergeBlockProof([*attestation_type1s, proposer_type1], pks_per_part)`; `SignedBlock{ .block, .proof }`. Proposer entry LAST.
+Replace the `SignedBlock{ .signature = ... }` literal (validator_client.zig:151-157) with: lift `signBlockRoot` bytes via `xmss.Signature.fromBytes`; build proposer singleton Type-1 (`participants` = only proposer index); get owned pubkey bytes via `chain.resolveSigningPubkeys(produced_block.block, produced_block.attestation_type1s, slot_proposer_id)`; build `pks_per_part` (`buildPubkeysPerPart`, canonical order §2.x — attestations in body order, proposer LAST); `raw = chain.mergeBlockProof([*attestation_type1s, proposer_type1], pks_per_part)`; **wrap the raw wire in the SSZ container (codex P1 §2.y): `SignedBlock.proof = ssz_encode(TypeTwoMultiSignature{proof: ByteList512KiB(raw)})` — do NOT store `raw` directly, leanSpec's wire format is the SSZ-framed container.** `SignedBlock{ .block, .proof }`. Proposer entry LAST.
 
 - [ ] **Step 6: Run test, expect pass. Commit.**
 
@@ -622,7 +622,7 @@ chain.zig:3273-3277 → `try stf.verifySignatures(self.allocator, pre_snapshot, 
 
 - [ ] **Step 4: Keep the eager tracker update; remove only the proof-write loop**
 
-Read chain.zig:3440-3475 first. The per-validator `forkChoice.onAttestation(att_for_validator, is_from_block=true)` calls (subsystem A — fork-choice weight) STAY exactly as they are; they use the trusted `aggregation_bits`, need no proof. KEEP the existing log-and-continue on `InvalidAttestation`/unknown-head there (documented exception — an unknown head during sync is not a malformed block; see design §5 hard-error policy). REMOVE only the `storeAggregatedPayload(..., is_from_block=true)` calls (subsystem B — they required per-attestation proofs that no longer exist). Do NOT add empty-key stamping. Delete the `is_from_block=true` branch in `forkchoice.zig:storeAggregatedPayload`. Update the `chain.zig:3337` `proof_data` comment to `proof`. **Ordering note (codex P1):** Task 12 will insert the fallible `deconstructBlockIntoStore` call BEFORE this tracker-update loop, so a deconstruction hard-reject leaves the tracker untouched. Leave the tracker loop where it is for now; Task 12 places deconstruction ahead of it.
+Read chain.zig:3440-3475 first. The per-validator `forkChoice.onAttestation(att_for_validator, is_from_block=true)` calls (subsystem A — fork-choice weight) STAY exactly as they are; they use the trusted `aggregation_bits`, need no proof. KEEP the existing log-and-continue on `InvalidAttestation`/unknown-head there (documented exception — an unknown head during sync is not a malformed block; see design §5 hard-error policy). REMOVE only the `storeAggregatedPayload(..., is_from_block=true)` calls (subsystem B — they required per-attestation proofs that no longer exist). Do NOT add empty-key stamping. Delete the `is_from_block=true` branch in `forkchoice.zig:storeAggregatedPayload`. Update the `chain.zig:3337` `proof_data` comment to `proof`. **Ordering note (codex P1, two rounds):** Task 12 inserts the fallible `deconstructCompute` call BEFORE `forkChoice.onBlock` (the protoarray insert at :3362), and `deconstructCommit` after the tracker loop — so a deconstruction hard-reject leaves protoarray AND tracker untouched. Leave the tracker loop where it is for now; Task 12 places compute ahead of `forkChoice.onBlock` and commit after.
 
 - [ ] **Step 5: Run test, expect pass. Commit.**
 
@@ -652,9 +652,9 @@ test "deconstruct: target.slot <= justified.slot → skipped" { ... }
 
 - [ ] **Step 2: Run, expect failure** (module/function undefined).
 
-- [ ] **Step 3: Implement `DeconstructResult` + `deconstructBlockIntoStore` skeleton**
+- [ ] **Step 3: Implement `StagedDeconstruct` + `deconstructCompute` skeleton**
 
-Signature per §6.2. Implement: empty-body short-circuit; Type-2 decode; build `pks_per_message`; index local partials by `hash_tree_root(AttestationData)`; per-attestation skip checks (`target.slot <= justified.slot`, `block_participants ⊆ local_union`). Leave the split+merge+write as the next task (return empty aggregates for now so the no-op tests pass).
+Per §6 (compute/commit split — codex P1). `deconstructCompute(allocator, fork_choice, signed_block, parent_state) !StagedDeconstruct`. Implement: empty-body short-circuit; **SSZ-decode `signed_block.proof` → `TypeTwoMultiSignature` container, use `container.proof` (raw wire) for splits (§2.y)**; build `pks_per_message`; snapshot + index local partials by `hash_tree_root(AttestationData)` under `signatures_mutex` (release before any prover call); per-attestation skip checks (`target.slot <= justified.slot`, `block_participants ⊆ local_union`). Leave the split+merge as the next task (return empty staged for now so the no-op tests pass). Also stub `deconstructCommit(fork_choice, staged) StagedAggregates` returning empty.
 
 - [ ] **Step 4: Run trivial tests, expect pass. Commit.**
 
@@ -680,13 +680,13 @@ test "deconstruct: mixed golden — covered + unseen + below-justified in one bl
 
 - [ ] **Step 2: Run, expect failure.**
 
-- [ ] **Step 3: Implement the active path** per §6.3
+- [ ] **Step 3: Implement the COMPUTE active path** per §6.3 (no pool mutation)
 
-`splitType2ByMessage` (resolve proposer-component pubkey OUTSIDE the attestation cache per codex P1; the split layout includes the proposer entry) → restore participants from att bits → **select only local partials whose validators are DISJOINT from the block component's participants (codex P2 — a validator must not appear in two children of one `aggregateType1` call; the full-coverage skip misses partial overlap like local `{A}` + block `{A,B}`)** → if disjoint partials exist: `aggregateType1(component + disjoint)` else use component as-is → mutate `latest_new_aggregated_payloads` under `signatures_mutex` (remove superseded across all keys sharing the data_root, insert combined under the block's `data` key via `sszClone`) → append `SignedAggregatedAttestation` to result. Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
+In `deconstructCompute`: `splitType2ByMessage(container.proof, ...)` (resolve proposer-component pubkey OUTSIDE the attestation cache per codex P1; the split layout includes the proposer entry) → restore participants from att bits → **select only local partials whose validators are DISJOINT from the block component's participants (codex P2 — a validator must not appear in two children of one `aggregateType1` call; the full-coverage skip misses partial overlap like local `{A}` + block `{A,B}`)** → if disjoint partials exist: `aggregateType1(component + disjoint)` else use component as-is → STAGE `(combined, superseded-partials, data)` into `StagedDeconstruct`. NO pool write here. Prover calls run lock-free (snapshot taken in Task 10, released before these calls).
 
-- [ ] **Step 4: Implement the lock dance + race handling** per §6.4 (CORRECTED lock)
+- [ ] **Step 4: Implement COMMIT + lock/race handling** per §6.4 (compute/commit split — codex P1; CORRECTED lock — codex P2)
 
-Use `forkChoice.signatures_mutex` (the payload-map lock), NOT the main `forkChoice.mutex` (codex P2 — that one guards the protoarray + tracker). `SyncMutex` is exclusive-only: under `signatures_mutex`, copy out the local partials snapshot → release → heavy split/merge (lock-free prover calls) → re-acquire `signatures_mutex`, re-check the snapshot still holds → mutate; retry once on race, then `error.RaceDuringDeconstruct`. Never hold the main `mutex` across the prover calls.
+`deconstructCommit(fork_choice, staged)`: re-acquire `forkChoice.signatures_mutex` (the payload-map lock, NOT the main `forkChoice.mutex` which guards protoarray + tracker). `SyncMutex` is exclusive-only. Re-check each staged item's snapshot still holds; on race retry once then `error.RaceDuringDeconstruct`. Then mutate `latest_new_aggregated_payloads` (remove superseded across all keys sharing the data_root, insert combined under the block's `data` key via `sszClone`) and build the `SignedAggregatedAttestation` list to return. Never hold the main `mutex` across prover calls (those already happened in compute). Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
 
 - [ ] **Step 5: Add error-path tests**
 
@@ -703,10 +703,10 @@ git add pkgs/node/src/deconstruct.zig
 git commit -m "feat(node): deconstruct split+merge+store mutation with race handling"
 ```
 
-### Task 12: Wire deconstruction into onBlock (before tracker) + thread aggregates to BeamNode
+### Task 12: Wire compute→fc→commit into onBlock + thread aggregates to BeamNode
 
 **Files:**
-- Modify: `pkgs/node/src/chain.zig` (onBlock; insert deconstruction BEFORE the tracker-update loop)
+- Modify: `pkgs/node/src/chain.zig` (onBlock: COMPUTE before `forkChoice.onBlock`; COMMIT after the tracker loop)
 - Modify: `pkgs/node/src/node.zig` (the block-import caller that owns the `BeamNode` pointer — publish recovered aggregates there)
 - Test: `pkgs/node/src/chain.zig` in-file
 
@@ -727,11 +727,14 @@ test "onBlock rejects the whole block when deconstruction fails, tracker untouch
 
 - [ ] **Step 2: Run, expect failure.**
 
-- [ ] **Step 3: Wire it in — ORDER + publish path (codex P1/P2)**
+- [ ] **Step 3: Wire COMPUTE→fc→COMMIT order + publish path (codex P1/P2)**
 
-Read chain.zig around the post-STF region first. Insert `deconstruct.deconstructBlockIntoStore(...)` (obtain `parent_state` via `statesGet(block.parent_root)`) AFTER `apply_transition` but BEFORE the per-validator `onAttestationUnlocked(is_from_block=true)` tracker loop from Task 9 — so a deconstruction hard error rejects the block with the tracker untouched (codex P1). No fallback — propagate the error (whole-block reject, design §5).
+Read chain.zig:3361-3493 first (the `fcprocessing` block — note `forkChoice.onBlock` protoarray insert is at :3362, BEFORE the tracker loop at :3466). Wire in this exact order:
+1. After `apply_transition`: `staged = deconstructCompute(...)` (obtain `parent_state` via `statesGet(block.parent_root)`). This is the fallible/hard-reject step — it runs BEFORE `forkChoice.onBlock` so a failure rejects the block with protoarray AND tracker untouched (codex P1, two rounds). No fallback — propagate the error (whole-block reject, design §5).
+2. `forkChoice.onBlock(...)` (protoarray insert) → the per-validator `onAttestationUnlocked(is_from_block=true)` tracker loop (Task 9).
+3. After those succeed: `aggregates = deconstructCommit(forkChoice, staged)` — infallible pool write. (On the rare rotation race it returns `error.RaceDuringDeconstruct`; since this is post-insert, treat per the race policy — retry already happened in commit.)
 
-Publishing (codex P2): `BeamChain` has NO `node` field, so do NOT call `self.node.publishProducedAggregations(...)` inside `chain.onBlock`. Instead, have `onBlock` surface the recovered `DeconstructResult.aggregates` to its caller (return them, or stash on a per-call out-param), and publish from the `node.zig` block-import path that already holds the `BeamNode` pointer (mirror how `submitAggregateOnInterval` hands a `BeamNode*` to the aggregate worker). Publish only when `is_aggregator_enabled`. Read the existing aggregate-publish wiring first to match the pattern.
+Publishing (codex P2): `BeamChain` has NO `node` field, so do NOT call `self.node.publishProducedAggregations(...)` inside `chain.onBlock`. Have `onBlock` surface the committed aggregates to its caller (return / out-param), and publish from the `node.zig` block-import path that holds the `BeamNode` pointer (mirror how `submitAggregateOnInterval` hands a `BeamNode*` to the aggregate worker). Publish only when `is_aggregator_enabled`. Read the existing aggregate-publish wiring first.
 
 - [ ] **Step 4: Run test, expect pass. Commit.**
 
@@ -886,5 +889,5 @@ git commit -m "docs: devnet5 release notes (fresh datadir required)"
 ## Self-review notes
 
 - **Spec coverage:** every design §1-8 maps to a task (FFI→T1-3, types→T4-6, verify/import→T7-9, deconstruct→T10-12, spectest/hive/serial→T13-15, validation→T16-17, test-config gate→T0).
-- **Type consistency:** `TypeOneMultiSignature`/`TypeTwoMultiSignature`/`ByteList512KiB`/`MessageBinding`/`attestation_type1s`/`resolveSigningPubkeys`/`mergeBlockProof`/`deconstructBlockIntoStore`/`DeconstructResult` used consistently across tasks. (Corrected after codex review: removed `stampKnownAttestationDataKey` — no empty-key stamping; renamed `borrowStateForSigning` → `resolveSigningPubkeys` — copy-out-and-release, no held borrow across the prover.)
+- **Type consistency:** `TypeOneMultiSignature`/`TypeTwoMultiSignature`/`ByteList512KiB`/`MessageBinding`/`attestation_type1s`/`resolveSigningPubkeys(block,…)`/`mergeBlockProof`/`deconstructCompute`/`deconstructCommit`/`StagedDeconstruct`/`StagedAggregates` used consistently across tasks. (Corrected after 3 codex rounds: removed `stampKnownAttestationDataKey` — no empty-key stamping; `borrowStateForSigning` → `resolveSigningPubkeys(block,attestation_type1s,proposer_index)` — copy-out-and-release, takes the block layout; split single `deconstructBlockIntoStore` → `deconstructCompute` (fallible, before fork-choice mutation) + `deconstructCommit` (infallible, after); SignedBlock.proof = SSZ(TypeTwoMultiSignature) wire layer.)
 - **Known soft spots (flagged inline, not placeholders):** exact `rec_aggregation` Rust signatures (arg order, Result vs panic, message-binding shape) must be confirmed against rev `f33a0775` during Task 2 — the leanMultisig-py v0.0.5 wrapper is the reference. These are real "confirm against upstream" actions, not vague TODOs.
