@@ -113,6 +113,9 @@ git commit -m "build(multisig-glue): bump leanMultisig to devnet5-patched f33a07
 - Modify: `rust/multisig-glue/src/lib.rs` (replace aggregate/verify functions; keep setup_prover/verifier/rayon)
 - Modify: `rust/zeam-glue/src/lib.rs` (re-export new symbols)
 
+> **SAFETY (codex P2 — applies to ALL six functions below):** before EVERY `slice::from_raw_parts`,
+> null-check the parent array pointer when its count is non-zero — e.g. `if num_raw > 0 && (raw_pub_keys.is_null() || raw_signatures.is_null()) { return -1; }`, and likewise for `child_*`, `pks_flat`, `type_1_proof_ptrs`, `message_hashes`, `message_slots`. A malformed Zig call (non-zero count + null array ptr) must return `-1`/`false`, NOT hit UB. The devnet4 `xmss_aggregate` did this; the new surface must too. The templates below show the body logic but ABBREVIATE these guards — add them at the top of each function.
+
 - [ ] **Step 1: Add the private decompress helpers**
 
 In `lib.rs`, after the `PublicKey`/`Signature` repr(C) structs:
@@ -707,8 +710,8 @@ git commit -m "feat(node): deconstruct split+merge+store mutation with race hand
 ### Task 12: Wire compute→fc→commit into onBlock + thread aggregates to BeamNode
 
 **Files:**
-- Modify: `pkgs/node/src/chain.zig` (onBlock: COMPUTE before `forkChoice.onBlock`; COMMIT after the tracker loop)
-- Modify: `pkgs/node/src/node.zig` (the block-import caller that owns the `BeamNode` pointer — publish recovered aggregates there)
+- Modify: `pkgs/node/src/chain.zig` (onBlock: COMPUTE before `forkChoice.onBlock`; COMMIT after the tracker loop; return struct carrying missing_roots + recovered_aggregates)
+- Modify: `pkgs/node/src/node.zig` (`chainWorkerOnBlockThunk` + imported-block callback: keep forwarding `missing_roots`, additionally publish recovered aggregates via the `BeamNode` pointer)
 - Test: `pkgs/node/src/chain.zig` in-file
 
 - [ ] **Step 1: Failing test — deconstruction recovers proofs into latest_new (not weight)**
@@ -735,7 +738,9 @@ Read chain.zig:3361-3493 first (the `fcprocessing` block — note `forkChoice.on
 2. `forkChoice.onBlock(...)` (protoarray insert) → the per-validator `onAttestationUnlocked(is_from_block=true)` tracker loop (Task 9).
 3. After those succeed: `aggregates = deconstructCommit(forkChoice, staged)` — **infallible** pool write (codex P2 round 4): idempotent insert + best-effort remove, no error/retry, because it runs after fork-choice was already mutated. A benign rotation race just means "remove superseded" is a partial no-op.
 
-Publishing (codex P2): `BeamChain` has NO `node` field, so do NOT call `self.node.publishProducedAggregations(...)` inside `chain.onBlock`. Have `onBlock` surface the committed aggregates to its caller (return / out-param), and publish from the `node.zig` block-import path that holds the `BeamNode` pointer (mirror how `submitAggregateOnInterval` hands a `BeamNode*` to the aggregate worker). Publish only when `is_aggregator_enabled`. Read the existing aggregate-publish wiring first.
+Publishing (codex P2): `BeamChain` has NO `node` field, so do NOT call `self.node.publishProducedAggregations(...)` inside `chain.onBlock`. Have `onBlock` surface the committed aggregates to its caller and publish from the `node.zig` block-import path that holds the `BeamNode` pointer (mirror how `submitAggregateOnInterval` hands a `BeamNode*` to the aggregate worker). Publish only when `is_aggregator_enabled`. Read the existing aggregate-publish wiring first.
+
+**PRESERVE the missing_roots return channel (codex P2 round 5):** `BeamChain.onBlock` currently returns `![]types.Root` — the `missing_roots` slice that `chainWorkerOnBlockThunk` forwards to the imported-block callback to fetch unknown attestation heads (sync path). Do NOT replace that return value with the aggregates, or successful imports with unresolved heads stop triggering the fetch and sync stalls. Change `onBlock` to return a small result struct (or add an out-param) carrying BOTH `missing_roots: []types.Root` AND `recovered_aggregates: []SignedAggregatedAttestation`. Update `chainWorkerOnBlockThunk` and the imported-block callback to keep forwarding `missing_roots` exactly as today, and additionally route `recovered_aggregates` to the publish path. Read the current `onBlock` return + thunk wiring first.
 
 - [ ] **Step 4: Run test, expect pass. Commit.**
 
@@ -766,7 +771,7 @@ cd leanSpec && git fetch origin && git checkout <devnet5-fixture-commit> && cd .
 
 - [ ] **Step 2: Rewrite verify_signatures_runner** per §7.2
 
-Parse `signedBlock.proof` → `ByteList512KiB`; build `pks_per_message` + `messages` (mirror Task 7); call `xmss.verifyType2`; pass/fail == fixture expectation. Delete `parseAggregatedSignatureProof`, attestation-signature + proposer-signature parsing. If Task 0 = (B1/B2), dispatch test-scheme via `leanEnv` and drop the `:134` skip; if (A-fallback), keep the skip.
+Parse `signedBlock.proof` → `ByteList512KiB`, then **SSZ-decode it to `TypeTwoMultiSignature` and pass the INNER `container.proof` (raw wire) to `xmss.verifyType2` (codex P2 — mirror Task 7's §2.y container decode; devnet5 fixtures are SSZ-framed, so passing the outer bytes directly makes `decompress_without_pubkeys` reject valid fixtures)**; build `pks_per_message` + `messages` (mirror Task 7); pass/fail == fixture expectation. Delete `parseAggregatedSignatureProof`, attestation-signature + proposer-signature parsing. If Task 0 = (B1/B2), dispatch test-scheme via `leanEnv` and drop the `:134` skip; if (A-fallback), keep the skip.
 
 - [ ] **Step 3: Update ssz_runner + fork_choice_runner + networking_codec_runner** per §7.3/7.4/7.6
 

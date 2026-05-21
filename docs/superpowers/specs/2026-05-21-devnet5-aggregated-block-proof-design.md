@@ -226,6 +226,11 @@ Zig wrappers: `aggregateType1`, `verifyType1`, `verifyType1Batch`, `mergeType1To
 Threading: all wrappers are pure Zig + extern; callers MUST keep them off libxev (doc comment
 on each). Re-export the new symbol set through `rust/zeam-glue`.
 
+**FFI pointer safety (codex P2).** Every new extern function must null-check each parent array
+pointer before `slice::from_raw_parts` when its count is non-zero (raw pks/sigs, child arrays,
+`pks_flat`, proof-ptr arrays, message hashes/slots). A malformed call (non-zero count + null ptr)
+returns `-1`/`false`, never UB. The devnet4 `xmss_aggregate` guarded these; the new surface must too.
+
 **Error-code granularity (codex P2).** The `0/-1/-2` protocol cannot distinguish decode failure,
 invalid proof, prover-setup failure, panic, or OOM. `-1` is a generic failure; the Rust side logs
 the specific cause (via `tracing`) before returning. If debugging proves this too coarse, add a
@@ -375,6 +380,12 @@ layer (which owns `BeamNode`, e.g. the same place `submitAggregateOnInterval` ha
 the aggregate worker) drains that list to `node.publishProducedAggregations(...)` when this node is
 an aggregator. The plan must thread the aggregates from `chain.onBlock`'s caller up to the node
 layer, not call `self.node.*` inside chain.
+
+**Preserve `missing_roots` (codex P2 round 5).** `chain.onBlock` currently returns `![]types.Root`
+(the `missing_roots` slice the chain-worker thunk forwards to fetch unknown attestation heads — a
+sync-critical path). Surfacing recovered aggregates must NOT clobber that return value. `onBlock`
+returns a small struct (or out-param) carrying BOTH `missing_roots` AND `recovered_aggregates`; the
+thunk keeps forwarding `missing_roots` unchanged and additionally routes the aggregates to publish.
 
 ### 7. Spectest / hive / serialization
 
