@@ -259,6 +259,50 @@ These series help correlate **long `[clock]` `slot_interval` gaps** with wall ti
 - **Labels**: None
 - **Sample Collection Event**: On each invocation of `compactAttestations`
 
+### Block proposal attestation build metrics (`build_block` / `getProposalAttestations`)
+
+`lean_block_building_payload_aggregation_time_seconds` remains the cross-client wall-clock total for the whole call. The metrics below attribute time and counts inside block-proposal attestation selection.
+
+These are **not** the same as `zeam_compact_attestations_*`: those measure only the `compactAttestations` FFI helper (wall time plus attestation row counts in/out per call). They do not cover greedy payload selection, STF simulation, builds completed, child payloads consumed, or final distinct `AttestationData` / aggregate counts. The `compact_ffi` phase here overlaps in time with `zeam_compact_attestations_time_seconds` when compaction runs, but the `lean_block_proposal_*` suite is the portable, spec-aligned surface.
+
+#### `lean_block_proposal_attestation_build_phase_seconds` (HistogramVec)
+- **Description**: Phase-level time inside proposal attestation selection.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8
+- **Labels**: `phase` — `select_payloads` (greedy child-payload pick), `compact_ffi` (recursive `compactAttestations`), `stf_simulate` (candidate block STF)
+- **Sample Collection Event**: Once per outer-loop iteration, per phase
+
+#### `lean_block_proposal_attestation_builds_total` (Counter)
+- **Description**: Completed block-proposal attestation selection runs (one per proposal attempt).
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On successful return from `getProposalAttestationsUnlocked`
+
+#### `lean_block_proposal_child_payloads_consumed_total` (Counter)
+- **Description**: Child aggregated payloads cloned from `latest_known_aggregated_payloads` during greedy selection (before compaction).
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: Summed over one proposal build
+
+#### `lean_block_proposal_attestation_data_selected` (Histogram)
+- **Description**: Distinct `AttestationData` entries selected for the proposal block body.
+- **Type**: Histogram
+- **Unit**: Count
+- **Buckets**: 0, 1, 2, 4, 8, 16, 32
+- **Labels**: None
+- **Sample Collection Event**: On successful return from `getProposalAttestationsUnlocked`
+
+#### `lean_block_proposal_aggregates_selected` (Histogram)
+- **Description**: Aggregated signature proofs in the proposal result after compaction.
+- **Type**: Histogram
+- **Unit**: Count
+- **Buckets**: 0, 1, 2, 4, 8, 16, 32, 64, 128
+- **Labels**: None
+- **Sample Collection Event**: On successful return from `getProposalAttestationsUnlocked`
+
 
 ## Usage
 
