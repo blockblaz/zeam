@@ -103,6 +103,13 @@ pub const NodeOptions = struct {
     /// `--chain-worker false` as the kill-switch for the legacy
     /// synchronous path.
     chain_worker_enabled: bool = true,
+    /// Override the rayon worker count for the multisig aggregate prover.
+    /// `null` keeps the existing automatic split (half of the post-system-
+    /// thread budget to Zig workers, half to rayon). Aggregators in
+    /// CPU-rich environments can set this higher to give the prover more
+    /// parallelism without rebuilding (#899). Surfaced as `--rayon-threads`
+    /// on the `zeam node` CLI.
+    rayon_threads: ?u32 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -417,9 +424,43 @@ pub const Node = struct {
         // the extra worker on odd counts since aggregate verification enters
         // rayon from Zig workers. Both pools still keep a minimum of one worker
         // so tiny/cgroup-limited systems remain functional.
+        //
+        // Operators can override the rayon worker count with `--rayon-threads`
+        // (#899). The automatic split is conservative — it deliberately leaves
+        // half of the post-system-thread budget to the Zig pool because
+        // verification and gossip work also enter rayon. On a CPU-rich
+        // aggregator that bottleneck is the produce path instead, so giving
+        // rayon more cores measurably shortens the per-pass build time.
+        //
         // Must be called before setupProver/setupVerifier since rayon’s global
         // pool is initialized lazily on first use.
-        const rayon_threads = @max(@as(usize, 1), desired_workers -| worker_count);
+        const rayon_threads = if (options.rayon_threads) |override|
+            @max(@as(usize, 1), @as(usize, override))
+        else
+            @max(@as(usize, 1), desired_workers -| worker_count);
+        self.logger.info(
+            "thread pools: cpu_count={d} zig_workers={d} rayon_threads={d}{s}",
+            .{
+                cpu_count,
+                worker_count,
+                rayon_threads,
+                if (options.rayon_threads != null) " (rayon override via --rayon-threads)" else "",
+            },
+        );
+        // Operator-typo guard for --rayon-threads (review feedback on #903).
+        // Rayon tolerates over-subscription, but values like `--rayon-threads 160`
+        // on a 4-vCPU box silently degrade throughput. Warn (don't reject) so the
+        // operator notices in startup logs without blocking deliberate edge cases
+        // (e.g. fractional cgroup quotas where `getCpuCount` reports more CPUs
+        // than the container can actually use).
+        if (options.rayon_threads) |override| {
+            if (@as(usize, override) > cpu_count) {
+                self.logger.warn(
+                    "--rayon-threads {d} exceeds detected cpu_count={d}; rayon over-subscription typically reduces throughput. Verify this is intentional.",
+                    .{ override, cpu_count },
+                );
+            }
+        }
         xmss.setRayonThreads(rayon_threads);
 
         // Pre-warm the XMSS verifier on the main thread before any worker can

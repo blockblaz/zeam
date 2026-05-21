@@ -82,6 +82,13 @@ pub const NodeCommand = struct {
     /// worker path is the supported prod path; the synchronous path
     /// stays in place as a kill-switch via `--chain-worker false`.
     @"chain-worker": bool = true,
+    /// Override the rayon worker count used by the multisig (XMSS) aggregate
+    /// prover. `null` (the default, surfaced as omitted on the CLI) keeps the
+    /// existing post-system-thread split that gives roughly half of the
+    /// remaining cores to the Zig pool and half to rayon — fine for non-
+    /// aggregator nodes. Aggregators on CPU-rich hosts can pass a value here
+    /// to give the prover more parallelism without rebuilding (#899).
+    @"rayon-threads": ?u32 = null,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -107,6 +114,7 @@ pub const NodeCommand = struct {
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
+        .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
         .help = "Show help information for the node command",
     };
 };
@@ -842,6 +850,7 @@ fn mainInner(init: std.process.Init) !void {
                 .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
                 .db_backend = leancmd.@"db-backend",
+                .rayon_threads = leancmd.@"rayon-threads",
             };
 
             defer start_options.deinit(allocator);
