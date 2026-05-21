@@ -530,7 +530,7 @@ test "verifySignatures rejects duplicate AttestationData in body" {
 
 - [ ] **Step 3: Rewrite `verifySignatures`** per design §5.1
 
-Add `assertUniqueAndCappedAttestationData` (unique + ≤ `MAX_ATTESTATIONS_DATA`). **Add explicit `aggregation_bits` validation (codex P2 — Type-2 has no `participants` field, so the bits are the SOLE binding to pubkeys; the old per-attestation participant cross-check is gone):** for each attestation reject if bits are empty, any set index ≥ `len(validators)` (out-of-range), or the bitlist length is invalid. Do these cheap checks BEFORE calling the prover. Build `pks_per_message` (N atts in body order + proposer last, canonical order §2.x) and `messages` (att-data-root,slot then block-root,block.slot). Call `xmss.verifyType2`. Use the `pubkey_cache` for pubkey resolution. Delete the per-attestation loop and the participant cross-check. Delete `verifySignaturesParallel`, `AggregatedPayloadVerifyBatch` task prep. Rename metrics to `lean_pq_sig_block_proof_*`.
+Add `assertUniqueAndCappedAttestationData` (unique + ≤ `MAX_ATTESTATIONS_DATA`). **Add explicit `aggregation_bits` validation (codex P2 — Type-2 has no `participants` field, so the bits are the SOLE binding to pubkeys; the old per-attestation participant cross-check is gone):** for each attestation reject if bits are empty, any set index ≥ `len(validators)` (out-of-range), or the bitlist length is invalid. Do these cheap checks BEFORE calling the prover. Build `pks_per_message` (N atts in body order + proposer last, canonical order §2.x) and `messages` (att-data-root,slot then block-root,block.slot). **Use the attestation `pubkey_cache` for the N attestation components, but resolve the proposer (last) component's PROPOSAL pubkey OUTSIDE that cache (codex P1) — the cache is keyed by validator index and holds attestation keys; a proposer who also attested would otherwise verify with the wrong key and the valid block would be rejected.** Call `xmss.verifyType2`. Delete the per-attestation loop and the participant cross-check. Delete `verifySignaturesParallel`, `AggregatedPayloadVerifyBatch` task prep. Rename metrics to `lean_pq_sig_block_proof_*`.
 
 - [ ] **Step 4: Add the order + cap + bitlist tests**
 
@@ -622,7 +622,7 @@ chain.zig:3273-3277 → `try stf.verifySignatures(self.allocator, pre_snapshot, 
 
 - [ ] **Step 4: Keep the eager tracker update; remove only the proof-write loop**
 
-Read chain.zig:3440-3475 first. The per-validator `forkChoice.onAttestation(att_for_validator, is_from_block=true)` calls (subsystem A — fork-choice weight) STAY exactly as they are; they use the trusted `aggregation_bits`, need no proof. KEEP the existing log-and-continue on `InvalidAttestation`/unknown-head there (documented exception — an unknown head during sync is not a malformed block; see design §5 hard-error policy). REMOVE only the `storeAggregatedPayload(..., is_from_block=true)` calls (subsystem B — they required per-attestation proofs that no longer exist). Do NOT add empty-key stamping. Delete the `is_from_block=true` branch in `forkchoice.zig:storeAggregatedPayload`. Update the `chain.zig:3337` `proof_data` comment to `proof`. (Proof recovery is wired in Task 12.)
+Read chain.zig:3440-3475 first. The per-validator `forkChoice.onAttestation(att_for_validator, is_from_block=true)` calls (subsystem A — fork-choice weight) STAY exactly as they are; they use the trusted `aggregation_bits`, need no proof. KEEP the existing log-and-continue on `InvalidAttestation`/unknown-head there (documented exception — an unknown head during sync is not a malformed block; see design §5 hard-error policy). REMOVE only the `storeAggregatedPayload(..., is_from_block=true)` calls (subsystem B — they required per-attestation proofs that no longer exist). Do NOT add empty-key stamping. Delete the `is_from_block=true` branch in `forkchoice.zig:storeAggregatedPayload`. Update the `chain.zig:3337` `proof_data` comment to `proof`. **Ordering note (codex P1):** Task 12 will insert the fallible `deconstructBlockIntoStore` call BEFORE this tracker-update loop, so a deconstruction hard-reject leaves the tracker untouched. Leave the tracker loop where it is for now; Task 12 places deconstruction ahead of it.
 
 - [ ] **Step 5: Run test, expect pass. Commit.**
 
@@ -674,6 +674,7 @@ git commit -m "feat(node): deconstruct module skeleton + skip-path tests"
 ```zig
 test "deconstruct: unseen attestation → split, write as-is, emit aggregate" { ... }
 test "deconstruct: locally-seen subset → split + merge with partial → combined replaces partial" { ... }
+test "deconstruct: partial overlap local {A} + block {A,B} → no double-count (merge disjoint only)" { ... }
 test "deconstruct: mixed golden — covered + unseen + below-justified in one block" { ... }
 ```
 
@@ -681,7 +682,7 @@ test "deconstruct: mixed golden — covered + unseen + below-justified in one bl
 
 - [ ] **Step 3: Implement the active path** per §6.3
 
-`splitType2ByMessage` → restore participants from att bits → if local partials: `aggregateType1(component + partials)` else use as-is → mutate `latest_new_aggregated_payloads` under `signatures_mutex` (remove superseded across all keys sharing the data_root, insert combined under the block's `data` key via `sszClone`) → append `SignedAggregatedAttestation` to result. Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
+`splitType2ByMessage` (resolve proposer-component pubkey OUTSIDE the attestation cache per codex P1; the split layout includes the proposer entry) → restore participants from att bits → **select only local partials whose validators are DISJOINT from the block component's participants (codex P2 — a validator must not appear in two children of one `aggregateType1` call; the full-coverage skip misses partial overlap like local `{A}` + block `{A,B}`)** → if disjoint partials exist: `aggregateType1(component + disjoint)` else use component as-is → mutate `latest_new_aggregated_payloads` under `signatures_mutex` (remove superseded across all keys sharing the data_root, insert combined under the block's `data` key via `sszClone`) → append `SignedAggregatedAttestation` to result. Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
 
 - [ ] **Step 4: Implement the lock dance + race handling** per §6.4 (CORRECTED lock)
 
@@ -702,10 +703,11 @@ git add pkgs/node/src/deconstruct.zig
 git commit -m "feat(node): deconstruct split+merge+store mutation with race handling"
 ```
 
-### Task 12: Wire deconstruction into onBlock + aggregator publish
+### Task 12: Wire deconstruction into onBlock (before tracker) + thread aggregates to BeamNode
 
 **Files:**
-- Modify: `pkgs/node/src/chain.zig` (onBlock; call after STF, before updateHead)
+- Modify: `pkgs/node/src/chain.zig` (onBlock; insert deconstruction BEFORE the tracker-update loop)
+- Modify: `pkgs/node/src/node.zig` (the block-import caller that owns the `BeamNode` pointer — publish recovered aggregates there)
 - Test: `pkgs/node/src/chain.zig` in-file
 
 - [ ] **Step 1: Failing test — deconstruction recovers proofs into latest_new (not weight)**
@@ -717,19 +719,25 @@ test "onBlock deconstruction recovers Type-1 proofs into latest_new_aggregated_p
     // AttestationData. (Fork-choice weight is already covered by Task 9's tracker
     // test — this test is about PROOF availability for block building, not weight.)
 }
+test "onBlock rejects the whole block when deconstruction fails, tracker untouched" {
+    // force a deconstruction hard error (e.g. missing parent state); assert onBlock
+    // returns an error AND the AttestationTracker was NOT mutated with this block's votes.
+}
 ```
 
 - [ ] **Step 2: Run, expect failure.**
 
-- [ ] **Step 3: Wire it in** per §6.6
+- [ ] **Step 3: Wire it in — ORDER + publish path (codex P1/P2)**
 
-After `apply_transition`, before `updateHead`: call `deconstruct.deconstructBlockIntoStore(...)` (obtain `parent_state` via `statesGet(block.parent_root)`); if `is_aggregator_enabled`, `self.node.publishProducedAggregations(recovered.aggregates.items)`. No fallback — propagate errors (deconstruction failure → whole-block reject, per design §5 hard-error policy).
+Read chain.zig around the post-STF region first. Insert `deconstruct.deconstructBlockIntoStore(...)` (obtain `parent_state` via `statesGet(block.parent_root)`) AFTER `apply_transition` but BEFORE the per-validator `onAttestationUnlocked(is_from_block=true)` tracker loop from Task 9 — so a deconstruction hard error rejects the block with the tracker untouched (codex P1). No fallback — propagate the error (whole-block reject, design §5).
+
+Publishing (codex P2): `BeamChain` has NO `node` field, so do NOT call `self.node.publishProducedAggregations(...)` inside `chain.onBlock`. Instead, have `onBlock` surface the recovered `DeconstructResult.aggregates` to its caller (return them, or stash on a per-call out-param), and publish from the `node.zig` block-import path that already holds the `BeamNode` pointer (mirror how `submitAggregateOnInterval` hands a `BeamNode*` to the aggregate worker). Publish only when `is_aggregator_enabled`. Read the existing aggregate-publish wiring first to match the pattern.
 
 - [ ] **Step 4: Run test, expect pass. Commit.**
 
 ```bash
-git add pkgs/node/src/chain.zig
-git commit -m "feat(node): wire block deconstruction into onBlock with aggregator publish"
+git add pkgs/node/src/chain.zig pkgs/node/src/node.zig
+git commit -m "node: deconstruct before tracker update; publish recovered aggregates via BeamNode"
 ```
 
 ---

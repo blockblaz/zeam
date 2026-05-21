@@ -72,20 +72,31 @@ on_block:
   verify_signatures: single verify_type_2 over all attestations + proposer
                      + reject malformed/duplicate/out-of-range aggregation_bits (see §5.1)
   state_transition
-  # (A) Fork-choice weight — EAGER, unchanged from devnet4. Uses trusted bits, no proof.
-  for each body attestation, for each validator in aggregation_bits:
-        onAttestationUnlocked(att_for_validator, is_from_block=true)   → latestKnown
-  # (B) Proof recovery — replaces the old storeAggregatedPayload(is_from_block=true) loop,
-  #     which consumed per-attestation proofs that no longer exist on the block envelope.
+  # ORDER MATTERS (codex P1): the fallible, hard-reject step (B) runs BEFORE the
+  # tracker mutation (C). Otherwise a deconstruction failure would reject the block
+  # AFTER its votes were already written to the tracker — corrupting fork choice with
+  # a rejected block's votes.
+  # (B) Proof recovery — fallible, hard error → whole-block reject. Reads the payload
+  #     pool + justified checkpoint only; does NOT touch the tracker.
   deconstruct_block_into_store (mandatory, hard error on failure):
      for each att where target.slot > justified.slot AND block_participants ⊄ local_union:
         split_type_2_by_msg → Type-1 component; restore participants from att bits
-        if local partials exist: aggregate_type_1(component + partials) → combined
+        # Only merge local partials DISJOINT from the block component (codex P2) — a
+        # validator must not appear in two children of one aggregate_type_1 call.
+        disjoint = local partials whose validators ∩ block_participants = ∅
+        if disjoint non-empty: aggregate_type_1(component + disjoint) → combined
         else: combined = component
         write combined → latest_new_aggregated_payloads (under signatures_mutex); drop superseded
-        if aggregator: queue combined for gossip publish
+        if aggregator: collect combined into the returned aggregates list
+  # (C) Fork-choice weight — EAGER, unchanged from devnet4. Uses trusted bits, no proof.
+  #     Runs only after (B) succeeded, so a rejected block never mutates the tracker.
+  for each body attestation, for each validator in aggregation_bits:
+        onAttestationUnlocked(att_for_validator, is_from_block=true)   → latestKnown
   update_head
-  publish queued aggregates (aggregator only)
+  # (D) Publishing happens at the node layer (which owns the BeamNode pointer), NOT in
+  #     chain.onBlock (BeamChain has no node field — codex P2). onBlock returns / surfaces
+  #     the recovered aggregates; the node layer publishes them when aggregator.
+  if aggregator: node publishes recovered aggregates
 ```
 
 ### Key behavioural points
@@ -221,6 +232,13 @@ import path. New policy:
 
 - `verifySignatures` collapses to: structural checks → build `pks_per_message` + `messages`
   (canonical order §2.x) → single `verifyType2`.
+- **Proposer key must bypass the attestation pubkey cache (codex P1).** `xmss.PublicKeyCache` is
+  keyed by validator index and stores ATTESTATION pubkeys. The proposer component (last) needs the
+  validator's PROPOSAL pubkey. If a proposer also attested earlier, the cache holds their attestation
+  key under the same index → the proposer component would verify with the wrong key → a valid block
+  is rejected. Resolve the proposer's proposal pubkey by deserializing it directly (NOT via the
+  attestation cache), or via a separate proposal-key cache. Same caveat applies anywhere we resolve
+  pubkeys for the proposer component (production §4, deconstruction §6).
 - **Structural checks (codex P2 — Type-2 has no `participants`, so `aggregation_bits` is the SOLE
   binding to pubkeys; the old per-attestation participant cross-check is gone, so these must be
   explicit):**
@@ -230,17 +248,20 @@ import path. New policy:
   - reject if any of these fail BEFORE calling the prover (cheap rejection, avoids a wasted verify).
 - Delete `verifySignaturesParallel` (per-attestation fan-out is gone; Type-2 is one call,
   internally rayon-parallel). `chain.onBlock` calls `verifySignatures` directly.
-- `chain.onBlock` (corrected — see "Two independent subsystems"):
-  - **Keep** the eager per-validator `onAttestationUnlocked(att, is_from_block=true)` tracker
-    updates (subsystem A — fork-choice weight, unchanged from devnet4).
-  - **Replace** the old `storeAggregatedPayload(is_from_block=true)` loop with
-    `deconstructBlockIntoStore` (subsystem B — proof recovery into `latest_new`). No empty-key
-    stamping (dropped — see behavioural point 3).
-  - Deconstruction runs synchronously, hard error on failure; if aggregator, publish recovered
-    aggregates.
+- `chain.onBlock` (corrected — see "Two independent subsystems"; ORDER per codex P1):
+  - **First** run `deconstructBlockIntoStore` (subsystem B — proof recovery into `latest_new`,
+    fallible/hard-reject). It must run BEFORE the tracker mutation so a deconstruction failure
+    rejects the block without having already written its votes. Replaces the old
+    `storeAggregatedPayload(is_from_block=true)` loop. No empty-key stamping (dropped — point 3).
+  - **Then** the eager per-validator `onAttestationUnlocked(att, is_from_block=true)` tracker
+    updates (subsystem A — fork-choice weight, unchanged from devnet4). Only reached if (B) succeeded.
+  - **Publishing is NOT done inside `chain.onBlock`** (codex P2 — `BeamChain` has no `node` field).
+    `deconstructBlockIntoStore` returns the recovered aggregates; the node layer that owns the
+    `BeamNode` pointer publishes them (see §6).
 - **Hard-error policy (codex P2 — specify which current log-and-continue become rejection):**
   - `verifySignatures` failure (structural or crypto) → whole-block REJECT (already the case).
-  - `deconstructBlockIntoStore` failure → whole-block REJECT (new; no fallback).
+  - `deconstructBlockIntoStore` failure → whole-block REJECT (new; no fallback). Runs before the
+    tracker update, so a reject leaves the tracker untouched.
   - The eager `onAttestationUnlocked(is_from_block=true)` calls: today these can log-and-continue on
     `InvalidAttestation` (unknown head index). Post-`verifySignatures` the bits are trusted, but the
     head block may legitimately be unknown locally (sync gap). Keep log-and-continue HERE
@@ -266,7 +287,26 @@ the main `mutex` across the prover calls.
 Index local partials by `hash_tree_root(AttestationData)` (spec-mandated: equivalent data from
 different code paths may not share a Zig map key). Memory: `sszClone` the combined proof into
 the map; caller owns the returned aggregates. Metric `lean_block_deconstruct_seconds` +
-`lean_block_deconstruct_recovered_bytes`. Publishing via existing `node.publishProducedAggregations`.
+`lean_block_deconstruct_recovered_bytes`.
+
+**Disjoint-merge guard (codex P2).** A validator must not appear in two children of one
+`aggregate_type_1` call, or the merge can fail / produce an invalid combined proof. The skip check
+`block_participants ⊄ local_union` only catches FULL coverage; on partial overlap (local `{A}`,
+block component `{A,B}`) it proceeds. So before merging: select only local partials whose validator
+set is DISJOINT from the block component's participants. If no disjoint partial exists, pass the
+block component through as-is (`combined = component`). This preserves the additive intent (cover
+validators the block adds) without double-counting. Add a unit test for the `{A}` + `{A,B}` case.
+
+**Proposer key resolution (codex P1).** When building `public_keys_per_message` for the split layout,
+the proposer component must use the PROPOSAL pubkey, not the attestation-keyed cache (same caveat as
+§5). Resolve it directly.
+
+**Publishing path (codex P2).** `deconstructBlockIntoStore` does NOT publish — `BeamChain` has no
+`BeamNode` pointer. It returns the recovered aggregates in `DeconstructResult.aggregates`. The node
+layer (which owns `BeamNode`, e.g. the same place `submitAggregateOnInterval` hands a `BeamNode*` to
+the aggregate worker) drains that list to `node.publishProducedAggregations(...)` when this node is
+an aggregator. The plan must thread the aggregates from `chain.onBlock`'s caller up to the node
+layer, not call `self.node.*` inside chain.
 
 ### 7. Spectest / hive / serialization
 
@@ -322,8 +362,9 @@ merge→split_by_msg recovery; verify rejects wrong (hash,slot); proof>512KiB �
 types: SSZ round-trip for TypeOne/TypeTwo/SignedBlock/SignedAggAtt.
 state-transition: verify happy path; reject duplicate AttestationData; reject >MAX; reject
 swapped proposer/att order.
-deconstruct: the 10 cases (empty body / fully covered / target≤justified / unseen→as-is /
-subset→merge / mixed golden / missing parent state / malformed Type-2 / race-retry-then-fail).
+deconstruct: empty body / fully covered / target≤justified / unseen→as-is / subset→merge /
+partial-overlap {A}+{A,B}→no-double-count / mixed golden / missing parent state / malformed Type-2 /
+race-retry-then-fail.
 node: onBlock applies eager tracker weight (block votes count at import via
 onAttestationUnlocked(is_from_block=true)); deconstruction recovers Type-1 proofs into latest_new;
 recovered proofs become available for block building after the next rotation tick; validator_client
