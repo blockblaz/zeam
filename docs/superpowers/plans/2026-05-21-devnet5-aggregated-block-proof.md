@@ -674,7 +674,8 @@ git commit -m "feat(node): deconstruct module skeleton + skip-path tests"
 ```zig
 test "deconstruct: unseen attestation → split, write as-is, emit aggregate" { ... }
 test "deconstruct: locally-seen subset → split + merge with partial → combined replaces partial" { ... }
-test "deconstruct: partial overlap local {A} + block {A,B} → no double-count (merge disjoint only)" { ... }
+test "deconstruct: partial overlap local {A} + block {A,B} → no double-count" { ... }
+test "deconstruct: overlapping local partials {C,D}+{D,E} + block {A,B} → greedy union, D once" { ... }
 test "deconstruct: mixed golden — covered + unseen + below-justified in one block" { ... }
 ```
 
@@ -682,18 +683,18 @@ test "deconstruct: mixed golden — covered + unseen + below-justified in one bl
 
 - [ ] **Step 3: Implement the COMPUTE active path** per §6.3 (no pool mutation)
 
-In `deconstructCompute`: `splitType2ByMessage(container.proof, ...)` (resolve proposer-component pubkey OUTSIDE the attestation cache per codex P1; the split layout includes the proposer entry) → restore participants from att bits → **select only local partials whose validators are DISJOINT from the block component's participants (codex P2 — a validator must not appear in two children of one `aggregateType1` call; the full-coverage skip misses partial overlap like local `{A}` + block `{A,B}`)** → if disjoint partials exist: `aggregateType1(component + disjoint)` else use component as-is → STAGE `(combined, superseded-partials, data)` into `StagedDeconstruct`. NO pool write here. Prover calls run lock-free (snapshot taken in Task 10, released before these calls).
+In `deconstructCompute`: `splitType2ByMessage(container.proof, ...)` (resolve proposer-component pubkey OUTSIDE the attestation cache per codex P1; the split layout includes the proposer entry) → restore participants from att bits → **select local partials greedily against an ACCUMULATED union (codex P2 rounds 3+4 — a validator must not appear in two children of one `aggregateType1` call; "disjoint from the block component" is insufficient because two local partials can overlap each other, e.g. block `{A,B}` + local `{C,D}` + `{D,E}` → D twice). Use the spec's `select_greedily` pattern: `covered = block_participants`; for each partial, select only if it adds validators ∉ covered, then `covered |= partial.validators`.** → if any selected: `aggregateType1(component + selected)` else use component as-is → STAGE `(combined, superseded-partials, data)` into `StagedDeconstruct`. NO pool write here. Prover calls run lock-free (snapshot taken in Task 10, released before these calls).
 
-- [ ] **Step 4: Implement COMMIT + lock/race handling** per §6.4 (compute/commit split — codex P1; CORRECTED lock — codex P2)
+- [ ] **Step 4: Implement INFALLIBLE COMMIT** per §6 (compute/commit split — codex P1; infallible commit — codex P2 round 4; CORRECTED lock — codex P2)
 
-`deconstructCommit(fork_choice, staged)`: re-acquire `forkChoice.signatures_mutex` (the payload-map lock, NOT the main `forkChoice.mutex` which guards protoarray + tracker). `SyncMutex` is exclusive-only. Re-check each staged item's snapshot still holds; on race retry once then `error.RaceDuringDeconstruct`. Then mutate `latest_new_aggregated_payloads` (remove superseded across all keys sharing the data_root, insert combined under the block's `data` key via `sszClone`) and build the `SignedAggregatedAttestation` list to return. Never hold the main `mutex` across prover calls (those already happened in compute). Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
+`deconstructCommit(fork_choice, staged) StagedAggregates` — **must NOT fail** (it runs after the fork-choice mutations; a failure here would report a failed import after protoarray/tracker were already changed). Re-acquire `forkChoice.signatures_mutex` (payload-map lock, NOT the main `forkChoice.mutex`). `SyncMutex` is exclusive-only. Mutate `latest_new_aggregated_payloads`: insert combined under the block's `data` key via `sszClone` (idempotent), and remove superseded partials best-effort (a rotation may have already moved them to `latest_known` — leave those; the greedy set-cover at build/aggregation time dedups the harmless redundancy). NO `error.RaceDuringDeconstruct`, NO retry — the race is benign (combined ⊇ partials). Build the `SignedAggregatedAttestation` list to return. Never hold the main `mutex` across prover calls (those happened in compute). Add `lean_block_deconstruct_seconds` / `lean_block_deconstruct_recovered_bytes` metrics.
 
 - [ ] **Step 5: Add error-path tests**
 
 ```zig
-test "deconstruct: missing parent state → error.MissingParentState" { ... }
-test "deconstruct: malformed Type-2 → error.Type2DecodeFailed" { ... }
-test "deconstruct: rotation race → retry once then error.RaceDuringDeconstruct" { ... }
+test "deconstructCompute: missing parent state → error.MissingParentState" { ... }
+test "deconstructCompute: malformed Type-2 → error.Type2DecodeFailed" { ... }
+test "deconstructCommit: rotation moved a partial to known between compute and commit → still commits combined, no error" { ... }
 ```
 
 - [ ] **Step 6: Run all deconstruct tests, expect pass. Commit.**
@@ -732,7 +733,7 @@ test "onBlock rejects the whole block when deconstruction fails, tracker untouch
 Read chain.zig:3361-3493 first (the `fcprocessing` block — note `forkChoice.onBlock` protoarray insert is at :3362, BEFORE the tracker loop at :3466). Wire in this exact order:
 1. After `apply_transition`: `staged = deconstructCompute(...)` (obtain `parent_state` via `statesGet(block.parent_root)`). This is the fallible/hard-reject step — it runs BEFORE `forkChoice.onBlock` so a failure rejects the block with protoarray AND tracker untouched (codex P1, two rounds). No fallback — propagate the error (whole-block reject, design §5).
 2. `forkChoice.onBlock(...)` (protoarray insert) → the per-validator `onAttestationUnlocked(is_from_block=true)` tracker loop (Task 9).
-3. After those succeed: `aggregates = deconstructCommit(forkChoice, staged)` — infallible pool write. (On the rare rotation race it returns `error.RaceDuringDeconstruct`; since this is post-insert, treat per the race policy — retry already happened in commit.)
+3. After those succeed: `aggregates = deconstructCommit(forkChoice, staged)` — **infallible** pool write (codex P2 round 4): idempotent insert + best-effort remove, no error/retry, because it runs after fork-choice was already mutated. A benign rotation race just means "remove superseded" is a partial no-op.
 
 Publishing (codex P2): `BeamChain` has NO `node` field, so do NOT call `self.node.publishProducedAggregations(...)` inside `chain.onBlock`. Have `onBlock` surface the committed aggregates to its caller (return / out-param), and publish from the `node.zig` block-import path that holds the `BeamNode` pointer (mirror how `submitAggregateOnInterval` hands a `BeamNode*` to the aggregate worker). Publish only when `is_aggregator_enabled`. Read the existing aggregate-publish wiring first.
 

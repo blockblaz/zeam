@@ -87,12 +87,16 @@ on_block:
   deconstruct_compute:
      for each att where target.slot > justified.slot AND block_participants ⊄ local_union:
         split_type_2_by_msg(inner type2 wire, ...) → Type-1 component; restore participants from att bits
-        # Only merge local partials DISJOINT from the block component (codex P2) — a
-        # validator must not appear in two children of one aggregate_type_1 call.
-        disjoint = local partials whose validators ∩ block_participants = ∅
-        if disjoint non-empty: aggregate_type_1(component + disjoint) → combined
+        # Greedy select against ACCUMULATED coverage (codex P2 rounds 3+4) — a validator
+        # must not appear in two children of one aggregate_type_1 call. Disjoint-from-block
+        # alone is insufficient (two local partials can overlap each other).
+        covered = block_participants
+        selected = []
+        for partial in local partials (by hash_tree_root):
+            if partial.validators ⊄ covered: selected += partial; covered |= partial.validators
+        if selected non-empty: aggregate_type_1(component + selected) → combined
         else: combined = component
-        stage (combined, superseded-partials) for commit
+        stage (combined, superseded=selected) for commit
   forkChoice.onBlock(block, post_state)        # protoarray insert (first fc mutation)
   # (C) Fork-choice weight — EAGER, unchanged from devnet4. Uses trusted bits, no proof.
   for each body attestation, for each validator in aggregation_bits:
@@ -329,24 +333,37 @@ Direct port of `_deconstruct_block_into_store` (Section 6.3) but phase-split.
 Locking (codex P2 — corrected): the payload maps are guarded by `forkChoice.signatures_mutex`
 (NOT the main `forkChoice.mutex`, which guards the protoarray + `AttestationTracker`). COMPUTE takes
 `signatures_mutex` only to snapshot local partials, releases it for the heavy split+aggregate prover
-calls. COMMIT re-takes `signatures_mutex`, re-checks the snapshot still holds, and mutates.
-`SyncMutex` is exclusive (no shared mode), so snapshot copies out what it needs and drops the lock
-before the FFI. Retry-once-then-fail on a rotation race between compute and commit
-(`error.RaceDuringDeconstruct`) — a strict bound, not a fallback. Do NOT hold the main `mutex`
+calls. COMMIT re-takes `signatures_mutex` and mutates. `SyncMutex` is exclusive (no shared mode), so
+snapshot copies out what it needs and drops the lock before the FFI. Do NOT hold the main `mutex`
 across the prover calls.
+
+**COMMIT is infallible (codex P2 round 4).** COMMIT runs AFTER the fork-choice mutations
+(`forkChoice.onBlock` + tracker), so it must NOT be able to fail — otherwise a failed commit reports
+a failed import after fork choice was already mutated, the exact inconsistency the compute/commit
+split exists to prevent. The earlier `error.RaceDuringDeconstruct` retry-then-fail is REMOVED. A
+rotation race between compute and commit is BENIGN: the combined proof is a superset of the partials
+it merged, so (a) inserting it into `latest_new` is always valid, and (b) "remove superseded" is
+best-effort — if rotation already moved a partial to `latest_known`, leave it (the greedy set-cover
+at block-build/aggregation time dedups the redundant coverage). So COMMIT = idempotent insert +
+best-effort remove, returns no error. This is correct concurrency handling for a non-correctness-path
+(subsystem B) operation, not an error-masking fallback — fork-choice weight already landed via the
+tracker (subsystem A).
 
 Index local partials by `hash_tree_root(AttestationData)` (spec-mandated: equivalent data from
 different code paths may not share a Zig map key). Memory: `sszClone` the combined proof into
 the map; caller owns the returned aggregates. Metric `lean_block_deconstruct_seconds` +
 `lean_block_deconstruct_recovered_bytes`.
 
-**Disjoint-merge guard (codex P2).** A validator must not appear in two children of one
-`aggregate_type_1` call, or the merge can fail / produce an invalid combined proof. The skip check
-`block_participants ⊄ local_union` only catches FULL coverage; on partial overlap (local `{A}`,
-block component `{A,B}`) it proceeds. So before merging: select only local partials whose validator
-set is DISJOINT from the block component's participants. If no disjoint partial exists, pass the
-block component through as-is (`combined = component`). This preserves the additive intent (cover
-validators the block adds) without double-counting. Add a unit test for the `{A}` + `{A,B}` case.
+**Disjoint selection against accumulated coverage (codex P2 rounds 3+4).** A validator must not
+appear in two children of one `aggregate_type_1` call, or the merge can fail / produce an invalid
+combined proof. The block-coverage skip (`block_participants ⊄ local_union`) only catches FULL
+coverage. A naive "disjoint from the block component" filter is ALSO insufficient: two local partials
+can overlap EACH OTHER (block `{A,B}`, local `{C,D}` and `{D,E}` → D twice). So select greedily
+against an ACCUMULATED union, exactly like the spec's `select_greedily`: start `covered =
+block_participants`; for each local partial, select it only if it adds validators ∉ `covered`, then
+`covered |= partial.validators`. This guarantees no validator appears in two selected children. If
+nothing adds coverage, `combined = component`. Tests: the `{A}`+`{A,B}` case AND the overlapping-local
+`{C,D}`+`{D,E}` case.
 
 **Proposer key resolution (codex P1).** When building `public_keys_per_message` for the split layout,
 the proposer component must use the PROPOSAL pubkey, not the attestation-keyed cache (same caveat as
@@ -427,7 +444,8 @@ gate: `just check` grep-clean compile after the deletion sweep.
 
 1. **Type-2 size budget** — add a `MAX_ATTESTATIONS_DATA`-full block smoke test asserting
    encoded Type-2 ≤ 512 KiB before merge.
-2. **Deconstruction race** — retry-once-then-fail; unit-tested.
+2. **Deconstruction race** — commit is infallible (idempotent insert + best-effort remove); benign
+   rotation race between compute and commit handled without error; unit-tested.
 3. **Deconstruction perf on every node** — bounded by target.slot/coverage skips; watch
    `lean_block_deconstruct_seconds` in shadow-testing.
 4. **Prover throughput** — production (merge + per-att aggregate) and deconstruction
