@@ -279,11 +279,12 @@ pub const ForkChoiceParams = struct {
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
     thread_pool: ?*ThreadPool = null,
-    /// Minimum (children + gossip-sig) inputs required to invoke the
-    /// recursive STARK prover for an `AttestationData`. Threaded through
-    /// from the `--min-aggregation-inputs` CLI flag; see
-    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs` and
-    /// `isTrivialAggregationInput` for the predicate semantics.
+    /// Minimum (children + gossip-sig) inputs the aggregator pre-filter
+    /// requires before letting an `att_data` reach
+    /// `computeAggregatedSignatures`. Threaded through from the
+    /// `--min-aggregation-inputs` CLI flag and consumed by
+    /// `pruneTrivialFromAggregateSnapshot` (NOT by the FFI). See
+    /// `isAggregatorTrivialInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 };
 
@@ -340,10 +341,12 @@ pub const ForkChoice = struct {
     status: ForkChoiceStatus,
     // Optional shared worker pool used for CPU-heavy attestation compaction.
     thread_pool: ?*ThreadPool = null,
-    /// Threshold passed into `computeAggregatedSignatures` on every
-    /// `aggregate*` call. See `ForkChoiceParams.min_aggregation_inputs`.
-    /// Defaulted to the post-#908 value here so test struct literals
-    /// that don't care about the threshold can omit it.
+    /// Threshold consumed by `pruneTrivialFromAggregateSnapshot` on
+    /// every `aggregate*` call to decide which `att_data` entries to
+    /// drop before invoking `computeAggregatedSignatures`. See
+    /// `ForkChoiceParams.min_aggregation_inputs`. Defaulted at the field
+    /// level so test struct literals that don't care about the
+    /// threshold can omit it.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     last_node_tick_time_ms: ?i64,
 
@@ -2119,6 +2122,26 @@ pub const ForkChoice = struct {
             agg.attestation_signatures.deinit();
         };
 
+        // Aggregator-only policy filter: drop `att_data` entries from the
+        // owned snapshot whose only input is a single (or sub-threshold)
+        // local gossip sig and which have no peer payload to fold into.
+        // This MUST live here in the aggregator wrapper, NOT inside
+        // `computeAggregatedSignatures`: the same FFI function is the
+        // primitive a future block proposer would use to aggregate the
+        // exact `att_data` set it chose to include in a block, and a
+        // proposer must aggregate every chosen `att_data` (blocks carry
+        // aggregated proofs, not raw sigs) — even a 1-validator one. By
+        // filtering the snapshot before the FFI runs, the function
+        // remains spec-pure (aggregate whatever you are given) and the
+        // policy is opt-in per call site. See review on PR #908 and
+        // issue #907 finding 4.
+        pruneTrivialFromAggregateSnapshot(
+            self.allocator,
+            &snap,
+            self.min_aggregation_inputs,
+            self.logger,
+        );
+
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
         try agg.computeAggregatedSignatures(
             &state.validators,
@@ -2126,7 +2149,6 @@ pub const ForkChoice = struct {
             &snap.new_payloads,
             &snap.known_payloads,
             slot_filter,
-            self.min_aggregation_inputs,
         );
         observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 
@@ -2996,9 +3018,9 @@ test "aggregate prunes attestation signatures" {
         },
     };
     // Two signatures from distinct validators on the same AttestationData.
-    // A single sig with no peer payloads now hits the trivial-input fast
-    // path in `computeAggregatedSignatures` (issue #907 finding 4 — see
-    // `pkgs/types/src/block.zig isTrivialAggregationInput`) and is left in
+    // A single sig with no peer payloads is now dropped from the snapshot
+    // by the aggregator pre-filter (issue #907 finding 4 — see
+    // `pruneTrivialFromAggregateSnapshot`) and is left in
     // `attestation_signatures` for a future non-trivial pass. Two sigs is
     // the minimum non-trivial shape that exercises the aggregation +
     // pruning path this test is asserting.
@@ -3097,9 +3119,10 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
     // empty-input or trivial-input return path could pass without ever
     // touching the mutex even before the fix). Two distinct validators
     // is the minimum non-trivial shape after the issue #907 finding 4
-    // fast path was added — a single sig with no peer payloads is now
-    // skipped, so it would not exercise the FFI-bearing path this
-    // mutex-contract test is guarding.
+    // aggregator pre-filter was added — a single sig with no peer
+    // payloads is now dropped from the snapshot before
+    // `computeAggregatedSignatures` runs, so it would not exercise the
+    // FFI-bearing path this mutex-contract test is guarding.
     const attestation_data = types.AttestationData{
         .slot = 0,
         .head = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
@@ -3716,6 +3739,114 @@ const AggregateSnapshot = struct {
         deinitAggregatedPayloadsMap(allocator, &self.known_payloads);
     }
 };
+
+/// Returns true when an `att_data` in the aggregator's snapshot is
+/// trivial under the operator's threshold and should be dropped before
+/// `computeAggregatedSignatures` runs:
+///   - no child payloads (neither `new` nor `known`) for this `att_data`, AND
+///   - fewer than `min_inputs` local gossip sigs.
+///
+/// This is the AGGREGATOR-side policy. The FFI function
+/// `computeAggregatedSignatures` itself is spec-pure and has no notion
+/// of this threshold — block proposers would call it with no
+/// pre-filtering so a chosen `att_data` with a lone gossip sig still
+/// produces a valid (1-validator) aggregate for inclusion in the block.
+///
+/// Pure / unit-testable: takes counts, not maps.
+fn isAggregatorTrivialInput(num_children: usize, num_gossip_sigs: usize, min_inputs: u32) bool {
+    if (num_children > 0) return false;
+    return num_gossip_sigs < @as(usize, min_inputs);
+}
+
+test "isAggregatorTrivialInput: any child makes it non-trivial" {
+    try std.testing.expect(!isAggregatorTrivialInput(1, 0, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(1, 1, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(2, 5, 8));
+}
+
+test "isAggregatorTrivialInput default threshold (2): 0 or 1 sig is trivial, 2+ is not" {
+    try std.testing.expect(isAggregatorTrivialInput(0, 0, 2));
+    try std.testing.expect(isAggregatorTrivialInput(0, 1, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 2, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 8, 2));
+}
+
+test "isAggregatorTrivialInput threshold=1 reverts to pre-#908 (only 0+0 trivial)" {
+    try std.testing.expect(isAggregatorTrivialInput(0, 0, 1));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 1, 1));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 2, 1));
+}
+
+test "isAggregatorTrivialInput higher thresholds skip more no-children inputs" {
+    try std.testing.expect(isAggregatorTrivialInput(0, 1, 3));
+    try std.testing.expect(isAggregatorTrivialInput(0, 2, 3));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 3, 3));
+}
+
+/// Walk the owned aggregator snapshot and drop every `att_data` entry
+/// from `signatures` that is trivial under `min_inputs` (see
+/// `isAggregatorTrivialInput`). The corresponding inner map is freed.
+///
+/// Untouched gossip sigs stay in the live `attestation_signatures` map
+/// (the snapshot is a clone — pruning the snapshot does NOT touch the
+/// live map) and naturally feed the next aggregation pass once any
+/// peer payload arrives or another local sig accumulates on the same
+/// `att_data`.
+///
+/// Logs a single debug line summarising the count + threshold so the
+/// startup `aggregator threshold:` info line stays the only visible
+/// boot-time mention of this knob; per-pass detail is at debug level.
+fn pruneTrivialFromAggregateSnapshot(
+    allocator: Allocator,
+    snap: *AggregateSnapshot,
+    min_inputs: u32,
+    logger: zeam_utils.ModuleLogger,
+) void {
+    // `min_inputs <= 1` reduces to the pre-existing `0 sigs + 0
+    // children` skip already inside `computeAggregatedSignatures`, so
+    // the pre-filter is a no-op and we can return early.
+    if (min_inputs <= 1) return;
+
+    // Collect keys to remove first — std.AutoHashMap does not support
+    // removal during iteration.
+    var to_drop: std.ArrayList(types.AttestationData) = .empty;
+    defer to_drop.deinit(allocator);
+
+    var it = snap.signatures.iterator();
+    while (it.next()) |entry| {
+        const att_data = entry.key_ptr.*;
+        const num_sigs: usize = @intCast(entry.value_ptr.count());
+
+        const num_children: usize = blk: {
+            var n: usize = 0;
+            if (snap.new_payloads.get(att_data)) |list| n += list.items.len;
+            if (snap.known_payloads.get(att_data)) |list| n += list.items.len;
+            break :blk n;
+        };
+
+        if (isAggregatorTrivialInput(num_children, num_sigs, min_inputs)) {
+            to_drop.append(allocator, att_data) catch {
+                // Best-effort filtering: on OOM we skip the rest of the
+                // sweep and let `computeAggregatedSignatures` aggregate
+                // whatever's still there. Correctness is preserved
+                // (over-aggregation, never under), and OOM here is
+                // exceedingly unlikely given how small the key list is.
+                return;
+            };
+        }
+    }
+
+    if (to_drop.items.len == 0) return;
+
+    for (to_drop.items) |att_data| {
+        snap.signatures.removeAndDeinit(att_data);
+    }
+
+    logger.debug(
+        "aggregator pre-filter: dropped {d} trivial att_data (threshold min_aggregation_inputs={d})",
+        .{ to_drop.items.len, min_inputs },
+    );
+}
 
 fn collectCoverageFromPayloads(
     map: *AggregatedPayloadsMap,

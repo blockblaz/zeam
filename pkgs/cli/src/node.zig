@@ -111,10 +111,13 @@ pub const NodeOptions = struct {
     /// on the `zeam node` CLI.
     rayon_threads: ?u32 = null,
     /// Minimum (children + gossip-sig) inputs required before the
-    /// aggregator invokes the recursive STARK prover for an
-    /// `AttestationData`. Threaded through to `ForkChoice` →
-    /// `computeAggregatedSignatures`. Surfaced as
-    /// `--min-aggregation-inputs` on the `zeam node` CLI; default is
+    /// aggregator pre-filter lets an `AttestationData` reach the FFI.
+    /// Threaded through to `ForkChoice.min_aggregation_inputs` and
+    /// applied by `pruneTrivialFromAggregateSnapshot` in
+    /// `pkgs/node/src/forkchoice.zig` BEFORE
+    /// `computeAggregatedSignatures` runs (the FFI itself stays
+    /// spec-pure). Surfaced as `--min-aggregation-inputs` on the
+    /// `zeam node` CLI; default is
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
     /// issue #907 finding 4.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
@@ -473,8 +476,9 @@ pub const Node = struct {
 
         // Log the aggregator threshold on startup so operators can see
         // exactly how `--min-aggregation-inputs` was resolved (default vs
-        // override). The threshold is enforced inside
-        // `computeAggregatedSignatures` via `ForkChoice.min_aggregation_inputs`.
+        // override). The threshold is enforced by the aggregator-side
+        // pre-filter in `forkchoice.zig:pruneTrivialFromAggregateSnapshot`,
+        // not inside the spec-pure `computeAggregatedSignatures` FFI.
         self.logger.info(
             "aggregator threshold: min_aggregation_inputs={d}{s}",
             .{
