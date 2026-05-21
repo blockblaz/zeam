@@ -1,9 +1,13 @@
-// Production config (default)
+// Production config (default).
+//
+// Upstream renamed `Scheme...` → `SIG...` in `lifetime_2_to_the_32` only
+// (leanSig main, pulled in via leanMultisig `5eba3b1`). The `lifetime_2_to_the_8`
+// test module below is unchanged and still exports `Scheme...`.
 #[cfg(not(feature = "test-config"))]
 mod config {
     pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::{
         PubKeyAbortingTargetSumLifetime32Dim46Base8 as XmssPublicKey,
-        SchemeAbortingTargetSumLifetime32Dim46Base8 as XmssScheme,
+        SIGAbortingTargetSumLifetime32Dim46Base8 as XmssScheme,
         SecretKeyAbortingTargetSumLifetime32Dim46Base8 as XmssSecretKey,
         SigAbortingTargetSumLifetime32Dim46Base8 as XmssSignature,
     };
