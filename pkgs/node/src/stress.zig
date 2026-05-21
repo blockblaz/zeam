@@ -594,11 +594,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try ThreadPool.init(.{
-        .allocator = allocator,
-        .io = std.Io.Threaded.global_single_threaded.io(),
-        .thread_count = 1,
-    });
+    const thread_pool = try @import("./testing.zig").initTestThreadPool(allocator);
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{
@@ -1103,11 +1099,7 @@ fn runStressSaturation(allocator: Allocator, cfg: SaturationConfig) !SaturationS
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try ThreadPool.init(.{
-        .allocator = allocator,
-        .io = std.Io.Threaded.global_single_threaded.io(),
-        .thread_count = 1,
-    });
+    const thread_pool = try @import("./testing.zig").initTestThreadPool(allocator);
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{

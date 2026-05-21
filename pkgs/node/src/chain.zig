@@ -4732,11 +4732,7 @@ pub const BlockValidationError = error{
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 fn initTestThreadPool() !*ThreadPool {
-    return ThreadPool.init(.{
-        .allocator = std.testing.allocator,
-        .io = std.Io.Threaded.global_single_threaded.io(),
-        .thread_count = 1,
-    });
+    return @import("./testing.zig").initTestThreadPool(std.testing.allocator);
 }
 
 test "process and add mock blocks into a node's chain" {

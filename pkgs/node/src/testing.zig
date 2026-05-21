@@ -13,6 +13,19 @@ const xmss = @import("@zeam/xmss");
 const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const clockFactory = @import("./clock.zig");
 
+/// Test helper: initialize a `*ThreadPool` configured for use in tests.
+///
+/// Centralized so every test/driver in the workspace constructs the pool the
+/// same way (single-threaded global I/O, 4 worker threads). Callers own the
+/// returned pool and must call `deinit` on it.
+pub fn initTestThreadPool(allocator: Allocator) !*ThreadPool {
+    return ThreadPool.init(.{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .thread_count = 4,
+    });
+}
+
 pub const NodeTestOptions = struct {
     num_validators: usize = 4,
     key_manager_slots: usize = 10,
@@ -113,11 +126,7 @@ pub const NodeTestContext = struct {
         var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, &loop, logger_config);
         errdefer clock.deinit(allocator);
 
-        const thread_pool = try ThreadPool.init(.{
-            .allocator = allocator,
-            .io = std.Io.Threaded.global_single_threaded.io(),
-            .thread_count = 1,
-        });
+        const thread_pool = try initTestThreadPool(allocator);
         errdefer thread_pool.deinit();
 
         return NodeTestContext{

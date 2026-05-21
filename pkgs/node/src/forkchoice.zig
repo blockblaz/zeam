@@ -2803,11 +2803,7 @@ pub const ForkChoiceError = error{
 };
 
 fn initTestThreadPool() !*ThreadPool {
-    return ThreadPool.init(.{
-        .allocator = std.testing.allocator,
-        .io = std.Io.Threaded.global_single_threaded.io(),
-        .thread_count = 1,
-    });
+    return @import("./testing.zig").initTestThreadPool(std.testing.allocator);
 }
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
