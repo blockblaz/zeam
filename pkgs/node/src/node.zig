@@ -2805,6 +2805,17 @@ pub const BeamNode = struct {
         }
         // Finalize clears pending state + releases in-flight slot.
         self.network.finalizePendingRequest(request_id);
+
+        // `processBlockByRootChunk` may have discovered the next parent while
+        // this request was still counted in `blocks_by_root_inflight`. During a
+        // long parent walk (late-start sync / checkpoint catch-up) that can hit
+        // MAX_CONCURRENT_BLOCKS_BY_ROOT before any completion event releases a
+        // slot, leaving the newest parent root queued in
+        // `batch_pending_parent_roots` with nobody left to flush it. Now that
+        // this request is finalized, immediately drain any queued parent roots
+        // and keep the walk on the peer that served this response.
+        self.flushPendingParentFetches(peer_id);
+
         // Re-schedule each unserved root; fetchBlockByRoots will
         // dedup against forkchoice/cache/pending and pick a new peer.
         for (roots_to_retry.items) |item| {
