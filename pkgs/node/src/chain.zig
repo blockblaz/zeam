@@ -4274,12 +4274,10 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Submit aggregate work to the shared `ThreadPool` (issue #907).
-    /// Returns within microseconds (atomic cap check + non-blocking `spawnWg`)
-    /// so the libxev interval tick is never parked on the FFI. The worker calls
-    /// `publishProducedAggregations` itself. If `aggregate_max_inflight` is
-    /// already saturated, the submit is skipped and the `in_flight` skip metric
-    /// is incremented.
+    /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
+    /// Returns within microseconds; the worker calls `publishProducedAggregations`
+    /// itself. If the previous aggregate is still in-flight, the submit is
+    /// skipped and the skip metric is incremented.
     pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
