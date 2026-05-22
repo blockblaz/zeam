@@ -102,7 +102,10 @@ unsafe fn write_out(src: &[u8], out_buf: *mut u8, out_cap: usize, out_written: *
 ///
 /// # Safety
 /// `base[0..count]` must be valid pointers (or the function returns None on the first null).
-unsafe fn collect_pubkeys(base: *const *const PublicKey, count: usize) -> Option<Vec<XmssPublicKey>> {
+unsafe fn collect_pubkeys(
+    base: *const *const PublicKey,
+    count: usize,
+) -> Option<Vec<XmssPublicKey>> {
     let mut out = Vec::with_capacity(count);
     let ptrs = slice::from_raw_parts(base, count);
     for &p in ptrs {
@@ -156,10 +159,11 @@ pub unsafe extern "C" fn xmss_aggregate_type_1(
         return -1;
     }
 
-    let message: [u8; MESSAGE_LEN] = match slice::from_raw_parts(message_hash_ptr, MESSAGE_LEN).try_into() {
-        Ok(a) => a,
-        Err(_) => return -1,
-    };
+    let message: [u8; MESSAGE_LEN] =
+        match slice::from_raw_parts(message_hash_ptr, MESSAGE_LEN).try_into() {
+            Ok(a) => a,
+            Err(_) => return -1,
+        };
 
     // Raw (pubkey, signature) pairs.
     let mut raw_xmss: Vec<(XmssPublicKey, XmssSignature)> = Vec::with_capacity(num_raw);
@@ -187,7 +191,12 @@ pub unsafe extern "C" fn xmss_aggregate_type_1(
                 Some(v) => v,
                 None => return -1,
             };
-            offset += n;
+            // Guard the flat-array cursor against usize overflow: a wrapped offset would make the
+            // next `.add(offset)` compute a wild pointer and read out of bounds.
+            offset = match offset.checked_add(n) {
+                Some(v) => v,
+                None => return -1,
+            };
             if proof_ptrs[i].is_null() || proof_lens[i] == 0 {
                 return -1;
             }
@@ -208,7 +217,12 @@ pub unsafe extern "C" fn xmss_aggregate_type_1(
         Ok(Ok(t1)) => t1,
         _ => return -1,
     };
-    write_out(&t1.compress_without_pubkeys(), out_buf, out_cap, out_written)
+    write_out(
+        &t1.compress_without_pubkeys(),
+        out_buf,
+        out_cap,
+        out_written,
+    )
 }
 
 /// Verify a Type-1 multi-signature against a resolved pubkey set, message, and slot.
@@ -233,10 +247,11 @@ pub unsafe extern "C" fn xmss_verify_type_1(
     if num_keys > 0 && public_keys.is_null() {
         return false;
     }
-    let message: [u8; MESSAGE_LEN] = match slice::from_raw_parts(message_hash_ptr, MESSAGE_LEN).try_into() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
+    let message: [u8; MESSAGE_LEN] =
+        match slice::from_raw_parts(message_hash_ptr, MESSAGE_LEN).try_into() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
     let pks = match collect_pubkeys(public_keys, num_keys) {
         Some(v) => v,
         None => return false,
@@ -294,7 +309,11 @@ pub unsafe extern "C" fn xmss_merge_type_1_to_type_2(
             Some(v) => v,
             None => return -1,
         };
-        offset += n;
+        // Guard the flat-array cursor against usize overflow (see xmss_aggregate_type_1).
+        offset = match offset.checked_add(n) {
+            Some(v) => v,
+            None => return -1,
+        };
         if proof_ptrs[i].is_null() || proof_lens[i] == 0 {
             return -1;
         }
@@ -304,12 +323,18 @@ pub unsafe extern "C" fn xmss_merge_type_1_to_type_2(
             None => return -1,
         }
     }
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| merge_many_type_1(parts, log_inv_rate)));
+    let result =
+        std::panic::catch_unwind(AssertUnwindSafe(|| merge_many_type_1(parts, log_inv_rate)));
     let t2 = match result {
         Ok(Ok(t2)) => t2,
         _ => return -1,
     };
-    write_out(&t2.compress_without_pubkeys(), out_buf, out_cap, out_written)
+    write_out(
+        &t2.compress_without_pubkeys(),
+        out_buf,
+        out_cap,
+        out_written,
+    )
 }
 
 /// Recover the Type-1 component bound to `target_message_hash` out of a Type-2 proof.
@@ -340,10 +365,11 @@ pub unsafe extern "C" fn xmss_split_type_2_by_msg(
     if num_messages > 0 && (pks_flat.is_null() || pks_per_message_counts.is_null()) {
         return -1;
     }
-    let target: [u8; MESSAGE_LEN] = match slice::from_raw_parts(target_message_hash, MESSAGE_LEN).try_into() {
-        Ok(a) => a,
-        Err(_) => return -1,
-    };
+    let target: [u8; MESSAGE_LEN] =
+        match slice::from_raw_parts(target_message_hash, MESSAGE_LEN).try_into() {
+            Ok(a) => a,
+            Err(_) => return -1,
+        };
     let counts = slice::from_raw_parts(pks_per_message_counts, num_messages);
     let mut per_msg: Vec<Vec<XmssPublicKey>> = Vec::with_capacity(num_messages);
     let mut offset = 0usize;
@@ -352,7 +378,11 @@ pub unsafe extern "C" fn xmss_split_type_2_by_msg(
             Some(v) => v,
             None => return -1,
         };
-        offset += n;
+        // Guard the flat-array cursor against usize overflow (see xmss_aggregate_type_1).
+        offset = match offset.checked_add(n) {
+            Some(v) => v,
+            None => return -1,
+        };
         per_msg.push(pks);
     }
     let wire = slice::from_raw_parts(type_2_bytes, type_2_len);
@@ -360,13 +390,19 @@ pub unsafe extern "C" fn xmss_split_type_2_by_msg(
         Some(t) => t,
         None => return -1,
     };
-    let result =
-        std::panic::catch_unwind(AssertUnwindSafe(|| split_type_2_by_msg(type_2, target, log_inv_rate)));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        split_type_2_by_msg(type_2, target, log_inv_rate)
+    }));
     let t1 = match result {
         Ok(Ok(t1)) => t1,
         _ => return -1,
     };
-    write_out(&t1.compress_without_pubkeys(), out_buf, out_cap, out_written)
+    write_out(
+        &t1.compress_without_pubkeys(),
+        out_buf,
+        out_cap,
+        out_written,
+    )
 }
 
 /// Verify a Type-2 multi-message proof. `verify_type_2` checks only the SNARK; the per-component
@@ -403,7 +439,11 @@ pub unsafe extern "C" fn xmss_verify_type_2(
             Some(v) => v,
             None => return false,
         };
-        offset += n;
+        // Guard the flat-array cursor against usize overflow (see xmss_aggregate_type_1).
+        offset = match offset.checked_add(n) {
+            Some(v) => v,
+            None => return false,
+        };
         per_msg.push(pks);
     }
     let wire = slice::from_raw_parts(type_2_bytes, type_2_len);
@@ -421,7 +461,9 @@ pub unsafe extern "C" fn xmss_verify_type_2(
     for i in 0..num_messages {
         let mut expected = [0u8; MESSAGE_LEN];
         expected.copy_from_slice(&hashes[i * MESSAGE_LEN..(i + 1) * MESSAGE_LEN]);
-        if sig.info[i].without_pubkeys.message != expected || sig.info[i].without_pubkeys.slot != slots[i] {
+        if sig.info[i].without_pubkeys.message != expected
+            || sig.info[i].without_pubkeys.slot != slots[i]
+        {
             return false;
         }
     }

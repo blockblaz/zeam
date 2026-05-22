@@ -18,9 +18,12 @@ const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
-/// Maximum number of distinct AttestationData entries a single block may
-/// include, matching leanSpec's chain.config.MAX_ATTESTATIONS_DATA.
-pub const MAX_ATTESTATIONS_DATA: usize = 16;
+/// Maximum number of distinct AttestationData entries a single block may include. Re-exported from
+/// `@zeam/params` so the forkchoice import gate and the signature verifier (state-transition) share
+/// one source of truth. devnet5 collapses the body attestations + proposer signature into a single
+/// Type-2 proof (N attestations → N+1 components), which must stay within leanMultisig's
+/// MAX_RECURSIONS=16; 8 (+1 proposer = 9) leaves margin and matches the spec value peers enforce.
+pub const MAX_ATTESTATIONS_DATA: usize = params.MAX_ATTESTATIONS_DATA;
 
 fn validateAttestationDataLimits(
     allocator: Allocator,
@@ -2447,7 +2450,7 @@ pub const ForkChoice = struct {
             }
 
             // Per leanSpec store.process_block: a block may include at most
-            // MAX_ATTESTATIONS_DATA (16) distinct AttestationData entries, and
+            // MAX_ATTESTATIONS_DATA (8) distinct AttestationData entries, and
             // each distinct entry must appear exactly once. Enforce this before
             // registering the block in protoArray so rejected blocks leave no
             // residue in fork choice state.
@@ -2852,7 +2855,7 @@ test "forkchoice block tree" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2903,7 +2906,7 @@ test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence sem
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2989,7 +2992,7 @@ test "aggregate prunes attestation signatures" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3102,7 +3105,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3272,7 +3275,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -4135,7 +4138,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -5115,7 +5118,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 

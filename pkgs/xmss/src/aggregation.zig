@@ -185,7 +185,11 @@ pub fn aggregateType1(
         child_proof_lens[i] = ps.len;
     }
 
-    var buf: [MAX_AGGREGATE_PROOF_SIZE]u8 = undefined;
+    // 512 KiB scratch — heap-allocated, not on the stack: these wrappers run on worker threads
+    // and nest (buildType2BlockProof → mergeType1ToType2; deconstruct → split → aggregate), so
+    // multiple live 512 KiB stack frames would risk overflowing a small worker stack.
+    const buf = allocator.alloc(u8, MAX_AGGREGATE_PROOF_SIZE) catch return AggregationError.Type1AggregateFailed;
+    defer allocator.free(buf);
     var written: usize = 0;
     const rc = xmss_aggregate_type_1(
         raw_pks.ptr,
@@ -199,7 +203,7 @@ pub fn aggregateType1(
         message_hash,
         slot,
         log_inv_rate,
-        &buf,
+        buf.ptr,
         buf.len,
         &written,
     );
@@ -266,7 +270,9 @@ pub fn mergeType1ToType2(
         off += pp.len;
     }
 
-    var buf: [MAX_AGGREGATE_PROOF_SIZE]u8 = undefined;
+    // 512 KiB scratch on the heap, not the stack (see aggregateType1).
+    const buf = allocator.alloc(u8, MAX_AGGREGATE_PROOF_SIZE) catch return AggregationError.Type2MergeFailed;
+    defer allocator.free(buf);
     var written: usize = 0;
     const rc = xmss_merge_type_1_to_type_2(
         num_parts,
@@ -275,7 +281,7 @@ pub fn mergeType1ToType2(
         pks_flat.ptr,
         pks_counts.ptr,
         log_inv_rate,
-        &buf,
+        buf.ptr,
         buf.len,
         &written,
     );
@@ -322,7 +328,9 @@ pub fn splitType2ByMessage(
     }
 
     const wire = type_2_proof.constSlice();
-    var buf: [MAX_AGGREGATE_PROOF_SIZE]u8 = undefined;
+    // 512 KiB scratch on the heap, not the stack (see aggregateType1).
+    const buf = allocator.alloc(u8, MAX_AGGREGATE_PROOF_SIZE) catch return AggregationError.Type2SplitFailed;
+    defer allocator.free(buf);
     var written: usize = 0;
     const rc = xmss_split_type_2_by_msg(
         wire.ptr,
@@ -332,7 +340,7 @@ pub fn splitType2ByMessage(
         num_messages,
         target_message_hash,
         log_inv_rate,
-        &buf,
+        buf.ptr,
         buf.len,
         &written,
     );

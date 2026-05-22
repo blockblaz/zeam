@@ -3206,7 +3206,7 @@ test "Node peer tracking on connect/disconnect" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3911,6 +3911,10 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         .slot = slot,
         .proposer_index = validator_ids[0],
     });
+    // Own produced_block until consumed below, so a signing / proof-building error frees
+    // the block + its Type-1 list instead of leaking it (the testing allocator flags leaks).
+    var produced_block_consumed = false;
+    errdefer if (!produced_block_consumed) produced_block.deinit();
     const produced_root = produced_block.blockRoot;
 
     const proposer_signature = try ctx.key_manager.signBlockRoot(
@@ -3921,7 +3925,11 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
 
     // Merge per-attestation Type-1s + proposer singleton into the single Type-2 block proof.
     var proof = try types.ByteList512KiB.init(allocator);
+    // Gate on the same flag as the block: once consumed, signed_block owns proof and its
+    // `defer signed_block.deinit()` frees it, so this errdefer must not also fire (double free).
+    errdefer if (!produced_block_consumed) proof.deinit();
     try node.chain.buildBlockProof(&produced_block, &proposer_signature, &proof);
+    produced_block_consumed = true;
     for (produced_block.attestation_type1s.slice()) |*t1| t1.deinit();
     produced_block.attestation_type1s.deinit();
 
