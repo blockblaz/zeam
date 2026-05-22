@@ -1,5 +1,7 @@
 const aggregation = @import("./aggregation.zig");
-pub const AggregatedSignatureProof = aggregation.AggregatedSignatureProof;
+pub const TypeOneMultiSignature = aggregation.TypeOneMultiSignature;
+pub const TypeTwoMultiSignature = aggregation.TypeTwoMultiSignature;
+pub const MessageBinding = aggregation.MessageBinding;
 pub const LOG_INV_RATE_TEST = aggregation.LOG_INV_RATE_TEST;
 pub const LOG_INV_RATE_PROD = aggregation.LOG_INV_RATE_PROD;
 
@@ -25,12 +27,12 @@ pub const BeamBlockBody = block.BeamBlockBody;
 pub const SignedBlock = block.SignedBlock;
 pub const AggregatedAttestations = block.AggregatedAttestations;
 pub const AggregatedAttestationsResult = block.AggregatedAttestationsResult;
-pub const AttestationSignatures = block.AttestationSignatures;
-pub const BlockSignatures = block.BlockSignatures;
-pub const createBlockSignatures = block.createBlockSignatures;
 pub const StoredSignature = block.StoredSignature;
 pub const SignaturesMap = block.SignaturesMap;
 pub const aggregateInnerMap = block.AggregateInnerMap;
+pub const buildType2BlockProof = block.buildType2BlockProof;
+pub const Type1ProofList = block.Type1ProofList;
+pub const ByteList512KiB = block.ByteList512KiB;
 pub const StoredAggregatedPayload = block.StoredAggregatedPayload;
 pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
 pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;

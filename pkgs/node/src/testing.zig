@@ -104,7 +104,7 @@ pub const NodeTestContext = struct {
                 .name = spec_name,
                 .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
-                .max_attestations_data = 16,
+                .max_attestations_data = 8,
             },
         };
 
@@ -180,85 +180,5 @@ pub const NodeTestContext = struct {
 
     pub fn genesisConfig(self: *NodeTestContext) types.GenesisSpec {
         return self.genesis_config;
-    }
-
-    pub fn signBlockWithValidatorKeys(
-        self: *const NodeTestContext,
-        allocator: Allocator,
-        block: *types.SignedBlock,
-    ) !void {
-        var attestation_signatures = try types.AttestationSignatures.init(allocator);
-        errdefer attestation_signatures.deinit();
-
-        for (block.block.body.attestations.constSlice()) |aggregated_attestation| {
-            var signature_proof = try types.AggregatedSignatureProof.init(allocator);
-            errdefer signature_proof.deinit();
-
-            var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-            defer indices.deinit(allocator);
-
-            // Collect signature handles for aggregation
-            var signature_handles: std.ArrayList(xmss.Signature) = .empty;
-            defer {
-                for (signature_handles.items) |*sig| {
-                    sig.deinit();
-                }
-                signature_handles.deinit(allocator);
-            }
-
-            // Sign attestation for each validator and set participant bits
-            for (indices.items) |validator_index| {
-                try types.aggregationBitsSet(&signature_proof.participants, validator_index, true);
-
-                // Create attestation for this validator
-                const attestation = types.Attestation{
-                    .validator_id = @intCast(validator_index),
-                    .data = aggregated_attestation.data,
-                };
-
-                // Sign and keep the handle for aggregation
-                const sig = try self.key_manager.signAttestationWithHandle(&attestation, allocator);
-                try signature_handles.append(allocator, sig);
-            }
-
-            // Perform actual aggregation if we have signatures
-            if (signature_handles.items.len > 0) {
-                const num_sigs = signature_handles.items.len;
-                const pub_keys = try allocator.alloc(*const xmss.HashSigPublicKey, num_sigs);
-                defer allocator.free(pub_keys);
-                const sig_ptrs = try allocator.alloc(*const xmss.HashSigSignature, num_sigs);
-                defer allocator.free(sig_ptrs);
-
-                for (indices.items, 0..) |val_idx, i| {
-                    pub_keys[i] = try self.key_manager.getAttestationPubkeyHandle(val_idx);
-                    sig_ptrs[i] = signature_handles.items[i].handle;
-                }
-
-                // Compute message hash
-                var message_hash: [32]u8 = undefined;
-                try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
-
-                const epoch: u32 = @intCast(aggregated_attestation.data.slot);
-
-                // Perform the actual aggregation (no children in testing mode)
-                const empty_children_pks: [][]*const xmss.HashSigPublicKey = &.{};
-                const empty_children_proofs: []const xmss.ByteListMiB = &.{};
-                try xmss.aggregateSignatures(pub_keys, sig_ptrs, empty_children_pks, empty_children_proofs, &message_hash, epoch, types.LOG_INV_RATE_TEST, &signature_proof.proof_data);
-            }
-
-            try attestation_signatures.append(signature_proof);
-        }
-
-        var block_root: types.Root = undefined;
-        try zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &block_root, allocator);
-        const proposer_signature = try self.key_manager.signBlockRoot(block.block.proposer_index, &block_root, @intCast(block.block.slot));
-
-        const signatures = types.BlockSignatures{
-            .attestation_signatures = attestation_signatures,
-            .proposer_signature = proposer_signature,
-        };
-
-        block.signature.deinit();
-        block.signature = signatures;
     }
 };

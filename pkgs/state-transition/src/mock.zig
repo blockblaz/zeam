@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 
 const params = @import("@zeam/params");
 const types = @import("@zeam/types");
+const xmss = @import("@zeam/xmss");
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
 
@@ -96,18 +97,10 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var block_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
 
+    // Genesis is the anchor block and is not signature-verified, so it carries an empty proof.
     const gen_signed_block = types.SignedBlock{
         .block = genesis_block,
-        .signature = blk: {
-            var signatures = try types.createBlockSignatures(allocator, genesis_block.body.attestations.len());
-            const proposer_sig = try key_manager.signBlockRoot(
-                genesis_block.proposer_index,
-                &block_root,
-                @intCast(genesis_block.slot),
-            );
-            signatures.proposer_signature = proposer_sig;
-            break :blk signatures;
-        },
+        .proof = try xmss.ByteList512KiB.init(allocator),
     };
 
     try blockList.append(allocator, gen_signed_block);
@@ -292,7 +285,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             agg_attestations.deinit();
         };
 
-        var agg_signatures = try types.AttestationSignatures.init(allocator);
+        var agg_signatures = try types.Type1ProofList.init(allocator);
         var agg_sig_cleanup = true;
         errdefer if (agg_sig_cleanup) {
             for (agg_signatures.slice()) |*sig| sig.deinit();
@@ -331,22 +324,38 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         try transition.apply_raw_block(allocator, &beam_state, &block, block_building_logger, null);
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
-        // Sign block root with proposal key
+        // Sign block root with proposal key.
         const proposer_sig = try key_manager.signBlockRoot(
             proposer_index,
             &block_root,
             @intCast(block.slot),
         );
 
-        const block_signatures = types.BlockSignatures{
-            .attestation_signatures = agg_signatures,
-            .proposer_signature = proposer_sig,
-        };
+        // Merge the per-attestation Type-1 proofs + the proposer singleton into the single
+        // Type-2 block proof carried by SignedBlock.proof.
+        var proof_bytes = try xmss.ByteList512KiB.init(allocator);
+        errdefer proof_bytes.deinit();
+        try types.buildType2BlockProof(
+            allocator,
+            &beam_state.validators,
+            &block.body.attestations,
+            agg_signatures.constSlice(),
+            proposer_index,
+            &block_root,
+            @intCast(block.slot),
+            &proposer_sig,
+            &proof_bytes,
+        );
+
+        // The per-attestation Type-1s are now folded into proof_bytes and are no longer owned
+        // by the block (devnet5 SignedBlock has no per-attestation list). Free them here.
+        for (agg_signatures.slice()) |*sig| sig.deinit();
+        agg_signatures.deinit();
         agg_sig_cleanup = false;
 
         const signed_block = types.SignedBlock{
             .block = block,
-            .signature = block_signatures,
+            .proof = proof_bytes,
         };
         try blockList.append(allocator, signed_block);
         try blockRootList.append(allocator, block_root);

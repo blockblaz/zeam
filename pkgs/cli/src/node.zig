@@ -924,7 +924,7 @@ pub fn buildStartOptions(
         }
     }
 
-    // Resolve max_attestations_data from config.yaml (no CLI flag; defaults to 16 in ChainConfig).
+    // Resolve max_attestations_data from config.yaml (no CLI flag; defaults to 8 in ChainConfig — devnet5).
     opts.max_attestations_data = maxAttestationsDataFromYAML(parsed_config);
 }
 

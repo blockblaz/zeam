@@ -3,6 +3,7 @@ const json = std.json;
 const Allocator = std.mem.Allocator;
 const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
+const xmss = @import("@zeam/xmss");
 const zeam_utils = @import("@zeam/utils");
 const jsonToString = zeam_utils.jsonToString;
 const key_manager_lib = @import("@zeam/key-manager");
@@ -138,22 +139,30 @@ pub const ValidatorClient = struct {
             }
 
             self.logger.debug("constructing block for slot={d} proposer={d}", .{ slot, slot_proposer_id });
-            const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
+            var produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
             self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
 
-            // Sign block root with proposer's proposal key
+            // Sign block root with proposer's proposal key.
             const proposer_signature = try self.key_manager.signBlockRoot(
                 slot_proposer_id,
                 &produced_block.blockRoot,
                 @intCast(slot),
             );
 
+            // Merge the per-attestation Type-1 proofs + a proposer singleton into the single
+            // Type-2 block proof. The chain helper resolves the validator set and runs the prover.
+            var proof = try xmss.ByteList512KiB.init(self.allocator);
+            errdefer proof.deinit();
+            try self.chain.buildBlockProof(&produced_block, &proposer_signature, &proof);
+
+            // The per-attestation Type-1s are folded into `proof` and are no longer owned by the
+            // block (devnet5 SignedBlock has no per-attestation list). Free them; move the block.
+            for (produced_block.attestation_type1s.slice()) |*t1| t1.deinit();
+            produced_block.attestation_type1s.deinit();
+
             const signed_block = types.SignedBlock{
                 .block = produced_block.block,
-                .signature = .{
-                    .attestation_signatures = produced_block.attestation_signatures,
-                    .proposer_signature = proposer_signature,
-                },
+                .proof = proof,
             };
 
             self.logger.info("signed produced block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });

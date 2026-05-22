@@ -678,7 +678,7 @@ fn processBlockStep(
 
     // Store block body attestations as known aggregated payloads
     for (aggregated_attestations) |agg_att| {
-        var proof_template = types.AggregatedSignatureProof.init(driver.allocator) catch continue;
+        var proof_template = types.TypeOneMultiSignature.init(driver.allocator) catch continue;
         defer proof_template.deinit();
 
         const bits_len = agg_att.aggregation_bits.len();
@@ -840,7 +840,7 @@ fn processGossipAggregatedAttestationStep(
     }
 
     // Build proof template for storeAggregatedPayload
-    var proof_template = types.AggregatedSignatureProof.init(driver.allocator) catch return error.OutOfMemory;
+    var proof_template = types.TypeOneMultiSignature.init(driver.allocator) catch return error.OutOfMemory;
     defer proof_template.deinit();
     const bits_len = aggregation_bits.len();
     for (0..bits_len) |i| {
@@ -1151,78 +1151,49 @@ pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
     };
     defer block.deinit();
 
-    const sig_val = signed_block_obj.get("signature") orelse return buildSimpleResult(allocator, false, "MissingSignature");
-    const sig_obj = switch (sig_val) {
-        .object => |m| m,
-        else => return buildSimpleResult(allocator, false, "InvalidSignature"),
-    };
+    var any_failure = false;
+    var failure_reason: ?[]const u8 = null;
 
-    // ----- Proposer signature verification -----
-    const proposer_sig_hex = blk: {
-        const v = getFieldMulti(sig_obj, &.{ "proposerSignature", "proposer_signature" }) orelse
-            break :blk null;
+    // ----- Devnet5: single Type-2 block proof verification -----
+    // SignedBlock carries one `proof` (SSZ-encoded Type-2) covering every body attestation plus
+    // the proposer's signature. Parse it, assemble the SignedBlock, and reuse the unified verifier.
+    // NOTE (A-fallback): the prod-scheme verifier cannot check test-scheme aggregation proofs; for
+    // leanEnv=test fixtures with body attestations this mirrors the spectest skip and is unsupported.
+    _ = is_test_env;
+    const proof_hex = blk: {
+        const v = signed_block_obj.get("proof") orelse break :blk null;
         break :blk switch (v) {
             .string => |s| s,
             else => null,
         };
     };
 
-    var any_failure = false;
-    var failure_reason: ?[]const u8 = null;
-
-    if (proposer_sig_hex) |hex| proposer: {
-        // Use a stack buffer — SIGSIZE (2536 bytes) is a known compile-time constant.
-        var sig_buf: [types.SIGSIZE]u8 = undefined;
-        const proposer_sig_bytes = parseHexBytes(&sig_buf, hex) catch {
+    if (proof_hex) |hex| verify: {
+        var proof_list = xmss.ByteList512KiB.init(aa) catch {
             any_failure = true;
-            failure_reason = "InvalidProposerSignatureHex";
-            break :proposer;
+            failure_reason = "OutOfMemory";
+            break :verify;
         };
-
-        // Hash the block
-        var block_root: [32]u8 = undefined;
-        zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, aa) catch {
+        const proof_bytes = parseHexBytesAlloc(aa, hex) catch {
             any_failure = true;
-            failure_reason = "HashFailed";
-            break :proposer;
+            failure_reason = "InvalidProofHex";
+            break :verify;
         };
-
-        const proposer_index: usize = @intCast(block.proposer_index);
-        const validators_slice = state.validators.constSlice();
-        if (proposer_index >= validators_slice.len) {
+        for (proof_bytes) |b| proof_list.append(b) catch {
             any_failure = true;
-            failure_reason = "InvalidProposerIndex";
-            break :proposer;
-        }
-
-        const proposal_pubkey = validators_slice[proposer_index].getProposalPubkey();
-        const epoch: u32 = @intCast(block.slot);
-
-        const result = if (is_test_env)
-            xmss.verifySszTest(proposal_pubkey, &block_root, epoch, proposer_sig_bytes)
-        else
-            xmss.verifySsz(proposal_pubkey, &block_root, epoch, proposer_sig_bytes);
-        if (result) |_| {} else |_| {
+            failure_reason = "ProofTooLarge";
+            break :verify;
+        };
+        // `block` is owned by the outer `defer block.deinit()`; signed_block aliases it and is not
+        // separately deinit'd. `proof_list` lives in the request arena.
+        const signed_block = types.SignedBlock{ .block = block, .proof = proof_list };
+        state_transition.verifySignatures(aa, &state, &signed_block, null) catch {
             any_failure = true;
-            failure_reason = "ProposerSignatureVerificationFailed";
-        }
+            failure_reason = "SignatureVerificationFailed";
+        };
     } else {
         any_failure = true;
-        failure_reason = "MissingProposerSignature";
-    }
-
-    // ----- Attestation signature verification -----
-    if (!any_failure) {
-        const att_sigs_result = verifyAttestationSignatures(aa, &state, &block, sig_obj, is_test_env);
-        if (att_sigs_result) |att_failed| {
-            if (att_failed) {
-                any_failure = true;
-                failure_reason = "AttestationSignatureVerificationFailed";
-            }
-        } else |_| {
-            any_failure = true;
-            failure_reason = "AttestationSignatureVerificationError";
-        }
+        failure_reason = "MissingProof";
     }
 
     // Report the truth about whether signatures verified.
@@ -1331,8 +1302,8 @@ fn verifyAttestationSignatures(
     return any_failed;
 }
 
-/// Parse an AggregatedSignatureProof from a JSON value (test driver format).
-fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.AggregatedSignatureProof {
+/// Parse a TypeOneMultiSignature from a JSON value (test driver format).
+fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.TypeOneMultiSignature {
     const obj = switch (value) {
         .object => |m| m,
         else => return error.InvalidField,
@@ -1359,7 +1330,7 @@ fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.Aggre
         participants.append(b) catch return error.InvalidField;
     }
 
-    const proof_data_obj = switch (getFieldMulti(obj, &.{ "proofData", "proof_data" }) orelse return error.MissingField) {
+    const proof_data_obj = switch (obj.get("proof") orelse return error.MissingField) {
         .object => |m| m,
         else => return error.InvalidField,
     };
@@ -1370,15 +1341,15 @@ fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.Aggre
     const proof_bytes = try parseHexBytesAlloc(allocator, proof_data_hex);
     defer allocator.free(proof_bytes);
 
-    var proof_data = try xmss.ByteListMiB.init(allocator);
-    errdefer proof_data.deinit();
+    var proof = try xmss.ByteList512KiB.init(allocator);
+    errdefer proof.deinit();
     for (proof_bytes) |b| {
-        proof_data.append(b) catch return error.InvalidField;
+        proof.append(b) catch return error.InvalidField;
     }
 
-    return types.AggregatedSignatureProof{
+    return types.TypeOneMultiSignature{
         .participants = participants,
-        .proof_data = proof_data,
+        .proof = proof,
     };
 }
 

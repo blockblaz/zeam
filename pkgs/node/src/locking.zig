@@ -2106,7 +2106,7 @@ fn makeFixtureSignedBlockPtr(
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.ByteList512KiB.init(allocator),
     };
     return block_ptr;
 }

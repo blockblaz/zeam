@@ -14,7 +14,6 @@ const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const constants = @import("./constants.zig");
 
-const AggregatedSignatureProof = types.AggregatedSignatureProof;
 const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
@@ -1020,7 +1019,7 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     pub const ProposalAttestationsResult = struct {
         attestations: types.AggregatedAttestations,
-        signatures: types.AttestationSignatures,
+        signatures: types.Type1ProofList,
     };
 
     /// Checks whether `slot` is justified under the given tracking state,
@@ -1102,7 +1101,7 @@ pub const ForkChoice = struct {
             agg_attestations.deinit();
         };
 
-        var attestation_signatures = try types.AttestationSignatures.init(self.allocator);
+        var attestation_signatures = try types.Type1ProofList.init(self.allocator);
         var agg_sig_cleanup = true;
         errdefer if (agg_sig_cleanup) {
             for (attestation_signatures.slice()) |*sig| sig.deinit();
@@ -1208,7 +1207,7 @@ pub const ForkChoice = struct {
                 defer covered.deinit();
 
                 while (true) {
-                    var best_proof: ?*const types.AggregatedSignatureProof = null;
+                    var best_proof: ?*const types.TypeOneMultiSignature = null;
                     var best_new_coverage: usize = 0;
 
                     for (payloads.items) |*stored| {
@@ -1228,8 +1227,8 @@ pub const ForkChoice = struct {
 
                     if (best_proof == null or best_new_coverage == 0) break;
 
-                    var cloned_proof: types.AggregatedSignatureProof = undefined;
-                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
+                    var cloned_proof: types.TypeOneMultiSignature = undefined;
+                    try types.sszClone(self.allocator, types.TypeOneMultiSignature, best_proof.?.*, &cloned_proof);
                     errdefer cloned_proof.deinit();
 
                     var att_bits: types.AggregationBits = undefined;
@@ -1712,11 +1711,11 @@ pub const ForkChoice = struct {
     pub fn storeAggregatedPayload(
         self: *Self,
         attestation_data: *const types.AttestationData,
-        proof: types.AggregatedSignatureProof,
+        proof: types.TypeOneMultiSignature,
         is_from_block: bool,
     ) !void {
-        var cloned_proof: types.AggregatedSignatureProof = undefined;
-        try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+        var cloned_proof: types.TypeOneMultiSignature = undefined;
+        try types.sszClone(self.allocator, types.TypeOneMultiSignature, proof, &cloned_proof);
         var cloned_proof_owned = true;
         errdefer if (cloned_proof_owned) cloned_proof.deinit();
 
@@ -1747,8 +1746,8 @@ pub const ForkChoice = struct {
                     self.latest_block_aggregated_payloads_slot = attestation_data.slot;
                 }
 
-                var block_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &block_proof);
+                var block_proof: types.TypeOneMultiSignature = undefined;
+                try types.sszClone(self.allocator, types.TypeOneMultiSignature, proof, &block_proof);
                 var block_proof_owned = true;
                 errdefer if (block_proof_owned) block_proof.deinit();
 
@@ -1959,7 +1958,7 @@ pub const ForkChoice = struct {
     fn buildAggregateSourceAttribution(
         self: *Self,
         att_data: types.AttestationData,
-        proof: types.AggregatedSignatureProof,
+        proof: types.TypeOneMultiSignature,
         source_payload_bits: *types.AggregationBits,
         source_gossip_bits: *types.AggregationBits,
     ) !void {
@@ -2123,8 +2122,8 @@ pub const ForkChoice = struct {
                 errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
                 try self.buildAggregateSourceAttribution(agg_att.data, proof, &source_payload_bits, &source_gossip_bits);
 
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+                var cloned_proof: types.TypeOneMultiSignature = undefined;
+                try types.sszClone(self.allocator, types.TypeOneMultiSignature, proof, &cloned_proof);
                 errdefer cloned_proof.deinit();
                 try gop.value_ptr.append(self.allocator, .{
                     .slot = agg_att.data.slot,
@@ -2135,8 +2134,8 @@ pub const ForkChoice = struct {
                 source_payload_bits_owned = false;
                 source_gossip_bits_owned = false;
 
-                var output_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
+                var output_proof: types.TypeOneMultiSignature = undefined;
+                try types.sszClone(self.allocator, types.TypeOneMultiSignature, proof, &output_proof);
                 errdefer output_proof.deinit();
                 try results.append(self.allocator, .{
                     .data = agg_att.data,
@@ -3514,7 +3513,7 @@ fn stageAggregatedAttestation(
 ) !void {
     try fork_choice.onSignedAttestation(signed_attestation);
 
-    var proof = try types.AggregatedSignatureProof.init(allocator);
+    var proof = try types.TypeOneMultiSignature.init(allocator);
     defer proof.deinit();
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
@@ -3561,8 +3560,8 @@ fn cloneAggregatedPayloadsMap(
 
         try gop.value_ptr.ensureTotalCapacityPrecise(allocator, entry.value_ptr.items.len);
         for (entry.value_ptr.items) |*stored| {
-            var cloned_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(allocator, types.AggregatedSignatureProof, stored.proof, &cloned_proof);
+            var cloned_proof: types.TypeOneMultiSignature = undefined;
+            try types.sszClone(allocator, types.TypeOneMultiSignature, stored.proof, &cloned_proof);
             errdefer cloned_proof.deinit();
 
             var cloned_source_payload: ?types.AggregationBits = null;

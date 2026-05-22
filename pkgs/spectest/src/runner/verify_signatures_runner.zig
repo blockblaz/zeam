@@ -5,6 +5,7 @@ const forks = @import("../fork.zig");
 const fixture_kind = @import("../fixture_kind.zig");
 const skip = @import("../skip.zig");
 const stf_runner = @import("state_transition_runner.zig");
+const state_transition = @import("@zeam/state-transition");
 
 const Fork = forks.Fork;
 const FixtureKind = fixture_kind.FixtureKind;
@@ -118,25 +119,16 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
     const block_obj = try expect_mod.expectObject(FixtureError, signed_block_obj, &.{"block"}, ctx, "signedBlock.block");
     const expect_exception = case_obj.get("expectException");
 
-    // Body attestation verification dispatches to leanMultisig, which is
-    // hardcoded to the production scheme. Skip cases with body attestations
-    // when running against test-scheme fixtures: the prod path would reject
-    // test-scheme bytes by accident at deserialization, which is the right
-    // outcome for invalid fixtures but the wrong outcome for valid ones.
-    // A parallel test-scheme leanMultisig FFI is the right fix; tracked separately.
+    // Devnet5 collapses every body attestation AND the proposer signature into a single Type-2
+    // proof verified through leanMultisig, which is hardcoded to the production scheme. So the
+    // ENTIRE verify path is prod-only now — skip all leanEnv=test fixtures (a parallel test-scheme
+    // leanMultisig FFI is the right fix; tracked separately, A-fallback).
     if (std.mem.eql(u8, lean_env, "test")) {
-        const body_obj = try expect_mod.expectObject(FixtureError, block_obj, &.{"body"}, ctx, "signedBlock.block.body");
-        const attestations_obj = try expect_mod.expectObject(FixtureError, body_obj, &.{"attestations"}, ctx, "signedBlock.block.body.attestations");
-        if (attestations_obj.get("data")) |data_val| {
-            const arr = try expect_mod.expectArrayValue(FixtureError, data_val, ctx, "body.attestations.data");
-            if (arr.items.len > 0) {
-                std.debug.print(
-                    "spectest: skipping verify_signatures fixture {s} (leanEnv=test with body attestations; needs test-scheme leanMultisig FFI)\n",
-                    .{ctx.fixture_label},
-                );
-                return FixtureError.SkippedFixture;
-            }
-        }
+        std.debug.print(
+            "spectest: skipping verify_signatures fixture {s} (leanEnv=test; devnet5 Type-2 proof needs test-scheme leanMultisig FFI)\n",
+            .{ctx.fixture_label},
+        );
+        return FixtureError.SkippedFixture;
     }
 
     const anchor_value = case_obj.get("anchorState") orelse {
@@ -152,230 +144,42 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
     var block = try stf_runner.buildBlock(allocator, ctx, 0, block_obj);
     defer block.deinit();
 
-    const signature_obj = try expect_mod.expectObject(FixtureError, signed_block_obj, &.{"signature"}, ctx, "signedBlock.signature");
-    const proposer_sig_hex = try expect_mod.expectStringField(
+    // Devnet5: SignedBlock carries one SSZ-encoded Type-2 proof covering every body attestation
+    // plus the proposer signature. Build the SignedBlock and run the unified verifier, then
+    // compare its outcome to the fixture's expectException.
+    const proof_hex = try expect_mod.expectStringField(
         FixtureError,
-        signature_obj,
-        &.{ "proposerSignature", "proposer_signature" },
+        signed_block_obj,
+        &.{"proof"},
         ctx,
-        "signedBlock.signature.proposerSignature",
+        "signedBlock.proof",
     );
+    const proof_bytes = try parseHexBytes(allocator, ctx, proof_hex, "signedBlock.proof");
 
-    const proposer_sig_bytes = try parseHexBytes(allocator, ctx, proposer_sig_hex, "signedBlock.signature.proposerSignature");
+    var proof_list = try xmss.ByteList512KiB.init(allocator);
+    defer proof_list.deinit();
+    for (proof_bytes) |b| proof_list.append(b) catch return FixtureError.InvalidFixture;
 
-    // Hash the block to produce the verification message.
-    var block_root: [32]u8 = undefined;
-    zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, allocator) catch {
-        std.debug.print(
-            "fixture {s} case {s}: failed to hash block\n",
-            .{ ctx.fixture_label, ctx.case_name },
-        );
-        return FixtureError.InvalidFixture;
-    };
-
-    const proposer_index: usize = @intCast(block.proposer_index);
-    const validators_slice = state.validators.constSlice();
-    if (proposer_index >= validators_slice.len) {
-        // Out-of-range proposer is itself a rejection-worthy case. If the
-        // fixture expected an exception, this counts as success; otherwise
-        // it is a validator-state mismatch.
-        if (case_obj.get("expectException") != null) return;
-        std.debug.print(
-            "fixture {s} case {s}: proposer_index {d} >= validators.len {d}\n",
-            .{ ctx.fixture_label, ctx.case_name, proposer_index, validators_slice.len },
-        );
-        return FixtureError.FixtureMismatch;
-    }
-
-    const proposal_pubkey = validators_slice[proposer_index].getProposalPubkey();
-    const epoch: u32 = @intCast(block.slot);
-
-    const proposer_result = if (std.mem.eql(u8, lean_env, "test"))
-        xmss.verifySszTest(proposal_pubkey, &block_root, epoch, proposer_sig_bytes)
-    else
-        xmss.verifySsz(proposal_pubkey, &block_root, epoch, proposer_sig_bytes);
-    const proposer_failed = if (proposer_result) |_| false else |_| true;
-
-    // Verify each body-attestation aggregated signature, if any. The fixture's
-    // attestationSignatures array runs in lockstep with block.body.attestations.
-    //
-    // leanMultisig's Rust glue is hardcoded to the production scheme; test-scheme
-    // bytes will not deserialize through it. For invalid-fixture cases that path
-    // returning false is the expected outcome anyway (the spec asserts the
-    // implementation rejects). For valid-fixture cases with body attestations,
-    // we'd need a parallel test-scheme leanMultisig FFI; none of the current
-    // valid fixtures carry body attestations so that gap doesn't bite yet.
-    const att_failed = verifyBodyAttestations(allocator, ctx, &state, &block, signed_block_obj) catch |err| switch (err) {
-        FixtureError.SkippedFixture => return FixtureError.SkippedFixture,
-        else => return err,
-    };
-
-    const any_failure = proposer_failed or att_failed;
+    // signed_block aliases `block` (freed by its own defer); only proof_list needs cleanup.
+    const signed_block = types.SignedBlock{ .block = block, .proof = proof_list };
+    const verify_failed = if (state_transition.verifySignatures(allocator, &state, &signed_block, null)) |_| false else |_| true;
 
     if (expect_exception != null) {
-        if (any_failure) return; // expected — at least one signature was rejected
+        if (verify_failed) return; // expected — the proof was rejected
         std.debug.print(
-            "fixture {s} case {s}: expected exception but every signature verified\n",
+            "fixture {s} case {s}: expected exception but the block proof verified\n",
             .{ ctx.fixture_label, ctx.case_name },
         );
         return FixtureError.FixtureMismatch;
     }
 
-    if (any_failure) {
-        if (proposer_result) |_| {} else |err| {
-            std.debug.print(
-                "fixture {s} case {s}: unexpected proposer signature verification error: {s}\n",
-                .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
-            );
-        }
-        if (att_failed) {
-            std.debug.print(
-                "fixture {s} case {s}: unexpected body-attestation verification failure\n",
-                .{ ctx.fixture_label, ctx.case_name },
-            );
-        }
-        return FixtureError.FixtureMismatch;
-    }
-}
-
-/// Verify each body-attestation aggregated signature. Returns true if any
-/// verification rejected the input (whether due to invalid bytes, scheme
-/// mismatch, or genuine cryptographic failure).
-fn verifyBodyAttestations(
-    allocator: Allocator,
-    ctx: Context,
-    state: *const types.BeamState,
-    block: *const types.BeamBlock,
-    signed_block_obj: std.json.ObjectMap,
-) FixtureError!bool {
-    const attestations = block.body.attestations.constSlice();
-    if (attestations.len == 0) return false;
-
-    const signature_obj = try expect_mod.expectObject(FixtureError, signed_block_obj, &.{"signature"}, ctx, "signedBlock.signature");
-    const att_sigs_obj = try expect_mod.expectObject(FixtureError, signature_obj, &.{ "attestationSignatures", "attestation_signatures" }, ctx, "signedBlock.signature.attestationSignatures");
-    // Structural malformations (missing data field, length mismatch with body
-    // attestations) are valid representations of network-level rejections —
-    // they exercise the verifier's input-validation path, not a corrupt
-    // fixture. Surface them as "verification rejected" (return true) so the
-    // expectException check at the call site can match. Matches the HTTP
-    // test driver's behavior in pkgs/cli/src/test_driver.zig.
-    const att_sigs_data = att_sigs_obj.get("data") orelse {
+    if (verify_failed) {
         std.debug.print(
-            "fixture {s} case {s}: attestationSignatures missing data\n",
+            "fixture {s} case {s}: unexpected block proof verification failure\n",
             .{ ctx.fixture_label, ctx.case_name },
         );
-        return true;
-    };
-    const sig_arr = try expect_mod.expectArrayValue(FixtureError, att_sigs_data, ctx, "attestationSignatures.data");
-
-    if (sig_arr.items.len != attestations.len) {
-        std.debug.print(
-            "fixture {s} case {s}: body attestations ({d}) != attestationSignatures ({d})\n",
-            .{ ctx.fixture_label, ctx.case_name, attestations.len, sig_arr.items.len },
-        );
-        return true;
+        return FixtureError.FixtureMismatch;
     }
-
-    const validators_slice = state.validators.constSlice();
-    var any_failed = false;
-
-    for (attestations, sig_arr.items, 0..) |aggregated_attestation, sig_value, idx| {
-        var validator_indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator) catch {
-            any_failed = true;
-            continue;
-        };
-        defer validator_indices.deinit(allocator);
-
-        var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
-        defer {
-            for (pubkey_wrappers.items) |*wrapper| wrapper.deinit();
-            pubkey_wrappers.deinit(allocator);
-        }
-        var public_keys: std.ArrayList(*const xmss.HashSigPublicKey) = .empty;
-        defer public_keys.deinit(allocator);
-
-        var pubkey_load_failed = false;
-        for (validator_indices.items) |validator_index| {
-            if (validator_index >= validators_slice.len) {
-                pubkey_load_failed = true;
-                break;
-            }
-            const pubkey_bytes = validators_slice[validator_index].getAttestationPubkey();
-            const pk = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
-                pubkey_load_failed = true;
-                break;
-            };
-            pubkey_wrappers.append(allocator, pk) catch {
-                pubkey_load_failed = true;
-                break;
-            };
-            public_keys.append(allocator, pk.handle) catch {
-                pubkey_load_failed = true;
-                break;
-            };
-        }
-        if (pubkey_load_failed) {
-            any_failed = true;
-            continue;
-        }
-
-        // Parse the aggregated signature proof from the fixture (variable byte
-        // list — scheme-agnostic at the wire level). Use the same helper the
-        // state-transition runner uses so we benefit from any future format
-        // tightening.
-        var proof = try parseAggregatedSignatureProof(allocator, ctx, sig_value, idx);
-        defer proof.deinit();
-
-        var message_hash: [32]u8 = undefined;
-        zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator) catch {
-            any_failed = true;
-            continue;
-        };
-
-        const epoch: u64 = aggregated_attestation.data.slot;
-        proof.verify(public_keys.items, &message_hash, epoch) catch {
-            any_failed = true;
-        };
-    }
-
-    return any_failed;
-}
-
-fn parseAggregatedSignatureProof(
-    allocator: Allocator,
-    ctx: Context,
-    value: JsonValue,
-    idx: usize,
-) FixtureError!types.AggregatedSignatureProof {
-    var label_buf: [64]u8 = undefined;
-    const label = std.fmt.bufPrint(&label_buf, "attestationSignatures[{d}]", .{idx}) catch "attestationSignatures[]";
-
-    const obj = try expect_mod.expectObjectValue(FixtureError, value, ctx, label);
-
-    const participants_value = obj.get("participants") orelse {
-        std.debug.print(
-            "fixture {s} case {s}: {s}.participants missing\n",
-            .{ ctx.fixture_label, ctx.case_name, label },
-        );
-        return FixtureError.InvalidFixture;
-    };
-    var participants = try stf_runner.parseAggregationBits(allocator, ctx, participants_value);
-    errdefer participants.deinit();
-
-    const proof_data_obj = try expect_mod.expectObject(FixtureError, obj, &.{ "proofData", "proof_data" }, ctx, "attestationSignatures[].proofData");
-    const proof_data_hex = try expect_mod.expectStringField(FixtureError, proof_data_obj, &.{"data"}, ctx, "attestationSignatures[].proofData.data");
-    const proof_data_bytes = try parseHexBytes(allocator, ctx, proof_data_hex, "attestationSignatures[].proofData.data");
-
-    var proof_data = try xmss.ByteListMiB.init(allocator);
-    errdefer proof_data.deinit();
-    for (proof_data_bytes) |b| {
-        proof_data.append(b) catch return FixtureError.InvalidFixture;
-    }
-
-    return types.AggregatedSignatureProof{
-        .participants = participants,
-        .proof_data = proof_data,
-    };
 }
 
 fn parseHexBytes(

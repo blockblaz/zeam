@@ -31,11 +31,10 @@ const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 /// Gossip block message size limit.
 ///
-/// XMSS/post-quantum signatures are substantially larger than BLS: a single
-/// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
-/// MAX_ATTESTATIONS_DATA (16) attestations each with such a proof.  On devnet4
-/// a legitimate block reached ~9.37 MB, exceeding the 4 MB RPC limit and
-/// triggering error.TooLarge (issue #723).
+/// XMSS/post-quantum signatures are substantially larger than BLS. In devnet5 a block carries a
+/// single merged Type-2 proof (covering up to MAX_ATTESTATIONS_DATA = 8 attestations plus the
+/// proposer); in devnet4 a legitimate block (per-attestation proofs) reached ~9.37 MB, exceeding
+/// the 4 MB RPC limit and triggering error.TooLarge (issue #723).
 ///
 /// Set to 50 MB to accommodate current devnet block sizes with room to grow.
 /// Revisit once the leanSpec formalises a MAX_GOSSIP_BLOCK_SIZE constant.

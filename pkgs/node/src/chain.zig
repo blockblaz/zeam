@@ -30,6 +30,7 @@ const LockTimer = locking.LockTimer;
 const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
+const deconstruct = @import("./deconstruct.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -87,15 +88,16 @@ pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
 
-    // Aggregated signatures corresponding to attestations in the block body.
-    attestation_signatures: types.AttestationSignatures,
+    // Per-attestation Type-1 proofs (parallel to block.body.attestations). The validator service
+    // merges these + a proposer singleton into the single Type-2 block proof before publishing.
+    attestation_type1s: types.Type1ProofList,
 
     pub fn deinit(self: *ProducedBlock) void {
         self.block.deinit();
-        for (self.attestation_signatures.slice()) |*sig_group| {
+        for (self.attestation_type1s.slice()) |*sig_group| {
             sig_group.deinit();
         }
-        self.attestation_signatures.deinit();
+        self.attestation_type1s.deinit();
     }
 };
 
@@ -2633,8 +2635,41 @@ pub const BeamChain = struct {
         return .{
             .block = block,
             .blockRoot = block_root,
-            .attestation_signatures = attestation_signatures,
+            .attestation_type1s = attestation_signatures,
         };
+    }
+
+    /// Merge a produced block's per-attestation Type-1 proofs + the proposer's raw signature into
+    /// the single Type-2 block proof carried by `SignedBlock.proof`. Clones the validator set out
+    /// of the block's committed state and releases the states lock BEFORE the prover runs, so the
+    /// heavy merge does not block block import on `states_lock.exclusive` (issue #863).
+    /// `out_proof` must be an init'd, empty `xmss.ByteList512KiB`. Runs on the caller's thread;
+    /// callers should keep it off libxev (it drives the prover).
+    pub fn buildBlockProof(
+        self: *Self,
+        produced: *const ProducedBlock,
+        proposer_sig: *const types.SIGBYTES,
+        out_proof: *xmss.ByteList512KiB,
+    ) !void {
+        var borrow = self.statesGet(produced.blockRoot) orelse return BlockProductionError.MissingPreState;
+        defer borrow.assertReleasedOrPanic();
+        const state_snapshot = try borrow.cloneAndRelease(self.allocator);
+        defer {
+            state_snapshot.deinit();
+            self.allocator.destroy(state_snapshot);
+        }
+
+        try types.buildType2BlockProof(
+            self.allocator,
+            &state_snapshot.validators,
+            &produced.block.body.attestations,
+            produced.attestation_type1s.constSlice(),
+            @intCast(produced.block.proposer_index),
+            &produced.blockRoot,
+            @intCast(produced.block.slot),
+            proposer_sig,
+            out_proof,
+        );
     }
 
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
@@ -3270,11 +3305,10 @@ pub const BeamChain = struct {
             // atomic and the loser frees its handle. The previous
             // mutex around this block was the dominant contributor
             // to the ~78ms mean lock hold reported in #863.
-            if (self.thread_pool) |pool| {
-                try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
-            } else {
-                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
-            }
+            // Single Type-2 verify (devnet5): one verify covers every body attestation plus the
+            // proposer signature. The per-attestation fan-out is gone, so there is no parallel
+            // variant — verifyType2 is internally rayon-parallel.
+            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
             step_watch.lap("verify_signatures");
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify).
@@ -3359,6 +3393,22 @@ pub const BeamChain = struct {
 
         // 3. fc onblock if the block was not pre added by the block production
         const fcBlock = self.forkChoice.getBlock(block_root) orelse fcprocessing: {
+            // (B1) Deconstruction COMPUTE — recover per-attestation Type-1 proofs from this block's
+            // Type-2 into staged form, BEFORE any fork-choice mutation. Non-fatal: any failure
+            // stages nothing. This is subsystem B (proof pool / aggregator gossip); fork-choice
+            // weight lands eagerly via the tracker loop below, independent of this.
+            var staged = stage: {
+                var parent_borrow = self.statesGet(block.parent_root) orelse break :stage deconstruct.StagedDeconstruct.empty(self.allocator);
+                defer parent_borrow.assertReleasedOrPanic();
+                const parent_state = parent_borrow.cloneAndRelease(self.allocator) catch break :stage deconstruct.StagedDeconstruct.empty(self.allocator);
+                defer {
+                    parent_state.deinit();
+                    self.allocator.destroy(parent_state);
+                }
+                break :stage deconstruct.deconstructCompute(self.allocator, &self.forkChoice, &signedBlock, parent_state) catch deconstruct.StagedDeconstruct.empty(self.allocator);
+            };
+            defer staged.deinit();
+
             const freshFcBlock = try self.forkChoice.onBlock(block, post_state, .{
                 .currentSlot = block.slot,
                 .blockDelayMs = 0,
@@ -3375,15 +3425,6 @@ pub const BeamChain = struct {
             });
 
             const aggregated_attestations = block.body.attestations.constSlice();
-            const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
-
-            if (aggregated_attestations.len != signature_groups.len) {
-                self.logger.err(
-                    "signature group count mismatch for block root=0x{x}: attestations={d} signature_groups={d}",
-                    .{ &freshFcBlock.blockRoot, aggregated_attestations.len, signature_groups.len },
-                );
-                return BlockProcessingError.InvalidSignatureGroups;
-            }
 
             // Each unique AttestationData must appear at most once per block.
             {
@@ -3427,26 +3468,16 @@ pub const BeamChain = struct {
                 }
             }
 
-            for (aggregated_attestations, 0..) |aggregated_attestation, index| {
+            // Apply each block attestation's votes to the fork-choice tracker (subsystem A: eager
+            // weight from the trusted aggregation_bits — no proof needed; the block's Type-2 was
+            // already verified above). Per-attestation Type-1 proofs are NOT recorded here; they
+            // are recovered into latest_new via the separate deconstruction path.
+            for (aggregated_attestations) |aggregated_attestation| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
 
-                // Get participant indices from the signature proof, length already validated
-                const signature_proof = &signature_groups[index];
-
-                var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
-                defer participant_indices.deinit(self.allocator);
-
-                if (validator_indices.items.len != participant_indices.items.len or !std.mem.eql(usize, validator_indices.items, participant_indices.items)) {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                    self.logger.err(
-                        "attestation signature mismatch index={d} validators={d} participants={d}",
-                        .{ index, validator_indices.items.len, participant_indices.items.len },
-                    );
-                    continue;
-                }
-
-                // Validate aggregated attestation data once before processing individual validators
+                // An unknown head during sync is a fork-choice availability condition, not a
+                // malformed block — log-and-continue (buffered for replay), never reject here.
                 self.validateAttestationData(aggregated_attestation.data, true) catch |e| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     if (e == AttestationValidationError.UnknownHeadBlock) {
@@ -3474,21 +3505,22 @@ pub const BeamChain = struct {
 
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
-
-                // store the aggregated payloads in known
-                var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-                defer self.allocator.free(validator_ids);
-                for (validator_indices.items, 0..) |vi, i| {
-                    validator_ids[i] = @intCast(vi);
-                }
-                self.forkChoice.storeAggregatedPayload(&aggregated_attestation.data, signature_proof.*, true) catch |e| {
-                    self.logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
-                };
             }
 
             // 5. fc update head
             _ = try self.forkChoice.updateHead();
             step_watch.lap("block_attestations");
+
+            // (B2) Deconstruction COMMIT — infallible; insert recovered Type-1 proofs into
+            // latest_new_aggregated_payloads now that the fork-choice mutations succeeded. The
+            // returned aggregates mirror leanSpec's immediate aggregator re-gossip, but in zeam the
+            // recovered proofs now live in latest_new and are picked up + gossiped by the normal
+            // aggregation interval (aggregateUnlocked reads latest_new), so an explicit re-gossip
+            // here is redundant — dropped. (At most a one-tick gossip-latency difference vs leanSpec.)
+            var recovered = deconstruct.deconstructCommit(self.allocator, &self.forkChoice, &staged);
+            for (recovered.items) |*agg| agg.deinit();
+            recovered.deinit(self.allocator);
+            step_watch.lap("block_deconstruct");
 
             break :fcprocessing freshFcBlock;
         };
@@ -4740,7 +4772,7 @@ test "process and add mock blocks into a node's chain" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -4831,7 +4863,7 @@ test "printSlot output demonstration" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -4912,7 +4944,7 @@ test "buildTreeVisualization integration test" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5005,7 +5037,7 @@ test "attestation validation - comprehensive" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5299,7 +5331,7 @@ test "attestation validation - gossip future-slot bound" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5431,7 +5463,7 @@ const FutureSlotTestFixture = struct {
                 .name = spec_name,
                 .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
-                .max_attestations_data = 16,
+                .max_attestations_data = 8,
             },
         };
         fx.beam_state = fx.mock_chain.genesis_state;
@@ -5905,7 +5937,7 @@ test "attestation processing - valid block attestation" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -6008,7 +6040,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -6064,13 +6096,13 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     };
 
     // Create mock proofs with all 4 validators participating
-    var proof_unseen = try types.AggregatedSignatureProof.init(allocator);
+    var proof_unseen = try types.TypeOneMultiSignature.init(allocator);
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_unseen.participants, i, true);
     }
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true);
 
-    var proof_known = try types.AggregatedSignatureProof.init(allocator);
+    var proof_known = try types.TypeOneMultiSignature.init(allocator);
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_known.participants, i, true);
     }
@@ -6144,7 +6176,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     // Heap-allocate beam_state and zeam_logger_config so their addresses are
@@ -6236,7 +6268,7 @@ test "produceBlock - older-but-justified source is accepted" {
         .source = .{ .root = older_source_root, .slot = older_justified_slot },
     };
     const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
-    var proof = try types.AggregatedSignatureProof.init(allocator);
+    var proof = try types.TypeOneMultiSignature.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true);
 
@@ -6298,7 +6330,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
         .target = .{ .root = parent_root, .slot = 4 },
         .source = .{ .root = types.ZERO_HASH, .slot = justified_slot },
     };
-    var proof_zs = try types.AggregatedSignatureProof.init(allocator);
+    var proof_zs = try types.TypeOneMultiSignature.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zs.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true);
 
@@ -6309,7 +6341,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
         .target = .{ .root = types.ZERO_HASH, .slot = 4 },
         .source = .{ .root = justified_root, .slot = justified_slot },
     };
-    var proof_zt = try types.AggregatedSignatureProof.init(allocator);
+    var proof_zt = try types.TypeOneMultiSignature.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zt.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true);
 
@@ -6321,7 +6353,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
         .target = .{ .root = parent_root, .slot = 4 },
         .source = .{ .root = justified_root, .slot = justified_slot },
     };
-    var proof_valid = try types.AggregatedSignatureProof.init(allocator);
+    var proof_valid = try types.TypeOneMultiSignature.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_valid.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true);
 
@@ -6390,7 +6422,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
         .target = .{ .root = justified_root, .slot = already_justified_slot },
         .source = .{ .root = mock_chain.blockRoots[1], .slot = 1 },
     };
-    var proof_aj = try types.AggregatedSignatureProof.init(allocator);
+    var proof_aj = try types.TypeOneMultiSignature.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
 
@@ -6406,7 +6438,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
         .target = .{ .root = genesis_root, .slot = 0 },
         .source = .{ .root = genesis_root, .slot = 0 },
     };
-    var proof_gsv = try types.AggregatedSignatureProof.init(allocator);
+    var proof_gsv = try types.TypeOneMultiSignature.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_gsv.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true);
 
@@ -6868,7 +6900,7 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -7058,7 +7090,7 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -7221,7 +7253,7 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
                 .name = spec_name,
                 .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
-                .max_attestations_data = 16,
+                .max_attestations_data = 8,
             },
         };
 
@@ -7378,7 +7410,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
                 .name = spec_name,
                 .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
-                .max_attestations_data = 16,
+                .max_attestations_data = 8,
             },
         };
 
@@ -7609,7 +7641,7 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -7826,7 +7858,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -7951,7 +7983,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
             .name = spec_name_2,
             .fork_digest = fork_digest_2,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8104,7 +8136,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8217,7 +8249,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8324,7 +8356,7 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8433,7 +8465,7 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8532,7 +8564,7 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 

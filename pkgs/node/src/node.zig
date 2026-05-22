@@ -3296,7 +3296,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.ByteList512KiB.init(allocator),
     };
 
     const block2_ptr = try allocator.create(types.SignedBlock);
@@ -3310,7 +3310,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.ByteList512KiB.init(allocator),
     };
 
     // Cache blocks
@@ -3350,10 +3350,10 @@ test "Node: processCachedDescendants basic flow" {
 
     const chain_config = ctx.takeChainConfig();
     const anchor_state = ctx.takeAnchorState();
+    // genMockChain already builds valid Type-2 block proofs for every block, so no extra signing
+    // step is needed here (devnet5 collapsed per-attestation signing into the single block proof).
     var mock_chain = try stf.genMockChain(allocator, 3, ctx.genesisConfig());
     defer mock_chain.deinit(allocator);
-    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[1]);
-    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[2]);
 
     const test_registry = try allocator.create(NodeNameRegistry);
     defer allocator.destroy(test_registry);
@@ -3434,7 +3434,7 @@ fn makeTestSignedBlockWithParent(
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.ByteList512KiB.init(allocator),
     };
 
     return block_ptr;
@@ -3875,7 +3875,7 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
     // onInterval is called before block production)
     try node.chain.forkChoice.onInterval(slot * constants.INTERVALS_PER_SLOT, false);
 
-    const produced_block = try node.chain.produceBlock(.{
+    var produced_block = try node.chain.produceBlock(.{
         .slot = slot,
         .proposer_index = validator_ids[0],
     });
@@ -3887,12 +3887,15 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         @intCast(slot),
     );
 
+    // Merge per-attestation Type-1s + proposer singleton into the single Type-2 block proof.
+    var proof = try types.ByteList512KiB.init(allocator);
+    try node.chain.buildBlockProof(&produced_block, &proposer_signature, &proof);
+    for (produced_block.attestation_type1s.slice()) |*t1| t1.deinit();
+    produced_block.attestation_type1s.deinit();
+
     var signed_block = types.SignedBlock{
         .block = produced_block.block,
-        .signature = .{
-            .attestation_signatures = produced_block.attestation_signatures,
-            .proposer_signature = proposer_signature,
-        },
+        .proof = proof,
     };
     defer signed_block.deinit();
 

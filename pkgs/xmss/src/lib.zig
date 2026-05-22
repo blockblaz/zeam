@@ -2,16 +2,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const aggregate = @import("aggregation.zig");
-pub const MAX_AGGREGATE_SIGNATURE_SIZE = aggregate.MAX_AGGREGATE_SIGNATURE_SIZE;
-pub const ByteListMiB = aggregate.ByteListMiB;
+pub const MAX_AGGREGATE_PROOF_SIZE = aggregate.MAX_AGGREGATE_PROOF_SIZE;
+pub const ByteList512KiB = aggregate.ByteList512KiB;
+pub const MessageBinding = aggregate.MessageBinding;
 pub const AggregationError = aggregate.AggregationError;
 pub const setRayonThreads = aggregate.setRayonThreads;
 pub const setupProver = aggregate.setupProver;
 pub const setupVerifier = aggregate.setupVerifier;
-pub const aggregateSignatures = aggregate.aggregateSignatures;
-pub const verifyAggregatedPayload = aggregate.verifyAggregatedPayload;
-pub const verifyAggregatedPayloadBatch = aggregate.verifyAggregatedPayloadBatch;
-pub const AggregatedPayloadVerifyBatch = aggregate.AggregatedPayloadVerifyBatch;
+pub const aggregateType1 = aggregate.aggregateType1;
+pub const verifyType1 = aggregate.verifyType1;
+pub const mergeType1ToType2 = aggregate.mergeType1ToType2;
+pub const splitType2ByMessage = aggregate.splitType2ByMessage;
+pub const verifyType2 = aggregate.verifyType2;
 pub const aggregate_module = aggregate;
 
 const hashsig = @import("hashsig.zig");

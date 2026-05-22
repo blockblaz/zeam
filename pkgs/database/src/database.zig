@@ -509,17 +509,7 @@ fn testSaveAndLoadBlock(backend: Backend) !void {
 
     const block_root = test_helpers.createDummyRoot(0xAB);
 
-    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
-    var attestation_signatures_cleanup = true;
-    errdefer if (attestation_signatures_cleanup) {
-        for (attestation_signatures.slice()) |*sig| {
-            sig.deinit();
-        }
-        attestation_signatures.deinit();
-    };
-
-    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, attestation_signatures);
-    attestation_signatures_cleanup = false;
+    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF);
     defer signed_block.deinit();
 
     db.saveBlock(DbBlocksNamespace, block_root, signed_block);
@@ -550,17 +540,7 @@ fn testBatchWriteAndCommit(backend: Backend) !void {
     defer db.deinit();
 
     const block_root = test_helpers.createDummyRoot(0xAA);
-    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
-    var attestation_signatures_cleanup = true;
-    errdefer if (attestation_signatures_cleanup) {
-        for (attestation_signatures.slice()) |*sig| {
-            sig.deinit();
-        }
-        attestation_signatures.deinit();
-    };
-
-    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, attestation_signatures);
-    attestation_signatures_cleanup = false;
+    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC);
     defer signed_block.deinit();
 
     const state_root = test_helpers.createDummyRoot(0xEE);

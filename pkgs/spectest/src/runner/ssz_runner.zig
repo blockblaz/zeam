@@ -43,7 +43,7 @@ const SampleUint64Vector4 = [4]u64;
 const SampleBitlist16 = ssz.utils.Bitlist(16);
 const SampleBytes32List8 = ssz.utils.List([32]u8, 8);
 const SampleUint32List16 = ssz.utils.List(u32, 16);
-const ByteListMiB = xmss.ByteListMiB;
+const ByteList512KiB = xmss.ByteList512KiB;
 
 // Boundary fixture types (leanSpec test_merkleization_boundaries) — exercise
 // the bit-packed encoding at exactly chunk boundaries and at the byte/bit
@@ -120,31 +120,9 @@ const TestSignedAttestation = struct {
     signature: TEST_SIGBYTES,
 };
 
-/// Mirror of types.BlockSignatures with test-sized proposer_signature.
-/// attestation_signatures uses AggregatedSignatureProof (ByteListMiB) which
-/// has no SIGBYTES dependency, so it stays unchanged.
-const TestBlockSignatures = struct {
-    attestation_signatures: types.AttestationSignatures,
-    proposer_signature: TEST_SIGBYTES,
-
-    pub fn deinit(self: *TestBlockSignatures) void {
-        for (self.attestation_signatures.slice()) |*group| {
-            group.deinit();
-        }
-        self.attestation_signatures.deinit();
-    }
-};
-
-/// Mirror of types.SignedBlock with test-sized BlockSignatures.
-const TestSignedBlock = struct {
-    block: types.BeamBlock,
-    signature: TestBlockSignatures,
-
-    pub fn deinit(self: *TestSignedBlock) void {
-        self.block.deinit();
-        self.signature.deinit();
-    }
-};
+// Devnet5 `SignedBlock` carries a single opaque `proof: ByteList512KiB` (no SIGBYTES-sized
+// fields), so it needs no test-scheme mirror — the same type SSZ-roundtrips prod and test
+// fixtures. The old TestBlockSignatures/TestSignedBlock mirrors were removed with BlockSignatures.
 
 // ---------------------------------------------------------------------------
 // SSZ type map — maps fixture `typeName` to Zig types.
@@ -174,11 +152,11 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "State", .zig_type = types.BeamState, .has_deinit = true },
     .{ .name = "Status", .zig_type = types.Status, .has_deinit = false },
     .{ .name = "BlocksByRootRequest", .zig_type = types.BlockByRootRequest, .has_deinit = false },
-    .{ .name = "AggregatedSignatureProof", .zig_type = types.AggregatedSignatureProof, .has_deinit = true },
+    .{ .name = "TypeOneMultiSignature", .zig_type = types.TypeOneMultiSignature, .has_deinit = true },
+    .{ .name = "TypeTwoMultiSignature", .zig_type = types.TypeTwoMultiSignature, .has_deinit = true },
     .{ .name = "PublicKey", .zig_type = types.Bytes52, .has_deinit = false },
-    .{ .name = "SignedBlock", .zig_type = types.SignedBlock, .has_deinit = true, .test_zig_type = TestSignedBlock, .test_has_deinit = true },
+    .{ .name = "SignedBlock", .zig_type = types.SignedBlock, .has_deinit = true },
     .{ .name = "SignedAttestation", .zig_type = types.SignedAttestation, .has_deinit = false, .test_zig_type = TestSignedAttestation, .test_has_deinit = false },
-    .{ .name = "BlockSignatures", .zig_type = types.BlockSignatures, .has_deinit = true, .test_zig_type = TestBlockSignatures, .test_has_deinit = true },
     .{ .name = "Signature", .zig_type = types.SIGBYTES, .has_deinit = false, .test_zig_type = TEST_SIGBYTES, .test_has_deinit = false },
     .{ .name = "SignedAggregatedAttestation", .zig_type = types.SignedAggregatedAttestation, .has_deinit = true },
     // SSZ basic scalar types from leanSpec's test_basic_types fixtures.
@@ -205,7 +183,7 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "SampleBitlist16", .zig_type = SampleBitlist16, .has_deinit = true },
     .{ .name = "SampleBytes32List8", .zig_type = SampleBytes32List8, .has_deinit = true },
     .{ .name = "SampleUint32List16", .zig_type = SampleUint32List16, .has_deinit = true },
-    .{ .name = "ByteListMiB", .zig_type = ByteListMiB, .has_deinit = true },
+    .{ .name = "ByteList512KiB", .zig_type = ByteList512KiB, .has_deinit = true },
     // Merkleization-boundary fixtures (leanSpec PR #646).
     .{ .name = "BoundaryBitvector1", .zig_type = BoundaryBitvector1, .has_deinit = false },
     .{ .name = "BoundaryBitvector7", .zig_type = BoundaryBitvector7, .has_deinit = false },

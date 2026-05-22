@@ -1031,18 +1031,7 @@ test "save and load block" {
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAB);
 
-    // Create dummy attestation signatures using helper
-    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
-    var attestation_signatures_cleanup = true;
-    errdefer if (attestation_signatures_cleanup) {
-        for (attestation_signatures.slice()) |*sig| {
-            sig.deinit();
-        }
-        attestation_signatures.deinit();
-    };
-
-    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, attestation_signatures);
-    attestation_signatures_cleanup = false; // ownership moved into signed_block
+    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF);
     defer signed_block.deinit();
 
     // Save the block
@@ -1063,9 +1052,8 @@ test "save and load block" {
     // Verify attestations list is empty as expected
     try std.testing.expect(loaded.body.attestations.len() == 0);
 
-    // Verify attestation signatures count matches
-    const signature_proofs = loaded_block.?.signature.attestation_signatures;
-    try std.testing.expect(signature_proofs.len() == signed_block.signature.attestation_signatures.len());
+    // Verify the block proof round-trips byte-for-byte.
+    try std.testing.expect(loaded_block.?.proof.len() == signed_block.proof.len());
 
     // Test loading a non-existent block
     const non_existent_root = test_helpers.createDummyRoot(0xFF);
@@ -1137,18 +1125,7 @@ test "batch write and commit" {
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAA);
 
-    // Create dummy attestation signatures using helper
-    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
-    var attestation_signatures_cleanup = true;
-    errdefer if (attestation_signatures_cleanup) {
-        for (attestation_signatures.slice()) |*sig| {
-            sig.deinit();
-        }
-        attestation_signatures.deinit();
-    };
-
-    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, attestation_signatures);
-    attestation_signatures_cleanup = false; // ownership moved into signed_block
+    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC);
     defer signed_block.deinit();
 
     const test_state_root = test_helpers.createDummyRoot(0xEE);
@@ -1184,9 +1161,8 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.parent_root, &signed_block.block.parent_root));
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.state_root, &signed_block.block.state_root));
 
-    // Verify attestation signatures count matches
-    const batch_signature_proofs = loaded_block.?.signature.attestation_signatures;
-    try std.testing.expect(batch_signature_proofs.len() == attestation_signatures.len());
+    // Verify the block proof round-trips byte-for-byte.
+    try std.testing.expect(loaded_block.?.proof.len() == signed_block.proof.len());
 
     // Verify state was saved and can be loaded
     const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);

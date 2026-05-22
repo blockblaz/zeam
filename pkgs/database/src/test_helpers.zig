@@ -2,8 +2,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
-/// Helper function to create a dummy block for testing
-pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, attestation_signatures: types.AttestationSignatures) !types.SignedBlock {
+/// Helper function to create a dummy block for testing. Carries an empty devnet5 Type-2 proof
+/// (these DB tests exercise SSZ persistence/round-trip, not signature verification).
+pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8) !types.SignedBlock {
     const attestations_list = try types.AggregatedAttestations.init(allocator);
 
     var test_block = types.BeamBlock{
@@ -18,17 +19,10 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
     @memset(&test_block.parent_root, parent_root_fill);
     @memset(&test_block.state_root, state_root_fill);
 
-    const block_signatures = types.BlockSignatures{
-        .attestation_signatures = attestation_signatures,
-        .proposer_signature = types.ZERO_SIGBYTES,
-    };
-
-    const signed_block = types.SignedBlock{
+    return types.SignedBlock{
         .block = test_block,
-        .signature = block_signatures,
+        .proof = try types.ByteList512KiB.init(allocator),
     };
-
-    return signed_block;
 }
 
 /// Helper function to create a dummy state for testing
@@ -76,22 +70,4 @@ pub fn createDummyRoot(fill_byte: u8) types.Root {
     var root: types.Root = undefined;
     @memset(&root, fill_byte);
     return root;
-}
-
-/// Helper function to create dummy attestation signatures with AggregatedSignatureProof objects
-pub fn createDummyAttestationSignatures(allocator: Allocator, num_proofs: usize) !types.AttestationSignatures {
-    var attestation_signatures = try types.AttestationSignatures.init(allocator);
-    errdefer attestation_signatures.deinit();
-
-    for (0..num_proofs) |i| {
-        var signature_proof = try types.AggregatedSignatureProof.init(allocator);
-        errdefer signature_proof.deinit();
-
-        // Set a participant bit for each proof
-        try types.aggregationBitsSet(&signature_proof.participants, i, true);
-
-        try attestation_signatures.append(signature_proof);
-    }
-
-    return attestation_signatures;
 }

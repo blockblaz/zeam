@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
-backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
+rec_aggregation = { git = "https://github.com/anshalshukla/leanMultisig.git", rev = "f33a0775e4f88ec8b23b2cb8282a4472c145fb93" }
+leansig_wrapper = { git = "https://github.com/anshalshukla/leanMultisig.git", rev = "f33a0775e4f88ec8b23b2cb8282a4472c145fb93" }
+backend = { git = "https://github.com/anshalshukla/leanMultisig.git", rev = "f33a0775e4f88ec8b23b2cb8282a4472c145fb93" }
 rayon = "1"
 
 [lib]
