@@ -11,6 +11,7 @@ const chainFactory = @import("./chain.zig");
 pub const BeamChain = chainFactory.BeamChain;
 
 pub const fcFactory = @import("./forkchoice.zig");
+pub const testing = @import("./testing.zig");
 pub const tree_visualizer = @import("./tree_visualizer.zig");
 pub const constants = @import("./constants.zig");
 pub const utils = @import("./utils.zig");

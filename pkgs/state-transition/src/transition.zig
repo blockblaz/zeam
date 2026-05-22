@@ -57,6 +57,8 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
 // Verify aggregated signatures using AggregatedSignatureProof
 // If pubkey_cache is provided, public keys are cached to avoid repeated SSZ deserialization.
 // This can significantly reduce CPU overhead when processing many blocks.
+// TODO: benchmark and compare with verifySignaturesParallel, see if the scheduling overhead
+// on thread pool overcomes the benefit of parallelizing the verification.
 pub fn verifySignatures(
     allocator: Allocator,
     state: *const types.BeamState,

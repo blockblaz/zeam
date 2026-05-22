@@ -1116,98 +1116,80 @@ pub fn compactAttestations(
         preps[ei] = .{ .entry = entry, .child_pk_slices = child_arr };
     }
 
-    if (thread_pool) |pool| {
-        // Parallel path: per-AttestationData aggregation across the shared
-        // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
-        // touch FFI deserialization themselves.
-        const slots = try allocator.alloc(CompactGroupSlot, preps.len);
-        defer allocator.free(slots);
-        for (slots) |*slot| slot.* = .{};
-        errdefer {
-            for (slots) |*slot| {
-                if (slot.result) |*r| {
-                    r.attestation.deinit();
-                    r.signature.deinit();
-                }
-            }
-        }
-
-        const Runner = struct {
-            fn runScope(
-                scope: anytype,
-                preps_in: []const CompactGroupPrep,
-                sigs: []const aggregation.AggregatedSignatureProof,
-                alloc: Allocator,
-                out_slots: []CompactGroupSlot,
-                any_err: *std.atomic.Value(bool),
-            ) Allocator.Error!void {
-                for (preps_in, 0..) |prep, i| {
-                    try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err });
-                }
-            }
-
-            fn runOne(
-                alloc: Allocator,
-                prep: CompactGroupPrep,
-                sigs: []const aggregation.AggregatedSignatureProof,
-                out_slot: *CompactGroupSlot,
-                any_err: *std.atomic.Value(bool),
-            ) void {
-                if (any_err.load(.acquire)) return;
-                const result = runCompactGroupPrep(alloc, prep, sigs) catch |err| {
-                    out_slot.err = err;
-                    any_err.store(true, .release);
-                    return;
-                };
-                out_slot.result = result;
-            }
-        };
-
-        var any_err = std.atomic.Value(bool).init(false);
-        try pool.scope(Runner.runScope, .{
-            preps,
-            sig_slice,
-            allocator,
-            slots,
-            &any_err,
-        });
-
+    // Parallel path: per-AttestationData aggregation across the shared
+    // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
+    // touch FFI deserialization themselves.
+    const slots = try allocator.alloc(CompactGroupSlot, preps.len);
+    defer allocator.free(slots);
+    for (slots) |*slot| slot.* = .{};
+    errdefer {
         for (slots) |*slot| {
-            if (slot.err) |err| return err;
-        }
-
-        for (slots) |*slot| {
-            var result = slot.result orelse continue;
-            slot.result = null;
-
-            var att_moved = false;
-            var sig_moved = false;
-            defer {
-                if (!att_moved) result.attestation.deinit();
-                if (!sig_moved) result.signature.deinit();
+            if (slot.result) |*r| {
+                r.attestation.deinit();
+                r.signature.deinit();
             }
-
-            try out_atts.append(result.attestation);
-            att_moved = true;
-            try out_sigs.append(result.signature);
-            sig_moved = true;
         }
-    } else {
-        for (preps) |prep| {
-            var result = try runCompactGroupPrep(allocator, prep, sig_slice);
+    }
 
-            var att_moved = false;
-            var sig_moved = false;
-            defer {
-                if (!att_moved) result.attestation.deinit();
-                if (!sig_moved) result.signature.deinit();
+    const Runner = struct {
+        fn runScope(
+            scope: anytype,
+            preps_in: []const CompactGroupPrep,
+            sigs: []const aggregation.AggregatedSignatureProof,
+            alloc: Allocator,
+            out_slots: []CompactGroupSlot,
+            any_err: *std.atomic.Value(bool),
+        ) Allocator.Error!void {
+            for (preps_in, 0..) |prep, i| {
+                try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err });
             }
-
-            try out_atts.append(result.attestation);
-            att_moved = true;
-            try out_sigs.append(result.signature);
-            sig_moved = true;
         }
+
+        fn runOne(
+            alloc: Allocator,
+            prep: CompactGroupPrep,
+            sigs: []const aggregation.AggregatedSignatureProof,
+            out_slot: *CompactGroupSlot,
+            any_err: *std.atomic.Value(bool),
+        ) void {
+            if (any_err.load(.acquire)) return;
+            const result = runCompactGroupPrep(alloc, prep, sigs) catch |err| {
+                out_slot.err = err;
+                any_err.store(true, .release);
+                return;
+            };
+            out_slot.result = result;
+        }
+    };
+
+    var any_err = std.atomic.Value(bool).init(false);
+    try thread_pool.scope(Runner.runScope, .{
+        preps,
+        sig_slice,
+        allocator,
+        slots,
+        &any_err,
+    });
+
+    for (slots) |*slot| {
+        if (slot.err) |err| return err;
+    }
+
+    for (slots) |*slot| {
+        var result = slot.result orelse continue;
+        slot.result = null;
+
+        var att_moved = false;
+        var sig_moved = false;
+        defer {
+            if (!att_moved) result.attestation.deinit();
+            if (!sig_moved) result.signature.deinit();
+        }
+
+        try out_atts.append(result.attestation);
+        att_moved = true;
+        try out_sigs.append(result.signature);
+        sig_moved = true;
     }
 
     // Free old input entries
