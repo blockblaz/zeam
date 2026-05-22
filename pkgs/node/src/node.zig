@@ -59,6 +59,10 @@ const NodeOpts = struct {
     /// `--chain-worker` (bool); `--chain-worker false` is the
     /// kill-switch for the legacy synchronous path.
     chain_worker_enabled: bool = true,
+    /// CLI knob (`--min-aggregation-inputs`) for the per-att_data
+    /// aggregation threshold; see
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 };
 
 pub const BeamNode = struct {
@@ -138,6 +142,7 @@ pub const BeamNode = struct {
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
                 .thread_pool = opts.thread_pool,
+                .min_aggregation_inputs = opts.min_aggregation_inputs,
             },
             network.connected_peers,
         ) catch |init_err| {
@@ -399,7 +404,7 @@ pub const BeamNode = struct {
                         }
                     }
                     // Flush any pending parent root fetches accumulated during caching.
-                    self.flushPendingParentFetches();
+                    self.flushPendingParentFetches(null);
                     // Return early - don't pass to chain until parent arrives
                     return;
                 }
@@ -534,7 +539,7 @@ pub const BeamNode = struct {
         }
 
         // Flush any parent roots accumulated during block/descendant processing.
-        self.flushPendingParentFetches();
+        self.flushPendingParentFetches(null);
     }
 
     fn pruneCachedBlocksCallback(ptr: *anyopaque, finalized: types.Checkpoint) usize {
@@ -660,7 +665,7 @@ pub const BeamNode = struct {
 
         // Coalesce any parent fetches accumulated during the
         // descendant retry into one batched `blocks_by_root` request.
-        self.flushPendingParentFetches();
+        self.flushPendingParentFetches(null);
     }
 
     /// Rejected-block backchannel handler (#890 zclawz review). Fires
@@ -722,7 +727,7 @@ pub const BeamNode = struct {
                         );
                     }
                 }
-                self.flushPendingParentFetches();
+                self.flushPendingParentFetches(null);
             },
             .pre_finalized => {
                 self.finishRangeAsyncChunkImport(block_root, false, true);
@@ -1267,7 +1272,7 @@ pub const BeamNode = struct {
                             });
                         }
                     }
-                    self.flushPendingParentFetches();
+                    self.flushPendingParentFetches(block_ctx.peer_id);
                     return;
                 }
 
@@ -1318,7 +1323,7 @@ pub const BeamNode = struct {
         // Flush any parent roots queued during this RPC block's processing. When a syncing peer
         // walks a long parent chain one block at a time, each response triggers one more parent
         // fetch. Batching them here consolidates concurrent parent requests into one round-trip.
-        self.flushPendingParentFetches();
+        self.flushPendingParentFetches(block_ctx.peer_id);
     }
 
     // --- blocks_by_range catch-up orchestration (issue #893) ---
@@ -1369,7 +1374,7 @@ pub const BeamNode = struct {
 
     fn syncFetchPeerHeadByRoot(self: *Self, peer_id: []const u8, head_root: types.Root) void {
         const roots = [_]types.Root{head_root};
-        self.fetchBlockByRoots(&roots, 0) catch |err| {
+        self.fetchBlockByRootsFromPeer(&roots, 0, peer_id) catch |err| {
             self.logger.warn("failed to fetch peer head block 0x{x} from peer {s}{f}: {any}", .{
                 &head_root,
                 peer_id,
@@ -1728,7 +1733,7 @@ pub const BeamNode = struct {
                         self.logger.warn("blocks_by_range: failed to cache block 0x{x}: {any}", .{ &block_root, cache_err });
                     }
                 }
-                self.flushPendingParentFetches();
+                self.flushPendingParentFetches(peer_id);
                 return;
             }
             if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
@@ -1750,10 +1755,10 @@ pub const BeamNode = struct {
         self.chain.onBlockFollowup(true, signed_block);
         self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
         self.processCachedDescendants(block_root);
-        self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+        self.fetchBlockByRootsFromPeer(missing_roots, 0, peer_id) catch |err| {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
         };
-        self.flushPendingParentFetches();
+        self.flushPendingParentFetches(peer_id);
     }
 
     fn completeBlocksByRangeRequest(self: *Self, request_id: u64, snap: networkFactory.Network.PendingRequestSnapshot) void {
@@ -2195,7 +2200,14 @@ pub const BeamNode = struct {
     /// stream, causing 300+ sequential round-trips when a peer walks a long parent chain.
     /// Collecting roots here and flushing them in one request reduces that to a single
     /// round-trip for the same burst of missing parents.
-    fn flushPendingParentFetches(self: *Self) void {
+    ///
+    /// **Throughput trade-off (review #3):** when `preferred_peer` is non-null, all
+    /// roots in this batch are sent to a single peer.  This keeps checkpoint /
+    /// parent walks fast (the peer already proved it can serve the chain), but
+    /// concentrates load and loses parallelism that random peer selection would
+    /// provide.  If the peer's bandwidth becomes a bottleneck, callers can pass
+    /// `null` (gossip and cached-descendant paths already do) to spread load.
+    fn flushPendingParentFetches(self: *Self, preferred_peer: ?[]const u8) void {
         // Drain under the dedicated lock so the gossip / req-resp paths
         // can keep enqueueing while we issue the batched fetch.
         var roots: std.ArrayList(types.Root) = .empty;
@@ -2224,7 +2236,7 @@ pub const BeamNode = struct {
         if (roots.items.len == 0) return;
         self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
 
-        self.fetchBlockByRoots(roots.items, max_depth) catch |err| {
+        self.fetchBlockByRootsFromPeer(roots.items, max_depth, preferred_peer) catch |err| {
             self.logger.warn("failed to batch-fetch {d} pending parent root(s): {any}", .{ roots.items.len, err });
         };
     }
@@ -2233,6 +2245,15 @@ pub const BeamNode = struct {
         self: *Self,
         roots: []const types.Root,
         depth: u32,
+    ) !void {
+        return self.fetchBlockByRootsFromPeer(roots, depth, null);
+    }
+
+    fn fetchBlockByRootsFromPeer(
+        self: *Self,
+        roots: []const types.Root,
+        depth: u32,
+        preferred_peer: ?[]const u8,
     ) !void {
         if (roots.len == 0) return;
 
@@ -2327,7 +2348,7 @@ pub const BeamNode = struct {
         if (missing_roots.items.len == 0) return;
 
         const handler = self.getReqRespResponseHandler();
-        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler) catch |err| blk: {
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer) catch |err| blk: {
             switch (err) {
                 error.NoPeersAvailable => {
                     // PR #842 review #1: previously this path bumped
@@ -2784,6 +2805,17 @@ pub const BeamNode = struct {
         }
         // Finalize clears pending state + releases in-flight slot.
         self.network.finalizePendingRequest(request_id);
+
+        // `processBlockByRootChunk` may have discovered the next parent while
+        // this request was still counted in `blocks_by_root_inflight`. During a
+        // long parent walk (late-start sync / checkpoint catch-up) that can hit
+        // MAX_CONCURRENT_BLOCKS_BY_ROOT before any completion event releases a
+        // slot, leaving the newest parent root queued in
+        // `batch_pending_parent_roots` with nobody left to flush it. Now that
+        // this request is finalized, immediately drain any queued parent roots
+        // and keep the walk on the peer that served this response.
+        self.flushPendingParentFetches(peer_id);
+
         // Re-schedule each unserved root; fetchBlockByRoots will
         // dedup against forkchoice/cache/pending and pick a new peer.
         for (roots_to_retry.items) |item| {

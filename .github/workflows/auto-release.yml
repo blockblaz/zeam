@@ -179,7 +179,9 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+        # See cache-key rationale in ci.yml `lint` job (#903): include the
+        # rust workspace Cargo.toml so profile changes bust the cache.
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock', 'rust/Cargo.toml') }}
 
     - name: Build zeam natively
       run: |

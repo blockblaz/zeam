@@ -37,6 +37,7 @@ pub const StoredAggregatedPayload = block.StoredAggregatedPayload;
 pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
 pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
 pub const compactAttestations = block.compactAttestations;
+pub const default_min_aggregation_inputs = block.default_min_aggregation_inputs;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;

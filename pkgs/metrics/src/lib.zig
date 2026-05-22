@@ -126,10 +126,13 @@ const Metrics = struct {
     // Attestation aggregate coverage gauges. Section labels are the same
     // names printed in the slot/report logs: timely, late, block, combined,
     // agg_start_new, proposal_payloads, proposal_gossip, and proposal_combined.
+    // `subnet="combined"` is the all-subnet validator total for the section;
+    // `subnet="subnet_N"` is that section's validator coverage on one subnet.
     // Direction labels are block_only and timely_only.
-    zeam_attestation_aggregate_coverage_validators: AttestationAggregateCoverageValidatorsGauge,
-    zeam_attestation_aggregate_coverage_subnets: AttestationAggregateCoverageSubnetsGauge,
-    zeam_attestation_aggregate_coverage_diff_validators: AttestationAggregateCoverageDiffValidatorsGauge,
+    // Slot is the X-axis (time series progression), not a label dimension.
+    lean_attestation_aggregate_coverage_validators: AttestationAggregateCoverageValidatorsGauge,
+    lean_attestation_aggregate_coverage_subnets: AttestationAggregateCoverageSubnetsGauge,
+    lean_attestation_aggregate_coverage_diff_validators: AttestationAggregateCoverageDiffValidatorsGauge,
     // Committee aggregation histogram
     lean_committee_signatures_aggregation_time_seconds: CommitteeSignaturesAggregationHistogram,
     // Validator status gauges
@@ -173,6 +176,14 @@ const Metrics = struct {
     zeam_aggregate_skip_total: AggregateSkipCounter,
     /// Histogram for the wall-clock duration of the aggregate FFI worker.
     zeam_aggregate_worker_duration_seconds: AggregateWorkerDurationHistogram,
+    /// Counter for SignedAggregatedAttestation messages published by the local
+    /// aggregator worker (after the FFI returned), labeled by attestation subnet.
+    /// Separate from the standard `lean_pq_sig_aggregated_signatures_total`
+    /// (which zeam increments only on the block-proposal path) so cross-client
+    /// dashboards keep the standard metric's semantics intact. Operators can
+    /// use this counter to tell whether the local aggregator is producing for
+    /// its duty subnet at all without inferring it from the worker histogram.
+    zeam_aggregator_publish_aggregations_total: AggregatorPublishAggregationsCounter,
     // BeamNode mutex contention metrics (issue #786)
     // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
     // Hold time = how long the callsite kept the mutex locked.
@@ -444,7 +455,7 @@ const Metrics = struct {
     const LeanGossipSignaturesGauge = metrics_lib.Gauge(u64);
     const LeanLatestNewAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
     const LeanLatestKnownAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
-    const AttestationAggregateCoverageValidatorsGauge = metrics_lib.GaugeVec(u64, struct { section: []const u8 });
+    const AttestationAggregateCoverageValidatorsGauge = metrics_lib.GaugeVec(u64, struct { section: []const u8, subnet: []const u8 });
     const AttestationAggregateCoverageSubnetsGauge = metrics_lib.GaugeVec(u64, struct { section: []const u8 });
     const AttestationAggregateCoverageDiffValidatorsGauge = metrics_lib.GaugeVec(u64, struct { direction: []const u8 });
     // Committee aggregation histogram type
@@ -511,6 +522,7 @@ const Metrics = struct {
     const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
     const AggregateWorkerDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
+    const AggregatorPublishAggregationsCounter = metrics_lib.CounterVec(u64, struct { subnet: []const u8 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -887,9 +899,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_gossip_signatures = Metrics.LeanGossipSignaturesGauge.init("lean_gossip_signatures", .{ .help = "Number of gossip signatures in fork-choice store" }, .{}),
         .lean_latest_new_aggregated_payloads = Metrics.LeanLatestNewAggregatedPayloadsGauge.init("lean_latest_new_aggregated_payloads", .{ .help = "Number of new aggregated payload items" }, .{}),
         .lean_latest_known_aggregated_payloads = Metrics.LeanLatestKnownAggregatedPayloadsGauge.init("lean_latest_known_aggregated_payloads", .{ .help = "Number of known aggregated payload items" }, .{}),
-        .zeam_attestation_aggregate_coverage_validators = try Metrics.AttestationAggregateCoverageValidatorsGauge.init(allocator, io, "zeam_attestation_aggregate_coverage_validators", .{ .help = "Validator coverage in attestation aggregate reports, labeled by section (timely|late|block|combined|agg_start_new|proposal_payloads|proposal_gossip|proposal_combined)." }, .{}),
-        .zeam_attestation_aggregate_coverage_subnets = try Metrics.AttestationAggregateCoverageSubnetsGauge.init(allocator, io, "zeam_attestation_aggregate_coverage_subnets", .{ .help = "Subnet coverage in attestation aggregate reports, labeled by section (timely|late|block|combined|agg_start_new|proposal_payloads|proposal_gossip|proposal_combined)." }, .{}),
-        .zeam_attestation_aggregate_coverage_diff_validators = try Metrics.AttestationAggregateCoverageDiffValidatorsGauge.init(allocator, io, "zeam_attestation_aggregate_coverage_diff_validators", .{ .help = "Validator coverage delta between block payloads and timely pre-merge payloads, labeled by direction (block_only|timely_only)." }, .{}),
+        .lean_attestation_aggregate_coverage_validators = try Metrics.AttestationAggregateCoverageValidatorsGauge.init(allocator, io, "lean_attestation_aggregate_coverage_validators", .{ .help = "Validator coverage in attestation aggregate reports, labeled by section and subnet. subnet=combined is the section total; subnet=subnet_N is per-subnet coverage. Updated each slot (slot is the X-axis)." }, .{}),
+        .lean_attestation_aggregate_coverage_subnets = try Metrics.AttestationAggregateCoverageSubnetsGauge.init(allocator, io, "lean_attestation_aggregate_coverage_subnets", .{ .help = "Number of covered subnets in attestation aggregate reports, labeled by section. Updated each slot (slot is the X-axis)." }, .{}),
+        .lean_attestation_aggregate_coverage_diff_validators = try Metrics.AttestationAggregateCoverageDiffValidatorsGauge.init(allocator, io, "lean_attestation_aggregate_coverage_diff_validators", .{ .help = "Validator coverage delta between block payloads and timely pre-merge payloads, labeled by direction (block_only|timely_only). Updated each slot (slot is the X-axis)." }, .{}),
         // Committee aggregation histogram
         .lean_committee_signatures_aggregation_time_seconds = Metrics.CommitteeSignaturesAggregationHistogram.init("lean_committee_signatures_aggregation_time_seconds", .{ .help = "Time taken to aggregate committee signatures" }, .{}),
         // Validator status gauges
@@ -921,6 +933,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
         .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: in_flight, not_aggregator, not_synced, missing_state." }, .{}),
         .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of the aggregate FFI worker (XMSS recursive aggregation)." }, .{}),
+        .zeam_aggregator_publish_aggregations_total = try Metrics.AggregatorPublishAggregationsCounter.init(allocator, io, "zeam_aggregator_publish_aggregations_total", .{ .help = "SignedAggregatedAttestation messages published by the local aggregator worker, labeled by attestation subnet. Distinct from lean_pq_sig_aggregated_signatures_total (block-proposal path only) so cross-client dashboards keep the standard metric's semantics intact." }, .{}),
         // BeamNode mutex contention metrics (issue #786)
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
         .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
@@ -966,24 +979,24 @@ pub fn init(allocator: std.mem.Allocator) !void {
     metrics.lean_gossip_signatures.set(0);
     metrics.lean_latest_new_aggregated_payloads.set(0);
     metrics.lean_latest_known_aggregated_payloads.set(0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "timely" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "late" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "block" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "combined" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "agg_start_new" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "proposal_payloads" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "proposal_gossip" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_validators.set(.{ .section = "proposal_combined" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "timely" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "late" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "block" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "combined" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "agg_start_new" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "proposal_payloads" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "proposal_gossip" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_subnets.set(.{ .section = "proposal_combined" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, 0);
-    try metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "timely", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "late", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "block", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "combined", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "agg_start_new", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "proposal_payloads", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "proposal_gossip", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "proposal_combined", .subnet = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "timely" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "late" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "block" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "agg_start_new" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "proposal_payloads" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "proposal_gossip" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "proposal_combined" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, 0);
+    try metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, 0);
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
     zeam_chain_onblock_duration_seconds.context = @ptrCast(&metrics.zeam_chain_onblock_duration_seconds);
@@ -1371,6 +1384,33 @@ test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in 
     for (fetch_outcomes) |lbl| {
         try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
     }
+}
+
+test "attestation aggregate coverage metrics use leanSpec names" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "timely", .subnet = "combined" }, 42);
+    try metrics.lean_attestation_aggregate_coverage_validators.set(.{ .section = "block", .subnet = "subnet_0" }, 7);
+    try metrics.lean_attestation_aggregate_coverage_subnets.set(.{ .section = "timely" }, 3);
+    try metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, 5);
+    try metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, 2);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "lean_attestation_aggregate_coverage_validators") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lean_attestation_aggregate_coverage_subnets") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lean_attestation_aggregate_coverage_diff_validators") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_attestation_aggregate_coverage") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "section=\"timely\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "subnet=\"combined\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "subnet=\"subnet_0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "direction=\"block_only\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "direction=\"timely_only\"") != null);
 }
 
 // Issues #863 / #867: clock-loop xev drain observability must stay in the

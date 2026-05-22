@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# devnet5 needs the Type-1/Type-2 multi-signature API (merge_many_type_1 / split_type_2_by_msg),
+# which only exists on the devnet5-patched leanMultisig (anshalshukla@f33a0775, == leanMultisig-py
+# v0.0.5). main's devnet4 head (leanEthereum@5eba3b1) predates the Type-2 work, so we keep f33a0775
+# here rather than main's rev. (Re-evaluate when a devnet5 rev lands on leanEthereum/leanMultisig.)
 rec_aggregation = { git = "https://github.com/anshalshukla/leanMultisig.git", rev = "f33a0775e4f88ec8b23b2cb8282a4472c145fb93" }
 leansig_wrapper = { git = "https://github.com/anshalshukla/leanMultisig.git", rev = "f33a0775e4f88ec8b23b2cb8282a4472c145fb93" }
 backend = { git = "https://github.com/anshalshukla/leanMultisig.git", rev = "f33a0775e4f88ec8b23b2cb8282a4472c145fb93" }

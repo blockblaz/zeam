@@ -278,6 +278,13 @@ pub const ForkChoiceParams = struct {
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
     thread_pool: ?*ThreadPool = null,
+    /// Minimum (children + gossip-sig) inputs the aggregator pre-filter
+    /// requires before letting an `att_data` reach
+    /// `computeAggregatedSignatures`. Threaded through from the
+    /// `--min-aggregation-inputs` CLI flag and consumed by
+    /// `pruneTrivialFromAggregateSnapshot` (NOT by the FFI). See
+    /// `isAggregatorTrivialInput` for the predicate semantics.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 };
 
 // Use shared signature map types from types package
@@ -333,6 +340,13 @@ pub const ForkChoice = struct {
     status: ForkChoiceStatus,
     // Optional shared worker pool used for CPU-heavy attestation compaction.
     thread_pool: ?*ThreadPool = null,
+    /// Threshold consumed by `pruneTrivialFromAggregateSnapshot` on
+    /// every `aggregate*` call to decide which `att_data` entries to
+    /// drop before invoking `computeAggregatedSignatures`. See
+    /// `ForkChoiceParams.min_aggregation_inputs`. Defaulted at the field
+    /// level so test struct literals that don't care about the
+    /// threshold can omit it.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     last_node_tick_time_ms: ?i64,
 
     const Self = @This();
@@ -425,6 +439,7 @@ pub const ForkChoice = struct {
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
             .thread_pool = opts.thread_pool,
+            .min_aggregation_inputs = opts.min_aggregation_inputs,
             .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
@@ -1406,9 +1421,9 @@ pub const ForkChoice = struct {
             }
         }
 
-        recordAggregateCoverageMetrics("proposal_payloads", proposal_payload_seen, proposal_payload_has_subnet);
-        recordAggregateCoverageMetrics("proposal_gossip", proposal_gossip_seen, proposal_gossip_has_subnet);
-        recordAggregateCoverageMetrics("proposal_combined", final_seen, final_has_subnet);
+        recordAggregateCoverageMetrics("proposal_payloads", proposal_payload_seen, proposal_payload_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("proposal_gossip", proposal_gossip_seen, proposal_gossip_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("proposal_combined", final_seen, final_has_subnet, committee_count_u32);
 
         if (!has_any) {
             self.logger.info("block proposal slot={d}: attestation aggregate coverage=none", .{slot});
@@ -1870,12 +1885,12 @@ pub const ForkChoice = struct {
             if (pn and !b) prev_new_not_block += 1;
         }
 
-        recordAggregateCoverageMetrics("timely", prev_new_seen, prev_new_has_subnet);
-        recordAggregateCoverageMetrics("late", late_seen, late_has_subnet);
-        recordAggregateCoverageMetrics("block", block_seen, block_has_subnet);
-        recordAggregateCoverageMetrics("combined", combined_seen, combined_has_subnet);
-        zeam_metrics.metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, @intCast(block_not_prev_new)) catch {};
-        zeam_metrics.metrics.zeam_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, @intCast(prev_new_not_block)) catch {};
+        recordAggregateCoverageMetrics("timely", prev_new_seen, prev_new_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("late", late_seen, late_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("block", block_seen, block_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("combined", combined_seen, combined_has_subnet, committee_count_u32);
+        zeam_metrics.metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "block_only" }, @intCast(block_not_prev_new)) catch {};
+        zeam_metrics.metrics.lean_attestation_aggregate_coverage_diff_validators.set(.{ .direction = "timely_only" }, @intCast(prev_new_not_block)) catch {};
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -1896,8 +1911,23 @@ pub const ForkChoice = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    /// Log subnet-wise coverage of the current new payloads before starting aggregation.
-    /// Called from aggregateImpl just before fork-choice aggregation runs.
+    /// Log subnet-wise coverage of the aggregation input set before the FFI runs.
+    /// Called from aggregateImpl just before fork-choice aggregation.
+    ///
+    /// The aggregator's input is the **union** of two maps:
+    ///   - `latest_new_aggregated_payloads`: cross-subnet aggregations received
+    ///     from peers since the last accept-merge (reported as `new_payloads`).
+    ///   - `attestation_signatures`: individual gossip signatures from this
+    ///     node's subscribed subnets (reported as `gossip_sigs`).
+    ///
+    /// Earlier this function looked only at `latest_new_aggregated_payloads` and
+    /// reported `coverage=none` whenever it was empty, even when dozens of
+    /// individual gossip sigs were waiting on the local duty subnet (#899).
+    /// Operators misread the "none" line as "we have no input"; the input was
+    /// in fact a different map. Reporting both sections separately removes the
+    /// ambiguity and surfaces "we have raw sigs from subnet 0 but no
+    /// cross-subnet aggregations yet" — the common steady-state on a single-
+    /// subnet aggregator.
     pub fn logNewPayloadsCoverageForAggregation(self: *Self, slot: types.Slot) void {
         const validator_count: usize = @intCast(self.config.genesis.numValidators());
         if (validator_count == 0) return;
@@ -1909,6 +1939,10 @@ pub const ForkChoice = struct {
         defer self.allocator.free(new_seen);
         const new_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
         defer self.allocator.free(new_has_subnet);
+        const gossip_seen = self.allocator.alloc(bool, validator_count) catch return;
+        defer self.allocator.free(gossip_seen);
+        const gossip_has_subnet = self.allocator.alloc(bool, committee_count) catch return;
+        defer self.allocator.free(gossip_has_subnet);
         const dummy_seen = self.allocator.alloc(bool, validator_count) catch return;
         defer self.allocator.free(dummy_seen);
         const dummy_has = self.allocator.alloc(bool, committee_count) catch return;
@@ -1916,6 +1950,8 @@ pub const ForkChoice = struct {
 
         @memset(new_seen, false);
         @memset(new_has_subnet, false);
+        @memset(gossip_seen, false);
+        @memset(gossip_has_subnet, false);
         @memset(dummy_seen, false);
         @memset(dummy_has, false);
 
@@ -1932,26 +1968,48 @@ pub const ForkChoice = struct {
             dummy_has,
         );
 
-        var has_any = false;
-        for (new_has_subnet) |h| {
-            if (h) {
-                has_any = true;
-                break;
-            }
-        }
+        collectGossipSigCoverageForSlot(
+            &self.attestation_signatures,
+            slot,
+            committee_count_u32,
+            validator_count,
+            gossip_seen,
+            gossip_has_subnet,
+        );
 
-        if (!has_any) {
-            recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet);
-            self.logger.info("agg start slot={d}: new payloads coverage=none", .{slot});
+        var new_has_any = false;
+        for (new_has_subnet) |h| if (h) {
+            new_has_any = true;
+            break;
+        };
+        var gossip_has_any = false;
+        for (gossip_has_subnet) |h| if (h) {
+            gossip_has_any = true;
+            break;
+        };
+
+        recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet, committee_count_u32);
+        recordAggregateCoverageMetrics("agg_start_gossip", gossip_seen, gossip_has_subnet, committee_count_u32);
+
+        if (!new_has_any and !gossip_has_any) {
+            self.logger.info("agg start slot={d}: new_payloads=none gossip_sigs=none", .{slot});
             return;
         }
-
-        recordAggregateCoverageMetrics("agg_start_new", new_seen, new_has_subnet);
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         appendFmt(self.allocator, &out, "agg start slot={d}: ", .{slot}) catch return;
-        appendCoverageSection(self.allocator, &out, "new", new_seen, new_has_subnet, validator_count, committee_count_u32) catch return;
+        if (new_has_any) {
+            appendCoverageSection(self.allocator, &out, "new_payloads", new_seen, new_has_subnet, validator_count, committee_count_u32) catch return;
+        } else {
+            appendFmt(self.allocator, &out, "new_payloads=none", .{}) catch return;
+        }
+        appendFmt(self.allocator, &out, " | ", .{}) catch return;
+        if (gossip_has_any) {
+            appendCoverageSection(self.allocator, &out, "gossip_sigs", gossip_seen, gossip_has_subnet, validator_count, committee_count_u32) catch return;
+        } else {
+            appendFmt(self.allocator, &out, "gossip_sigs=none", .{}) catch return;
+        }
         self.logger.info("{s}", .{out.items});
     }
 
@@ -2062,6 +2120,26 @@ pub const ForkChoice = struct {
             for (agg.attestation_signatures.slice()) |*sig| sig.deinit();
             agg.attestation_signatures.deinit();
         };
+
+        // Aggregator-only policy filter: drop `att_data` entries from the
+        // owned snapshot whose only input is a single (or sub-threshold)
+        // local gossip sig and which have no peer payload to fold into.
+        // This MUST live here in the aggregator wrapper, NOT inside
+        // `computeAggregatedSignatures`: the same FFI function is the
+        // primitive a future block proposer would use to aggregate the
+        // exact `att_data` set it chose to include in a block, and a
+        // proposer must aggregate every chosen `att_data` (blocks carry
+        // aggregated proofs, not raw sigs) — even a 1-validator one. By
+        // filtering the snapshot before the FFI runs, the function
+        // remains spec-pure (aggregate whatever you are given) and the
+        // policy is opt-in per call site. See review on PR #908 and
+        // issue #907 finding 4.
+        pruneTrivialFromAggregateSnapshot(
+            self.allocator,
+            &snap,
+            self.min_aggregation_inputs,
+            self.logger,
+        );
 
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
         try agg.computeAggregatedSignatures(
@@ -2938,17 +3016,25 @@ test "aggregate prunes attestation signatures" {
             .slot = 0,
         },
     };
-    const attestation = types.Attestation{
-        .validator_id = 0,
-        .data = attestation_data,
-    };
-    const signature = try key_manager.signAttestation(&attestation, allocator);
-
-    try fork_choice.onSignedAttestation(.{
-        .validator_id = 0,
-        .message = attestation_data,
-        .signature = signature,
-    });
+    // Two signatures from distinct validators on the same AttestationData.
+    // A single sig with no peer payloads is now dropped from the snapshot
+    // by the aggregator pre-filter (issue #907 finding 4 — see
+    // `pruneTrivialFromAggregateSnapshot`) and is left in
+    // `attestation_signatures` for a future non-trivial pass. Two sigs is
+    // the minimum non-trivial shape that exercises the aggregation +
+    // pruning path this test is asserting.
+    inline for ([_]u32{ 0, 1 }) |validator_id| {
+        const attestation = types.Attestation{
+            .validator_id = validator_id,
+            .data = attestation_data,
+        };
+        const signature = try key_manager.signAttestation(&attestation, allocator);
+        try fork_choice.onSignedAttestation(.{
+            .validator_id = validator_id,
+            .message = attestation_data,
+            .signature = signature,
+        });
+    }
 
     const aggregations = try fork_choice.aggregate(&mock_chain.genesis_state);
     defer {
@@ -3028,22 +3114,29 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
     });
     defer fork_choice.deinit();
 
-    // Seed one signature so `aggregate` has work to do (otherwise an
-    // empty-input return path could pass without ever touching the
-    // mutex even before the fix).
+    // Seed two signatures so `aggregate` has work to do (otherwise an
+    // empty-input or trivial-input return path could pass without ever
+    // touching the mutex even before the fix). Two distinct validators
+    // is the minimum non-trivial shape after the issue #907 finding 4
+    // aggregator pre-filter was added — a single sig with no peer
+    // payloads is now dropped from the snapshot before
+    // `computeAggregatedSignatures` runs, so it would not exercise the
+    // FFI-bearing path this mutex-contract test is guarding.
     const attestation_data = types.AttestationData{
         .slot = 0,
         .head = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
         .target = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
         .source = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
     };
-    const attestation = types.Attestation{ .validator_id = 0, .data = attestation_data };
-    const signature = try key_manager.signAttestation(&attestation, allocator);
-    try fork_choice.onSignedAttestation(.{
-        .validator_id = 0,
-        .message = attestation_data,
-        .signature = signature,
-    });
+    inline for ([_]u32{ 0, 1 }) |validator_id| {
+        const attestation = types.Attestation{ .validator_id = validator_id, .data = attestation_data };
+        const signature = try key_manager.signAttestation(&attestation, allocator);
+        try fork_choice.onSignedAttestation(.{
+            .validator_id = validator_id,
+            .message = attestation_data,
+            .signature = signature,
+        });
+    }
 
     // Hold the forkchoice main mutex exclusive on the test thread for
     // the entire aggregator-thread lifetime. If `aggregate` (still)
@@ -3646,6 +3739,114 @@ const AggregateSnapshot = struct {
     }
 };
 
+/// Returns true when an `att_data` in the aggregator's snapshot is
+/// trivial under the operator's threshold and should be dropped before
+/// `computeAggregatedSignatures` runs:
+///   - no child payloads (neither `new` nor `known`) for this `att_data`, AND
+///   - fewer than `min_inputs` local gossip sigs.
+///
+/// This is the AGGREGATOR-side policy. The FFI function
+/// `computeAggregatedSignatures` itself is spec-pure and has no notion
+/// of this threshold — block proposers would call it with no
+/// pre-filtering so a chosen `att_data` with a lone gossip sig still
+/// produces a valid (1-validator) aggregate for inclusion in the block.
+///
+/// Pure / unit-testable: takes counts, not maps.
+fn isAggregatorTrivialInput(num_children: usize, num_gossip_sigs: usize, min_inputs: u32) bool {
+    if (num_children > 0) return false;
+    return num_gossip_sigs < @as(usize, min_inputs);
+}
+
+test "isAggregatorTrivialInput: any child makes it non-trivial" {
+    try std.testing.expect(!isAggregatorTrivialInput(1, 0, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(1, 1, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(2, 5, 8));
+}
+
+test "isAggregatorTrivialInput default threshold (2): 0 or 1 sig is trivial, 2+ is not" {
+    try std.testing.expect(isAggregatorTrivialInput(0, 0, 2));
+    try std.testing.expect(isAggregatorTrivialInput(0, 1, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 2, 2));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 8, 2));
+}
+
+test "isAggregatorTrivialInput threshold=1 reverts to pre-#908 (only 0+0 trivial)" {
+    try std.testing.expect(isAggregatorTrivialInput(0, 0, 1));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 1, 1));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 2, 1));
+}
+
+test "isAggregatorTrivialInput higher thresholds skip more no-children inputs" {
+    try std.testing.expect(isAggregatorTrivialInput(0, 1, 3));
+    try std.testing.expect(isAggregatorTrivialInput(0, 2, 3));
+    try std.testing.expect(!isAggregatorTrivialInput(0, 3, 3));
+}
+
+/// Walk the owned aggregator snapshot and drop every `att_data` entry
+/// from `signatures` that is trivial under `min_inputs` (see
+/// `isAggregatorTrivialInput`). The corresponding inner map is freed.
+///
+/// Untouched gossip sigs stay in the live `attestation_signatures` map
+/// (the snapshot is a clone — pruning the snapshot does NOT touch the
+/// live map) and naturally feed the next aggregation pass once any
+/// peer payload arrives or another local sig accumulates on the same
+/// `att_data`.
+///
+/// Logs a single debug line summarising the count + threshold so the
+/// startup `aggregator threshold:` info line stays the only visible
+/// boot-time mention of this knob; per-pass detail is at debug level.
+fn pruneTrivialFromAggregateSnapshot(
+    allocator: Allocator,
+    snap: *AggregateSnapshot,
+    min_inputs: u32,
+    logger: zeam_utils.ModuleLogger,
+) void {
+    // `min_inputs <= 1` reduces to the pre-existing `0 sigs + 0
+    // children` skip already inside `computeAggregatedSignatures`, so
+    // the pre-filter is a no-op and we can return early.
+    if (min_inputs <= 1) return;
+
+    // Collect keys to remove first — std.AutoHashMap does not support
+    // removal during iteration.
+    var to_drop: std.ArrayList(types.AttestationData) = .empty;
+    defer to_drop.deinit(allocator);
+
+    var it = snap.signatures.iterator();
+    while (it.next()) |entry| {
+        const att_data = entry.key_ptr.*;
+        const num_sigs: usize = @intCast(entry.value_ptr.count());
+
+        const num_children: usize = blk: {
+            var n: usize = 0;
+            if (snap.new_payloads.get(att_data)) |list| n += list.items.len;
+            if (snap.known_payloads.get(att_data)) |list| n += list.items.len;
+            break :blk n;
+        };
+
+        if (isAggregatorTrivialInput(num_children, num_sigs, min_inputs)) {
+            to_drop.append(allocator, att_data) catch {
+                // Best-effort filtering: on OOM we skip the rest of the
+                // sweep and let `computeAggregatedSignatures` aggregate
+                // whatever's still there. Correctness is preserved
+                // (over-aggregation, never under), and OOM here is
+                // exceedingly unlikely given how small the key list is.
+                return;
+            };
+        }
+    }
+
+    if (to_drop.items.len == 0) return;
+
+    for (to_drop.items) |att_data| {
+        snap.signatures.removeAndDeinit(att_data);
+    }
+
+    logger.debug(
+        "aggregator pre-filter: dropped {d} trivial att_data (threshold min_aggregation_inputs={d})",
+        .{ to_drop.items.len, min_inputs },
+    );
+}
+
 fn collectCoverageFromPayloads(
     map: *AggregatedPayloadsMap,
     slot: types.Slot,
@@ -3757,6 +3958,36 @@ fn collectCoverageFromSignaturesForData(
     }
 }
 
+/// Aggregate validator/subnet coverage of every individual gossip signature
+/// in `map` whose `AttestationData.slot == slot`. Used by
+/// `logNewPayloadsCoverageForAggregation` to surface the local-subnet input
+/// that `latest_new_aggregated_payloads` alone does not see (#899).
+fn collectGossipSigCoverageForSlot(
+    map: *const SignaturesMap,
+    slot: types.Slot,
+    committee_count: types.SubnetId,
+    validator_count: usize,
+    seen: []bool,
+    has_subnet: []bool,
+) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.slot != slot) continue;
+        var vid_it = entry.value_ptr.iterator();
+        while (vid_it.next()) |sig_entry| {
+            const validator_index: usize = @intCast(sig_entry.key_ptr.*);
+            if (validator_index >= validator_count) continue;
+            if (validator_index >= seen.len) continue;
+            if (std.mem.eql(u8, &sig_entry.value_ptr.signature, &ZERO_SIGBYTES)) continue;
+            const subnet_id = types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+            const subnet_index: usize = @intCast(subnet_id);
+            if (subnet_index >= has_subnet.len) continue;
+            seen[validator_index] = true;
+            has_subnet[subnet_index] = true;
+        }
+    }
+}
+
 fn collectCoverageFromAggregatedAttestation(
     agg_att: types.AggregatedAttestation,
     committee_count: types.SubnetId,
@@ -3834,15 +4065,29 @@ fn observeAggregateBuildPhase(comptime phase: []const u8, start_ns: i128) void {
     ) catch {};
 }
 
-fn recordAggregateCoverageMetrics(section: []const u8, seen: []const bool, has_subnet: []const bool) void {
-    zeam_metrics.metrics.zeam_attestation_aggregate_coverage_validators.set(
-        .{ .section = section },
+fn recordAggregateCoverageMetrics(
+    section: []const u8,
+    seen: []const bool,
+    has_subnet: []const bool,
+    committee_count: types.SubnetId,
+) void {
+    zeam_metrics.metrics.lean_attestation_aggregate_coverage_validators.set(
+        .{ .section = section, .subnet = "combined" },
         @intCast(countSeen(seen)),
     ) catch {};
-    zeam_metrics.metrics.zeam_attestation_aggregate_coverage_subnets.set(
+    zeam_metrics.metrics.lean_attestation_aggregate_coverage_subnets.set(
         .{ .section = section },
         @intCast(countSeen(has_subnet)),
     ) catch {};
+
+    for (has_subnet, 0..) |_, subnet_index| {
+        var subnet_label_buf: [32]u8 = undefined;
+        const subnet_label = std.fmt.bufPrint(&subnet_label_buf, "subnet_{d}", .{subnet_index}) catch continue;
+        zeam_metrics.metrics.lean_attestation_aggregate_coverage_validators.set(
+            .{ .section = section, .subnet = subnet_label },
+            @intCast(countSubnetSeen(seen, @intCast(subnet_index), committee_count)),
+        ) catch {};
+    }
 }
 
 fn countSubnetSeen(seen: []const bool, subnet_id: types.SubnetId, committee_count: types.SubnetId) usize {

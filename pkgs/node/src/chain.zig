@@ -67,6 +67,11 @@ pub const ChainOpts = struct {
     // Optional shared worker pool for CPU-bound work (signature verification).
     // When null, the chain falls back to the serial code paths.
     thread_pool: ?*ThreadPool = null,
+    /// Surfaces the `--min-aggregation-inputs` CLI flag to the
+    /// per-`ForkChoice` aggregation threshold. See
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs` for the
+    /// default and `isTrivialAggregationInput` for the predicate semantics.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -504,6 +509,7 @@ pub const BeamChain = struct {
             .anchorState = opts.anchorState,
             .logger = logger_config.logger(.forkchoice),
             .thread_pool = opts.thread_pool,
+            .min_aggregation_inputs = opts.min_aggregation_inputs,
         });
 
         var states = std.AutoHashMap(types.Root, *RcBeamState).init(allocator);
@@ -4429,7 +4435,41 @@ pub const BeamChain = struct {
 
         if (aggregations.len == 0) return;
 
+        // Per-subnet publish counter. Operators rely on this to tell whether the
+        // local aggregator is producing for its duty subnet at all; the standard
+        // `lean_pq_sig_aggregated_signatures_total` increments only on the
+        // block-proposal path (see chain.zig produceBlock) and stays near zero on
+        // a healthy aggregator that is not also a recent proposer, which makes it
+        // a poor signal for the aggregator role. Derive the subnet from the
+        // first set participant in each proof: all participants of a single
+        // SignedAggregatedAttestation come from the same committee subnet (cf.
+        // `computeSubnetId` = validator_index % attestation_committee_count).
+        const committee_count = chain.config.spec.attestation_committee_count;
+        if (committee_count > 0) {
+            for (aggregations) |signed| {
+                const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse continue;
+                var label_buf: [16]u8 = undefined;
+                const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch continue;
+                zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+            }
+        }
+
         node.publishProducedAggregations(aggregations);
+    }
+
+    /// Find the subnet of the first set participant in `participants`.
+    /// All participants in a single aggregated attestation come from the same
+    /// committee subnet, so the first one is representative. Returns null if
+    /// the bitfield is empty or every set bit is out of range.
+    fn firstParticipantSubnet(
+        participants: types.AggregationBits,
+        committee_count: types.SubnetId,
+    ) ?types.SubnetId {
+        for (0..participants.len()) |validator_index| {
+            if (!(participants.get(validator_index) catch false)) continue;
+            return types.computeSubnetId(@intCast(validator_index), committee_count) catch continue;
+        }
+        return null;
     }
 
     pub fn getStatus(self: *Self) types.Status {

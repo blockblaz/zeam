@@ -39,6 +39,20 @@ const json = std.json;
 
 const freeJsonValue = utils.freeJsonValue;
 
+/// Default `min_aggregation_inputs` for the aggregator-role pre-filter.
+///
+/// Surfaced on the CLI as `--min-aggregation-inputs` (see
+/// `pkgs/cli/src/main.zig`) and consumed by the aggregator wrapper in
+/// `pkgs/node/src/forkchoice.zig` (NOT by `computeAggregatedSignatures`,
+/// which is spec-pure and aggregates whatever it is given). Default
+/// `2`: aggregator skips publishing when an `att_data` has only a
+/// single local gossip sig and no peer payload, since the raw sig is
+/// already on the gossip topic and a 1-validator "aggregate" carries
+/// no consensus signal (#907 finding 4). `1` reverts to pre-#908
+/// behavior (always aggregate ≥1 sig). Higher values trade slot
+/// latency for fewer sub-threshold aggregates on chatty subnets.
+pub const default_min_aggregation_inputs: u32 = 2;
+
 // signatures_map types for aggregation
 
 /// Stored signatures_map entry: per-validator signature + slot metadata.
@@ -552,7 +566,18 @@ pub const AggregatedAttestationsResult = struct {
     ///         optionally restricted to the supplied attestation slots.
     /// Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
     /// Step 3: Collect individual gossip signatures not covered by children
-    /// Step 4: Recursive aggregate — combine selected children + remaining gossip sigs
+    /// Step 4: Lone-child clone fast path: `0 gossip + 1 child` clones the
+    ///         lone child as the result without invoking the prover.
+    /// Step 5: Recursive aggregate — combine selected children + remaining gossip sigs.
+    ///
+    /// Spec-pure: this function aggregates whatever it is given. Callers
+    /// that want to skip trivially-shaped inputs (e.g. the aggregator
+    /// role wanting to avoid spending the full STARK prover budget on a
+    /// single-validator "aggregate" that carries no consensus signal —
+    /// see issue #907 finding 4) must filter the inputs they pass in.
+    /// Block proposers, by contrast, MUST aggregate every `att_data`
+    /// they choose to include in a block, even if its only input is a
+    /// single gossip signature.
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
