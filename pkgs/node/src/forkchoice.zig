@@ -1161,7 +1161,11 @@ pub const ForkChoice = struct {
         var processed_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
         defer processed_att_data.deinit();
 
+        var child_payloads_consumed: usize = 0;
+
         while (true) {
+            const select_start_ns = zeam_utils.monotonicTimestampNs();
+
             // Find attestation_data entries whose source slot is justified on this chain,
             // that reference blocks we know about, and whose target is not yet justified.
             // Collect and sort by target slot for deterministic processing order.
@@ -1262,14 +1266,18 @@ pub const ForkChoice = struct {
 
                     try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
                     try attestation_signatures.append(cloned_proof);
+                    child_payloads_consumed += 1;
                 }
             }
+
+            observeProposalBuildPhase("select_payloads", select_start_ns);
 
             if (!found_entries) break;
 
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_start_ns = zeam_utils.monotonicTimestampNs();
             const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
                 self.allocator,
@@ -1283,6 +1291,9 @@ pub const ForkChoice = struct {
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
             zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
+            observeProposalBuildPhase("compact", compact_start_ns);
+
+            const stf_start_ns = zeam_utils.monotonicTimestampNs();
 
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
@@ -1323,6 +1334,7 @@ pub const ForkChoice = struct {
                 candidate_state.latest_justified.slot != current_justified.slot;
             const finalized_changed = candidate_state.latest_finalized.slot != current_finalized_slot;
             if (justified_changed or finalized_changed) {
+                observeProposalBuildPhase("stf_simulate", stf_start_ns);
                 current_justified = candidate_state.latest_justified;
                 current_finalized_slot = candidate_state.latest_finalized.slot;
                 // Swap in the updated justified_slots (clone first so candidate_state
@@ -1334,9 +1346,16 @@ pub const ForkChoice = struct {
                 continue;
             }
 
+            observeProposalBuildPhase("stf_simulate", stf_start_ns);
+
             // Justification and finalization unchanged - block production done.
             break;
         }
+
+        zeam_metrics.metrics.lean_block_proposal_attestation_builds_total.incr();
+        zeam_metrics.metrics.lean_block_proposal_child_payloads_consumed_total.incrBy(@intCast(child_payloads_consumed));
+        zeam_metrics.lean_block_proposal_attestation_data_selected.record(@floatFromInt(processed_att_data.count()));
+        zeam_metrics.lean_block_proposal_aggregates_selected.record(@floatFromInt(attestation_signatures.len()));
 
         self.logBlockProposalPayloadCoverage(slot, &agg_attestations);
 
@@ -4042,17 +4061,28 @@ fn countSeen(seen: []const bool) usize {
 }
 
 fn observeAggregateBuildPhase(comptime phase: []const u8, start_ns: i128) void {
-    const end_ns = zeam_utils.monotonicTimestampNs();
-    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
-    // Histogram seconds are f32; precision below roughly 100 ns is intentionally
-    // irrelevant for these phase buckets. The existing total histogram still
-    // wraps only the recursive proof build inside compute, so phase sums are an
-    // attribution view rather than an exact replacement for that metric.
-    const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    const elapsed_s = phaseElapsedSeconds(start_ns);
     zeam_metrics.metrics.zeam_pq_sig_aggregated_signatures_building_phase_seconds.observe(
         .{ .phase = phase },
         elapsed_s,
     ) catch {};
+}
+
+fn observeProposalBuildPhase(comptime phase: []const u8, start_ns: i128) void {
+    const elapsed_s = phaseElapsedSeconds(start_ns);
+    zeam_metrics.metrics.lean_block_proposal_attestation_build_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_s,
+    ) catch {};
+}
+
+fn phaseElapsedSeconds(start_ns: i128) f32 {
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    // Histogram seconds are f32; precision below roughly 100 ns is intentionally
+    // irrelevant for these phase buckets. Phase sums are an attribution view
+    // rather than an exact replacement for the path's total wall-clock histogram.
+    return @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
 }
 
 fn recordAggregateCoverageMetrics(

@@ -157,6 +157,15 @@ const Metrics = struct {
     zeam_compact_attestations_time_seconds: CompactAttestationsTimeHistogram,
     zeam_compact_attestations_input_total: CompactAttestationsInputCounter,
     zeam_compact_attestations_output_total: CompactAttestationsOutputCounter,
+    // Block-proposal attestation selection (`getProposalAttestations`). Phase
+    // attribution mirrors `zeam_pq_sig_aggregated_signatures_building_phase_seconds`
+    // on the interval-2 aggregator path. `lean_block_building_payload_aggregation_time_seconds`
+    // remains the cross-client wall-clock total for the whole call.
+    lean_block_proposal_attestation_build_phase_seconds: BlockProposalAttestationBuildPhaseHistogram,
+    lean_block_proposal_attestation_builds_total: BlockProposalAttestationBuildsTotalCounter,
+    lean_block_proposal_child_payloads_consumed_total: BlockProposalChildPayloadsConsumedTotalCounter,
+    lean_block_proposal_attestation_data_selected: BlockProposalAttestationDataSelectedHistogram,
+    lean_block_proposal_aggregates_selected: BlockProposalAggregatesSelectedHistogram,
     // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
     /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run` (issues #863, #867).
@@ -489,6 +498,11 @@ const Metrics = struct {
     const AggregationIntervalTickHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
     const CompactAttestationsInputCounter = metrics_lib.Counter(u64);
     const CompactAttestationsOutputCounter = metrics_lib.Counter(u64);
+    const BlockProposalAttestationBuildPhaseHistogram = metrics_lib.HistogramVec(f32, struct { phase: []const u8 }, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 });
+    const BlockProposalAttestationBuildsTotalCounter = metrics_lib.Counter(u64);
+    const BlockProposalChildPayloadsConsumedTotalCounter = metrics_lib.Counter(u64);
+    const BlockProposalAttestationDataSelectedHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16, 32 });
+    const BlockProposalAggregatesSelectedHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16, 32, 64, 128 });
     // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
     // both fast acquisitions and long stalls observed when STF runs under the lock.
     const NodeMutexLabel = struct { site: []const u8 };
@@ -682,6 +696,18 @@ fn observeAttestationProduction(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeBlockProposalAttestationDataSelected(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockProposalAttestationDataSelectedHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeBlockProposalAggregatesSelected(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockProposalAggregatesSelectedHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeCompactAttestations(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.CompactAttestationsTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -808,6 +834,14 @@ pub var zeam_compact_attestations_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeCompactAttestations,
 };
+pub var lean_block_proposal_attestation_data_selected: Histogram = .{
+    .context = null,
+    .observe = &observeBlockProposalAttestationDataSelected,
+};
+pub var lean_block_proposal_aggregates_selected: Histogram = .{
+    .context = null,
+    .observe = &observeBlockProposalAggregatesSelected,
+};
 pub var lean_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeTickIntervalDuration,
@@ -925,6 +959,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
         .zeam_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("zeam_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
         .zeam_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("zeam_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
+        .lean_block_proposal_attestation_build_phase_seconds = try Metrics.BlockProposalAttestationBuildPhaseHistogram.init(allocator, io, "lean_block_proposal_attestation_build_phase_seconds", .{ .help = "Phase-level time in block-proposal attestation selection (build_block / getProposalAttestations): select_payloads, compact (recursive merge per AttestationData), stf_simulate." }, .{}),
+        .lean_block_proposal_attestation_builds_total = Metrics.BlockProposalAttestationBuildsTotalCounter.init("lean_block_proposal_attestation_builds_total", .{ .help = "Completed block-proposal attestation selection runs (one per proposal attempt)." }, .{}),
+        .lean_block_proposal_child_payloads_consumed_total = Metrics.BlockProposalChildPayloadsConsumedTotalCounter.init("lean_block_proposal_child_payloads_consumed_total", .{ .help = "Child aggregated payloads selected during greedy proof picking (before recursive compaction)." }, .{}),
+        .lean_block_proposal_attestation_data_selected = Metrics.BlockProposalAttestationDataSelectedHistogram.init("lean_block_proposal_attestation_data_selected", .{ .help = "Distinct AttestationData entries in the proposal block body." }, .{}),
+        .lean_block_proposal_aggregates_selected = Metrics.BlockProposalAggregatesSelectedHistogram.init("lean_block_proposal_aggregates_selected", .{ .help = "Aggregated signature proofs in the proposal result after compaction." }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
@@ -1021,6 +1060,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_gossip_aggregation_size_bytes.context = @ptrCast(&metrics.lean_gossip_aggregation_size_bytes);
     lean_attestations_production_time_seconds.context = @ptrCast(&metrics.lean_attestations_production_time_seconds);
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
+    lean_block_proposal_attestation_data_selected.context = @ptrCast(&metrics.lean_block_proposal_attestation_data_selected);
+    lean_block_proposal_aggregates_selected.context = @ptrCast(&metrics.lean_block_proposal_aggregates_selected);
     lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
     zeam_xev_clock_until_done_drain_seconds.context = @ptrCast(&metrics.zeam_xev_clock_until_done_drain_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
