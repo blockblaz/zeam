@@ -632,7 +632,7 @@ fn mainInner(init: std.process.Init) !void {
             const cpu_count = std.Thread.getCpuCount() catch 2;
             const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
             const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
-            const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+            const worker_count = @min(desired_workers, @as(usize, 4));
             const thread_pool = try ThreadPool.init(.{
                 .allocator = allocator,
                 .io = init.io,
