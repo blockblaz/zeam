@@ -73,8 +73,11 @@ pub const ChainOpts = struct {
     /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
     /// enforced lock-free by `submitAggregateOnInterval`; further submits
     /// are skipped (counted as `zeam_aggregate_skip_total{reason="in_flight"}`).
-    /// See `BeamChain.aggregateImpl` for the worker body.
-    aggregate_max_inflight: u32 = 16,
+    /// Kept low (default 4) so the queue drains quickly and the aggregator
+    /// stays focused on CURRENT slots rather than catching up old ones — per
+    /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
+    /// further-back slots are wasted work. See `BeamChain.aggregateImpl`.
+    aggregate_max_inflight: u32 = 4,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -4310,31 +4313,37 @@ pub const BeamChain = struct {
             },
         }
 
+        // Non-blocking cap check on the libxev thread. Done BEFORE the
+        // expensive state borrow + `cloneAndRelease` so a saturated worker
+        // pool doesn't burn deep-clones we'd immediately throw away.
+        // `fetchAdd`-then-compare is a soft ceiling — transient overshoot
+        // is bounded by concurrent caller count and self-corrects on the
+        // next interval.
+        const prev = self.aggregate_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= self.aggregate_max_inflight) {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
+            self.logger.info("skipping aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
+            return;
+        }
+        // Past this point we own one `aggregate_inflight` slot — every
+        // early-return below must release it.
+
         // Snapshot state on the caller's thread (fast path).
         const head_root = self.forkChoice.getHead().blockRoot;
         var borrow = self.statesGet(head_root) orelse {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
             zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "missing_state" }) catch {};
             return;
         };
         defer borrow.assertReleasedOrPanic();
         const snapshot = borrow.cloneAndRelease(self.allocator) catch |err| {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
             return;
         };
 
-        // Non-blocking cap check on the libxev thread. `fetchAdd`-then-compare
-        // is a soft ceiling — transient overshoot is bounded by concurrent
-        // caller count and self-corrects on the next interval.
-        const prev = self.aggregate_inflight.fetchAdd(1, .acq_rel);
-        if (prev >= self.aggregate_max_inflight) {
-            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
-            self.logger.info("skipping aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
-            snapshot.deinit();
-            self.allocator.destroy(snapshot);
-            return;
-        }
         // Non-blocking enqueue onto the shared ThreadPool. The libxev thread
         // returns immediately; the worker runs on a pool thread. We deliberately
         // do NOT fall back to inline execution on OOM (unlike replay batches)
