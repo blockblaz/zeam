@@ -1175,14 +1175,21 @@ pub fn compactAttestations(
             var cpk_idx: usize = 0;
             for (0..child.participants.len()) |i| {
                 if (child.participants.get(i) catch false) {
-                    if (i >= validators.len()) continue;
-                    const val = validators.get(@intCast(i)) catch continue;
-                    const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch continue;
+                    // No silent fallback: dropping a participant here (out-of-range bit, or a
+                    // malformed registered pubkey) would shrink this child's pubkey set below its
+                    // participants bitfield, yielding an aggregate whose pubkey multiset no longer
+                    // matches the bits — a silently-invalid proof that fails verify downstream.
+                    // Surface the corruption instead of producing a bad block.
+                    if (i >= validators.len()) return error.InvalidValidatorIndex;
+                    const val = try validators.get(@intCast(i));
+                    const pk = try xmss.PublicKey.fromBytes(&val.attestation_pubkey);
                     try pubkey_wrappers.append(allocator, pk);
                     cpks[cpk_idx] = pk.handle;
                     cpk_idx += 1;
                 }
             }
+            // cpk_idx == n_participants now (every set bit resolved), so the slice length matches
+            // the child proof's participant count.
             child_arr[child_i] = cpks[0..cpk_idx];
         }
 
