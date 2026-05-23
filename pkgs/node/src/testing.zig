@@ -10,7 +10,21 @@ const zeam_utils = @import("@zeam/utils");
 const xev = @import("xev").Dynamic;
 const networks = @import("@zeam/network");
 const xmss = @import("@zeam/xmss");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const clockFactory = @import("./clock.zig");
+
+/// Test helper: initialize a `*ThreadPool` configured for use in tests.
+///
+/// Centralized so every test/driver in the workspace constructs the pool the
+/// same way (single-threaded global I/O, 4 worker threads). Callers own the
+/// returned pool and must call `deinit` on it.
+pub fn initTestThreadPool(allocator: Allocator) !*ThreadPool {
+    return ThreadPool.init(.{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .thread_count = 4,
+    });
+}
 
 pub const NodeTestOptions = struct {
     num_validators: usize = 4,
@@ -45,6 +59,7 @@ pub const NodeTestContext = struct {
     fork_digest: []u8,
     chain_config: configs.ChainConfig,
     clock: clockFactory.Clock,
+    thread_pool: *ThreadPool,
     anchor_state_owned: bool = true,
     spec_name_owned: bool = true,
 
@@ -111,6 +126,9 @@ pub const NodeTestContext = struct {
         var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, &loop, logger_config);
         errdefer clock.deinit(allocator);
 
+        const thread_pool = try initTestThreadPool(allocator);
+        errdefer thread_pool.deinit();
+
         return NodeTestContext{
             .allocator = allocator,
             .loop = loop,
@@ -127,10 +145,12 @@ pub const NodeTestContext = struct {
             .fork_digest = fork_digest,
             .chain_config = chain_config,
             .clock = clock,
+            .thread_pool = thread_pool,
         };
     }
 
     pub fn deinit(self: *NodeTestContext) void {
+        self.thread_pool.deinit();
         self.clock.deinit(self.allocator);
         self.db.deinit();
         self.tmp_dir.cleanup();
@@ -176,6 +196,10 @@ pub const NodeTestContext = struct {
 
     pub fn dbInstance(self: *NodeTestContext) database.Db {
         return self.db;
+    }
+
+    pub fn threadPool(self: *NodeTestContext) *ThreadPool {
+        return self.thread_pool;
     }
 
     pub fn genesisConfig(self: *NodeTestContext) types.GenesisSpec {

@@ -1189,7 +1189,10 @@ pub fn compactAttestations(
         preps[ei] = .{ .entry = entry, .child_pk_slices = child_arr };
     }
 
-    if (thread_pool) |pool| {
+    {
+        // #915: thread_pool is non-optional (the node always has a worker pool), so there is no
+        // serial fallback — always aggregate in parallel.
+        const pool = thread_pool;
         // Parallel path: per-AttestationData aggregation across the shared
         // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
         // touch FFI deserialization themselves.
@@ -1252,22 +1255,6 @@ pub fn compactAttestations(
         for (slots) |*slot| {
             var result = slot.result orelse continue;
             slot.result = null;
-
-            var att_moved = false;
-            var sig_moved = false;
-            defer {
-                if (!att_moved) result.attestation.deinit();
-                if (!sig_moved) result.signature.deinit();
-            }
-
-            try out_atts.append(result.attestation);
-            att_moved = true;
-            try out_sigs.append(result.signature);
-            sig_moved = true;
-        }
-    } else {
-        for (preps) |prep| {
-            var result = try runCompactGroupPrep(allocator, prep, sig_slice);
 
             var att_moved = false;
             var sig_moved = false;

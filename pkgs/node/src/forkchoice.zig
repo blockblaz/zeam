@@ -280,7 +280,7 @@ pub const ForkChoiceParams = struct {
     config: configs.ChainConfig,
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
-    thread_pool: ?*ThreadPool = null,
+    thread_pool: *ThreadPool,
     /// Minimum (children + gossip-sig) inputs the aggregator pre-filter
     /// requires before letting an `att_data` reach
     /// `computeAggregatedSignatures`. Threaded through from the
@@ -341,8 +341,8 @@ pub const ForkChoice = struct {
     // `ready` on the first block-driven justified update.  Validator duties (block
     // production, attestation) must not run while status == .initing.
     status: ForkChoiceStatus,
-    // Optional shared worker pool used for CPU-heavy attestation compaction.
-    thread_pool: ?*ThreadPool = null,
+    // Shared worker pool used for CPU-heavy attestation compaction.
+    thread_pool: *ThreadPool,
     /// Threshold consumed by `pruneTrivialFromAggregateSnapshot` on
     /// every `aggregate*` call to decide which `att_data` entries to
     /// drop before invoking `computeAggregatedSignatures`. See
@@ -1163,7 +1163,11 @@ pub const ForkChoice = struct {
         var processed_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
         defer processed_att_data.deinit();
 
+        var child_payloads_consumed: usize = 0;
+
         while (true) {
+            const select_start_ns = zeam_utils.monotonicTimestampNs();
+
             // Find attestation_data entries whose source slot is justified on this chain,
             // that reference blocks we know about, and whose target is not yet justified.
             // Collect and sort by target slot for deterministic processing order.
@@ -1264,14 +1268,18 @@ pub const ForkChoice = struct {
 
                     try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
                     try attestation_signatures.append(cloned_proof);
+                    child_payloads_consumed += 1;
                 }
             }
+
+            observeProposalBuildPhase("select_payloads", select_start_ns);
 
             if (!found_entries) break;
 
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_start_ns = zeam_utils.monotonicTimestampNs();
             const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
                 self.allocator,
@@ -1285,6 +1293,9 @@ pub const ForkChoice = struct {
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
             zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
+            observeProposalBuildPhase("compact", compact_start_ns);
+
+            const stf_start_ns = zeam_utils.monotonicTimestampNs();
 
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
@@ -1325,6 +1336,7 @@ pub const ForkChoice = struct {
                 candidate_state.latest_justified.slot != current_justified.slot;
             const finalized_changed = candidate_state.latest_finalized.slot != current_finalized_slot;
             if (justified_changed or finalized_changed) {
+                observeProposalBuildPhase("stf_simulate", stf_start_ns);
                 current_justified = candidate_state.latest_justified;
                 current_finalized_slot = candidate_state.latest_finalized.slot;
                 // Swap in the updated justified_slots (clone first so candidate_state
@@ -1336,9 +1348,16 @@ pub const ForkChoice = struct {
                 continue;
             }
 
+            observeProposalBuildPhase("stf_simulate", stf_start_ns);
+
             // Justification and finalization unchanged - block production done.
             break;
         }
+
+        zeam_metrics.metrics.lean_block_proposal_attestation_builds_total.incr();
+        zeam_metrics.metrics.lean_block_proposal_child_payloads_consumed_total.incrBy(@intCast(child_payloads_consumed));
+        zeam_metrics.lean_block_proposal_attestation_data_selected.record(@floatFromInt(processed_att_data.count()));
+        zeam_metrics.lean_block_proposal_aggregates_selected.record(@floatFromInt(attestation_signatures.len()));
 
         self.logBlockProposalPayloadCoverage(slot, &agg_attestations);
 
@@ -2314,36 +2333,6 @@ pub const ForkChoice = struct {
         return results.toOwnedSlice(self.allocator);
     }
 
-    /// Build aggregate-attestation payloads from the gossip
-    /// `attestation_signatures` map and the cached
-    /// `latest_known_aggregated_payloads`.
-    ///
-    /// **#863 / #890 followup — neither the forkchoice main mutex nor
-    /// the `signatures_mutex` is held during the heavy XMSS FFI
-    /// window.** The forkchoice main mutex isn't acquired at all (the
-    /// body doesn't touch state guarded by it). `signatures_mutex` is
-    /// acquired twice, both ms-scale: once for the snapshot phase,
-    /// once for the commit phase. The ~18 s
-    /// `computeAggregatedSignatures` runs in between with no locks,
-    /// so libxev's `chain.onInterval` →
-    /// `acceptNewAttestationsUnlocked` (which also takes
-    /// `signatures_mutex`) and the chain worker's per-attestation /
-    /// per-block forkchoice updates are unblocked even while an
-    /// aggregation is in flight. See the docstring on
-    /// `aggregateUnlocked` for the three-phase contract.
-    ///
-    /// `submitAggregateOnInterval` already gates concurrent
-    /// `aggregateForSlots()` invocations via `aggregate_group.concurrent`
-    /// (concurrent_limit=1), so two aggregations cannot race here.
-    ///
-    /// Unfiltered aggregation is retained for tests and explicit defensive backfills
-    /// only. Production slot workers should pass a bounded slot window via
-    /// `aggregateForSlots` so stale/future retained map entries cannot reintroduce
-    /// the #899 recursive-aggregation tail.
-    pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
-        return self.aggregateUnlocked(state_opt, null);
-    }
-
     /// Produce aggregations only for the caller-supplied attestation slots.
     ///
     /// The aggregate worker is scheduled with `aggregate_group.concurrent`
@@ -2834,6 +2823,10 @@ pub const ForkChoiceError = error{
     TooManyAttestationData,
 };
 
+fn initTestThreadPool() !*ThreadPool {
+    return @import("./testing.zig").initTestThreadPool(std.testing.allocator);
+}
+
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "forkchoice block tree" {
@@ -2861,10 +2854,13 @@ test "forkchoice block tree" {
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);
+    const test_thread_pool = try initTestThreadPool();
+    defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
         .anchorState = &beam_state,
         .logger = module_logger,
+        .thread_pool = test_thread_pool,
     });
 
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
@@ -2912,10 +2908,13 @@ test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence sem
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);
+    const test_thread_pool = try initTestThreadPool();
+    defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
         .anchorState = &beam_state,
         .logger = module_logger,
+        .thread_pool = test_thread_pool,
     });
 
     // 1. Empty input is a no-op (does not panic / does not deadlock).
@@ -2997,10 +2996,13 @@ test "aggregate prunes attestation signatures" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const test_thread_pool = try initTestThreadPool();
+    defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
         .anchorState = &mock_chain.genesis_state,
         .logger = zeam_logger_config.logger(.forkchoice),
+        .thread_pool = test_thread_pool,
     });
     defer fork_choice.deinit();
 
@@ -3039,7 +3041,7 @@ test "aggregate prunes attestation signatures" {
         });
     }
 
-    const aggregations = try fork_choice.aggregate(&mock_chain.genesis_state);
+    const aggregations = try fork_choice.aggregateForSlots(&mock_chain.genesis_state, &.{0});
     defer {
         for (aggregations) |*signed_aggregation| {
             signed_aggregation.deinit();
@@ -3110,10 +3112,13 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const test_thread_pool = try initTestThreadPool();
+    defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
         .anchorState = &mock_chain.genesis_state,
         .logger = zeam_logger_config.logger(.forkchoice),
+        .thread_pool = test_thread_pool,
     });
     defer fork_choice.deinit();
 
@@ -3155,7 +3160,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
         result: anyerror![]types.SignedAggregatedAttestation = undefined,
 
         fn run(ctx: *@This()) void {
-            ctx.result = ctx.fork_choice.aggregate(ctx.state);
+            ctx.result = ctx.fork_choice.aggregateForSlots(ctx.state, &.{0});
         }
     };
     var worker: Worker = .{ .fork_choice = &fork_choice, .state = &mock_chain.genesis_state };
@@ -3323,6 +3328,8 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .latest_finalized = anchorCP,
     };
 
+    const test_thread_pool = try initTestThreadPool();
+    defer test_thread_pool.deinit();
     var fork_choice = ForkChoice{
         .allocator = allocator,
         .protoArray = proto_array,
@@ -3342,6 +3349,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .latest_block_aggregated_payloads_slot = null,
         .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
+        .thread_pool = test_thread_pool,
         .last_node_tick_time_ms = null,
     };
     defer fork_choice.attestations.deinit();
@@ -4055,17 +4063,28 @@ fn countSeen(seen: []const bool) usize {
 }
 
 fn observeAggregateBuildPhase(comptime phase: []const u8, start_ns: i128) void {
-    const end_ns = zeam_utils.monotonicTimestampNs();
-    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
-    // Histogram seconds are f32; precision below roughly 100 ns is intentionally
-    // irrelevant for these phase buckets. The existing total histogram still
-    // wraps only the recursive proof build inside compute, so phase sums are an
-    // attribution view rather than an exact replacement for that metric.
-    const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    const elapsed_s = phaseElapsedSeconds(start_ns);
     zeam_metrics.metrics.zeam_pq_sig_aggregated_signatures_building_phase_seconds.observe(
         .{ .phase = phase },
         elapsed_s,
     ) catch {};
+}
+
+fn observeProposalBuildPhase(comptime phase: []const u8, start_ns: i128) void {
+    const elapsed_s = phaseElapsedSeconds(start_ns);
+    zeam_metrics.metrics.lean_block_proposal_attestation_build_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_s,
+    ) catch {};
+}
+
+fn phaseElapsedSeconds(start_ns: i128) f32 {
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    // Histogram seconds are f32; precision below roughly 100 ns is intentionally
+    // irrelevant for these phase buckets. Phase sums are an attribution view
+    // rather than an exact replacement for the path's total wall-clock histogram.
+    return @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
 }
 
 fn recordAggregateCoverageMetrics(
@@ -4127,6 +4146,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
     fork_choice: ForkChoice,
     spec_name: []u8,
     fork_digest: []u8,
+    thread_pool: *ThreadPool,
 } {
     const spec_name = try allocator.dupe(u8, "beamdev");
     const fork_digest = try allocator.dupe(u8, "12345678");
@@ -4167,6 +4187,8 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
 
     const module_logger = rebase_test_logger_config.logger(.forkchoice);
 
+    const test_thread_pool = try initTestThreadPool();
+    errdefer test_thread_pool.deinit();
     const fork_choice = ForkChoice{
         .allocator = allocator,
         .protoArray = proto_array,
@@ -4186,6 +4208,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .latest_block_aggregated_payloads_slot = null,
         .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
+        .thread_pool = test_thread_pool,
         .last_node_tick_time_ms = null,
     };
 
@@ -4193,6 +4216,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .fork_choice = fork_choice,
         .spec_name = spec_name,
         .fork_digest = fork_digest,
+        .thread_pool = test_thread_pool,
     };
 }
 
@@ -4203,6 +4227,7 @@ const RebaseTestContext = struct {
     fork_choice: ForkChoice,
     spec_name: []u8,
     fork_digest: []u8,
+    thread_pool: *ThreadPool,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, num_validators: usize) !RebaseTestContext {
@@ -4225,12 +4250,14 @@ const RebaseTestContext = struct {
         errdefer deinitAggregatedPayloadsMap(allocator, &test_data.fork_choice.latest_known_aggregated_payloads);
         errdefer deinitAggregatedPayloadsMap(allocator, &test_data.fork_choice.latest_new_aggregated_payloads);
         errdefer deinitAggregatedPayloadsMap(allocator, &test_data.fork_choice.latest_block_aggregated_payloads);
+        errdefer test_data.thread_pool.deinit();
 
         return .{
             .mock_chain = mock_chain,
             .fork_choice = test_data.fork_choice,
             .spec_name = test_data.spec_name,
             .fork_digest = test_data.fork_digest,
+            .thread_pool = test_data.thread_pool,
             .allocator = allocator,
         };
     }
@@ -4248,6 +4275,7 @@ const RebaseTestContext = struct {
         if (self.fork_choice.saved_pre_merge_new_coverage) |*cov| cov.deinit(self.allocator);
         self.allocator.free(self.spec_name);
         self.allocator.free(self.fork_digest);
+        self.thread_pool.deinit();
 
         // Cleanup mock_chain genesis_state components
         self.mock_chain.genesis_state.validators.deinit();
@@ -5142,6 +5170,8 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);
 
+    const test_thread_pool = try initTestThreadPool();
+    defer test_thread_pool.deinit();
     var fork_choice = ForkChoice{
         .allocator = allocator,
         .protoArray = proto_array,
@@ -5161,6 +5191,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .latest_block_aggregated_payloads_slot = null,
         .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
+        .thread_pool = test_thread_pool,
         .last_node_tick_time_ms = null,
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're

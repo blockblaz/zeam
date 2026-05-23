@@ -47,9 +47,8 @@ const NodeOpts = struct {
     is_aggregator: bool = false,
     /// Explicit subnet ids to subscribe and import gossip attestations for aggregation
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
-    /// When non-null it is shared across all nodes in the same process.
-    thread_pool: ?*ThreadPool = null,
+    /// Shared worker pool for parallelizing CPU-bound chain work (signature verification).
+    thread_pool: *ThreadPool,
     /// Slice c-2b commit 3 of #803: when true, the chain spawns a
     /// dedicated worker thread and producer-side handlers for
     /// gossip blocks / attestations route through its bounded
@@ -3224,6 +3223,7 @@ test "Node peer tracking on connect/disconnect" {
         .db = db,
         .logger_config = ctx.logger_config,
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3309,6 +3309,7 @@ test "Node: fetched blocks cache and deduplication" {
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3403,6 +3404,7 @@ test "Node: processCachedDescendants basic flow" {
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3503,6 +3505,7 @@ test "Node: pruneCachedBlocks removes root and all cached descendants" {
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3578,6 +3581,7 @@ test "Node: pruneCachedBlocks removes entire chain including ancestors" {
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3658,6 +3662,7 @@ test "Node: pruneCachedBlocks removes cached descendants even if root is not cac
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3717,6 +3722,7 @@ test "Node: pruneCachedBlocks with finalized checkpoint keeps finalized descenda
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3785,6 +3791,7 @@ test "Node: pruneCachedBlocks skips pruning finalized root" {
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3832,6 +3839,7 @@ test "Node: cacheFetchedBlock deduplicates children entries on repeated caching"
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3899,6 +3907,7 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -3983,6 +3992,7 @@ test "Network: BlockCache wiring smoke (slice a-3)" {
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -4066,6 +4076,7 @@ test "Network: ConnectedPeers integration with selectPeer (slice a-3)" {
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
         .node_registry = test_registry,
+        .thread_pool = ctx.threadPool(),
     });
     defer node.deinit();
 
@@ -4134,6 +4145,7 @@ const TestHarness = struct {
             .db = harness.ctx.dbInstance(),
             .logger_config = harness.ctx.loggerConfig(),
             .node_registry = harness.test_registry,
+            .thread_pool = harness.ctx.threadPool(),
         });
     }
 
