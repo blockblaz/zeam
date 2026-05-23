@@ -1165,6 +1165,20 @@ pub const ForkChoice = struct {
 
         var child_payloads_consumed: usize = 0;
 
+        // Snapshot the known-payloads pool under signatures_mutex so the selection loop + XMSS FFI
+        // below operate on an owned copy. The live map is mutated by aggregation-commit / import
+        // paths under signatures_mutex; iterating it here under only the fork-choice shared mutex
+        // would race (torn reads / use-after-free of proofs being moved). This mirrors the
+        // lock-free-FFI-on-snapshot pattern aggregateUnlocked already uses. Lock order is
+        // fc-mutex(shared) -> signatures_mutex, matching every other site (no path takes them in
+        // the reverse order), so this cannot deadlock.
+        var known_payloads_snapshot = snapshot_blk: {
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+            break :snapshot_blk try cloneAggregatedPayloadsMap(self.allocator, &self.latest_known_aggregated_payloads);
+        };
+        defer deinitAggregatedPayloadsMap(self.allocator, &known_payloads_snapshot);
+
         while (true) {
             const select_start_ns = zeam_utils.monotonicTimestampNs();
 
@@ -1178,7 +1192,7 @@ pub const ForkChoice = struct {
             var sorted_entries: std.ArrayList(MapEntry) = .empty;
             defer sorted_entries.deinit(self.allocator);
 
-            var payload_it = self.latest_known_aggregated_payloads.iterator();
+            var payload_it = known_payloads_snapshot.iterator();
             while (payload_it.next()) |entry| {
                 const att_data = entry.key_ptr;
 
