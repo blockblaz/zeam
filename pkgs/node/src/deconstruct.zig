@@ -419,7 +419,13 @@ pub fn deconstructCommit(
                         }
                     }
                     if (drop) {
+                        // Free ALL owned fields, matching deinitAggregatedPayloadsList: a
+                        // StoredAggregatedPayload owns its proof AND the two optional
+                        // source-attribution bitfields. Freeing only proof leaked those bits on
+                        // every superseded drop.
                         stored.proof.deinit();
+                        if (stored.source_payload_participants) |*bits| bits.deinit();
+                        if (stored.source_gossip_participants) |*bits| bits.deinit();
                     } else {
                         list_ptr.items[w] = stored.*;
                         w += 1;
