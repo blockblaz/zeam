@@ -121,8 +121,8 @@ const TestSignedAttestation = struct {
 };
 
 // Devnet5 `SignedBlock` carries a single opaque `proof: ByteList512KiB` (no SIGBYTES-sized
-// fields), so it needs no test-scheme mirror — the same type SSZ-roundtrips prod and test
-// fixtures. The old TestBlockSignatures/TestSignedBlock mirrors were removed with BlockSignatures.
+// fields), so one type SSZ-roundtrips both prod and test fixtures — no separate test-scheme type
+// is needed. The old TestBlockSignatures/TestSignedBlock types were removed with BlockSignatures.
 
 // ---------------------------------------------------------------------------
 // SSZ type map — maps fixture `typeName` to Zig types.

@@ -18,11 +18,7 @@ const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
-/// Maximum number of distinct AttestationData entries a single block may include. Re-exported from
-/// `@zeam/params` so the forkchoice import gate and the signature verifier (state-transition) share
-/// one source of truth. devnet5 collapses the body attestations + proposer signature into a single
-/// Type-2 proof (N attestations → N+1 components), which must stay within leanMultisig's
-/// MAX_RECURSIONS=16; 8 (+1 proposer = 9) leaves margin and matches the spec value peers enforce.
+/// Re-exported from @zeam/params so the import gate and the signature verifier share one value.
 pub const MAX_ATTESTATIONS_DATA: usize = params.MAX_ATTESTATIONS_DATA;
 
 fn validateAttestationDataLimits(
@@ -1165,13 +1161,9 @@ pub const ForkChoice = struct {
 
         var child_payloads_consumed: usize = 0;
 
-        // Snapshot the known-payloads pool under signatures_mutex so the selection loop + XMSS FFI
-        // below operate on an owned copy. The live map is mutated by aggregation-commit / import
-        // paths under signatures_mutex; iterating it here under only the fork-choice shared mutex
-        // would race (torn reads / use-after-free of proofs being moved). This mirrors the
-        // lock-free-FFI-on-snapshot pattern aggregateUnlocked already uses. Lock order is
-        // fc-mutex(shared) -> signatures_mutex, matching every other site (no path takes them in
-        // the reverse order), so this cannot deadlock.
+        // Selection + FFI below run on an owned copy: the live pool is mutated under
+        // signatures_mutex by other threads, so iterating it under only the fork-choice shared
+        // mutex would race. Lock order fc-mutex(shared) then signatures_mutex avoids deadlock.
         var known_payloads_snapshot = snapshot_blk: {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();

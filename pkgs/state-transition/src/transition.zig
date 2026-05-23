@@ -71,11 +71,8 @@ pub fn verifySignatures(
     const attestations = block.body.attestations.constSlice();
     const validators = state.validators.constSlice();
 
-    // Reject over-cap blocks BEFORE building/verifying the (expensive) Type-2 layout. devnet5 caps
-    // distinct attestations at MAX_ATTESTATIONS_DATA(8); a 9–15-attestation block still yields a
-    // structurally valid Type-2 (≤16 components) that would otherwise pass verify here and only be
-    // rejected later by forkchoice — wasting the proof verify + STF, and (for standalone callers
-    // that don't go through forkchoice) reporting the block as valid. This is the cheap gate.
+    // Reject over-cap blocks before the expensive Type-2 verify (a 9-15-attestation block is still
+    // a structurally valid Type-2, so verify alone would accept it).
     if (attestations.len > params.MAX_ATTESTATIONS_DATA) {
         return StateTransitionError.TooManyAttestationData;
     }
@@ -144,9 +141,7 @@ pub fn verifySignatures(
     if (proposer_index >= validators.len) {
         return StateTransitionError.InvalidValidatorId;
     }
-    // A malformed registered proposal key is invalid validator state, not a bad block signature —
-    // classify it like the proposer-index range check above so a state/registration bug isn't
-    // misreported (and peer-blamed) as a signature failure.
+    // A malformed registered proposal key is invalid validator state, not a bad signature.
     var proposer_pk = xmss.PublicKey.fromBytes(validators[proposer_index].getProposalPubkey()) catch {
         return StateTransitionError.InvalidValidatorId;
     };
@@ -157,9 +152,8 @@ pub fn verifySignatures(
 
     var block_root: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, block.*, &block_root, ar);
-    // The proposer message (block_root) shares the Type-2 message-space with the attestation
-    // components; reject a collision with any attestation data root so split/verify stay
-    // unambiguous (cryptographically negligible, but the dedup intent must cover every component).
+    // Reject a block_root that collides with any attestation data root, so the per-message
+    // split/verify stays unambiguous (cryptographically negligible).
     const proposer_gop = try seen_roots.getOrPut(block_root);
     if (proposer_gop.found_existing) {
         return StateTransitionError.InvalidBlockSignatures;

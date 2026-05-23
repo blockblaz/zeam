@@ -18,13 +18,8 @@ pub const HISTORICAL_ROOTS_LIMIT = activePresetValues.HISTORICAL_ROOTS_LIMIT;
 pub const VALIDATOR_REGISTRY_LIMIT = activePresetValues.VALIDATOR_REGISTRY_LIMIT;
 pub const MAX_REQUEST_BLOCKS = activePresetValues.MAX_REQUEST_BLOCKS;
 
-/// MAX_ATTESTATIONS_DATA — maximum number of distinct AttestationData entries a block may include.
-/// devnet5 value is 8, set by leanSpec PR #717 (commit "limit max attestation data to 8"); see
-/// leanSpec main `subspecs/chain/config.py` (`Uint8(8)`). NOTE: devnet4 used 16, and the vendored
-/// `leanSpec/` submodule is pinned PRE-#717 so it still shows 16 — do not trust it for this value.
-/// 8 also sits comfortably under leanMultisig MAX_RECURSIONS=16 (8 atts + 1 proposer = 9 ≤ 16).
-/// Single source of truth — referenced by both the signature verifier (state-transition) and the
-/// forkchoice import gate (node).
+/// Max distinct AttestationData entries per block. devnet5 value is 8 (leanSpec #717); was 16 in
+/// devnet4. Single source of truth, referenced by the signature verifier and the forkchoice gate.
 pub const MAX_ATTESTATIONS_DATA: usize = 8;
 
 test "test preset loading" {

@@ -185,9 +185,8 @@ pub fn aggregateType1(
         child_proof_lens[i] = ps.len;
     }
 
-    // 512 KiB scratch — heap-allocated, not on the stack: these wrappers run on worker threads
-    // and nest (buildType2BlockProof → mergeType1ToType2; deconstruct → split → aggregate), so
-    // multiple live 512 KiB stack frames would risk overflowing a small worker stack.
+    // 512 KiB scratch on the heap: these wrappers nest on worker threads, so stack frames could
+    // overflow a small worker stack.
     const buf = allocator.alloc(u8, MAX_AGGREGATE_PROOF_SIZE) catch return AggregationError.Type1AggregateFailed;
     defer allocator.free(buf);
     var written: usize = 0;

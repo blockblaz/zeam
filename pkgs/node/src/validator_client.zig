@@ -140,9 +140,8 @@ pub const ValidatorClient = struct {
 
             self.logger.debug("constructing block for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             var produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
-            // Own produced_block until it is consumed below: signBlockRoot and (especially)
-            // buildBlockProof can hard-error (e.g. error.ProverSetupFailed), and without this the
-            // block + its Type-1 proof list would leak on every failed proposal attempt.
+            // Own produced_block until consumed below, so a signing / proof-building error frees it
+            // instead of leaking the block + its Type-1 list.
             var produced_block_consumed = false;
             errdefer if (!produced_block_consumed) produced_block.deinit();
             self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
@@ -160,10 +159,8 @@ pub const ValidatorClient = struct {
             errdefer proof.deinit();
             try self.chain.buildBlockProof(&produced_block, &proposer_signature, &proof);
 
-            // The per-attestation Type-1s are folded into `proof` and are no longer owned by the
-            // block (devnet5 SignedBlock has no per-attestation list). Free them; move the block.
-            // Past this point produced_block is consumed (block moved into signed_block below,
-            // attestation_type1s freed here), so the errdefer above must not also free it.
+            // Type-1s are folded into `proof` and no longer owned by the block; free them and move
+            // the block into signed_block. produced_block is now consumed (errdefer must not fire).
             produced_block_consumed = true;
             for (produced_block.attestation_type1s.slice()) |*t1| t1.deinit();
             produced_block.attestation_type1s.deinit();

@@ -1165,8 +1165,8 @@ pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
     // ----- Devnet5: single Type-2 block proof verification -----
     // SignedBlock carries one `proof` (SSZ-encoded Type-2) covering every body attestation plus
     // the proposer's signature. Parse it, assemble the SignedBlock, and reuse the unified verifier.
-    // NOTE (A-fallback): the prod-scheme verifier cannot check test-scheme aggregation proofs; for
-    // leanEnv=test fixtures with body attestations this mirrors the spectest skip and is unsupported.
+    // NOTE (A-fallback): the prod-scheme verifier cannot check test-scheme aggregation proofs, so
+    // leanEnv=test fixtures with body attestations are unsupported here (skipped, as in spectest).
     _ = is_test_env;
     const proof_hex = blk: {
         const v = signed_block_obj.get("proof") orelse break :blk null;

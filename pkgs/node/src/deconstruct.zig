@@ -33,28 +33,14 @@ const TypeOneMultiSignature = types.TypeOneMultiSignature;
 
 const LOG_INV_RATE = types.LOG_INV_RATE_PROD;
 
-/// Max children per `aggregate_type_1` call, matching leanMultisig `MAX_RECURSIONS`. The block
-/// component plus the selected local partials must stay within this, or the prover asserts/aborts
-/// (caught as a failed recovery). Selection below is capped to MAX_AGGREGATE_CHILDREN - 1 partials.
+/// Max children per `aggregate_type_1` call (leanMultisig MAX_RECURSIONS); exceeding it aborts the
+/// prover. Selection below is capped to this minus the block component.
 const MAX_AGGREGATE_CHILDREN: usize = 16;
 
-/// Master gate for block deconstruction. Kept DISABLED, but the reason has narrowed.
-///
-/// The prior chain-liveness regression (justification stuck at 0 with deconstruction on) was the
-/// non-disjoint child selection in deconstructCompute — overlapping validators across aggregate
-/// children produced a combined proof whose pubkey multiset no longer matched its collapsed
-/// aggregation_bits, so re-aggregated blocks failed verify and never reached quorum. That bug is
-/// now fixed (strict-disjoint selection + child cap), and with it `enabled = true` justifies AND
-/// finalizes correctly in the multi-node simtest.
-///
-/// The REMAINING blocker is throughput, not correctness: COMPUTE runs the split + aggregate prover
-/// synchronously on the block-import path, which roughly halves chain progress in the simtest
-/// (Head ~20 vs ~36 in the same window) and starves a late-joining node's sync (node3_sync fails).
-/// Enabling for real requires moving COMPUTE onto an async worker queue, off the import critical
-/// path. Until then the proof pool is simply not fed from imported blocks — safe in zeam because
-/// fork-choice weight comes from the eager AttestationTracker (onAttestation(is_from_block=true)),
-/// not this pool; only block-reaggregation/gossip coverage is reduced. TODO: async COMPUTE, then
-/// flip to `true`.
+/// Master gate for block deconstruction. DISABLED: correctness is fixed (strict-disjoint child
+/// selection), but COMPUTE runs the prover synchronously on the import path and ~halves simtest
+/// throughput, so re-enabling needs COMPUTE moved to an async worker queue. Safe while off:
+/// fork-choice weight comes from the eager AttestationTracker, not this pool.
 pub const enabled = false;
 
 /// One recovered attestation staged for commit: the combined Type-1 proof to insert into
@@ -111,14 +97,8 @@ pub fn deconstructCompute(
     var staged = StagedDeconstruct.empty(allocator);
     errdefer staged.deinit();
 
-    // Deconstruction is gated OFF (see `enabled`). The old justify-stall was the non-disjoint
-    // child selection below (now fixed); the remaining blocker is that this COMPUTE runs the
-    // prover synchronously on the import path and ~halves simtest throughput. It is NOT a
-    // correctness/safety feature in zeam (fork-choice weight comes from the eager
-    // AttestationTracker via onAttestation(is_from_block=true), not the proof pool), so disabling
-    // it only reduces block-reaggregation/gossip coverage. Module + wiring are kept intact (and
-    // exercised by the simtest under `enabled = true`). TODO: move COMPUTE to an async worker
-    // queue off the import critical path, then re-enable.
+    // Gated off (see `enabled`). Disabling only reduces gossip/reaggregation coverage; fork-choice
+    // weight comes from the eager AttestationTracker, not this pool.
     if (!enabled) return staged;
 
     const block_atts = signed_block.block.body.attestations.constSlice();
@@ -252,10 +232,8 @@ pub fn deconstructCompute(
         if (!block_adds_new) continue;
 
         // Split this attestation's Type-1 out of the Type-2; restore participants from the block
-        // attestation bits (split returns an empty participant set). Split matches the component by
-        // message hash alone (no slot), which is unambiguous here: every component message in the
-        // block's Type-2 is distinct — verifySignatures rejects duplicate attestation data roots and
-        // the proposer's block_root, so no two components share a message hash.
+        // attestation bits (split returns an empty set). Split keys on message hash alone, which is
+        // unambiguous: verifySignatures guarantees every component message is distinct.
         var block_t1 = try TypeOneMultiSignature.init(allocator);
         var block_t1_owned = true;
         defer if (block_t1_owned) block_t1.deinit();
@@ -263,13 +241,9 @@ pub fn deconstructCompute(
         block_t1.participants.deinit();
         try types.sszClone(allocator, AggregationBits, att.aggregation_bits, &block_t1.participants);
 
-        // Greedily select local partials whose participant set is FULLY DISJOINT from `covered`
-        // (seeded with the block component, then grown per selection). A Type-1 proof is atomic —
-        // we cannot take a subset of its signers — so a partial that merely OVERLAPS would place a
-        // validator in two children of the aggregate call. Skipping partial overlaps keeps the
-        // children truly disjoint, as the merge requires (the previous "adds any new validator"
-        // rule did not: it unioned the whole overlapping set into `covered`). Cap the child count
-        // (block component + partials) at MAX_AGGREGATE_CHILDREN so we never exceed MAX_RECURSIONS.
+        // Select only partials fully disjoint from `covered` (seeded with the block component): a
+        // Type-1 is atomic, so an overlapping partial would put a validator in two aggregate
+        // children. Cap the child count (partials + block component) at MAX_AGGREGATE_CHILDREN.
         var selected_idx: std.ArrayList(usize) = .empty;
         defer selected_idx.deinit(allocator);
         for (local_proofs, 0..) |proof, pi| {
@@ -338,9 +312,8 @@ pub fn deconstructCompute(
                 continue;
             };
             entry.combined = combined;
-            // entry is not in `staged` yet, so the function-level `errdefer staged.deinit()` will
-            // NOT free its superseded bits if a clone/append below fails — clean them up here.
-            // (entry.combined aliases `combined`, freed by the errdefer above; not touched here.)
+            // entry isn't in `staged` yet, so free its superseded bits here if a clone/append fails
+            // below (combined is freed by the errdefer above).
             errdefer {
                 for (entry.superseded.items) |*p| p.deinit();
                 entry.superseded.deinit(allocator);
@@ -419,10 +392,8 @@ pub fn deconstructCommit(
                         }
                     }
                     if (drop) {
-                        // Free ALL owned fields, matching deinitAggregatedPayloadsList: a
-                        // StoredAggregatedPayload owns its proof AND the two optional
-                        // source-attribution bitfields. Freeing only proof leaked those bits on
-                        // every superseded drop.
+                        // Free every owned field, not just the proof — the two optional
+                        // source-attribution bitfields would otherwise leak.
                         stored.proof.deinit();
                         if (stored.source_payload_participants) |*bits| bits.deinit();
                         if (stored.source_gossip_participants) |*bits| bits.deinit();

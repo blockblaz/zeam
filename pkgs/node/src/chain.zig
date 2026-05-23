@@ -3508,12 +3508,10 @@ pub const BeamChain = struct {
             _ = try self.forkChoice.updateHead();
             step_watch.lap("block_attestations");
 
-            // (B2) Deconstruction COMMIT — infallible; insert recovered Type-1 proofs into
-            // latest_new_aggregated_payloads now that the fork-choice mutations succeeded. The
-            // returned aggregates mirror leanSpec's immediate aggregator re-gossip, but in zeam the
-            // recovered proofs now live in latest_new and are picked up + gossiped by the normal
-            // aggregation interval (aggregateUnlocked reads latest_new), so an explicit re-gossip
-            // here is redundant — dropped. (At most a one-tick gossip-latency difference vs leanSpec.)
+            // (B2) Deconstruction COMMIT — insert recovered Type-1 proofs into latest_new now that
+            // the fork-choice mutations succeeded. leanSpec re-gossips them immediately; in zeam the
+            // normal aggregation interval picks them up from latest_new, so explicit re-gossip is
+            // dropped (at most a one-tick gossip-latency difference).
             var recovered = deconstruct.deconstructCommit(self.allocator, &self.forkChoice, &staged);
             for (recovered.items) |*agg| agg.deinit();
             recovered.deinit(self.allocator);
