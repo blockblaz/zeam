@@ -33,6 +33,20 @@ const json = std.json;
 
 const freeJsonValue = utils.freeJsonValue;
 
+/// Default `min_aggregation_inputs` for the aggregator-role pre-filter.
+///
+/// Surfaced on the CLI as `--min-aggregation-inputs` (see
+/// `pkgs/cli/src/main.zig`) and consumed by the aggregator wrapper in
+/// `pkgs/node/src/forkchoice.zig` (NOT by `computeAggregatedSignatures`,
+/// which is spec-pure and aggregates whatever it is given). Default
+/// `2`: aggregator skips publishing when an `att_data` has only a
+/// single local gossip sig and no peer payload, since the raw sig is
+/// already on the gossip topic and a 1-validator "aggregate" carries
+/// no consensus signal (#907 finding 4). `1` reverts to pre-#908
+/// behavior (always aggregate ≥1 sig). Higher values trade slot
+/// latency for fewer sub-threshold aggregates on chatty subnets.
+pub const default_min_aggregation_inputs: u32 = 2;
+
 // signatures_map types for aggregation
 
 /// Stored signatures_map entry: per-validator signature + slot metadata.
@@ -445,6 +459,14 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
     };
 }
 
+fn slotAllowed(slot: Slot, slot_filter: ?[]const Slot) bool {
+    const slots = slot_filter orelse return true;
+    for (slots) |allowed| {
+        if (slot == allowed) return true;
+    }
+    return false;
+}
+
 pub const AggregatedAttestationsResult = struct {
     attestations: AggregatedAttestations,
     attestation_signatures: AttestationSignatures,
@@ -467,16 +489,29 @@ pub const AggregatedAttestationsResult = struct {
     }
 
     /// Compute aggregated signatures using recursive aggregation:
-    /// Step 1: Derive AttestationData keys from signatures_map ∪ new_payloads
+    /// Step 1: Derive AttestationData keys from signatures_map ∪ new_payloads,
+    ///         optionally restricted to the supplied attestation slots.
     /// Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
     /// Step 3: Collect individual gossip signatures not covered by children
-    /// Step 4: Recursive aggregate — combine selected children + remaining gossip sigs
+    /// Step 4: Lone-child clone fast path: `0 gossip + 1 child` clones the
+    ///         lone child as the result without invoking the prover.
+    /// Step 5: Recursive aggregate — combine selected children + remaining gossip sigs.
+    ///
+    /// Spec-pure: this function aggregates whatever it is given. Callers
+    /// that want to skip trivially-shaped inputs (e.g. the aggregator
+    /// role wanting to avoid spending the full STARK prover budget on a
+    /// single-validator "aggregate" that carries no consensus signal —
+    /// see issue #907 finding 4) must filter the inputs they pass in.
+    /// Block proposers, by contrast, MUST aggregate every `att_data`
+    /// they choose to include in a block, even if its only input is a
+    /// single gossip signature.
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
         signatures_map: *const SignaturesMap,
         new_payloads: ?*const AggregatedPayloadsMap,
         known_payloads: ?*const AggregatedPayloadsMap,
+        slot_filter: ?[]const Slot,
     ) !void {
         const allocator = self.allocator;
 
@@ -487,12 +522,14 @@ pub const AggregatedAttestationsResult = struct {
         {
             var it = signatures_map.iterator();
             while (it.next()) |entry| {
+                if (!slotAllowed(entry.key_ptr.slot, slot_filter)) continue;
                 try att_data_set.put(entry.key_ptr.*, {});
             }
         }
         if (new_payloads) |np| {
             var it = np.iterator();
             while (it.next()) |entry| {
+                if (!slotAllowed(entry.key_ptr.slot, slot_filter)) continue;
                 try att_data_set.put(entry.key_ptr.*, {});
             }
         }
@@ -1079,98 +1116,80 @@ pub fn compactAttestations(
         preps[ei] = .{ .entry = entry, .child_pk_slices = child_arr };
     }
 
-    if (thread_pool) |pool| {
-        // Parallel path: per-AttestationData aggregation across the shared
-        // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
-        // touch FFI deserialization themselves.
-        const slots = try allocator.alloc(CompactGroupSlot, preps.len);
-        defer allocator.free(slots);
-        for (slots) |*slot| slot.* = .{};
-        errdefer {
-            for (slots) |*slot| {
-                if (slot.result) |*r| {
-                    r.attestation.deinit();
-                    r.signature.deinit();
-                }
-            }
-        }
-
-        const Runner = struct {
-            fn runScope(
-                scope: anytype,
-                preps_in: []const CompactGroupPrep,
-                sigs: []const aggregation.AggregatedSignatureProof,
-                alloc: Allocator,
-                out_slots: []CompactGroupSlot,
-                any_err: *std.atomic.Value(bool),
-            ) Allocator.Error!void {
-                for (preps_in, 0..) |prep, i| {
-                    try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err });
-                }
-            }
-
-            fn runOne(
-                alloc: Allocator,
-                prep: CompactGroupPrep,
-                sigs: []const aggregation.AggregatedSignatureProof,
-                out_slot: *CompactGroupSlot,
-                any_err: *std.atomic.Value(bool),
-            ) void {
-                if (any_err.load(.acquire)) return;
-                const result = runCompactGroupPrep(alloc, prep, sigs) catch |err| {
-                    out_slot.err = err;
-                    any_err.store(true, .release);
-                    return;
-                };
-                out_slot.result = result;
-            }
-        };
-
-        var any_err = std.atomic.Value(bool).init(false);
-        try pool.scope(Runner.runScope, .{
-            preps,
-            sig_slice,
-            allocator,
-            slots,
-            &any_err,
-        });
-
+    // Parallel path: per-AttestationData aggregation across the shared
+    // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
+    // touch FFI deserialization themselves.
+    const slots = try allocator.alloc(CompactGroupSlot, preps.len);
+    defer allocator.free(slots);
+    for (slots) |*slot| slot.* = .{};
+    errdefer {
         for (slots) |*slot| {
-            if (slot.err) |err| return err;
-        }
-
-        for (slots) |*slot| {
-            var result = slot.result orelse continue;
-            slot.result = null;
-
-            var att_moved = false;
-            var sig_moved = false;
-            defer {
-                if (!att_moved) result.attestation.deinit();
-                if (!sig_moved) result.signature.deinit();
+            if (slot.result) |*r| {
+                r.attestation.deinit();
+                r.signature.deinit();
             }
-
-            try out_atts.append(result.attestation);
-            att_moved = true;
-            try out_sigs.append(result.signature);
-            sig_moved = true;
         }
-    } else {
-        for (preps) |prep| {
-            var result = try runCompactGroupPrep(allocator, prep, sig_slice);
+    }
 
-            var att_moved = false;
-            var sig_moved = false;
-            defer {
-                if (!att_moved) result.attestation.deinit();
-                if (!sig_moved) result.signature.deinit();
+    const Runner = struct {
+        fn runScope(
+            scope: anytype,
+            preps_in: []const CompactGroupPrep,
+            sigs: []const aggregation.AggregatedSignatureProof,
+            alloc: Allocator,
+            out_slots: []CompactGroupSlot,
+            any_err: *std.atomic.Value(bool),
+        ) Allocator.Error!void {
+            for (preps_in, 0..) |prep, i| {
+                try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err });
             }
-
-            try out_atts.append(result.attestation);
-            att_moved = true;
-            try out_sigs.append(result.signature);
-            sig_moved = true;
         }
+
+        fn runOne(
+            alloc: Allocator,
+            prep: CompactGroupPrep,
+            sigs: []const aggregation.AggregatedSignatureProof,
+            out_slot: *CompactGroupSlot,
+            any_err: *std.atomic.Value(bool),
+        ) void {
+            if (any_err.load(.acquire)) return;
+            const result = runCompactGroupPrep(alloc, prep, sigs) catch |err| {
+                out_slot.err = err;
+                any_err.store(true, .release);
+                return;
+            };
+            out_slot.result = result;
+        }
+    };
+
+    var any_err = std.atomic.Value(bool).init(false);
+    try thread_pool.scope(Runner.runScope, .{
+        preps,
+        sig_slice,
+        allocator,
+        slots,
+        &any_err,
+    });
+
+    for (slots) |*slot| {
+        if (slot.err) |err| return err;
+    }
+
+    for (slots) |*slot| {
+        var result = slot.result orelse continue;
+        slot.result = null;
+
+        var att_moved = false;
+        var sig_moved = false;
+        defer {
+            if (!att_moved) result.attestation.deinit();
+            if (!sig_moved) result.signature.deinit();
+        }
+
+        try out_atts.append(result.attestation);
+        att_moved = true;
+        try out_sigs.append(result.signature);
+        sig_moved = true;
     }
 
     // Free old input entries
@@ -1267,6 +1286,129 @@ pub const ExecutionPayloadHeader = struct {
         return utils.jsonToString(allocator, json_value);
     }
 };
+
+fn testAttestationData(slot: Slot) attestation.AttestationData {
+    return .{
+        .slot = slot,
+        .head = .{ .root = ZERO_HASH, .slot = slot },
+        .target = .{ .root = ZERO_HASH, .slot = slot },
+        .source = .{ .root = ZERO_HASH, .slot = 0 },
+    };
+}
+
+fn testDeinitPayloadsMap(allocator: Allocator, payloads: *AggregatedPayloadsMap) void {
+    var it = payloads.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.items) |*stored| {
+            stored.proof.deinit();
+            if (stored.source_payload_participants) |*bits| bits.deinit();
+            if (stored.source_gossip_participants) |*bits| bits.deinit();
+        }
+        entry.value_ptr.deinit(allocator);
+    }
+    payloads.deinit();
+}
+
+fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloadsMap, data: attestation.AttestationData, validator_index: usize) !void {
+    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    errdefer proof.deinit();
+    try attestation.aggregationBitsSet(&proof.participants, validator_index, true);
+
+    const gop = try payloads.getOrPut(data);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(allocator, .{
+        .slot = data.slot,
+        .proof = proof,
+    });
+}
+
+test "computeAggregatedSignatures filters attestation data by slot list" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures = SignaturesMap.init(allocator);
+    defer signatures.deinit();
+
+    var payloads = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads);
+
+    const slot_10 = testAttestationData(10);
+    const slot_11 = testAttestationData(11);
+    try testPutSingleChildPayload(allocator, &payloads, slot_10, 0);
+    try testPutSingleChildPayload(allocator, &payloads, slot_11, 1);
+
+    var result = try AggregatedAttestationsResult.init(allocator);
+    defer result.deinit();
+
+    const allowed_slots = [_]Slot{10};
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+
+    try std.testing.expectEqual(@as(usize, 1), result.attestations.len());
+    const aggregated = try result.attestations.get(0);
+    try std.testing.expectEqual(@as(Slot, 10), aggregated.data.slot);
+}
+
+test "computeAggregatedSignatures slot filter matches unfiltered for same-slot input" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures_a = SignaturesMap.init(allocator);
+    defer signatures_a.deinit();
+    var payloads_a = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads_a);
+
+    var signatures_b = SignaturesMap.init(allocator);
+    defer signatures_b.deinit();
+    var payloads_b = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads_b);
+
+    const data = testAttestationData(12);
+    try testPutSingleChildPayload(allocator, &payloads_a, data, 0);
+    try testPutSingleChildPayload(allocator, &payloads_b, data, 0);
+
+    var unfiltered = try AggregatedAttestationsResult.init(allocator);
+    defer unfiltered.deinit();
+    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null);
+
+    var filtered = try AggregatedAttestationsResult.init(allocator);
+    defer filtered.deinit();
+    const allowed_slots = [_]Slot{12};
+    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..]);
+
+    try std.testing.expectEqual(unfiltered.attestations.len(), filtered.attestations.len());
+    try std.testing.expectEqual(unfiltered.attestation_signatures.len(), filtered.attestation_signatures.len());
+    try std.testing.expectEqual(@as(usize, 1), filtered.attestations.len());
+    const filtered_att = try filtered.attestations.get(0);
+    try std.testing.expectEqual(@as(Slot, 12), filtered_att.data.slot);
+}
+
+test "computeAggregatedSignatures empty slot filter result is clean" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures = SignaturesMap.init(allocator);
+    defer signatures.deinit();
+
+    var payloads = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads);
+
+    try testPutSingleChildPayload(allocator, &payloads, testAttestationData(13), 0);
+
+    var result = try AggregatedAttestationsResult.init(allocator);
+    defer result.deinit();
+
+    const allowed_slots = [_]Slot{14};
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+
+    try std.testing.expectEqual(@as(usize, 0), result.attestations.len());
+    try std.testing.expectEqual(@as(usize, 0), result.attestation_signatures.len());
+}
 
 test "ssz seralize/deserialize signed beam block" {
     var attestations = try AggregatedAttestations.init(std.testing.allocator);

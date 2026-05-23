@@ -69,7 +69,13 @@ jobs:
       with:
         workspaces: "rust -> target"
         cache-bin: false
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        # PR #903 introduced a `multisig-release` cargo profile and pointed the
+        # default (dummy) prover at `rust/target/multisig-release/libzeam_glue.a`.
+        # Hashing `rust/Cargo.toml` here (in addition to Cargo.lock) busts the
+        # cache automatically on any future profile change, avoiding the
+        # "restored cache lacks the new profile dir → confusing linker error"
+        # failure mode flagged in #903 review.
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust/Cargo.toml') }}
 
     - name: Check Rust formatting
       run: |
@@ -152,7 +158,8 @@ jobs:
       with:
         cache-bin: false
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        # See cache-key rationale in the `lint` job.
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust/Cargo.toml') }}
 
     - name: Fetch Zig dependencies
       run: |
@@ -255,7 +262,8 @@ jobs:
       with:
         cache-bin: false
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
+        # See cache-key rationale in the `lint` job.
+        key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock', 'rust/Cargo.toml') }}
 
     - name: Fetch Zig dependencies
       run: |
@@ -366,7 +374,9 @@ jobs:
       with:
         cache-bin: false
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        # See cache-key rationale in the `lint` job. Also shared with `dummy-prove`
+        # (same key prefix) — busting via `rust/Cargo.toml` keeps both in sync.
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock', 'rust/Cargo.toml') }}
 
     - name: Fetch Zig dependencies
       run: |
@@ -497,7 +507,10 @@ jobs:
       with:
         cache-bin: false
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        # See cache-key rationale in the `lint` job. Shared key prefix with
+        # `test`/`simtest` so all three jobs invalidate together when the rust
+        # workspace profile set changes (e.g. PR #903's `multisig-release`).
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock', 'rust/Cargo.toml') }}
 
     - name: Fetch Zig dependencies
       run: |
@@ -571,7 +584,8 @@ jobs:
       with:
         cache-bin: false
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+        # See cache-key rationale in the `lint` job.
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock', 'rust/Cargo.toml') }}
 
     - name: Fetch Zig dependencies
       run: |

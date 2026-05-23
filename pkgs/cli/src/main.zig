@@ -82,6 +82,21 @@ pub const NodeCommand = struct {
     /// worker path is the supported prod path; the synchronous path
     /// stays in place as a kill-switch via `--chain-worker false`.
     @"chain-worker": bool = true,
+    /// Override the rayon worker count used by the multisig (XMSS) aggregate
+    /// prover. `null` (the default, surfaced as omitted on the CLI) keeps the
+    /// existing post-system-thread split that gives roughly half of the
+    /// remaining cores to the Zig pool and half to rayon — fine for non-
+    /// aggregator nodes. Aggregators on CPU-rich hosts can pass a value here
+    /// to give the prover more parallelism without rebuilding (#899).
+    @"rayon-threads": ?u32 = null,
+    /// Minimum (children + gossip-sig) inputs required before the aggregator
+    /// invokes the recursive STARK prover for an `AttestationData`. Default
+    /// `2` (post-#908) skips the no-children + single-gossip-sig case where
+    /// the prover would produce a 1-validator aggregate of zero consensus
+    /// value. `1` reverts to pre-#908 behavior (always aggregate ≥1 sig).
+    /// Higher values trade slot latency for fewer sub-threshold aggregates
+    /// on chatty subnets. See issue #907 finding 4.
+    @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -107,6 +122,8 @@ pub const NodeCommand = struct {
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
+        .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
+        .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to pre-#908 behavior. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
         .help = "Show help information for the node command",
     };
 };
@@ -842,6 +859,8 @@ fn mainInner(init: std.process.Init) !void {
                 .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
                 .db_backend = leancmd.@"db-backend",
+                .rayon_threads = leancmd.@"rayon-threads",
+                .min_aggregation_inputs = leancmd.@"min-aggregation-inputs",
             };
 
             defer start_options.deinit(allocator);

@@ -47,17 +47,28 @@ pub const DEFAULT_THRESHOLD_MS: u64 = 5000;
 /// would log every probe-interval for the entire freeze duration.
 const SUPPRESS_REFIRE: bool = true;
 
+/// Optional callback fired the first time a stall is detected for an episode.
+/// Implementations MUST be cheap and non-blocking — they execute on the
+/// watchdog thread, not on libxev. The recommended pattern is to flip an
+/// atomic flag that the next libxev tick observes (see `BeamNode.scheduleSyncRefresh`).
+pub const StallCallback = struct {
+    ptr: *anyopaque,
+    onStall: *const fn (ptr: *anyopaque, stall_s: f32) void,
+};
+
 pub const SlotDriverWatchdog = struct {
     clock: *Clock,
     logger: zeam_utils.ModuleLogger,
     probe_ms: u64,
     threshold_ms: u64,
+    on_stall: ?StallCallback,
     stop_flag: std.atomic.Value(bool),
     thread: ?Thread,
 
     pub const Options = struct {
         probe_ms: u64 = DEFAULT_PROBE_MS,
         threshold_ms: u64 = DEFAULT_THRESHOLD_MS,
+        on_stall: ?StallCallback = null,
     };
 
     pub fn init(
@@ -70,6 +81,7 @@ pub const SlotDriverWatchdog = struct {
             .logger = logger,
             .probe_ms = opts.probe_ms,
             .threshold_ms = opts.threshold_ms,
+            .on_stall = opts.on_stall,
             .stop_flag = std.atomic.Value(bool).init(false),
             .thread = null,
         };
@@ -155,6 +167,31 @@ pub const SlotDriverWatchdog = struct {
                 .{ stall_s, self.threshold_ms },
             );
             firing_for_current_stall = true;
+
+            // Notify the owner so it can request a peer status refresh
+            // when libxev next ticks. Callback is required to be O(1)
+            // (atomic flag flip) — see `StallCallback` doc.
+            if (self.on_stall) |cb| cb.onStall(cb.ptr, stall_s);
         }
     }
 };
+
+test "StallCallback signature is callable from a non-watchdog thread" {
+    const Sink = struct {
+        fired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        last_stall_s: f32 = 0,
+
+        fn onStall(ptr: *anyopaque, stall_s: f32) void {
+            const s: *@This() = @ptrCast(@alignCast(ptr));
+            s.last_stall_s = stall_s;
+            s.fired.store(true, .release);
+        }
+    };
+
+    var sink = Sink{};
+    const cb = StallCallback{ .ptr = &sink, .onStall = Sink.onStall };
+    cb.onStall(cb.ptr, 7.5);
+
+    try std.testing.expect(sink.fired.load(.acquire));
+    try std.testing.expectEqual(@as(f32, 7.5), sink.last_stall_s);
+}

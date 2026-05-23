@@ -1,8 +1,6 @@
 use crate::req_resp::error::ReqRespError;
 use snap::raw::max_compress_len;
-use unsigned_varint::{decode, encode};
-
-pub const MAX_VARINT_BYTES: usize = 10;
+use unsigned_varint::decode;
 
 /// Snappy framing format constants
 const SNAPPY_STREAM_IDENTIFIER: [u8; 10] =
@@ -36,12 +34,6 @@ pub fn decode_varint_prefix(src: &[u8]) -> Result<Option<(usize, usize)>, ReqRes
             "Invalid length prefix: {err}",
         ))),
     }
-}
-
-pub fn encode_varint(value: usize, dst: &mut Vec<u8>) {
-    let mut buffer = encode::usize_buffer();
-    let encoded = encode::usize(value, &mut buffer);
-    dst.extend_from_slice(encoded);
 }
 
 fn read_u24_le(bytes: &[u8]) -> usize {

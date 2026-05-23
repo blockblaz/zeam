@@ -103,6 +103,24 @@ pub const NodeOptions = struct {
     /// `--chain-worker false` as the kill-switch for the legacy
     /// synchronous path.
     chain_worker_enabled: bool = true,
+    /// Override the rayon worker count for the multisig aggregate prover.
+    /// `null` keeps the existing automatic split (half of the post-system-
+    /// thread budget to Zig workers, half to rayon). Aggregators in
+    /// CPU-rich environments can set this higher to give the prover more
+    /// parallelism without rebuilding (#899). Surfaced as `--rayon-threads`
+    /// on the `zeam node` CLI.
+    rayon_threads: ?u32 = null,
+    /// Minimum (children + gossip-sig) inputs required before the
+    /// aggregator pre-filter lets an `AttestationData` reach the FFI.
+    /// Threaded through to `ForkChoice.min_aggregation_inputs` and
+    /// applied by `pruneTrivialFromAggregateSnapshot` in
+    /// `pkgs/node/src/forkchoice.zig` BEFORE
+    /// `computeAggregatedSignatures` runs (the FFI itself stays
+    /// spec-pure). Surfaced as `--min-aggregation-inputs` on the
+    /// `zeam node` CLI; default is
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
+    /// issue #907 finding 4.
+    min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -417,10 +435,60 @@ pub const Node = struct {
         // the extra worker on odd counts since aggregate verification enters
         // rayon from Zig workers. Both pools still keep a minimum of one worker
         // so tiny/cgroup-limited systems remain functional.
+        //
+        // Operators can override the rayon worker count with `--rayon-threads`
+        // (#899). The automatic split is conservative — it deliberately leaves
+        // half of the post-system-thread budget to the Zig pool because
+        // verification and gossip work also enter rayon. On a CPU-rich
+        // aggregator that bottleneck is the produce path instead, so giving
+        // rayon more cores measurably shortens the per-pass build time.
+        //
         // Must be called before setupProver/setupVerifier since rayon’s global
         // pool is initialized lazily on first use.
-        const rayon_threads = @max(@as(usize, 1), desired_workers -| worker_count);
+        const rayon_threads = if (options.rayon_threads) |override|
+            @max(@as(usize, 1), @as(usize, override))
+        else
+            @max(@as(usize, 1), desired_workers -| worker_count);
+        self.logger.info(
+            "thread pools: cpu_count={d} zig_workers={d} rayon_threads={d}{s}",
+            .{
+                cpu_count,
+                worker_count,
+                rayon_threads,
+                if (options.rayon_threads != null) " (rayon override via --rayon-threads)" else "",
+            },
+        );
+        // Operator-typo guard for --rayon-threads (review feedback on #903).
+        // Rayon tolerates over-subscription, but values like `--rayon-threads 160`
+        // on a 4-vCPU box silently degrade throughput. Warn (don't reject) so the
+        // operator notices in startup logs without blocking deliberate edge cases
+        // (e.g. fractional cgroup quotas where `getCpuCount` reports more CPUs
+        // than the container can actually use).
+        if (options.rayon_threads) |override| {
+            if (@as(usize, override) > cpu_count) {
+                self.logger.warn(
+                    "--rayon-threads {d} exceeds detected cpu_count={d}; rayon over-subscription typically reduces throughput. Verify this is intentional.",
+                    .{ override, cpu_count },
+                );
+            }
+        }
         xmss.setRayonThreads(rayon_threads);
+
+        // Log the aggregator threshold on startup so operators can see
+        // exactly how `--min-aggregation-inputs` was resolved (default vs
+        // override). The threshold is enforced by the aggregator-side
+        // pre-filter in `forkchoice.zig:pruneTrivialFromAggregateSnapshot`,
+        // not inside the spec-pure `computeAggregatedSignatures` FFI.
+        self.logger.info(
+            "aggregator threshold: min_aggregation_inputs={d}{s}",
+            .{
+                options.min_aggregation_inputs,
+                if (options.min_aggregation_inputs != types.default_min_aggregation_inputs)
+                    " (override via --min-aggregation-inputs)"
+                else
+                    "",
+            },
+        );
 
         // Pre-warm the XMSS verifier on the main thread before any worker can
         // call `verifyAggregatedPayload`. The Rust-side verifier setup is
@@ -447,6 +515,7 @@ pub const Node = struct {
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
+            .min_aggregation_inputs = options.min_aggregation_inputs,
         });
         errdefer self.beam_node.deinit();
 
@@ -587,10 +656,20 @@ pub const Node = struct {
         // libxev stalls surface in the log + metrics even if the main
         // loop is stuck inside one completion or syscall. Failure to
         // spawn is non-fatal — log and continue without it.
+        //
+        // The stall callback flips an atomic flag on `BeamNode` that the
+        // next libxev tick observes and acts on, forcing a peer status
+        // refresh outside the normal 8-slot cadence. This bootstraps
+        // catch-up as soon as the slot driver resumes.
         self.slot_driver_watchdog = SlotDriverWatchdog.init(
             &self.clock,
             self.options.logger_config.logger(.clock),
-            .{},
+            .{
+                .on_stall = .{
+                    .ptr = &self.beam_node,
+                    .onStall = BeamNode.onSlotDriverStall,
+                },
+            },
         );
         if (self.slot_driver_watchdog) |*wd| {
             wd.start() catch |err| {

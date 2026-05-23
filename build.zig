@@ -50,7 +50,11 @@ fn defaultSimpleTestRunner(b: *Builder) std.Build.Step.Compile.TestRunner {
 // See blockblaz/zeam#773.
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     const glue_path = switch (prover) {
-        .dummy, .all => "rust/target/release/libzeam_glue.a",
+        // `.dummy` uses the dedicated multisig-only Cargo profile (ThinLTO,
+        // codegen-units=1) to give the leanMultisig prover the same level of
+        // cross-crate inlining that single-prover builds already get.
+        .dummy => "rust/target/multisig-release/libzeam_glue.a",
+        .all => "rust/target/release/libzeam_glue.a",
         .risc0 => "rust/target/risc0-release/libzeam_glue.a",
         .openvm => "rust/target/openvm-release/libzeam_glue.a",
     };
@@ -889,10 +893,10 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // any more than it satisfied the previous `cargo +nightly` shape.
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "rustup",                "run",        "nightly",                 "cargo",
-            "-C",                    path,         "-Z",                      "unstable-options",
-            "build",                 "--release",  "-p",                      "zeam-glue",
-            "--no-default-features", "--features", "libp2p,hashsig,multisig",
+            "rustup",    "run",                   "nightly",          "cargo",
+            "-C",        path,                    "-Z",               "unstable-options",
+            "build",     "--profile",             "multisig-release", "-p",
+            "zeam-glue", "--no-default-features", "--features",       "libp2p,hashsig,multisig",
         }),
         .risc0 => b.addSystemCommand(&.{
             "rustup",    "run",                   "nightly",       "cargo",
