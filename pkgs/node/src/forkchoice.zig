@@ -1003,11 +1003,23 @@ pub const ForkChoice = struct {
 
         // Promote latestNew → latestKnown in attestation tracker.
         // Attestations that were "new" (gossip) are now "known" (accepted).
+        //
+        // The migration is a union, not a replacement: a validator's known vote
+        // persists until a strictly newer vote overrides it (known votes are
+        // pruned only on finalization, never wiped per tick). This matches both
+        // leanSpec's accumulating known pool and LMD-GHOST's "latest message"
+        // rule. An unconditional `latestKnown = latestNew` would erase a known
+        // vote whenever the validator has no pending gossip vote — which happens
+        // for a validator whose latest vote arrived via a block's own attestation
+        // (recorded directly in latestKnown), with no matching latestNew.
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
-            // latestNew is always ahead of latestKnown (and will be non null if latestknown is not null)
-            tracker.latestKnown = tracker.latestNew;
-            try self.attestations.put(validator_id, tracker);
+            const new_att = tracker.latestNew orelse continue;
+            const known_slot = (tracker.latestKnown orelse ProtoAttestation{}).slot;
+            if (tracker.latestKnown == null or new_att.slot > known_slot) {
+                tracker.latestKnown = new_att;
+                try self.attestations.put(validator_id, tracker);
+            }
         }
 
         return self.updateHeadUnlocked();
