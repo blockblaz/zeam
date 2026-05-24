@@ -1173,52 +1173,13 @@ pub const ForkChoice = struct {
 
         var child_payloads_consumed: usize = 0;
 
-        // Selection + FFI below run on an owned copy: the live pools are mutated under
-        // signatures_mutex by other threads, so iterating them under only the fork-choice shared
+        // Selection + FFI below run on an owned copy: the live pool is mutated under
+        // signatures_mutex by other threads, so iterating it under only the fork-choice shared
         // mutex would race. Lock order fc-mutex(shared) then signatures_mutex avoids deadlock.
-        //
-        // A block proposer MUST aggregate every att_data it includes (blocks carry proofs, not
-        // raw sigs) — even a single-validator one — so we aggregate this node's own raw gossip
-        // signatures together with its payloads (NO trivial-input prune, unlike the aggregator
-        // gossip path). Without this a non-aggregator node could only propose aggregates it
-        // received pre-made over gossip; here it can also include attestations it holds only as
-        // raw gossip sigs, so its proposals are not starved when no peer aggregate arrived.
         var known_payloads_snapshot = snapshot_blk: {
-            var snap = try AggregateSnapshot.takeUnderLock(self);
-            defer snap.deinit(self.allocator);
-
-            // Seed from the known pool: att_data held only as a received gossip aggregate are
-            // not keyed by computeAggregatedSignatures (which scans signatures ∪ new_payloads),
-            // so seeding keeps them as selection candidates.
-            var combined = try cloneAggregatedPayloadsMap(self.allocator, &snap.known_payloads);
-            errdefer deinitAggregatedPayloadsMap(self.allocator, &combined);
-
-            var agg = try types.AggregatedAttestationsResult.init(self.allocator);
-            defer {
-                for (agg.attestations.slice()) |*att| att.deinit();
-                agg.attestations.deinit();
-                for (agg.attestation_signatures.slice()) |*sig| sig.deinit();
-                agg.attestation_signatures.deinit();
-            }
-            try agg.computeAggregatedSignatures(
-                &pre_state.validators,
-                &snap.signatures,
-                &snap.new_payloads,
-                &snap.known_payloads,
-                null,
-            );
-
-            const merged_atts = agg.attestations.constSlice();
-            const merged_sigs = agg.attestation_signatures.constSlice();
-            for (merged_atts, 0..) |merged_att, i| {
-                const gop = try combined.getOrPut(merged_att.data);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                var cloned_proof: types.TypeOneMultiSignature = undefined;
-                try types.sszClone(self.allocator, types.TypeOneMultiSignature, merged_sigs[i], &cloned_proof);
-                errdefer cloned_proof.deinit();
-                try gop.value_ptr.append(self.allocator, .{ .slot = merged_att.data.slot, .proof = cloned_proof });
-            }
-            break :snapshot_blk combined;
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+            break :snapshot_blk try cloneAggregatedPayloadsMap(self.allocator, &self.latest_known_aggregated_payloads);
         };
         defer deinitAggregatedPayloadsMap(self.allocator, &known_payloads_snapshot);
 
@@ -3115,110 +3076,6 @@ test "aggregate prunes attestation signatures" {
     try std.testing.expectEqual(@as(usize, 1), aggregations.len);
     try std.testing.expectEqual(@as(usize, 0), fork_choice.attestation_signatures.count());
     try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(attestation_data) != null);
-}
-
-test "getProposalAttestations includes raw signatures with known payloads" {
-    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    const allocator = arena_allocator.allocator();
-
-    const validator_count: usize = 2;
-    const num_blocks: usize = 6;
-
-    var key_manager = try keymanager.getTestKeyManager(allocator, validator_count, num_blocks);
-    defer key_manager.deinit();
-
-    const all_pubkeys = try key_manager.getAllPubkeys(allocator, validator_count);
-    defer allocator.free(all_pubkeys.attestation_pubkeys);
-    defer allocator.free(all_pubkeys.proposal_pubkeys);
-
-    const genesis_spec = types.GenesisSpec{
-        .genesis_time = 1234,
-        .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
-        .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
-    };
-
-    const mock_chain = try stf.genMockChain(allocator, num_blocks, genesis_spec);
-    const spec_name = try allocator.dupe(u8, "beamdev");
-    const fork_digest = try allocator.dupe(u8, "12345678");
-    const chain_config = configs.ChainConfig{
-        .id = configs.Chain.custom,
-        .genesis = mock_chain.genesis_config,
-        .spec = .{
-            .preset = params.Preset.mainnet,
-            .name = spec_name,
-            .fork_digest = fork_digest,
-            .attestation_committee_count = 1,
-            .max_attestations_data = 8,
-        },
-    };
-
-    var beam_state = mock_chain.genesis_state;
-    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.forkchoice);
-    const test_thread_pool = try initTestThreadPool();
-    defer test_thread_pool.deinit();
-    var fork_choice = try ForkChoice.init(allocator, .{
-        .config = chain_config,
-        .anchorState = &beam_state,
-        .logger = module_logger,
-        .thread_pool = test_thread_pool,
-    });
-    defer fork_choice.deinit();
-
-    for (1..5) |i| {
-        const signed_block = mock_chain.blocks[i];
-        const block = signed_block.block;
-        try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
-        try fork_choice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
-        _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
-    }
-
-    const proposal_slot: types.Slot = 5;
-    const parent_root = mock_chain.blockRoots[4];
-    const att_data = types.AttestationData{
-        .slot = proposal_slot - 1,
-        .head = .{ .root = parent_root, .slot = 4 },
-        .target = .{ .root = parent_root, .slot = 4 },
-        .source = mock_chain.latestJustified[4],
-    };
-
-    var payload_proof = try types.TypeOneMultiSignature.init(allocator);
-    try types.aggregationBitsSet(&payload_proof.participants, 0, true);
-    try fork_choice.storeAggregatedPayload(&att_data, payload_proof, true);
-
-    const raw_attestation = types.Attestation{
-        .validator_id = 1,
-        .data = att_data,
-    };
-    const raw_signature = try key_manager.signAttestation(&raw_attestation, allocator);
-    try fork_choice.onSignedAttestation(.{
-        .validator_id = 1,
-        .message = att_data,
-        .signature = raw_signature,
-    });
-
-    var proposal = try fork_choice.getProposalAttestations(
-        &beam_state,
-        proposal_slot,
-        proposal_slot % validator_count,
-        parent_root,
-    );
-    defer {
-        for (proposal.attestations.slice()) |*att| att.deinit();
-        proposal.attestations.deinit();
-        for (proposal.signatures.slice()) |*sig| sig.deinit();
-        proposal.signatures.deinit();
-    }
-
-    var found_combined = false;
-    for (proposal.attestations.constSlice()) |att| {
-        if (!std.meta.eql(att.data, att_data)) continue;
-        const has_payload_validator = att.aggregation_bits.get(0) catch false;
-        const has_raw_validator = att.aggregation_bits.get(1) catch false;
-        if (has_payload_validator and has_raw_validator) found_combined = true;
-    }
-    try std.testing.expect(found_combined);
 }
 
 test "aggregate (#890): does not acquire forkchoice main mutex" {
