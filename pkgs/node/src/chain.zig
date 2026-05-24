@@ -30,7 +30,6 @@ const LockTimer = locking.LockTimer;
 const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
-const deconstruct = @import("./deconstruct.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -3390,22 +3389,6 @@ pub const BeamChain = struct {
 
         // 3. fc onblock if the block was not pre added by the block production
         const fcBlock = self.forkChoice.getBlock(block_root) orelse fcprocessing: {
-            // (B1) Deconstruction COMPUTE — recover per-attestation Type-1 proofs from this block's
-            // Type-2 into staged form, BEFORE any fork-choice mutation. Non-fatal: any failure
-            // stages nothing. This is subsystem B (proof pool / aggregator gossip); fork-choice
-            // weight lands eagerly via the tracker loop below, independent of this.
-            var staged = stage: {
-                var parent_borrow = self.statesGet(block.parent_root) orelse break :stage deconstruct.StagedDeconstruct.empty(self.allocator);
-                defer parent_borrow.assertReleasedOrPanic();
-                const parent_state = parent_borrow.cloneAndRelease(self.allocator) catch break :stage deconstruct.StagedDeconstruct.empty(self.allocator);
-                defer {
-                    parent_state.deinit();
-                    self.allocator.destroy(parent_state);
-                }
-                break :stage deconstruct.deconstructCompute(self.allocator, &self.forkChoice, &signedBlock, parent_state) catch deconstruct.StagedDeconstruct.empty(self.allocator);
-            };
-            defer staged.deinit();
-
             const freshFcBlock = try self.forkChoice.onBlock(block, post_state, .{
                 .currentSlot = block.slot,
                 .blockDelayMs = 0,
@@ -3465,10 +3448,10 @@ pub const BeamChain = struct {
                 }
             }
 
-            // Apply each block attestation's votes to the fork-choice tracker (subsystem A: eager
-            // weight from the trusted aggregation_bits — no proof needed; the block's Type-2 was
-            // already verified above). Per-attestation Type-1 proofs are NOT recorded here; they
-            // are recovered into latest_new via the separate deconstruction path.
+            // Apply each block attestation's votes to the fork-choice tracker: eager weight from
+            // the trusted aggregation_bits — no proof needed, the block's Type-2 was already
+            // verified above. Per-attestation Type-1 proofs are not recorded here; attestation
+            // proofs propagate through the gossip pool independently.
             for (aggregated_attestations) |aggregated_attestation| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
@@ -3507,15 +3490,6 @@ pub const BeamChain = struct {
             // 5. fc update head
             _ = try self.forkChoice.updateHead();
             step_watch.lap("block_attestations");
-
-            // (B2) Deconstruction COMMIT — insert recovered Type-1 proofs into latest_new now that
-            // the fork-choice mutations succeeded. leanSpec re-gossips them immediately; in zeam the
-            // normal aggregation interval picks them up from latest_new, so explicit re-gossip is
-            // dropped (at most a one-tick gossip-latency difference).
-            var recovered = deconstruct.deconstructCommit(self.allocator, &self.forkChoice, &staged);
-            for (recovered.items) |*agg| agg.deinit();
-            recovered.deinit(self.allocator);
-            step_watch.lap("block_deconstruct");
 
             break :fcprocessing freshFcBlock;
         };
