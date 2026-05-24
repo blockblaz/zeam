@@ -61,24 +61,14 @@ pub const MAX_FUTURE_SLOT_QUEUE_TOLERANCE: u64 = 256;
 // count) this caps the queue at ~2MB which is negligible vs the rest of
 // chain state. Older entries (lower-slot, lower-receive-time) are evicted
 // first when the cap is hit.
-//
-// leanSpec analog: `subspecs/sync/config.py::MAX_CACHED_BLOCKS` (also 1024;
-// same magnitude, same FIFO-eviction policy on overflow). Naming differs
-// because `pending_blocks` is zeam's pre-existing identifier for the
-// future-block queue and renaming it would touch every callsite without
-// behavioural benefit; flag the spec mapping here so future maintainers
-// can find the spec source when leanSpec test vectors land.
 pub const MAX_PENDING_BLOCKS: usize = 1024;
 
 // Maximum buffered gossip attestations / aggregations awaiting their
-// referenced block to be processed. Direct mirror of leanSpec
-// `subspecs/sync/config.py::MAX_PENDING_ATTESTATIONS` (also 1024).
+// referenced block to be processed.
 //
-// The buffer underwrites the spec's "validate, on AssertionError buffer
-// for replay" lifecycle (`subspecs/sync/service.py::on_gossip_attestation`,
-// retried on every successful `on_gossip_block`). Keeping the bound in
-// sync with the spec value ensures replay churn stays within spec test
-// vectors. FIFO eviction matches the spec's "drop oldest" policy.
+// Backs the "validate, and on failure buffer for replay" lifecycle: a
+// buffered attestation is retried on every successful block import. FIFO
+// eviction drops the oldest entry when the cap is hit.
 pub const MAX_PENDING_ATTESTATIONS: usize = 1024;
 
 // Maximum depth for recursive block fetching

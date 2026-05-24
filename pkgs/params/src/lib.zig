@@ -18,8 +18,8 @@ pub const HISTORICAL_ROOTS_LIMIT = activePresetValues.HISTORICAL_ROOTS_LIMIT;
 pub const VALIDATOR_REGISTRY_LIMIT = activePresetValues.VALIDATOR_REGISTRY_LIMIT;
 pub const MAX_REQUEST_BLOCKS = activePresetValues.MAX_REQUEST_BLOCKS;
 
-/// Max distinct AttestationData entries per block. devnet5 value is 8 (leanSpec #717); was 16 in
-/// devnet4. Single source of truth, referenced by the signature verifier and the forkchoice gate.
+/// Max distinct AttestationData entries per block. devnet5 value is 8; was 16 in devnet4. Single
+/// source of truth, referenced by the signature verifier and the forkchoice gate.
 pub const MAX_ATTESTATIONS_DATA: usize = 8;
 
 test "test preset loading" {

@@ -30,10 +30,10 @@ pub const ChainConfig = struct {
                         chainOpts.attestation_committee_count = 1;
                     }
                     if (chainOpts.max_attestations_data == null) {
-                        // devnet5: MAX_ATTESTATIONS_DATA = 8 (leanSpec #717). The block's Type-2 proof
-                        // merges N attestation components + 1 proposer component, and leanMultisig's
-                        // MAX_RECURSIONS caps that at 16 — so the attestation cap must leave room for
-                        // the proposer (8 + 1 = 9 ≤ 16).
+                        // devnet5: 8 distinct AttestationData per block. The block's Type-2 proof
+                        // merges N attestation components + 1 proposer component, and the recursive
+                        // aggregation prover caps that at 16 — so the attestation cap must leave room
+                        // for the proposer (8 + 1 = 9 ≤ 16).
                         chainOpts.max_attestations_data = 8;
                     }
                     if (chainOpts.fork_digest == null) {

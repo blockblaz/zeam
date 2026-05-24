@@ -725,7 +725,7 @@ fn processTickStep(
     driver: *ForkChoiceDriverState,
     step_obj: std.json.ObjectMap,
 ) !void {
-    // Tick step supports two alternative forms (mirrors leanSpec ForkChoiceStep::Tick):
+    // Tick step supports two alternative forms:
     //   "time": unix timestamp  — convert to intervals via genesis_time
     //   "interval": direct interval count
     const anchor_genesis_time = driver.fork_choice.anchorState.config.genesis_time;
