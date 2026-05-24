@@ -506,6 +506,9 @@ pub const AggregatedAttestationsResult = struct {
     /// Block proposers, by contrast, MUST aggregate every `att_data`
     /// they choose to include in a block, even if its only input is a
     /// single gossip signature.
+    /// Aggregator entry point: when more than one `att_data` needs recursive
+    /// FFI, run each prove on `thread_pool` after a serial prep phase (issue
+    /// #907 — worker processes ~2 `att_data` per slot window).
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
@@ -513,29 +516,7 @@ pub const AggregatedAttestationsResult = struct {
         new_payloads: ?*const AggregatedPayloadsMap,
         known_payloads: ?*const AggregatedPayloadsMap,
         slot_filter: ?[]const Slot,
-    ) !void {
-        try computeAggregatedSignaturesWithPool(
-            self,
-            validators,
-            signatures_map,
-            new_payloads,
-            known_payloads,
-            slot_filter,
-            null,
-        );
-    }
-
-    /// Aggregator entry point: when more than one `att_data` needs recursive
-    /// FFI, run each prove on `thread_pool` after a serial prep phase (issue
-    /// #907 — worker processes ~2 `att_data` per slot window).
-    pub fn computeAggregatedSignaturesWithPool(
-        self: *Self,
-        validators: *const Validators,
-        signatures_map: *const SignaturesMap,
-        new_payloads: ?*const AggregatedPayloadsMap,
-        known_payloads: ?*const AggregatedPayloadsMap,
-        slot_filter: ?[]const Slot,
-        thread_pool: ?*ThreadPool,
+        thread_pool: *ThreadPool,
     ) !void {
         const allocator = self.allocator;
 
@@ -589,12 +570,11 @@ pub const AggregatedAttestationsResult = struct {
             if (preps[i].outcome == .ffi) ffi_prep_count += 1;
         }
 
-        const run_parallel = thread_pool != null and ffi_prep_count > 1;
-        if (run_parallel) {
-            try runAggregateAttDataPrepsParallel(allocator, preps, thread_pool.?);
-        } else {
-            try runAggregateAttDataPrepsSerial(allocator, preps);
-        }
+        try runAggregateAttDataPreps(
+            allocator,
+            preps,
+            thread_pool,
+        );
 
         for (preps) |*prep| {
             if (prep.outcome != .done) continue;
@@ -1026,16 +1006,7 @@ fn runAggregateAttDataFfi(
     };
 }
 
-fn runAggregateAttDataPrepsSerial(allocator: Allocator, preps: []AggregateAttDataPrep) !void {
-    for (preps) |*prep| {
-        if (prep.outcome != .ffi) continue;
-        const result = try runAggregateAttDataFfi(allocator, prep.data, &prep.outcome.ffi);
-        prep.outcome.ffi.deinit(allocator);
-        prep.outcome = .{ .done = result };
-    }
-}
-
-fn runAggregateAttDataPrepsParallel(allocator: Allocator, preps: []AggregateAttDataPrep, thread_pool: *ThreadPool) !void {
+fn runAggregateAttDataPreps(allocator: Allocator, preps: []AggregateAttDataPrep, thread_pool: *ThreadPool) !void {
     const slots = try allocator.alloc(AggregateAttDataSlot, preps.len);
     defer allocator.free(slots);
     for (slots) |*slot| slot.* = .{};
@@ -1553,6 +1524,14 @@ fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloads
     });
 }
 
+fn initTestThreadPool(allocator: Allocator) !*ThreadPool {
+    return ThreadPool.init(.{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .thread_count = 4,
+    });
+}
+
 test "computeAggregatedSignatures filters attestation data by slot list" {
     const allocator = std.testing.allocator;
 
@@ -1573,8 +1552,11 @@ test "computeAggregatedSignatures filters attestation data by slot list" {
     var result = try AggregatedAttestationsResult.init(allocator);
     defer result.deinit();
 
+    const thread_pool = try initTestThreadPool(allocator);
+    defer thread_pool.deinit();
+
     const allowed_slots = [_]Slot{10};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
 
     try std.testing.expectEqual(@as(usize, 1), result.attestations.len());
     const aggregated = try result.attestations.get(0);
@@ -1603,12 +1585,15 @@ test "computeAggregatedSignatures slot filter matches unfiltered for same-slot i
 
     var unfiltered = try AggregatedAttestationsResult.init(allocator);
     defer unfiltered.deinit();
-    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null);
+
+    const thread_pool = try initTestThreadPool(allocator);
+    defer thread_pool.deinit();
+    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool);
 
     var filtered = try AggregatedAttestationsResult.init(allocator);
     defer filtered.deinit();
     const allowed_slots = [_]Slot{12};
-    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..]);
+    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..], thread_pool);
 
     try std.testing.expectEqual(unfiltered.attestations.len(), filtered.attestations.len());
     try std.testing.expectEqual(unfiltered.attestation_signatures.len(), filtered.attestation_signatures.len());
@@ -1635,7 +1620,9 @@ test "computeAggregatedSignatures empty slot filter result is clean" {
     defer result.deinit();
 
     const allowed_slots = [_]Slot{14};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+    const thread_pool = try initTestThreadPool(allocator);
+    defer thread_pool.deinit();
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
 
     try std.testing.expectEqual(@as(usize, 0), result.attestations.len());
     try std.testing.expectEqual(@as(usize, 0), result.attestation_signatures.len());
