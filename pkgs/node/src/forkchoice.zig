@@ -2162,12 +2162,13 @@ pub const ForkChoice = struct {
         );
 
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
-        try agg.computeAggregatedSignatures(
+        try agg.computeAggregatedSignaturesWithPool(
             &state.validators,
             &snap.signatures,
             &snap.new_payloads,
             &snap.known_payloads,
             slot_filter,
+            self.thread_pool,
         );
         observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 
