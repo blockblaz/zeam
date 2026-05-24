@@ -306,6 +306,10 @@ jobs:
   test:
     name: test
     runs-on: ${{ matrix.os }}
+    # Backstop against a hung step burning the 6h default limit. A healthy run
+    # is ~57m (unit ~27m + fixtures ~26m); fixture generation has been seen to
+    # hang for 2h+ on ubuntu (vs 26m on macOS). Fail the job well before 6h.
+    timeout-minutes: 120
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -428,7 +432,12 @@ jobs:
 
     - name: Generate LeanSpec fixtures
       working-directory: leanSpec
-      run: uv run fill --clean --fork=Lstar -n auto
+      # Per-test timeout via pytest-timeout (already a leanSpec dependency) so a
+      # hung XMSS keygen / leanMultisig proof worker fails fast with a stack dump
+      # instead of hanging the job (observed 2h+ on ubuntu vs 26m on macOS). The
+      # thread method is required under pytest-xdist (-n auto); signal does not
+      # fire in worker threads. 900s is far above any single fixture's cost.
+      run: uv run fill --clean --fork=Lstar -n auto --timeout=900 --timeout-method=thread
     
     - name: Generate spec fixtures
       run: zig build spectest:generate --summary all
