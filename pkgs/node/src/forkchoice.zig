@@ -2106,9 +2106,12 @@ pub const ForkChoice = struct {
     ///      pairs that existed at snapshot time (entries added during
     ///      phase 2 stay so the next aggregator pass can consume them).
     ///
-    /// `submitAggregateOnInterval` already gates concurrent
-    /// `aggregate()` calls via `aggregate_group.concurrent`
-    /// (concurrent_limit=1), so two aggregations cannot race here.
+    /// Concurrent callers are safe by construction: the three-phase contract
+    /// above (snapshot under `signatures_mutex` → lock-free compute on owned
+    /// clones → merge under `signatures_mutex`) ensures two aggregations
+    /// cannot race on the live maps. `submitAggregateOnInterval`'s
+    /// `aggregate_max_inflight` cap is a CPU-budget knob layered on top, not
+    /// a correctness mechanism.
     fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState, slot_filter: ?[]const types.Slot) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
         const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
@@ -2334,11 +2337,12 @@ pub const ForkChoice = struct {
 
     /// Produce aggregations only for the caller-supplied attestation slots.
     ///
-    /// The aggregate worker is scheduled with `aggregate_group.concurrent`
-    /// (concurrent_limit=1), so a busy worker can skip an interval. Callers should
-    /// pass a small backfill window, e.g. `{current_slot - 1, current_slot}`, to
-    /// recover late or skipped-slot attestations without walking every stale/future
-    /// `AttestationData` key retained in the maps.
+    /// The aggregate worker runs on the shared `ThreadPool` bounded by
+    /// `BeamChain.aggregate_max_inflight`, so a saturated worker pool can skip
+    /// an interval. Callers should pass a small backfill window, e.g.
+    /// `{current_slot - 1, current_slot}`, to recover late or skipped-slot
+    /// attestations without walking every stale/future `AttestationData` key
+    /// retained in the maps.
     pub fn aggregateForSlots(self: *Self, state_opt: ?*const types.BeamState, slots: []const types.Slot) ![]types.SignedAggregatedAttestation {
         return self.aggregateUnlocked(state_opt, slots);
     }
