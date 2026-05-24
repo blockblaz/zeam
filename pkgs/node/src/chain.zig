@@ -386,8 +386,9 @@ pub const BeamChain = struct {
     /// In-flight aggregate worker count (issue #907). `submitAggregateOnInterval`
     /// atomically checks against `aggregate_max_inflight` before spawning so the
     /// libxev interval tick never blocks. `aggregateImpl` decrements on exit.
-    /// Concurrent runs are safe by construction — see the three-phase
-    /// snapshot/compute/merge contract on `forkchoice.aggregateUnlocked`.
+    /// Aggregators keep this at 1; per-att_data FFI parallelism lives inside
+    /// `aggregateUnlocked`. Values > 1 rely on commit-time duplicate suppression
+    /// in `forkchoice.aggregateUnlocked` (see PR #920 review).
     aggregate_inflight: std.atomic.Value(u32) = .init(0),
 
     /// Joined at `deinit` so aggregate workers cannot outlive chain state.

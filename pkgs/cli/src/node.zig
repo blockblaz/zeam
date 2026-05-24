@@ -523,10 +523,13 @@ pub const Node = struct {
             desired_workers
         else
             @max(@as(usize, 1), desired_workers -| worker_count);
-        const aggregate_max_inflight: u32 = if (options.is_aggregator)
-            @intCast(@min(worker_count, 3))
-        else
-            4;
+        // One outer aggregate worker at a time on aggregators. Parallelize the
+        // ~11s STARK work per att_data inside that worker
+        // (`computeAggregatedSignatures` thread pool), not across independent
+        // interval workers. Multiple in-flight outer workers can snapshot the
+        // same gossip sigs before either commits and publish duplicate
+        // aggregates (PR #920 review).
+        const aggregate_max_inflight: u32 = if (options.is_aggregator) 1 else 4;
         const rayon_source: []const u8 = if (options.rayon_threads != null)
             " (--rayon-threads override)"
         else if (options.is_aggregator)
