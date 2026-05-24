@@ -432,13 +432,11 @@ jobs:
 
     - name: Generate LeanSpec fixtures
       working-directory: leanSpec
-      # Run serially (NO -n auto): the lean_multisig prover has process-global
-      # setup state that pytest-xdist workers race on, corrupting proofs and
-      # hanging (observed 2h+ on ubuntu). leanSpec's own fill-ci runs serially
-      # for exactly this reason; restore -n auto only once the prover setup is
-      # per-process safe. --timeout is a per-test backstop (pytest-timeout is
-      # already a leanSpec dependency).
-      run: uv run fill --clean --fork=Lstar --timeout=900
+      # Mirror leanSpec's own `just fill-ci` (= `fill --fork=Lstar --clean -n auto`
+      # under the `test` dependency group, which provides pytest-xdist). Parallel
+      # fill completes in ~25min on ubuntu-latest; serial (1 worker) is ~4x slower.
+      # --timeout is a per-test backstop (pytest-timeout is a leanSpec dependency).
+      run: uv run --group test fill --clean --fork=Lstar -n auto --timeout=900
     
     - name: Generate spec fixtures
       run: zig build spectest:generate --summary all
