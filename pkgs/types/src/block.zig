@@ -5,6 +5,7 @@ const params = @import("@zeam/params");
 const zeam_metrics = @import("@zeam/metrics");
 const xmss = @import("@zeam/xmss");
 const zeam_utils = @import("@zeam/utils");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const aggregation = @import("./aggregation.zig");
 const attestation = @import("./attestation.zig");
@@ -505,6 +506,9 @@ pub const AggregatedAttestationsResult = struct {
     /// Block proposers, by contrast, MUST aggregate every `att_data`
     /// they choose to include in a block, even if its only input is a
     /// single gossip signature.
+    /// Aggregator entry point: when more than one `att_data` needs recursive
+    /// FFI, run each prove on `thread_pool` after a serial prep phase (issue
+    /// #907 — worker processes ~2 `att_data` per slot window).
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
@@ -512,6 +516,7 @@ pub const AggregatedAttestationsResult = struct {
         new_payloads: ?*const AggregatedPayloadsMap,
         known_payloads: ?*const AggregatedPayloadsMap,
         slot_filter: ?[]const Slot,
+        thread_pool: *ThreadPool,
     ) !void {
         const allocator = self.allocator;
 
@@ -534,230 +539,49 @@ pub const AggregatedAttestationsResult = struct {
             }
         }
 
-        // Process each AttestationData
-        var data_it = att_data_set.iterator();
-        while (data_it.next()) |data_entry| {
-            const data = data_entry.key_ptr.*;
-            const epoch: u64 = data.slot;
-            var message_hash: [32]u8 = undefined;
-            try zeam_utils.hashTreeRoot(attestation.AttestationData, data, &message_hash, allocator);
+        if (att_data_set.count() == 0) return;
 
-            // Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
-            var selected_children: std.ArrayList(aggregation.AggregatedSignatureProof) = .empty;
-            defer {
-                for (selected_children.items) |*child| {
-                    child.deinit();
-                }
-                selected_children.deinit(allocator);
-            }
+        var att_data_keys = try allocator.alloc(attestation.AttestationData, att_data_set.count());
+        defer allocator.free(att_data_keys);
+        var key_idx: usize = 0;
+        var data_it = att_data_set.keyIterator();
+        while (data_it.next()) |key| {
+            att_data_keys[key_idx] = key.*;
+            key_idx += 1;
+        }
+        std.mem.sort(attestation.AttestationData, att_data_keys, {}, attestationDataLessThan);
 
-            // We need to know max_validator for bitset sizing — derive from validators count
-            const max_validator = validators.len();
+        var preps = try allocator.alloc(AggregateAttDataPrep, att_data_keys.len);
+        defer {
+            for (preps) |*prep| prep.deinit(allocator);
+            allocator.free(preps);
+        }
 
-            var covered_by_children = try std.DynamicBitSet.initEmpty(allocator, max_validator);
-            defer covered_by_children.deinit();
-
-            // Dummy empty bitset for gossip_available (not known yet)
-            var empty_available = try std.DynamicBitSet.initEmpty(allocator, max_validator);
-            defer empty_available.deinit();
-
-            try extendProofsGreedily(
+        var ffi_prep_count: usize = 0;
+        for (att_data_keys, 0..) |data, i| {
+            preps[i] = try prepareAggregateAttData(
                 allocator,
+                validators,
+                signatures_map,
                 new_payloads,
-                data,
-                &selected_children,
-                &covered_by_children,
-                &empty_available,
-            );
-            try extendProofsGreedily(
-                allocator,
                 known_payloads,
                 data,
-                &selected_children,
-                &covered_by_children,
-                &empty_available,
             );
+            if (preps[i].outcome == .ffi) ffi_prep_count += 1;
+        }
 
-            // Step 3: Collect individual gossip signatures not covered by selected children
-            var sigmap_sigs: std.ArrayList(xmss.Signature) = .empty;
-            defer {
-                for (sigmap_sigs.items) |*sig| {
-                    sig.deinit();
-                }
-                sigmap_sigs.deinit(allocator);
-            }
+        try runAggregateAttDataPreps(
+            allocator,
+            preps,
+            thread_pool,
+        );
 
-            var sigmap_pks: std.ArrayList(xmss.PublicKey) = .empty;
-            defer {
-                for (sigmap_pks.items) |*pk| {
-                    pk.deinit();
-                }
-                sigmap_pks.deinit(allocator);
-            }
-
-            var sigmap_vids: std.ArrayList(usize) = .empty;
-            defer sigmap_vids.deinit(allocator);
-
-            const inner_map = signatures_map.get(data);
-            if (inner_map) |im| {
-                var vid_it = im.iterator();
-                while (vid_it.next()) |entry| {
-                    const vid: usize = @intCast(entry.key_ptr.*);
-                    const sig_entry = entry.value_ptr.*;
-
-                    // Skip if already covered by children
-                    if (vid < covered_by_children.capacity() and covered_by_children.isSet(vid)) continue;
-
-                    if (std.mem.eql(u8, &sig_entry.signature, &ZERO_SIGBYTES)) continue;
-
-                    var sig = xmss.Signature.fromBytes(&sig_entry.signature) catch continue;
-                    errdefer sig.deinit();
-
-                    if (vid >= validators.len()) {
-                        sig.deinit();
-                        continue;
-                    }
-
-                    const val = validators.get(vid) catch {
-                        sig.deinit();
-                        continue;
-                    };
-                    const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch {
-                        sig.deinit();
-                        continue;
-                    };
-
-                    try sigmap_sigs.append(allocator, sig);
-                    try sigmap_pks.append(allocator, pk);
-                    try sigmap_vids.append(allocator, vid);
-                }
-            }
-
-            const has_gossip = sigmap_sigs.items.len > 0;
-            const has_children = selected_children.items.len > 0;
-
-            if (!has_gossip and !has_children) continue;
-
-            // Build gossip participants bitfield and handle arrays
-            var xmss_participants: ?attestation.AggregationBits = null;
-            defer if (xmss_participants) |*gp| gp.deinit();
-
-            var pk_handles_buf: ?[]*const xmss.HashSigPublicKey = null;
-            defer if (pk_handles_buf) |buf| allocator.free(buf);
-            var sig_handles_buf: ?[]*const xmss.HashSigSignature = null;
-            defer if (sig_handles_buf) |buf| allocator.free(buf);
-
-            var pk_handles: []*const xmss.HashSigPublicKey = &.{};
-            var sig_handles: []*const xmss.HashSigSignature = &.{};
-
-            if (has_gossip) {
-                var gp = try attestation.AggregationBits.init(allocator);
-                errdefer gp.deinit();
-
-                const pks = try allocator.alloc(*const xmss.HashSigPublicKey, sigmap_sigs.items.len);
-                errdefer allocator.free(pks);
-                const sigs = try allocator.alloc(*const xmss.HashSigSignature, sigmap_sigs.items.len);
-                errdefer allocator.free(sigs);
-
-                for (sigmap_vids.items, 0..) |vid, idx| {
-                    try attestation.aggregationBitsSet(&gp, vid, true);
-                    pks[idx] = sigmap_pks.items[idx].handle;
-                    sigs[idx] = sigmap_sigs.items[idx].handle;
-                }
-
-                xmss_participants = gp;
-                pk_handles_buf = pks;
-                sig_handles_buf = sigs;
-                pk_handles = pks[0..sigmap_sigs.items.len];
-                sig_handles = sigs[0..sigmap_sigs.items.len];
-            }
-
-            // If only 1 child and no gossip, pass through the child directly
-            if (!has_gossip and selected_children.items.len == 1) {
-                const child = &selected_children.items[0];
-
-                var att_bits: attestation.AggregationBits = undefined;
-                try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits);
-                errdefer att_bits.deinit(); // ownership is for self.attestations
-
-                // Clone the child proof for the result (original will be freed by deferred cleanup)
-                var cloned_child: aggregation.AggregatedSignatureProof = undefined;
-                try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, child.*, &cloned_child);
-                errdefer cloned_child.deinit();
-
-                try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
-                try self.attestation_signatures.append(cloned_child);
-                continue;
-            }
-
-            // Recursive aggregation: children + gossip
-            var proof = try aggregation.AggregatedSignatureProof.init(allocator);
-            errdefer proof.deinit();
-
-            // Build per-child pub key arrays for recursive aggregation
-            var child_pk_allocs: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
-            defer {
-                for (child_pk_allocs.items) |arr| allocator.free(arr);
-                child_pk_allocs.deinit(allocator);
-            }
-            var child_pk_slices: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
-            defer child_pk_slices.deinit(allocator);
-
-            var child_pk_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
-            defer {
-                for (child_pk_wrappers.items) |*pw| pw.deinit();
-                child_pk_wrappers.deinit(allocator);
-            }
-
-            for (selected_children.items) |*child| {
-                var n_participants: usize = 0;
-                for (0..child.participants.len()) |i| {
-                    if (child.participants.get(i) catch false) {
-                        n_participants += 1;
-                    }
-                }
-
-                const cpks = try allocator.alloc(*const xmss.HashSigPublicKey, n_participants);
-                errdefer allocator.free(cpks);
-
-                var cpk_idx: usize = 0;
-                for (0..child.participants.len()) |i| {
-                    if (child.participants.get(i) catch false) {
-                        if (i >= validators.len()) continue;
-                        const val = validators.get(@intCast(i)) catch continue;
-                        const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch continue;
-                        try child_pk_wrappers.append(allocator, pk);
-                        cpks[cpk_idx] = pk.handle;
-                        cpk_idx += 1;
-                    }
-                }
-
-                try child_pk_allocs.append(allocator, cpks);
-                try child_pk_slices.append(allocator, cpks[0..cpk_idx]);
-            }
-
-            const pq_sig_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
-            try aggregation.AggregatedSignatureProof.aggregate(
-                allocator,
-                xmss_participants,
-                selected_children.items,
-                child_pk_slices.items,
-                pk_handles,
-                sig_handles,
-                &message_hash,
-                epoch,
-                &proof,
-            );
-            _ = pq_sig_timer.observe();
-            if (xmss_participants) |*gp| gp.deinit();
-            xmss_participants = null;
-
-            var att_bits: attestation.AggregationBits = undefined;
-            try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
-            errdefer att_bits.deinit(); // ownership is for self.attestations
-
-            try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
-            try self.attestation_signatures.append(proof);
+        for (preps) |*prep| {
+            if (prep.outcome != .done) continue;
+            const result = prep.outcome.done;
+            prep.outcome = .skip;
+            try self.attestations.append(result.attestation);
+            try self.attestation_signatures.append(result.signature);
         }
     }
 
@@ -857,6 +681,384 @@ const CompactGroupEntry = struct {
 const CompactGroupResult = struct {
     attestation: AggregatedAttestation,
     signature: aggregation.AggregatedSignatureProof,
+};
+
+fn attestationDataLessThan(_: void, a: attestation.AttestationData, b: attestation.AttestationData) bool {
+    if (a.slot != b.slot) return a.slot < b.slot;
+    const head_cmp = std.mem.order(u8, &a.head.root, &b.head.root);
+    if (head_cmp != .eq) return head_cmp == .lt;
+    const target_cmp = std.mem.order(u8, &a.target.root, &b.target.root);
+    if (target_cmp != .eq) return target_cmp == .lt;
+    const source_cmp = std.mem.order(u8, &a.source.root, &b.source.root);
+    if (source_cmp != .eq) return source_cmp == .lt;
+    if (a.head.slot != b.head.slot) return a.head.slot < b.head.slot;
+    if (a.target.slot != b.target.slot) return a.target.slot < b.target.slot;
+    return a.source.slot < b.source.slot;
+}
+
+const AggregateAttDataOutcome = union(enum) {
+    skip,
+    ffi: AggregateAttDataFfiArgs,
+    done: CompactGroupResult,
+};
+
+const AggregateAttDataPrep = struct {
+    data: attestation.AttestationData,
+    outcome: AggregateAttDataOutcome,
+
+    fn deinit(self: *AggregateAttDataPrep, allocator: Allocator) void {
+        switch (self.outcome) {
+            .skip => {},
+            .ffi => |*args| args.deinit(allocator),
+            .done => |*result| {
+                result.attestation.deinit();
+                result.signature.deinit();
+            },
+        }
+    }
+};
+
+const AggregateAttDataFfiArgs = struct {
+    message_hash: [32]u8,
+    epoch: u64,
+    xmss_participants: ?attestation.AggregationBits,
+    selected_children: []aggregation.AggregatedSignatureProof,
+    child_pk_slices: []const []*const xmss.HashSigPublicKey,
+    pk_handles: []*const xmss.HashSigPublicKey,
+    sig_handles: []*const xmss.HashSigSignature,
+    child_pk_allocs: [][]*const xmss.HashSigPublicKey,
+    child_pk_wrappers: []xmss.PublicKey,
+    gossip_sig_wrappers: []xmss.Signature,
+    gossip_pk_wrappers: []xmss.PublicKey,
+    pk_handles_buf: ?[]*const xmss.HashSigPublicKey,
+    sig_handles_buf: ?[]*const xmss.HashSigSignature,
+
+    fn deinit(self: *AggregateAttDataFfiArgs, allocator: Allocator) void {
+        for (self.selected_children) |*child| child.deinit();
+        allocator.free(self.selected_children);
+        for (self.child_pk_allocs) |arr| allocator.free(arr);
+        allocator.free(self.child_pk_allocs);
+        for (self.child_pk_wrappers) |*pw| pw.deinit();
+        allocator.free(self.child_pk_wrappers);
+        for (self.gossip_sig_wrappers) |*sig| sig.deinit();
+        allocator.free(self.gossip_sig_wrappers);
+        for (self.gossip_pk_wrappers) |*pk| pk.deinit();
+        allocator.free(self.gossip_pk_wrappers);
+        if (self.pk_handles_buf) |buf| allocator.free(buf);
+        if (self.sig_handles_buf) |buf| allocator.free(buf);
+        if (self.xmss_participants) |*gp| gp.deinit();
+    }
+};
+
+fn prepareAggregateAttData(
+    allocator: Allocator,
+    validators: *const Validators,
+    signatures_map: *const SignaturesMap,
+    new_payloads: ?*const AggregatedPayloadsMap,
+    known_payloads: ?*const AggregatedPayloadsMap,
+    data: attestation.AttestationData,
+) !AggregateAttDataPrep {
+    const epoch: u64 = data.slot;
+    var message_hash: [32]u8 = undefined;
+    try zeam_utils.hashTreeRoot(attestation.AttestationData, data, &message_hash, allocator);
+
+    var selected_children: std.ArrayList(aggregation.AggregatedSignatureProof) = .empty;
+    errdefer {
+        for (selected_children.items) |*child| child.deinit();
+        selected_children.deinit(allocator);
+    }
+
+    const max_validator = validators.len();
+
+    var covered_by_children = try std.DynamicBitSet.initEmpty(allocator, max_validator);
+    defer covered_by_children.deinit();
+
+    var empty_available = try std.DynamicBitSet.initEmpty(allocator, max_validator);
+    defer empty_available.deinit();
+
+    try extendProofsGreedily(allocator, new_payloads, data, &selected_children, &covered_by_children, &empty_available);
+    try extendProofsGreedily(allocator, known_payloads, data, &selected_children, &covered_by_children, &empty_available);
+
+    var sigmap_sigs: std.ArrayList(xmss.Signature) = .empty;
+    errdefer {
+        for (sigmap_sigs.items) |*sig| sig.deinit();
+        sigmap_sigs.deinit(allocator);
+    }
+
+    var sigmap_pks: std.ArrayList(xmss.PublicKey) = .empty;
+    errdefer {
+        for (sigmap_pks.items) |*pk| pk.deinit();
+        sigmap_pks.deinit(allocator);
+    }
+
+    var sigmap_vids: std.ArrayList(usize) = .empty;
+    errdefer sigmap_vids.deinit(allocator);
+
+    if (signatures_map.get(data)) |im| {
+        var vid_it = im.iterator();
+        while (vid_it.next()) |entry| {
+            const vid: usize = @intCast(entry.key_ptr.*);
+            const sig_entry = entry.value_ptr.*;
+
+            if (vid < covered_by_children.capacity() and covered_by_children.isSet(vid)) continue;
+            if (std.mem.eql(u8, &sig_entry.signature, &ZERO_SIGBYTES)) continue;
+
+            var sig = xmss.Signature.fromBytes(&sig_entry.signature) catch continue;
+            errdefer sig.deinit();
+
+            if (vid >= validators.len()) {
+                sig.deinit();
+                continue;
+            }
+
+            const val = validators.get(vid) catch {
+                sig.deinit();
+                continue;
+            };
+            const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch {
+                sig.deinit();
+                continue;
+            };
+
+            try sigmap_sigs.append(allocator, sig);
+            try sigmap_pks.append(allocator, pk);
+            try sigmap_vids.append(allocator, vid);
+        }
+    }
+
+    const has_gossip = sigmap_sigs.items.len > 0;
+    const has_children = selected_children.items.len > 0;
+
+    if (!has_gossip and !has_children) {
+        return .{ .data = data, .outcome = .skip };
+    }
+
+    if (!has_gossip and selected_children.items.len == 1) {
+        const child = &selected_children.items[0];
+
+        var att_bits: attestation.AggregationBits = undefined;
+        try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits);
+        errdefer att_bits.deinit();
+
+        var cloned_child: aggregation.AggregatedSignatureProof = undefined;
+        try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, child.*, &cloned_child);
+        errdefer cloned_child.deinit();
+
+        selected_children.items[0].deinit();
+        selected_children.deinit(allocator);
+
+        return .{
+            .data = data,
+            .outcome = .{
+                .done = .{
+                    .attestation = .{ .aggregation_bits = att_bits, .data = data },
+                    .signature = cloned_child,
+                },
+            },
+        };
+    }
+
+    var xmss_participants: ?attestation.AggregationBits = null;
+    var pk_handles_buf: ?[]*const xmss.HashSigPublicKey = null;
+    var sig_handles_buf: ?[]*const xmss.HashSigSignature = null;
+    var pk_handles: []*const xmss.HashSigPublicKey = &.{};
+    var sig_handles: []*const xmss.HashSigSignature = &.{};
+
+    if (has_gossip) {
+        var gp = try attestation.AggregationBits.init(allocator);
+        errdefer gp.deinit();
+
+        const pks = try allocator.alloc(*const xmss.HashSigPublicKey, sigmap_sigs.items.len);
+        errdefer allocator.free(pks);
+        const sigs = try allocator.alloc(*const xmss.HashSigSignature, sigmap_sigs.items.len);
+        errdefer allocator.free(sigs);
+
+        for (sigmap_vids.items, 0..) |vid, idx| {
+            try attestation.aggregationBitsSet(&gp, vid, true);
+            pks[idx] = sigmap_pks.items[idx].handle;
+            sigs[idx] = sigmap_sigs.items[idx].handle;
+        }
+
+        xmss_participants = gp;
+        pk_handles_buf = pks;
+        sig_handles_buf = sigs;
+        pk_handles = pks;
+        sig_handles = sigs;
+    }
+
+    var child_pk_allocs_list: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
+    errdefer {
+        for (child_pk_allocs_list.items) |arr| allocator.free(arr);
+        child_pk_allocs_list.deinit(allocator);
+    }
+    var child_pk_slices_list: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
+    errdefer child_pk_slices_list.deinit(allocator);
+
+    var child_pk_wrappers_list: std.ArrayList(xmss.PublicKey) = .empty;
+    errdefer {
+        for (child_pk_wrappers_list.items) |*pw| pw.deinit();
+        child_pk_wrappers_list.deinit(allocator);
+    }
+
+    for (selected_children.items) |*child| {
+        var n_participants: usize = 0;
+        for (0..child.participants.len()) |i| {
+            if (child.participants.get(i) catch false) n_participants += 1;
+        }
+
+        const cpks = try allocator.alloc(*const xmss.HashSigPublicKey, n_participants);
+        errdefer allocator.free(cpks);
+
+        var cpk_idx: usize = 0;
+        for (0..child.participants.len()) |i| {
+            if (child.participants.get(i) catch false) {
+                if (i >= validators.len()) continue;
+                const val = validators.get(@intCast(i)) catch continue;
+                const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch continue;
+                try child_pk_wrappers_list.append(allocator, pk);
+                cpks[cpk_idx] = pk.handle;
+                cpk_idx += 1;
+            }
+        }
+
+        try child_pk_allocs_list.append(allocator, cpks);
+        try child_pk_slices_list.append(allocator, cpks[0..cpk_idx]);
+    }
+
+    const gossip_sigs = try sigmap_sigs.toOwnedSlice(allocator);
+    errdefer {
+        for (gossip_sigs) |*sig| sig.deinit();
+        allocator.free(gossip_sigs);
+    }
+    sigmap_sigs = .empty;
+
+    const gossip_pks = try sigmap_pks.toOwnedSlice(allocator);
+    errdefer {
+        for (gossip_pks) |*pk| pk.deinit();
+        allocator.free(gossip_pks);
+    }
+    sigmap_pks = .empty;
+    sigmap_vids.deinit(allocator);
+
+    const children = try selected_children.toOwnedSlice(allocator);
+    selected_children = .empty;
+
+    const child_pk_allocs = try child_pk_allocs_list.toOwnedSlice(allocator);
+    child_pk_allocs_list = .empty;
+
+    const child_pk_slices = try child_pk_slices_list.toOwnedSlice(allocator);
+    child_pk_slices_list = .empty;
+
+    const child_pk_wrappers = try child_pk_wrappers_list.toOwnedSlice(allocator);
+    child_pk_wrappers_list = .empty;
+
+    return .{
+        .data = data,
+        .outcome = .{
+            .ffi = .{
+                .message_hash = message_hash,
+                .epoch = epoch,
+                .xmss_participants = xmss_participants,
+                .selected_children = children,
+                .child_pk_slices = child_pk_slices,
+                .pk_handles = pk_handles,
+                .sig_handles = sig_handles,
+                .child_pk_allocs = child_pk_allocs,
+                .child_pk_wrappers = child_pk_wrappers,
+                .gossip_sig_wrappers = gossip_sigs,
+                .gossip_pk_wrappers = gossip_pks,
+                .pk_handles_buf = pk_handles_buf,
+                .sig_handles_buf = sig_handles_buf,
+            },
+        },
+    };
+}
+
+fn runAggregateAttDataFfi(
+    allocator: Allocator,
+    data: attestation.AttestationData,
+    args: *AggregateAttDataFfiArgs,
+) !CompactGroupResult {
+    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    errdefer proof.deinit();
+
+    const pq_sig_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
+    try aggregation.AggregatedSignatureProof.aggregate(
+        allocator,
+        args.xmss_participants,
+        args.selected_children,
+        args.child_pk_slices,
+        args.pk_handles,
+        args.sig_handles,
+        &args.message_hash,
+        args.epoch,
+        &proof,
+    );
+    _ = pq_sig_timer.observe();
+
+    var att_bits: attestation.AggregationBits = undefined;
+    try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
+    errdefer att_bits.deinit();
+
+    return .{
+        .attestation = .{ .aggregation_bits = att_bits, .data = data },
+        .signature = proof,
+    };
+}
+
+fn runAggregateAttDataPreps(allocator: Allocator, preps: []AggregateAttDataPrep, thread_pool: *ThreadPool) !void {
+    const slots = try allocator.alloc(AggregateAttDataSlot, preps.len);
+    defer allocator.free(slots);
+    for (slots) |*slot| slot.* = .{};
+
+    const Runner = struct {
+        fn runScope(
+            scope: anytype,
+            alloc: Allocator,
+            preps_in: []AggregateAttDataPrep,
+            out_slots: []AggregateAttDataSlot,
+            any_err: *std.atomic.Value(bool),
+        ) Allocator.Error!void {
+            for (preps_in, 0..) |*prep, i| {
+                if (prep.outcome != .ffi) continue;
+                try scope.spawn(runOne, .{ alloc, prep, &out_slots[i], any_err });
+            }
+        }
+
+        fn runOne(
+            alloc: Allocator,
+            prep: *AggregateAttDataPrep,
+            out_slot: *AggregateAttDataSlot,
+            any_err: *std.atomic.Value(bool),
+        ) void {
+            if (any_err.load(.acquire)) return;
+            const result = runAggregateAttDataFfi(alloc, prep.data, &prep.outcome.ffi) catch |err| {
+                out_slot.err = err;
+                any_err.store(true, .release);
+                return;
+            };
+            out_slot.result = result;
+        }
+    };
+
+    var any_err = std.atomic.Value(bool).init(false);
+    try thread_pool.scope(Runner.runScope, .{ allocator, preps, slots, &any_err });
+
+    for (slots) |slot| {
+        if (slot.err) |err| return err;
+    }
+
+    for (preps, 0..) |*prep, i| {
+        if (prep.outcome != .ffi) continue;
+        const result = slots[i].result orelse return error.AggregateParallelMissingResult;
+        prep.outcome.ffi.deinit(allocator);
+        prep.outcome = .{ .done = result };
+    }
+}
+
+const AggregateAttDataSlot = struct {
+    result: ?CompactGroupResult = null,
+    err: ?anyerror = null,
 };
 
 const CompactGroupSlot = struct {
@@ -1322,6 +1524,14 @@ fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloads
     });
 }
 
+fn initTestThreadPool(allocator: Allocator) !*ThreadPool {
+    return ThreadPool.init(.{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .thread_count = 4,
+    });
+}
+
 test "computeAggregatedSignatures filters attestation data by slot list" {
     const allocator = std.testing.allocator;
 
@@ -1342,8 +1552,11 @@ test "computeAggregatedSignatures filters attestation data by slot list" {
     var result = try AggregatedAttestationsResult.init(allocator);
     defer result.deinit();
 
+    const thread_pool = try initTestThreadPool(allocator);
+    defer thread_pool.deinit();
+
     const allowed_slots = [_]Slot{10};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
 
     try std.testing.expectEqual(@as(usize, 1), result.attestations.len());
     const aggregated = try result.attestations.get(0);
@@ -1372,12 +1585,15 @@ test "computeAggregatedSignatures slot filter matches unfiltered for same-slot i
 
     var unfiltered = try AggregatedAttestationsResult.init(allocator);
     defer unfiltered.deinit();
-    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null);
+
+    const thread_pool = try initTestThreadPool(allocator);
+    defer thread_pool.deinit();
+    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool);
 
     var filtered = try AggregatedAttestationsResult.init(allocator);
     defer filtered.deinit();
     const allowed_slots = [_]Slot{12};
-    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..]);
+    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..], thread_pool);
 
     try std.testing.expectEqual(unfiltered.attestations.len(), filtered.attestations.len());
     try std.testing.expectEqual(unfiltered.attestation_signatures.len(), filtered.attestation_signatures.len());
@@ -1404,7 +1620,9 @@ test "computeAggregatedSignatures empty slot filter result is clean" {
     defer result.deinit();
 
     const allowed_slots = [_]Slot{14};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..]);
+    const thread_pool = try initTestThreadPool(allocator);
+    defer thread_pool.deinit();
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
 
     try std.testing.expectEqual(@as(usize, 0), result.attestations.len());
     try std.testing.expectEqual(@as(usize, 0), result.attestation_signatures.len());
