@@ -432,11 +432,12 @@ jobs:
 
     - name: Generate LeanSpec fixtures
       working-directory: leanSpec
-      # Mirror leanSpec's own `just fill-ci` (= `fill --fork=Lstar --clean -n auto`
-      # under the `test` dependency group, which provides pytest-xdist). Parallel
-      # fill completes in ~25min on ubuntu-latest; serial (1 worker) is ~4x slower.
-      # --timeout is a per-test backstop (pytest-timeout is a leanSpec dependency).
-      run: uv run --group test fill --clean --fork=Lstar -n auto --timeout=900
+      # Matches the submodule leanSpec's own `just fill-ci` body. Runs SERIALLY
+      # (no -n auto) on purpose: per leanSpec/Justfile, pytest-xdist workers race
+      # on the lean_multisig_py prover's process-global setup and corrupt proofs
+      # intermittently. Restore -n auto only once that is per-process safe upstream.
+      # (This is the matching ci.yml note leanSpec/Justfile points to.)
+      run: uv run --group test fill --clean --fork=Lstar
     
     - name: Generate spec fixtures
       run: zig build spectest:generate --summary all
