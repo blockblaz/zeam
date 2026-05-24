@@ -90,12 +90,9 @@ pub const NodeCommand = struct {
     /// to give the prover more parallelism without rebuilding (#899).
     @"rayon-threads": ?u32 = null,
     /// Minimum (children + gossip-sig) inputs required before the aggregator
-    /// invokes the recursive STARK prover for an `AttestationData`. Default
-    /// `2` (post-#908) skips the no-children + single-gossip-sig case where
-    /// the prover would produce a 1-validator aggregate of zero consensus
-    /// value. `1` reverts to pre-#908 behavior (always aggregate ≥1 sig).
-    /// Higher values trade slot latency for fewer sub-threshold aggregates
-    /// on chatty subnets. See issue #907 finding 4.
+    /// invokes the recursive prover for an `AttestationData`. Default `1`
+    /// aggregates every non-empty raw-signature input. Higher values trade
+    /// slot latency for fewer sub-threshold aggregates on chatty subnets.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
 
     pub const __shorts__ = .{
@@ -123,7 +120,7 @@ pub const NodeCommand = struct {
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
-        .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to pre-#908 behavior. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
+        .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive prover for an AttestationData. Default 1 aggregates every non-empty raw-signature input. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
         .help = "Show help information for the node command",
     };
 };

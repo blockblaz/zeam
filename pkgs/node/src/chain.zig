@@ -6518,6 +6518,81 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
     }
     try std.testing.expect(found_genesis_sv);
 }
+
+test "produceBlock - advancing target is not starved by genesis self-votes" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var fx = try setupJustifiedSourceTestChain(allocator, 6);
+    defer {
+        fx.beam_chain.deinit();
+        fx.thread_pool.deinit();
+        fx.test_registry.deinit();
+        fx.db.deinit();
+        fx.tmp_dir.cleanup();
+    }
+    const mock_chain = fx.mock_chain;
+    const beam_chain = fx.beam_chain;
+    beam_chain.config.spec.max_attestations_data = 2;
+    beam_chain.forkChoice.config.spec.max_attestations_data = 2;
+
+    for (1..5) |i| {
+        const signed_block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(signed_block.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        allocator.free(missing_roots);
+    }
+
+    const proposal_slot: types.Slot = 5;
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
+    const genesis_root = mock_chain.blockRoots[0];
+    const parent_root = mock_chain.blockRoots[4];
+    const justified_cp = mock_chain.latestJustified[4];
+
+    for (0..2) |i| {
+        const att_genesis_self_vote = types.AttestationData{
+            .slot = @intCast(i),
+            .head = .{ .root = mock_chain.blockRoots[i], .slot = @intCast(i) },
+            .target = .{ .root = genesis_root, .slot = 0 },
+            .source = .{ .root = genesis_root, .slot = 0 },
+        };
+        var proof_gsv = try types.TypeOneMultiSignature.init(allocator);
+        for (0..@intCast(num_validators)) |validator_index| {
+            try types.aggregationBitsSet(&proof_gsv.participants, validator_index, true);
+        }
+        try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true);
+    }
+
+    const att_advancing = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = parent_root, .slot = 4 },
+        .source = justified_cp,
+    };
+    var proof_advancing = try types.TypeOneMultiSignature.init(allocator);
+    for (0..@intCast(num_validators)) |validator_index| {
+        try types.aggregationBitsSet(&proof_advancing.participants, validator_index, true);
+    }
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_advancing, proof_advancing, true);
+
+    const produced = try beam_chain.produceBlock(.{
+        .slot = proposal_slot,
+        .proposer_index = proposal_slot % num_validators,
+    });
+    defer @constCast(&produced).deinit();
+
+    var found_advancing = false;
+    for (produced.block.body.attestations.constSlice()) |att| {
+        if (att.data.target.slot == att_advancing.target.slot and
+            std.mem.eql(u8, &att.data.target.root, &att_advancing.target.root))
+        {
+            found_advancing = true;
+        }
+    }
+    try std.testing.expect(found_advancing);
+}
+
 test "BorrowedState: cloneAndRelease success path against real BeamState" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();

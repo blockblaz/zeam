@@ -45,13 +45,10 @@ const freeJsonValue = utils.freeJsonValue;
 /// `pkgs/cli/src/main.zig`) and consumed by the aggregator wrapper in
 /// `pkgs/node/src/forkchoice.zig` (NOT by `computeAggregatedSignatures`,
 /// which is spec-pure and aggregates whatever it is given). Default
-/// `2`: aggregator skips publishing when an `att_data` has only a
-/// single local gossip sig and no peer payload, since the raw sig is
-/// already on the gossip topic and a 1-validator "aggregate" carries
-/// no consensus signal (#907 finding 4). `1` reverts to pre-#908
-/// behavior (always aggregate ≥1 sig). Higher values trade slot
-/// latency for fewer sub-threshold aggregates on chatty subnets.
-pub const default_min_aggregation_inputs: u32 = 2;
+/// `1`: aggregate every non-empty raw-signature input. Operators can
+/// raise this to trade slot latency for fewer sub-threshold aggregates
+/// on chatty subnets.
+pub const default_min_aggregation_inputs: u32 = 1;
 
 // signatures_map types for aggregation
 
@@ -571,10 +568,8 @@ pub const AggregatedAttestationsResult = struct {
     /// Step 5: Recursive aggregate — combine selected children + remaining gossip sigs.
     ///
     /// Spec-pure: this function aggregates whatever it is given. Callers
-    /// that want to skip trivially-shaped inputs (e.g. the aggregator
-    /// role wanting to avoid spending the full STARK prover budget on a
-    /// single-validator "aggregate" that carries no consensus signal —
-    /// see issue #907 finding 4) must filter the inputs they pass in.
+    /// that want to skip trivially-shaped inputs must filter the inputs
+    /// they pass in.
     /// Block proposers, by contrast, MUST aggregate every `att_data`
     /// they choose to include in a block, even if its only input is a
     /// single gossip signature.

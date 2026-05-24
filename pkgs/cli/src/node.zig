@@ -118,8 +118,7 @@ pub const NodeOptions = struct {
     /// `computeAggregatedSignatures` runs (the FFI itself stays
     /// spec-pure). Surfaced as `--min-aggregation-inputs` on the
     /// `zeam node` CLI; default is
-    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
-    /// issue #907 finding 4.
+    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
