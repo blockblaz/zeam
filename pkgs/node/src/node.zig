@@ -2581,6 +2581,7 @@ pub const BeamNode = struct {
         while (current_interval <= itime_intervals) : (current_interval += 1) {
             const interval: usize = @intCast(current_interval);
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
+            const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
 
             // Commit per interval before sub-steps so later errors cannot replay it.
             self.last_interval = current_interval;
@@ -2629,43 +2630,45 @@ pub const BeamNode = struct {
                 self.logger.err("error ticking validator to time(intervals)={d} err=error.TestInjected (continuing tick)", .{interval});
                 zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
             } else if (self.validator) |*validator| {
-                // we also tick validator per interval in case it would
-                // need to sync its future duties when its an independent validator
-                var maybe_validator_output = validator.onInterval(interval) catch |e| blk: {
-                    self.logger.err("error ticking validator to time(intervals)={d} err={any} (continuing tick)", .{ interval, e });
-                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                    break :blk null;
-                };
+                if (interval_in_slot == 0) {
+                    self.chain.submitProposeOnInterval(self, interval);
+                } else {
+                    // we also tick validator per interval in case it would
+                    // need to sync its future duties when its an independent validator
+                    var maybe_validator_output = validator.onInterval(interval) catch |e| blk: {
+                        self.logger.err("error ticking validator to time(intervals)={d} err={any} (continuing tick)", .{ interval, e });
+                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                        break :blk null;
+                    };
 
-                if (maybe_validator_output) |*output| {
-                    defer output.deinit();
-                    for (output.gossip_messages.items) |gossip_msg| {
-                        // Process based on message type
-                        switch (gossip_msg) {
-                            .block => |signed_block| {
-                                self.publishBlock(signed_block) catch |e| {
-                                    self.logger.err("error publishing block from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
-                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishBlock" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                                };
-                            },
-                            .attestation => |signed_attestation| {
-                                self.publishAttestation(signed_attestation) catch |e| {
-                                    self.logger.err("error publishing attestation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
-                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAttestation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                                };
-                            },
-                            .aggregation => |signed_aggregation| {
-                                self.publishAggregation(signed_aggregation) catch |e| {
-                                    self.logger.err("error publishing aggregation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
-                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAggregation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                                };
-                            },
+                    if (maybe_validator_output) |*output| {
+                        defer output.deinit();
+                        for (output.gossip_messages.items) |gossip_msg| {
+                            // Process based on message type
+                            switch (gossip_msg) {
+                                .block => |signed_block| {
+                                    self.publishBlock(signed_block) catch |e| {
+                                        self.logger.err("error publishing block from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishBlock" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                                    };
+                                },
+                                .attestation => |signed_attestation| {
+                                    self.publishAttestation(signed_attestation) catch |e| {
+                                        self.logger.err("error publishing attestation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAttestation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                                    };
+                                },
+                                .aggregation => |signed_aggregation| {
+                                    self.publishAggregation(signed_aggregation) catch |e| {
+                                        self.logger.err("error publishing aggregation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAggregation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                                    };
+                                },
+                            }
                         }
                     }
                 }
             }
-
-            const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
 
             // Forced refresh requested by the slot-driver watchdog after a
             // stall (#863). The watchdog runs on a separate OS thread and

@@ -720,7 +720,7 @@ test "SSE events integration test - wait for justification and finalization" {
     //   - node3 emits its own new_finalization, or
     //   - global finalization advances beyond the first finalized slot, or
     //   - new_head events keep arriving after node3's delayed start (chain still progressing).
-    const timeout_ms: u64 = 480000; // 480 seconds timeout
+    const timeout_ms: u64 = 120000; // 120s: a healthy chain justifies+finalizes well under 1 min; fail fast otherwise
     const start_ns = zeam_utils.monotonicTimestampNs();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;

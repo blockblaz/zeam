@@ -385,6 +385,14 @@ pub const BeamChain = struct {
     /// Long-lived group hosting submitted aggregate tasks.
     aggregate_group: std.Io.Group = .init,
 
+    /// Dedicated Io.Threaded for the block-proposal worker.
+    /// `concurrent_limit = .limited(1)` enforces at most one in-flight
+    /// proposal task; a second submit returns `error.ConcurrencyUnavailable`.
+    propose_io: *std.Io.Threaded,
+
+    /// Long-lived group hosting submitted proposal tasks.
+    propose_group: std.Io.Group = .init,
+
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -540,6 +548,16 @@ pub const BeamChain = struct {
         });
         errdefer agg_io.deinit();
 
+        // Dedicated Io.Threaded for block proposal/prover worker.
+        // concurrent_limit = .limited(1) ensures at most one in-flight proposal task.
+        const prop_io = try allocator.create(std.Io.Threaded);
+        errdefer allocator.destroy(prop_io);
+        prop_io.* = std.Io.Threaded.init(allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(1),
+        });
+        errdefer prop_io.deinit();
+
         var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
@@ -585,6 +603,8 @@ pub const BeamChain = struct {
             // aggregate_io: dedicated Io.Threaded for aggregate FFI worker (issue #873).
             .aggregate_io = agg_io,
             .aggregate_group = .init,
+            .propose_io = prop_io,
+            .propose_group = .init,
             // leanSpec _pending_attestations / _pending_aggregated_attestations
             // buffers — empty at init; FIFO-bounded by
             // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
@@ -1503,9 +1523,10 @@ pub const BeamChain = struct {
         // never called.)
         self.stopChainStateRefcountObserver();
 
-        // Issue #873: wait for any in-flight aggregate worker before
+        // Wait for any in-flight aggregate/proposal worker before
         // tearing down chain state it references.
         self.aggregate_group.cancel(self.aggregate_io.io());
+        self.propose_group.cancel(self.propose_io.io());
 
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
@@ -1519,10 +1540,12 @@ pub const BeamChain = struct {
             self.chain_worker = null;
         }
 
-        // Issue #873: tear down aggregate worker pool after chain_worker
-        // is stopped and aggregate_group is cancelled.
+        // Tear down aggregate/proposal worker pools after chain_worker
+        // is stopped and their groups are cancelled.
         self.aggregate_io.deinit();
         self.allocator.destroy(self.aggregate_io);
+        self.propose_io.deinit();
+        self.allocator.destroy(self.propose_io);
 
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
@@ -4308,6 +4331,62 @@ pub const BeamChain = struct {
         proof.verify(public_keys.items, &message_hash, epoch) catch {
             return error.InvalidAggregationSignature;
         };
+    }
+
+    /// Submit block proposal work to the dedicated Io.Threaded worker.
+    /// Returns quickly; the worker runs the existing validator proposal path
+    /// and publishes any produced block itself. If the previous proposal is
+    /// still in-flight, the submit is skipped.
+    pub fn submitProposeOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        const validator = if (node.validator) |*validator| validator else return;
+        if (validator.getSlotProposer(slot) == null) return;
+
+        // Submit to the dedicated proposal worker. concurrent_limit=1
+        // ensures at most one in-flight task. Proposal state is cloned
+        // inside maybeDoProposal/produceBlock, so there is no caller-side
+        // snapshot to free if the submit is skipped.
+        self.propose_group.concurrent(self.propose_io.io(), proposeImpl, .{ self, node, slot }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                self.logger.info("skipping block proposal for slot={d}: previous proposal still in-flight", .{slot});
+                return;
+            },
+        };
+    }
+
+    /// Worker body for block proposal/proving (runs on `propose_io` thread).
+    fn proposeImpl(chain: *Self, node: *@import("./node.zig").BeamNode, slot: usize) void {
+        var maybe_validator_output = node.validator.?.maybeDoProposal(slot) catch |err| blk: {
+            chain.logger.err("error producing block proposal at slot={d}: {any} (continuing tick)", .{ slot, err });
+            zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "maybeDoProposal" }) catch |me| chain.logger.warn("metric incr failed: {any}", .{me});
+            break :blk null;
+        };
+
+        if (maybe_validator_output) |*output| {
+            defer output.deinit();
+            for (output.gossip_messages.items) |gossip_msg| {
+                switch (gossip_msg) {
+                    .block => |signed_block| {
+                        node.publishBlock(signed_block) catch |err| {
+                            chain.logger.err("error publishing block from proposal worker at slot={d}: {any} (continuing tick)", .{ slot, err });
+                            zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishBlock" }) catch |me| chain.logger.warn("metric incr failed: {any}", .{me});
+                        };
+                    },
+                    .attestation => |signed_attestation| {
+                        node.publishAttestation(signed_attestation) catch |err| {
+                            chain.logger.err("error publishing attestation from proposal worker at slot={d}: {any} (continuing tick)", .{ slot, err });
+                            zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAttestation" }) catch |me| chain.logger.warn("metric incr failed: {any}", .{me});
+                        };
+                    },
+                    .aggregation => |signed_aggregation| {
+                        node.publishAggregation(signed_aggregation) catch |err| {
+                            chain.logger.err("error publishing aggregation from proposal worker at slot={d}: {any} (continuing tick)", .{ slot, err });
+                            zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAggregation" }) catch |me| chain.logger.warn("metric incr failed: {any}", .{me});
+                        };
+                    },
+                }
+            }
+        }
     }
 
     /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
