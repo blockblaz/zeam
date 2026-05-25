@@ -2118,16 +2118,11 @@ pub const ForkChoice = struct {
         defer _ = agg_timer.observe();
 
         // ─── Phase 1: snapshot ──────────────────────────────────────
-        // Deep-clone the three input maps under signatures_mutex so
-        // computeAggregatedSignatures (phase 2) can run on owned data
-        // without holding the lock. Cost is bounded by total entry
-        // count: SignaturesMap is POD (StoredSignature is 8B + SIGBYTES);
-        // AggregatedPayloadsMap entries each sszClone an
-        // AggregatedSignatureProof (Rust-allocated XMSS handle, refcount
-        // bump via FFI). Per-entry clone is sub-ms; total snapshot
-        // typically O(10 ms) on a healthy aggregator.
+        // Collect in-scope att_data keys under signatures_mutex (ethlambda-
+        // style job scoping) and deep-clone only those entries so we do not
+        // sszClone every stale proof retained in the live maps.
         const snapshot_start_ns = zeam_utils.monotonicTimestampNs();
-        var snap = try AggregateSnapshot.takeUnderLock(self);
+        var snap = try AggregateSnapshot.takeUnderLock(self, slot_filter);
         observeAggregateBuildPhase("snapshot", snapshot_start_ns);
         defer snap.deinit(self.allocator);
 
@@ -3674,6 +3669,95 @@ fn deinitAggregatedPayloadsMap(allocator: Allocator, map: *AggregatedPayloadsMap
     map.deinit();
 }
 
+/// Returns true when `att_data.slot` is in the optional slot window filter.
+fn aggregationSlotAllowed(slot: types.Slot, slot_filter: ?[]const types.Slot) bool {
+    const slots = slot_filter orelse return true;
+    for (slots) |allowed| {
+        if (slot == allowed) return true;
+    }
+    return false;
+}
+
+/// Collect `AttestationData` keys to snapshot, mirroring ethlambda's two-pass
+/// `snapshot_aggregation_inputs`: gossip groups first, then payload-only groups
+/// with at least two pending proofs. Scoped by `slot_filter` so zeam does not
+/// deep-clone every stale map entry on each worker run.
+fn collectAggregationSnapshotKeys(
+    allocator: Allocator,
+    fork_choice: *ForkChoice,
+    slot_filter: ?[]const types.Slot,
+    out_keys: *std.ArrayList(types.AttestationData),
+) !void {
+    var seen = std.AutoHashMap(types.AttestationData, void).init(allocator);
+    defer seen.deinit();
+
+    var gossip_roots = std.AutoHashMap(types.AttestationData, void).init(allocator);
+    defer gossip_roots.deinit();
+
+    {
+        var it = fork_choice.attestation_signatures.iterator();
+        while (it.next()) |entry| {
+            if (!aggregationSlotAllowed(entry.key_ptr.slot, slot_filter)) continue;
+            try gossip_roots.put(entry.key_ptr.*, {});
+            const gop = try seen.getOrPut(entry.key_ptr.*);
+            if (!gop.found_existing) try out_keys.append(allocator, entry.key_ptr.*);
+        }
+    }
+
+    {
+        var it = fork_choice.latest_new_aggregated_payloads.iterator();
+        while (it.next()) |entry| {
+            if (!aggregationSlotAllowed(entry.key_ptr.slot, slot_filter)) continue;
+            if (gossip_roots.contains(entry.key_ptr.*)) continue;
+            if (entry.value_ptr.items.len < 2) continue;
+            const gop = try seen.getOrPut(entry.key_ptr.*);
+            if (!gop.found_existing) try out_keys.append(allocator, entry.key_ptr.*);
+        }
+    }
+}
+
+/// Deep-clone one attestation-data entry from `src` into `dst`.
+fn cloneAggregatedPayloadsEntry(
+    allocator: Allocator,
+    att_data: types.AttestationData,
+    src_list: *const types.AggregatedPayloadsList,
+    dst: *AggregatedPayloadsMap,
+) !void {
+    if (src_list.items.len == 0) return;
+
+    const gop = try dst.getOrPut(att_data);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+
+    try gop.value_ptr.ensureTotalCapacityPrecise(allocator, src_list.items.len);
+    for (src_list.items) |*stored| {
+        var cloned_proof: types.AggregatedSignatureProof = undefined;
+        try types.sszClone(allocator, types.AggregatedSignatureProof, stored.proof, &cloned_proof);
+        errdefer cloned_proof.deinit();
+
+        var cloned_source_payload: ?types.AggregationBits = null;
+        if (stored.source_payload_participants) |source_payload| {
+            var bits: types.AggregationBits = undefined;
+            try types.sszClone(allocator, types.AggregationBits, source_payload, &bits);
+            errdefer bits.deinit();
+            cloned_source_payload = bits;
+        }
+        var cloned_source_gossip: ?types.AggregationBits = null;
+        if (stored.source_gossip_participants) |source_gossip| {
+            var bits: types.AggregationBits = undefined;
+            try types.sszClone(allocator, types.AggregationBits, source_gossip, &bits);
+            errdefer bits.deinit();
+            cloned_source_gossip = bits;
+        }
+
+        try gop.value_ptr.append(allocator, .{
+            .slot = stored.slot,
+            .proof = cloned_proof,
+            .source_payload_participants = cloned_source_payload,
+            .source_gossip_participants = cloned_source_gossip,
+        });
+    }
+}
+
 /// Deep-clone an `AggregatedPayloadsMap`. Each stored
 /// `AggregatedSignatureProof` is `sszClone`d so the destination owns
 /// its own Rust XMSS handle (independent refcount). Caller releases
@@ -3687,82 +3771,63 @@ fn cloneAggregatedPayloadsMap(
 
     var it = src.iterator();
     while (it.next()) |entry| {
-        const gop = try dst.getOrPut(entry.key_ptr.*);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-
-        try gop.value_ptr.ensureTotalCapacityPrecise(allocator, entry.value_ptr.items.len);
-        for (entry.value_ptr.items) |*stored| {
-            var cloned_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(allocator, types.AggregatedSignatureProof, stored.proof, &cloned_proof);
-            errdefer cloned_proof.deinit();
-
-            var cloned_source_payload: ?types.AggregationBits = null;
-            if (stored.source_payload_participants) |source_payload| {
-                var bits: types.AggregationBits = undefined;
-                try types.sszClone(allocator, types.AggregationBits, source_payload, &bits);
-                errdefer bits.deinit();
-                cloned_source_payload = bits;
-            }
-            var cloned_source_gossip: ?types.AggregationBits = null;
-            if (stored.source_gossip_participants) |source_gossip| {
-                var bits: types.AggregationBits = undefined;
-                try types.sszClone(allocator, types.AggregationBits, source_gossip, &bits);
-                errdefer bits.deinit();
-                cloned_source_gossip = bits;
-            }
-
-            try gop.value_ptr.append(allocator, .{
-                .slot = stored.slot,
-                .proof = cloned_proof,
-                .source_payload_participants = cloned_source_payload,
-                .source_gossip_participants = cloned_source_gossip,
-            });
-        }
+        try cloneAggregatedPayloadsEntry(allocator, entry.key_ptr.*, entry.value_ptr, &dst);
     }
     return dst;
 }
 
-/// Owned snapshot of the three signature/aggregation maps that
-/// `aggregateUnlocked` reads. Taken under `signatures_mutex` and
-/// then operated on outside the lock so the heavy XMSS FFI does
-/// not block libxev / chain-worker writers.
+/// Owned snapshot of signature/aggregation inputs for one aggregate worker pass.
+/// Taken under `signatures_mutex` using ethlambda-style job scoping: only
+/// in-window `att_data` keys (plus payload-only groups with ≥2 proofs) are
+/// cloned, not every entry retained in the live maps.
 const AggregateSnapshot = struct {
     signatures: types.SignaturesMap,
     new_payloads: AggregatedPayloadsMap,
     known_payloads: AggregatedPayloadsMap,
 
-    /// Acquires `fork_choice.signatures_mutex`, deep-clones the three
-    /// maps into freshly-allocated owned copies, then releases the
-    /// lock. Cost is dominated by `sszClone` of every
-    /// `AggregatedSignatureProof` (Rust FFI handle clone).
-    fn takeUnderLock(fork_choice: *ForkChoice) !AggregateSnapshot {
+    /// Acquires `fork_choice.signatures_mutex`, collects in-scope attestation
+    /// data keys, deep-clones only those entries, then releases the lock.
+    fn takeUnderLock(fork_choice: *ForkChoice, slot_filter: ?[]const types.Slot) !AggregateSnapshot {
         const allocator = fork_choice.allocator;
 
         fork_choice.signatures_mutex.lock();
         defer fork_choice.signatures_mutex.unlock();
 
+        var keys: std.ArrayList(types.AttestationData) = .empty;
+        defer keys.deinit(allocator);
+        try collectAggregationSnapshotKeys(allocator, fork_choice, slot_filter, &keys);
+
         var signatures = types.SignaturesMap.init(allocator);
         errdefer signatures.deinit();
 
-        var src_sig_it = fork_choice.attestation_signatures.iterator();
-        while (src_sig_it.next()) |entry| {
-            var inner = types.SignaturesMap.InnerMap.init(allocator);
-            errdefer inner.deinit();
-            try inner.ensureTotalCapacity(@intCast(entry.value_ptr.count()));
-
-            var inner_it = entry.value_ptr.iterator();
-            while (inner_it.next()) |vid_entry| {
-                try inner.put(vid_entry.key_ptr.*, vid_entry.value_ptr.*);
-            }
-
-            try signatures.put(entry.key_ptr.*, inner);
-        }
-
-        var new_payloads = try cloneAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
+        var new_payloads = AggregatedPayloadsMap.init(allocator);
         errdefer deinitAggregatedPayloadsMap(allocator, &new_payloads);
 
-        var known_payloads = try cloneAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
+        var known_payloads = AggregatedPayloadsMap.init(allocator);
         errdefer deinitAggregatedPayloadsMap(allocator, &known_payloads);
+
+        for (keys.items) |att_data| {
+            if (fork_choice.attestation_signatures.get(att_data)) |inner| {
+                var cloned_inner = types.SignaturesMap.InnerMap.init(allocator);
+                errdefer cloned_inner.deinit();
+                try cloned_inner.ensureTotalCapacity(@intCast(inner.count()));
+
+                var inner_it = inner.iterator();
+                while (inner_it.next()) |vid_entry| {
+                    try cloned_inner.put(vid_entry.key_ptr.*, vid_entry.value_ptr.*);
+                }
+
+                try signatures.put(att_data, cloned_inner);
+            }
+
+            if (fork_choice.latest_new_aggregated_payloads.getPtr(att_data)) |list| {
+                try cloneAggregatedPayloadsEntry(allocator, att_data, list, &new_payloads);
+            }
+
+            if (fork_choice.latest_known_aggregated_payloads.getPtr(att_data)) |list| {
+                try cloneAggregatedPayloadsEntry(allocator, att_data, list, &known_payloads);
+            }
+        }
 
         return .{
             .signatures = signatures,

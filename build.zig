@@ -202,6 +202,8 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     zeam_xmss.addImport("ssz", ssz);
+    zeam_xmss.addImport("@zeam/metrics", zeam_metrics);
+    zeam_xmss.addImport("@zeam/utils", zeam_utils);
 
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
