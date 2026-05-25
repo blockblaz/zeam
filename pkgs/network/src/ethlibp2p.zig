@@ -1344,7 +1344,7 @@ pub const EthLibp2p = struct {
     /// thread (response / EOS / error delivery). Unsynchronized access
     /// corrupts callback entries and has produced GPEs in onReqRespResponse
     /// during status RPC bursts (#933).
-    rpc_callbacks_lock: std.Thread.Mutex = .{},
+    rpc_callbacks_lock: zeam_utils.SyncMutex = .{},
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
 
