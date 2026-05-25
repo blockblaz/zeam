@@ -27,11 +27,35 @@ pub fn rangesOverlap(
     return a_start < b_end and b_start < a_end;
 }
 
+pub fn wallGapSlots(our_head_slot: types.Slot, wall_slot: types.Slot) u64 {
+    if (wall_slot <= our_head_slot) return 0;
+    return wall_slot - our_head_slot;
+}
+
 pub fn cappedSyncGapSlots(peer_head_slot: types.Slot, our_head_slot: types.Slot, wall_slot: types.Slot) u64 {
     if (peer_head_slot <= our_head_slot) return 0;
     const peer_gap: u64 = peer_head_slot - our_head_slot;
-    const wall_gap: u64 = if (wall_slot > our_head_slot) wall_slot - our_head_slot else 0;
-    return @min(peer_gap, wall_gap);
+    return @min(peer_gap, wallGapSlots(our_head_slot, wall_slot));
+}
+
+pub const PeriodicRefreshDecision = struct {
+    refresh: bool,
+    wall_head_lag_slots: u64,
+};
+
+pub fn periodicRefreshPeerStatusDecision(
+    sync_status: anytype,
+    our_head_slot: types.Slot,
+    wall_slot: types.Slot,
+    wall_head_lag_threshold_slots: u64,
+) PeriodicRefreshDecision {
+    const wall_head_lag_slots = wallGapSlots(our_head_slot, wall_slot);
+    const refresh = switch (sync_status) {
+        .fc_initing, .behind_peers => true,
+        .synced => wall_head_lag_slots >= wall_head_lag_threshold_slots,
+        .no_peers => false,
+    };
+    return .{ .refresh = refresh, .wall_head_lag_slots = wall_head_lag_slots };
 }
 
 /// Whether a peer status should trigger proactive catch-up (issue #893 / PR #894).
@@ -173,6 +197,45 @@ test "cappedSyncGapSlots limits range catch-up to wall-clock head" {
     try std.testing.expectEqual(@as(u64, 50), cappedSyncGapSlots(200, 100, 150));
     try std.testing.expectEqual(@as(u64, 100), cappedSyncGapSlots(200, 100, 250));
     try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(200, 150, 100));
+}
+
+test "periodicRefreshPeerStatusDecision handles sync state and wall lag" {
+    const TestSyncStatus = union(enum) {
+        synced,
+        no_peers,
+        fc_initing,
+        behind_peers,
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), wallGapSlots(100, 100));
+    try std.testing.expectEqual(@as(u64, 0), wallGapSlots(100, 99));
+    try std.testing.expectEqual(@as(u64, 4), wallGapSlots(100, 104));
+
+    const cases = [_]struct {
+        status: TestSyncStatus,
+        our_head_slot: types.Slot,
+        wall_slot: types.Slot,
+        threshold_slots: u64,
+        want_refresh: bool,
+        want_lag: u64,
+    }{
+        .{ .status = .synced, .our_head_slot = 100, .wall_slot = 103, .threshold_slots = 4, .want_refresh = false, .want_lag = 3 },
+        .{ .status = .synced, .our_head_slot = 100, .wall_slot = 104, .threshold_slots = 4, .want_refresh = true, .want_lag = 4 },
+        .{ .status = .fc_initing, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
+        .{ .status = .behind_peers, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
+        .{ .status = .no_peers, .our_head_slot = 100, .wall_slot = 200, .threshold_slots = 4, .want_refresh = false, .want_lag = 100 },
+    };
+
+    for (cases) |case| {
+        const decision = periodicRefreshPeerStatusDecision(
+            case.status,
+            case.our_head_slot,
+            case.wall_slot,
+            case.threshold_slots,
+        );
+        try std.testing.expectEqual(case.want_refresh, decision.refresh);
+        try std.testing.expectEqual(case.want_lag, decision.wall_head_lag_slots);
+    }
 }
 
 test "shouldCatchUpFromPeerStatus triggers on head gap before finalization" {
