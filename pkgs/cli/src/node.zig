@@ -553,11 +553,8 @@ pub const Node = struct {
         xmss.setRayonThreads(rayon_threads);
 
         if (options.is_aggregator) {
-            xmss.setupProver() catch |err| {
-                self.logger.warn("xmss prover setup failed: {any}; aggregation may be unavailable", .{err});
-            };
-            xmss.prewarmProver() catch |err| {
-                self.logger.warn("xmss prover prewarm failed: {any}", .{err});
+            xmss.ensureProverReady() catch |err| {
+                self.logger.warn("xmss prover init failed: {any}; aggregation may be unavailable", .{err});
             };
         }
 

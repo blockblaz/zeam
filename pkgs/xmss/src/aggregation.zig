@@ -79,16 +79,13 @@ extern fn xmss_aggregate_signature_from_bytes(
 /// Cached after first successful init; Rust side uses OnceLock as well.
 var prover_ready = std.atomic.Value(bool).init(false);
 
-fn ensureProverReady() !void {
+/// Idempotent prover init for aggregators. Calls `setupProver` once and sets
+/// `prover_ready` so the first `aggregateSignatures` does not pay setup on the
+/// hot path. Safe to call at startup before the first slot trigger.
+pub fn ensureProverReady() !void {
     if (prover_ready.load(.acquire)) return;
     try setupProver();
     prover_ready.store(true, .release);
-}
-
-/// Idempotent prover warm-up for aggregators. Call at startup (before the
-/// first slot trigger) so the first real aggregate does not pay cold-init tail.
-pub fn prewarmProver() !void {
-    try ensureProverReady();
 }
 
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
