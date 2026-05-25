@@ -788,6 +788,14 @@ pub const Mock = struct {
         self.discardDrainedPublishes(drain_count);
     }
 
+    pub fn cancelInflightRequest(ptr: *anyopaque, request_id: u64) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.rpcCallbacks.fetchRemove(request_id)) |entry| {
+            var callback = entry.value;
+            callback.deinit();
+        }
+    }
+
     pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest, callback: ?interface.OnReqRespResponseCbHandler) anyerror!u64 {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -895,6 +903,7 @@ pub const Mock = struct {
                 .sendRequestFn = sendRequest,
                 .onReqRespRequestFn = onReqRespRequest,
                 .subscribeFn = subscribeReqResp,
+                .cancelInflightRequestFn = cancelInflightRequest,
             },
             .peers = .{
                 .ptr = self,
