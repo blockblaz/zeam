@@ -1192,7 +1192,6 @@ pub const ForkChoice = struct {
             const MapEntry = struct {
                 att_data: *types.AttestationData,
                 payloads: *types.AggregatedPayloadsList,
-                is_genesis_self_vote: bool,
             };
             var sorted_entries: std.ArrayList(MapEntry) = .empty;
             defer sorted_entries.deinit(self.allocator);
@@ -1225,15 +1224,13 @@ pub const ForkChoice = struct {
                 try sorted_entries.append(self.allocator, .{
                     .att_data = att_data,
                     .payloads = entry.value_ptr,
-                    .is_genesis_self_vote = is_genesis_self_vote,
                 });
             }
 
+            // leanSpec build_block sorts purely by target.slot (forks/lstar/spec.py); the
+            // att_data.slot tiebreak only makes the unstable sort deterministic for equal targets.
             std.mem.sort(MapEntry, sorted_entries.items, {}, struct {
                 fn lessThan(_: void, a: MapEntry, b: MapEntry) bool {
-                    if (a.is_genesis_self_vote != b.is_genesis_self_vote) {
-                        return !a.is_genesis_self_vote;
-                    }
                     if (a.att_data.target.slot == b.att_data.target.slot) {
                         return a.att_data.slot < b.att_data.slot;
                     }
