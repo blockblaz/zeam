@@ -557,7 +557,7 @@ pub const AggregatedAttestationsResult = struct {
             allocator.free(preps);
         }
 
-        var ffi_prep_count: usize = 0;
+        const prep_start_ns = zeam_utils.monotonicTimestampNs();
         for (att_data_keys, 0..) |data, i| {
             preps[i] = try prepareAggregateAttData(
                 allocator,
@@ -567,8 +567,8 @@ pub const AggregatedAttestationsResult = struct {
                 known_payloads,
                 data,
             );
-            if (preps[i].outcome == .ffi) ffi_prep_count += 1;
         }
+        observeAggregateAttDataPrepPhase(prep_start_ns);
 
         try runAggregateAttDataPreps(
             allocator,
@@ -694,6 +694,13 @@ fn attestationDataLessThan(_: void, a: attestation.AttestationData, b: attestati
     if (a.head.slot != b.head.slot) return a.head.slot < b.head.slot;
     if (a.target.slot != b.target.slot) return a.target.slot < b.target.slot;
     return a.source.slot < b.source.slot;
+}
+
+fn observeAggregateAttDataPrepPhase(start_ns: i128) void {
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    zeam_metrics.observeAggregateAttestationBuildPhase("att_data_prep", elapsed_s);
 }
 
 const AggregateAttDataOutcome = union(enum) {

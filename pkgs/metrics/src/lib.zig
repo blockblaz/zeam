@@ -85,9 +85,17 @@ const Metrics = struct {
     lean_pq_sig_aggregated_signatures_building_time_seconds: PQSigBuildingTimeHistogram,
     // Zeam-specific phase attribution for aggregate production (#899).
     // phase="snapshot" clones live signature/payload maps under signatures_mutex.
-    // phase="compute_ffi" builds recursive aggregate proofs from the snapshot.
+    // phase="att_data_prep" serial prepareAggregateAttData (hashTreeRoot, greedy
+    // payload pick, handle setup) inside computeAggregatedSignatures.
+    // phase="xmss_prove" leanMultisig rec_xmss_aggregate via xmss_aggregate FFI.
+    // phase="compute_ffi" full computeAggregatedSignatures (prep + parallel proves).
     // phase="commit" publishes results back into latest_new_aggregated_payloads.
     zeam_pq_sig_aggregated_signatures_building_phase_seconds: PQSigBuildingPhaseHistogram,
+    /// Wall time inside `xmss_aggregate` / leanMultisig `rec_xmss_aggregate` only
+    /// (one recursive STARK prove per att_data). Compare directly to lean-bench /
+    /// `cargo run --release -- recursion --n 2`; zeam worker histograms include
+    /// snapshot, prep, child-proof deserialize, and serialize on top of this.
+    zeam_xmss_rec_aggregate_prove_seconds: XmssRecAggregateProveHistogram,
     lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
@@ -429,6 +437,7 @@ const Metrics = struct {
     const PQSigAttestationsInAggregatedTotalCounter = metrics_lib.Counter(u64);
     const PQSigBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigBuildingPhaseHistogram = metrics_lib.HistogramVec(f32, struct { phase: []const u8 }, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 });
+    const XmssRecAggregateProveHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0 });
     const PQSigAggregatedVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
     const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
@@ -739,6 +748,12 @@ fn observeAggregateWorkerDuration(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn onXmssRecAggregateProveHistogram(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.XmssRecAggregateProveHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeAggregationIntervalTick(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.AggregationIntervalTickHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -863,6 +878,10 @@ pub var zeam_aggregate_worker_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeAggregateWorkerDuration,
 };
+pub var zeam_xmss_rec_aggregate_prove_seconds: Histogram = .{
+    .context = null,
+    .observe = &onXmssRecAggregateProveHistogram,
+};
 pub var lean_pending_blocks_drain_iters: Histogram = .{
     .context = null,
     .observe = &observePendingBlocksDrainIters,
@@ -909,8 +928,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         // Aggregated attestation signature metrics
         .lean_pq_sig_aggregated_signatures_total = Metrics.PQSigAggregatedSignaturesTotalCounter.init("lean_pq_sig_aggregated_signatures_total", .{ .help = "Total number of aggregated signatures" }, .{}),
         .lean_pq_sig_attestations_in_aggregated_signatures_total = Metrics.PQSigAttestationsInAggregatedTotalCounter.init("lean_pq_sig_attestations_in_aggregated_signatures_total", .{ .help = "Total number of attestations included into aggregated signatures" }, .{}),
-        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Time spent inside computeAggregatedSignatures per att_data (wrap/clone path only on zeam). Does NOT include the XMSS recursive STARK worker; use zeam_aggregate_worker_duration_seconds for end-to-end aggregate FFI cost (issue #907)." }, .{}),
-        .zeam_pq_sig_aggregated_signatures_building_phase_seconds = try Metrics.PQSigBuildingPhaseHistogram.init(allocator, io, "zeam_pq_sig_aggregated_signatures_building_phase_seconds", .{ .help = "Phase-level time taken to produce aggregate attestations, labeled by phase (snapshot|compute_ffi|commit). See #899." }, .{}),
+        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Per att_data wall time for AggregatedSignatureProof.aggregate (bitfield merge + xmss.aggregateSignatures, including leanMultisig STARK). For bare rec_xmss_aggregate prove time comparable to lean-bench, use zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
+        .zeam_pq_sig_aggregated_signatures_building_phase_seconds = try Metrics.PQSigBuildingPhaseHistogram.init(allocator, io, "zeam_pq_sig_aggregated_signatures_building_phase_seconds", .{ .help = "Phase-level time for aggregate production, labeled by phase (snapshot|att_data_prep|xmss_prove|compute_ffi|commit). See #899 / #907." }, .{}),
+        .zeam_xmss_rec_aggregate_prove_seconds = Metrics.XmssRecAggregateProveHistogram.init("zeam_xmss_rec_aggregate_prove_seconds", .{ .help = "Wall time inside xmss_aggregate (leanMultisig rec_xmss_aggregate STARK prove + FFI key clones, one att_data). Compare to leanBench aggregate.flat_*_r2; worker/phase metrics add snapshot, prep, child-proof deserialize, and serialize." }, .{}),
         .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature" }, .{}),
         .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures" }, .{}),
         .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures" }, .{}),
@@ -1068,6 +1088,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
     zeam_node_aggregation_interval_tick_seconds.context = @ptrCast(&metrics.zeam_node_aggregation_interval_tick_seconds);
     zeam_aggregate_worker_duration_seconds.context = @ptrCast(&metrics.zeam_aggregate_worker_duration_seconds);
+    zeam_xmss_rec_aggregate_prove_seconds.context = @ptrCast(&metrics.zeam_xmss_rec_aggregate_prove_seconds);
     lean_pending_blocks_drain_iters.context = @ptrCast(&metrics.lean_pending_blocks_drain_iters);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
@@ -1195,6 +1216,23 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
     }
 
     try metrics_lib.write(&metrics, writer);
+}
+
+/// Record a sub-phase of aggregate attestation production (see
+/// `zeam_pq_sig_aggregated_signatures_building_phase_seconds`).
+pub fn observeAggregateAttestationBuildPhase(phase: []const u8, elapsed_seconds: f32) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_pq_sig_aggregated_signatures_building_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_seconds,
+    ) catch {};
+}
+
+/// Record leanMultisig `rec_xmss_aggregate` wall time for one att_data (xmss_aggregate FFI).
+pub fn observeXmssRecAggregateProve(elapsed_seconds: f32) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_xmss_rec_aggregate_prove_seconds.observe(elapsed_seconds);
+    observeAggregateAttestationBuildPhase("xmss_prove", elapsed_seconds);
 }
 
 // ---------------------------------------------------------------------

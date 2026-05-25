@@ -1,6 +1,8 @@
 const std = @import("std");
 const hashsig = @import("hashsig.zig");
 const ssz = @import("ssz");
+const zeam_metrics = @import("@zeam/metrics");
+const zeam_utils = @import("@zeam/utils");
 
 pub const AggregationError = error{ SerializationFailed, DeserializationFailed, PublicKeysSignatureLengthMismatch, AggregationFailed, InvalidAggregateSignature };
 
@@ -74,6 +76,15 @@ extern fn xmss_aggregate_signature_from_bytes(
     bytes_len: usize,
 ) callconv(.c) ?*AggregatedXMSS;
 
+/// Cached after first successful init; Rust side uses OnceLock as well.
+var prover_ready = std.atomic.Value(bool).init(false);
+
+fn ensureProverReady() !void {
+    if (prover_ready.load(.acquire)) return;
+    try setupProver();
+    prover_ready.store(true, .release);
+}
+
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
 /// Must be called before `setupProver` and before any aggregation work begins.
 /// `num_threads = 0` means "use rayon's default" (one thread per logical CPU).
@@ -120,7 +131,7 @@ pub fn aggregateSignatures(
         return AggregationError.AggregationFailed;
     }
 
-    try setupProver();
+    try ensureProverReady();
 
     const num_children = children_pub_keys.len;
     const allocator = std.heap.c_allocator;
@@ -161,6 +172,7 @@ pub fn aggregateSignatures(
         child_proof_lens[i] = proof_slice.len;
     }
 
+    const prove_start_ns = zeam_utils.monotonicTimestampNs();
     const agg_sig = xmss_aggregate(
         public_keys.ptr,
         signatures.ptr,
@@ -174,6 +186,7 @@ pub fn aggregateSignatures(
         epoch,
         log_inv_rate,
     ) orelse return AggregationError.AggregationFailed;
+    recordXmssProveDuration(prove_start_ns);
 
     // Serialize the aggregate signature to bytes
     var buffer: [MAX_AGGREGATE_SIGNATURE_SIZE]u8 = undefined;
@@ -190,6 +203,13 @@ pub fn aggregateSignatures(
     for (buffer[0..bytes_written]) |byte| {
         try multisig_aggregated_signature.append(byte);
     }
+}
+
+fn recordXmssProveDuration(start_ns: i128) void {
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    zeam_metrics.observeXmssRecAggregateProve(elapsed_s);
 }
 
 pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, message_hash: *const [32]u8, epoch: u32, agg_sig: *const ByteListMiB) !void {
