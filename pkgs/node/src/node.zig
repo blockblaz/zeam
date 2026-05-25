@@ -3007,6 +3007,7 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Publish an aggregation received from the network: validate, verify, store, then gossip.
     pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         self.logger.info("adding locally produced aggregation to chain: slot={d}", .{signed_aggregation.data.slot});
         try self.chain.onGossipAggregatedAttestation(signed_aggregation);
@@ -3022,16 +3023,34 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Publish an aggregation already committed by the aggregate worker.
+    ///
+    /// Skips XMSS re-verification and fork-choice payload re-store; only updates
+    /// attestation trackers and encodes to gossip.
+    pub fn publishLocalProducedAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
+        self.logger.info("publishing locally committed aggregation: slot={d}", .{signed_aggregation.data.slot});
+        try self.chain.applyAggregatedAttestationTrackers(signed_aggregation.data, &signed_aggregation.proof);
+
+        const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
+        const aggregation_published = try self.network.publish(&gossip_msg);
+
+        if (aggregation_published) {
+            self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
+        } else {
+            self.logger.warn("failed to publish aggregation to network (backend dropped publish): slot={d}", .{signed_aggregation.data.slot});
+        }
+    }
+
     /// Publish every aggregation independently; deinit each entry exactly once.
     pub fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) void {
         for (aggregations) |*signed_aggregation| {
-            self.publishAggregation(signed_aggregation.*) catch |err| {
+            self.publishLocalProducedAggregation(signed_aggregation.*) catch |err| {
                 self.logger.err(
                     "error publishing aggregation at slot={d}: {any} (continuing within slot)",
                     .{ signed_aggregation.data.slot, err },
                 );
                 zeam_metrics.metrics.lean_node_interval_error_total.incr(
-                    .{ .site = "publishProducedAggregations" },
+                    .{ .site = "publishLocalProducedAggregation" },
                 ) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
             };
             signed_aggregation.deinit();

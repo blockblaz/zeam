@@ -4208,20 +4208,20 @@ pub const BeamChain = struct {
         return self.forkChoice.onSignedAttestation(signedAttestation.message);
     }
 
-    pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        try self.validateAttestationData(signedAggregation.data, false);
-
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
+    /// Update fork-choice attestation trackers for an aggregated proof.
+    pub fn applyAggregatedAttestationTrackers(
+        self: *Self,
+        data: types.AttestationData,
+        proof: *const types.AggregatedSignatureProof,
+    ) !void {
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
-        try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
-
-        // Update attestation trackers for gossip attestations so fork choice sees these votes
         for (validator_indices.items) |vi| {
             const validator_id: types.ValidatorIndex = @intCast(vi);
             const attestation = types.Attestation{
                 .validator_id = validator_id,
-                .data = signedAggregation.data,
+                .data = data,
             };
             self.forkChoice.onAttestation(attestation, false) catch |err| {
                 self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
@@ -4229,7 +4229,16 @@ pub const BeamChain = struct {
                 });
             };
         }
+    }
 
+    pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
+        try self.validateAttestationData(signedAggregation.data, false);
+
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
+        defer validator_indices.deinit(self.allocator);
+
+        try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
+        try self.applyAggregatedAttestationTrackers(signedAggregation.data, &signedAggregation.proof);
         try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
     }
 
