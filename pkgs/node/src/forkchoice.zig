@@ -2039,7 +2039,7 @@ pub const ForkChoice = struct {
     fn buildAggregateSourceAttribution(
         self: *Self,
         att_data: types.AttestationData,
-        proof: types.AggregatedSignatureProof,
+        proof: *const types.AggregatedSignatureProof,
         source_payload_bits: *types.AggregationBits,
         source_gossip_bits: *types.AggregationBits,
     ) !void {
@@ -2187,17 +2187,25 @@ pub const ForkChoice = struct {
         var source_gossip_bits = try types.AggregationBits.init(self.allocator);
         var source_gossip_bits_owned = true;
         errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
-        try self.buildAggregateSourceAttribution(att_data, result.signature, &source_payload_bits, &source_gossip_bits);
+        // ssz.serialize corrupts the source value; clone once for storage and
+        // deserialize a second copy from the same bytes for the publish path.
+        var stored_proof: types.AggregatedSignatureProof = undefined;
+        const proof_bytes = try types.sszCloneAndGetBytes(
+            self.allocator,
+            types.AggregatedSignatureProof,
+            result.signature,
+            &stored_proof,
+        );
+        defer self.allocator.free(proof_bytes);
+        errdefer stored_proof.deinit();
 
-        var cloned_proof: types.AggregatedSignatureProof = undefined;
-        try types.sszClone(self.allocator, types.AggregatedSignatureProof, result.signature, &cloned_proof);
-        errdefer cloned_proof.deinit();
+        try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
 
         const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.allocator, .{
             .slot = att_data.slot,
-            .proof = cloned_proof,
+            .proof = stored_proof,
             .source_payload_participants = source_payload_bits,
             .source_gossip_participants = source_gossip_bits,
         });
@@ -2220,13 +2228,14 @@ pub const ForkChoice = struct {
 
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
         var participant_count: u64 = 0;
-        for (0..result.signature.participants.len()) |i| {
-            if (result.signature.participants.get(i) catch false) participant_count += 1;
+        for (0..stored_proof.participants.len()) |i| {
+            if (stored_proof.participants.get(i) catch false) participant_count += 1;
         }
         zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
 
-        const proof = result.signature;
-        return .{ .data = att_data, .proof = proof };
+        var publish_proof: types.AggregatedSignatureProof = undefined;
+        try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &publish_proof, self.allocator);
+        return .{ .data = att_data, .proof = publish_proof };
     }
 
     /// Produce aggregations only for the caller-supplied attestation slots.
