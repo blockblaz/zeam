@@ -2688,26 +2688,27 @@ pub const BeamNode = struct {
             // arrives to trigger RPC catch-up. Keep the pure policy in
             // `blocks_by_range_sync.zig`; this tick path only supplies snapshots
             // and performs the RPC side effect.
-            if (interval_in_slot == 0 and slot % constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS == 0) {
-                const sync_status = self.chain.getSyncStatus();
-                const our_head_slot = self.chain.forkChoice.getHead().slot;
-                const wall_slot = self.clock.wallSlotNow();
-                const refresh_decision = blocks_by_range_sync.periodicRefreshPeerStatusDecision(
-                    sync_status,
-                    our_head_slot,
-                    wall_slot,
-                    constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
-                );
-                if (refresh_decision.refresh) {
-                    switch (sync_status) {
-                        .synced => self.logger.info(
-                            "head is {d} wall-clock slots behind while synced; refreshing peer status for catch-up",
-                            .{refresh_decision.wall_head_lag_slots},
-                        ),
-                        else => {},
-                    }
-                    self.refreshSyncFromPeers();
+            const sync_status = self.chain.getSyncStatus();
+            const our_head_slot = self.chain.forkChoice.getHead().slot;
+            const wall_slot = self.clock.wallSlotNow();
+            const refresh_decision = blocks_by_range_sync.shouldRefreshPeerStatus(
+                sync_status,
+                interval_in_slot,
+                slot,
+                our_head_slot,
+                wall_slot,
+                constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS,
+                constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+            );
+            if (refresh_decision.refresh) {
+                switch (sync_status) {
+                    .synced => self.logger.info(
+                        "head is {d} wall-clock slots behind while synced; refreshing peer status for catch-up",
+                        .{refresh_decision.wall_head_lag_slots},
+                    ),
+                    else => {},
                 }
+                self.refreshSyncFromPeers();
             }
 
             if (interval_in_slot == 2) {
