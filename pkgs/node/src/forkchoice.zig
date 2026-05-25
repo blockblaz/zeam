@@ -2126,9 +2126,12 @@ pub const ForkChoice = struct {
     ///      pairs that existed at snapshot time (entries added during
     ///      phase 2 stay so the next aggregator pass can consume them).
     ///
-    /// `submitAggregateOnInterval` already gates concurrent
-    /// `aggregate()` calls via `aggregate_group.concurrent`
-    /// (concurrent_limit=1), so two aggregations cannot race here.
+    /// The three-phase contract (snapshot under `signatures_mutex` → lock-free
+    /// compute on owned clones → merge under `signatures_mutex`) prevents map
+    /// races but not duplicate publishes when two workers snapshot the same
+    /// gossip sigs before either commits. Aggregators keep
+    /// `aggregate_max_inflight` at 1; commit also suppresses merge/publish for
+    /// att_data whose snapshot gossip vids are already gone from the live map.
     fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState, slot_filter: ?[]const types.Slot) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
         const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
@@ -2270,6 +2273,31 @@ pub const ForkChoice = struct {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
 
+            // Drop att_data whose snapshot gossip inputs were already consumed
+            // by an earlier in-flight worker (defense when aggregate_max_inflight > 1).
+            var results_write_idx: usize = 0;
+            var results_idx: usize = 0;
+            while (results_idx < results.items.len) : (results_idx += 1) {
+                const att_data = results.items[results_idx].data;
+                if (shouldSuppressDuplicateAggregateCommit(&snap, att_data, &self.attestation_signatures)) {
+                    results.items[results_idx].deinit();
+                    if (new_payloads_local.fetchRemove(att_data)) |kv| {
+                        var list = kv.value;
+                        deinitAggregatedPayloadsList(self.allocator, &list);
+                    }
+                    self.logger.debug(
+                        "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
+                        .{att_data.slot},
+                    );
+                } else {
+                    if (results_write_idx != results_idx) {
+                        results.items[results_write_idx] = results.items[results_idx];
+                    }
+                    results_write_idx += 1;
+                }
+            }
+            results.shrinkRetainingCapacity(results_write_idx);
+
             // MERGE (NOT replace). The previous shape did
             //   deinitAggregatedPayloadsMap(allocator, &self.latest_new_aggregated_payloads);
             //   self.latest_new_aggregated_payloads = new_payloads_local;
@@ -2353,11 +2381,12 @@ pub const ForkChoice = struct {
 
     /// Produce aggregations only for the caller-supplied attestation slots.
     ///
-    /// The aggregate worker is scheduled with `aggregate_group.concurrent`
-    /// (concurrent_limit=1), so a busy worker can skip an interval. Callers should
-    /// pass a small backfill window, e.g. `{current_slot - 1, current_slot}`, to
-    /// recover late or skipped-slot attestations without walking every stale/future
-    /// `AttestationData` key retained in the maps.
+    /// The aggregate worker runs on the shared `ThreadPool` bounded by
+    /// `BeamChain.aggregate_max_inflight`, so a saturated worker pool can skip
+    /// an interval. Callers should pass a small backfill window, e.g.
+    /// `{current_slot - 1, current_slot}`, to recover late or skipped-slot
+    /// attestations without walking every stale/future `AttestationData` key
+    /// retained in the maps.
     pub fn aggregateForSlots(self: *Self, state_opt: ?*const types.BeamState, slots: []const types.Slot) ![]types.SignedAggregatedAttestation {
         return self.aggregateUnlocked(state_opt, slots);
     }
@@ -3809,6 +3838,95 @@ test "isAggregatorTrivialInput higher thresholds skip more no-children inputs" {
     try std.testing.expect(isAggregatorTrivialInput(0, 1, 3));
     try std.testing.expect(isAggregatorTrivialInput(0, 2, 3));
     try std.testing.expect(!isAggregatorTrivialInput(0, 3, 3));
+}
+
+/// Returns true when this worker's snapshot gossip vids for `att_data` were
+/// already consumed by an earlier aggregate commit, so merging/publishing this
+/// pass would duplicate aggregates (PR #920 review).
+fn shouldSuppressDuplicateAggregateCommit(
+    snap: *const AggregateSnapshot,
+    att_data: types.AttestationData,
+    live_sigs: *const types.SignaturesMap,
+) bool {
+    const snap_inner = snap.signatures.get(att_data) orelse return false;
+    if (snap_inner.count() == 0) return false;
+    const live_inner = live_sigs.get(att_data) orelse return true;
+    var it = snap_inner.iterator();
+    while (it.next()) |entry| {
+        if (live_inner.contains(entry.key_ptr.*)) return false;
+    }
+    return true;
+}
+
+test "shouldSuppressDuplicateAggregateCommit: no snap gossip never suppresses" {
+    const allocator = std.testing.allocator;
+    const zero_root = std.mem.zeroes(types.Root);
+    const att_data = types.AttestationData{
+        .slot = 1,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = zero_root, .slot = 0 },
+        .source = .{ .root = zero_root, .slot = 0 },
+    };
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+    var live = types.SignaturesMap.init(allocator);
+    defer live.deinit();
+    try std.testing.expect(!shouldSuppressDuplicateAggregateCommit(&snap, att_data, &live));
+}
+
+test "shouldSuppressDuplicateAggregateCommit: snap gossip still live does not suppress" {
+    const allocator = std.testing.allocator;
+    const zero_root = std.mem.zeroes(types.Root);
+    const att_data = types.AttestationData{
+        .slot = 1,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = zero_root, .slot = 0 },
+        .source = .{ .root = zero_root, .slot = 0 },
+    };
+    const stored_sig = types.StoredSignature{ .slot = 1, .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)) };
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+    var snap_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try snap_inner.put(0, stored_sig);
+    try snap_inner.put(1, stored_sig);
+    try snap.signatures.put(att_data, snap_inner);
+    var live = types.SignaturesMap.init(allocator);
+    defer live.deinit();
+    try live.addSignature(att_data, 0, stored_sig);
+    try std.testing.expect(!shouldSuppressDuplicateAggregateCommit(&snap, att_data, &live));
+}
+
+test "shouldSuppressDuplicateAggregateCommit: snap gossip fully consumed suppresses" {
+    const allocator = std.testing.allocator;
+    const zero_root = std.mem.zeroes(types.Root);
+    const att_data = types.AttestationData{
+        .slot = 1,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = zero_root, .slot = 0 },
+        .source = .{ .root = zero_root, .slot = 0 },
+    };
+    const stored_sig = types.StoredSignature{ .slot = 1, .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)) };
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+    var snap_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try snap_inner.put(0, stored_sig);
+    try snap_inner.put(1, stored_sig);
+    try snap.signatures.put(att_data, snap_inner);
+    var live = types.SignaturesMap.init(allocator);
+    defer live.deinit();
+    try std.testing.expect(shouldSuppressDuplicateAggregateCommit(&snap, att_data, &live));
 }
 
 /// Walk the owned aggregator snapshot and drop every `att_data` entry

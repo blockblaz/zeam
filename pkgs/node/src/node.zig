@@ -62,6 +62,8 @@ const NodeOpts = struct {
     /// aggregation threshold; see
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Soft cap on concurrent aggregate workers (`BeamChain.aggregate_inflight`).
+    aggregate_max_inflight: u32 = 4,
 };
 
 pub const BeamNode = struct {
@@ -142,6 +144,7 @@ pub const BeamNode = struct {
                 .is_aggregator = opts.is_aggregator,
                 .thread_pool = opts.thread_pool,
                 .min_aggregation_inputs = opts.min_aggregation_inputs,
+                .aggregate_max_inflight = opts.aggregate_max_inflight,
             },
             network.connected_peers,
         ) catch |init_err| {

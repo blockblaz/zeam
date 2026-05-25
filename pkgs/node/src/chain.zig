@@ -71,6 +71,14 @@ pub const ChainOpts = struct {
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs` for the
     /// default and `isTrivialAggregationInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
+    /// enforced lock-free by `submitAggregateOnInterval`; further submits
+    /// are skipped (counted as `zeam_aggregate_skip_total{reason="in_flight"}`).
+    /// Kept low (default 4) so the queue drains quickly and the aggregator
+    /// stays focused on CURRENT slots rather than catching up old ones — per
+    /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
+    /// further-back slots are wasted work. See `BeamChain.aggregateImpl`.
+    aggregate_max_inflight: u32 = 4,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -377,13 +385,19 @@ pub const BeamChain = struct {
     root_to_slot_lock: zeam_utils.SyncMutex = .{},
     events_lock: zeam_utils.SyncMutex = .{},
 
-    /// Dedicated Io.Threaded for the aggregate FFI worker (issue #873).
-    /// `concurrent_limit = .limited(1)` enforces at most one in-flight
-    /// aggregate task; a second submit returns `error.ConcurrencyUnavailable`.
-    aggregate_io: *std.Io.Threaded,
+    /// In-flight aggregate worker count (issue #907). `submitAggregateOnInterval`
+    /// atomically checks against `aggregate_max_inflight` before spawning so the
+    /// libxev interval tick never blocks. `aggregateImpl` decrements on exit.
+    /// Aggregators keep this at 1; per-att_data FFI parallelism lives inside
+    /// `aggregateUnlocked`. Values > 1 rely on commit-time duplicate suppression
+    /// in `forkchoice.aggregateUnlocked` (see PR #920 review).
+    aggregate_inflight: std.atomic.Value(u32) = .init(0),
 
-    /// Long-lived group hosting submitted aggregate tasks.
-    aggregate_group: std.Io.Group = .init,
+    /// Joined at `deinit` so aggregate workers cannot outlive chain state.
+    aggregate_wg: WaitGroup = .{},
+
+    /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
+    aggregate_max_inflight: u32,
 
     /// Dedicated Io.Threaded for the block-proposal worker.
     /// `concurrent_limit = .limited(1)` enforces at most one in-flight
@@ -538,18 +552,10 @@ pub const BeamChain = struct {
         errdefer anchor_rc.release();
         try states.put(fork_choice.head.blockRoot, anchor_rc);
 
-        // Issue #873: dedicated Io.Threaded for aggregate FFI worker.
-        // concurrent_limit = .limited(1) ensures at most one in-flight aggregate task.
-        const agg_io = try allocator.create(std.Io.Threaded);
-        errdefer allocator.destroy(agg_io);
-        agg_io.* = std.Io.Threaded.init(allocator, .{
-            .async_limit = .nothing,
-            .concurrent_limit = .limited(1),
-        });
-        errdefer agg_io.deinit();
-
-        // Dedicated Io.Threaded for block proposal/prover worker.
-        // concurrent_limit = .limited(1) ensures at most one in-flight proposal task.
+        // Dedicated Io.Threaded for the block-proposal prover worker (#863):
+        // produceBlock + buildBlockProof drive the recursive prover, which must run
+        // off the slot-driver loop. concurrent_limit = .limited(1) caps in-flight to one.
+        // (Aggregate work uses main's #907 counter + WaitGroup model, below.)
         const prop_io = try allocator.create(std.Io.Threaded);
         errdefer allocator.destroy(prop_io);
         prop_io.* = std.Io.Threaded.init(allocator, .{
@@ -600,11 +606,14 @@ pub const BeamChain = struct {
             // at its final heap location), so the worker's ctx pointer
             // remains stable for its entire lifetime.
             .chain_worker = null,
-            // aggregate_io: dedicated Io.Threaded for aggregate FFI worker (issue #873).
-            .aggregate_io = agg_io,
-            .aggregate_group = .init,
+            // Block-proposal prover worker (#863): offloaded off the slot driver.
             .propose_io = prop_io,
             .propose_group = .init,
+            // Aggregate worker bookkeeping (issue #907). Counter + WaitGroup
+            // backstop the lock-free cap check + `deinit` join — see field docs.
+            .aggregate_inflight = .init(0),
+            .aggregate_wg = .{},
+            .aggregate_max_inflight = opts.aggregate_max_inflight,
             // leanSpec _pending_attestations / _pending_aggregated_attestations
             // buffers — empty at init; FIFO-bounded by
             // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
@@ -1523,10 +1532,10 @@ pub const BeamChain = struct {
         // never called.)
         self.stopChainStateRefcountObserver();
 
-        // Wait for any in-flight aggregate/proposal worker before
-        // tearing down chain state it references.
-        self.aggregate_group.cancel(self.aggregate_io.io());
+        // Wait for any in-flight proposal worker (#863) and aggregate workers
+        // (#907) before tearing down chain state they reference.
         self.propose_group.cancel(self.propose_io.io());
+        self.thread_pool.waitAndWork(&self.aggregate_wg);
 
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
@@ -1540,10 +1549,8 @@ pub const BeamChain = struct {
             self.chain_worker = null;
         }
 
-        // Tear down aggregate/proposal worker pools after chain_worker
-        // is stopped and their groups are cancelled.
-        self.aggregate_io.deinit();
-        self.allocator.destroy(self.aggregate_io);
+        // Tear down the proposal worker pool (#863) after chain_worker is
+        // stopped and propose_group is cancelled.
         self.propose_io.deinit();
         self.allocator.destroy(self.propose_io);
 
@@ -4425,36 +4432,55 @@ pub const BeamChain = struct {
             },
         }
 
+        // Non-blocking cap check on the libxev thread. Done BEFORE the
+        // expensive state borrow + `cloneAndRelease` so a saturated worker
+        // pool doesn't burn deep-clones we'd immediately throw away.
+        // `fetchAdd`-then-compare is a soft ceiling — transient overshoot
+        // is bounded by concurrent caller count and self-corrects on the
+        // next interval.
+        const prev = self.aggregate_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= self.aggregate_max_inflight) {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
+            self.logger.info("skipping aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
+            return;
+        }
+        // Past this point we own one `aggregate_inflight` slot — every
+        // early-return below must release it.
+
         // Snapshot state on the caller's thread (fast path).
         const head_root = self.forkChoice.getHead().blockRoot;
         var borrow = self.statesGet(head_root) orelse {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
             zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "missing_state" }) catch {};
             return;
         };
         defer borrow.assertReleasedOrPanic();
         const snapshot = borrow.cloneAndRelease(self.allocator) catch |err| {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
             return;
         };
 
-        // Submit to the dedicated aggregate worker. concurrent_limit=1
-        // ensures at most one in-flight task.
-        self.aggregate_group.concurrent(self.aggregate_io.io(), aggregateImpl, .{ self, node, snapshot, slot }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                self.logger.info("skipping aggregation for slot={d}: previous aggregate still in-flight", .{slot});
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
-                // Free the snapshot we just cloned — the worker won't run.
-                snapshot.deinit();
-                self.allocator.destroy(snapshot);
-                return;
-            },
+        // Non-blocking enqueue onto the shared ThreadPool. The libxev thread
+        // returns immediately; the worker runs on a pool thread. We deliberately
+        // do NOT fall back to inline execution on OOM (unlike replay batches)
+        // because the ~10s aggregate FFI must not run on the libxev thread.
+        self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, snapshot, slot }) catch {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
+            snapshot.deinit();
+            self.allocator.destroy(snapshot);
+            return;
         };
     }
 
-    /// Worker body for the aggregate FFI (runs on `aggregate_io` thread).
+    /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).
     /// Owns `snapshot` and frees it on exit.
     fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, slot: usize) void {
+        defer _ = chain.aggregate_inflight.fetchSub(1, .acq_rel);
         const worker_timer = zeam_metrics.zeam_aggregate_worker_duration_seconds.start();
         defer _ = worker_timer.observe();
 

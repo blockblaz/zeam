@@ -214,6 +214,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("@zeam/utils", zeam_utils);
     zeam_types.addImport("@zeam/metrics", zeam_metrics);
     zeam_types.addImport("@zeam/xmss", zeam_xmss);
+    zeam_types.addImport("@zeam/thread-pool", zeam_thread_pool);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
