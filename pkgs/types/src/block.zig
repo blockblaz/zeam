@@ -539,6 +539,13 @@ fn slotAllowed(slot: Slot, slot_filter: ?[]const Slot) bool {
     return false;
 }
 
+fn observeAggregateAttDataPrepPhase(start_ns: i128) void {
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    zeam_metrics.observeAggregateAttestationBuildPhase("att_data_prep", elapsed_s);
+}
+
 pub const AggregatedAttestationsResult = struct {
     attestations: AggregatedAttestations,
     attestation_signatures: Type1ProofList,
@@ -611,6 +618,7 @@ pub const AggregatedAttestationsResult = struct {
         while (data_it.next()) |data_entry| {
             const data = data_entry.key_ptr.*;
             const epoch: u64 = data.slot;
+            const att_data_prep_start_ns = zeam_utils.monotonicTimestampNs();
             var message_hash: [32]u8 = undefined;
             try zeam_utils.hashTreeRoot(attestation.AttestationData, data, &message_hash, allocator);
 
@@ -708,7 +716,10 @@ pub const AggregatedAttestationsResult = struct {
             const has_gossip = sigmap_sigs.items.len > 0;
             const has_children = selected_children.items.len > 0;
 
-            if (!has_gossip and !has_children) continue;
+            if (!has_gossip and !has_children) {
+                observeAggregateAttDataPrepPhase(att_data_prep_start_ns);
+                continue;
+            }
 
             // Build gossip participants bitfield and handle arrays
             var xmss_participants: ?attestation.AggregationBits = null;
@@ -746,6 +757,8 @@ pub const AggregatedAttestationsResult = struct {
 
             // If only 1 child and no gossip, pass through the child directly
             if (!has_gossip and selected_children.items.len == 1) {
+                observeAggregateAttDataPrepPhase(att_data_prep_start_ns);
+
                 const child = &selected_children.items[0];
 
                 var att_bits: attestation.AggregationBits = undefined;
@@ -807,6 +820,8 @@ pub const AggregatedAttestationsResult = struct {
                 try child_pk_allocs.append(allocator, cpks);
                 try child_pk_slices.append(allocator, cpks[0..cpk_idx]);
             }
+
+            observeAggregateAttDataPrepPhase(att_data_prep_start_ns);
 
             const pq_sig_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
             try aggregation.TypeOneMultiSignature.aggregate(

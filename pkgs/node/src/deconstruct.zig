@@ -37,14 +37,6 @@ const LOG_INV_RATE = types.LOG_INV_RATE_PROD;
 /// recursion cap aborts it. Selection below is capped to this minus the block component.
 const MAX_AGGREGATE_CHILDREN: usize = 16;
 
-/// Master gate for block deconstruction. Enabled: COMPUTE runs the prover on the chain-worker
-/// thread during block import (NOT the libxev slot driver), measured not to lag import in the sim
-/// (head tracks current; per-call build ~0.3s). Recovers per-attestation Type-1 proofs into the
-/// pending pool so block PROPOSAL has aggregated attestations to include even when the gossip
-/// aggregate for that data was missed — without it a node proposes blocks with coverage=none and
-/// the chain never accrues justification weight, so it never justifies/finalizes.
-pub const enabled = true;
-
 /// One recovered attestation staged for commit: the combined Type-1 proof to insert into
 /// `latest_new_aggregated_payloads`, plus the participant sets of the local partials it merged in
 /// (so commit can best-effort drop those now-redundant entries).
@@ -98,10 +90,6 @@ pub fn deconstructCompute(
 ) !StagedDeconstruct {
     var staged = StagedDeconstruct.empty(allocator);
     errdefer staged.deinit();
-
-    // Gated off (see `enabled`). Disabling only reduces gossip/reaggregation coverage; fork-choice
-    // weight comes from the eager AttestationTracker, not this pool.
-    if (!enabled) return staged;
 
     const block_atts = signed_block.block.body.attestations.constSlice();
     if (block_atts.len == 0) return staged;

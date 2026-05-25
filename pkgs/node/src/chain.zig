@@ -4349,16 +4349,12 @@ pub const BeamChain = struct {
         const validator = if (node.validator) |*validator| validator else return;
         if (validator.getSlotProposer(slot) == null) return;
 
-        // Submit to the dedicated proposal worker. concurrent_limit=1
-        // ensures at most one in-flight task. Proposal state is cloned
-        // inside maybeDoProposal/produceBlock, so there is no caller-side
-        // snapshot to free if the submit is skipped.
-        self.propose_group.concurrent(self.propose_io.io(), proposeImpl, .{ self, node, slot }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                self.logger.info("skipping block proposal for slot={d}: previous proposal still in-flight", .{slot});
-                return;
-            },
-        };
+        // DIAGNOSTIC (0f778f94 cross-thread libxev bug): run proposeImpl SYNCHRONOUSLY on the
+        // slot-driver (main loop) thread instead of offloading to propose_io. proposeImpl calls
+        // node.publishBlock + forkChoice.onInterval, which touch the single-threaded libxev loop;
+        // doing that from the propose_io worker corrupts the loop's timer pairing-heap (infinite
+        // loop in combine_siblings). Synchronous == pre-0f778f94 behavior.
+        proposeImpl(self, node, slot);
     }
 
     /// Worker body for block proposal/proving (runs on `propose_io` thread).
@@ -4463,18 +4459,12 @@ pub const BeamChain = struct {
             return;
         };
 
-        // Non-blocking enqueue onto the shared ThreadPool. The libxev thread
-        // returns immediately; the worker runs on a pool thread. We deliberately
-        // do NOT fall back to inline execution on OOM (unlike replay batches)
-        // because the ~10s aggregate FFI must not run on the libxev thread.
-        self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, snapshot, slot }) catch {
-            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
-            self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
-            snapshot.deinit();
-            self.allocator.destroy(snapshot);
-            return;
-        };
+        // DIAGNOSTIC (cross-thread libxev bug): run aggregateImpl SYNCHRONOUSLY on the slot-driver
+        // (main loop) thread instead of a ThreadPool worker. aggregateImpl calls
+        // node.publishProducedAggregations, which in the single-process mock network touches the
+        // single-threaded libxev loop; doing it from a worker thread corrupts the loop's timer
+        // pairing-heap (infinite loop in combine_siblings). Synchronous == pre-#907 behavior.
+        aggregateImpl(self, node, snapshot, slot);
     }
 
     /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).

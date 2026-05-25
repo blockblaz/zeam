@@ -1,6 +1,8 @@
 const std = @import("std");
 const hashsig = @import("hashsig.zig");
 const ssz = @import("ssz");
+const zeam_metrics = @import("@zeam/metrics");
+const zeam_utils = @import("@zeam/utils");
 
 pub const AggregationError = error{
     PublicKeysSignatureLengthMismatch,
@@ -110,6 +112,15 @@ extern fn xmss_verify_type_2(
     message_slots: [*]const u32,
 ) callconv(.c) bool;
 
+/// Cached after first successful init; Rust side uses OnceLock as well.
+var prover_ready = std.atomic.Value(bool).init(false);
+
+fn ensureProverReady() AggregationError!void {
+    if (prover_ready.load(.acquire)) return;
+    try setupProver();
+    prover_ready.store(true, .release);
+}
+
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
 /// `num_threads = 0` means rayon default. Silently no-ops if the pool is already initialized.
 pub fn setRayonThreads(num_threads: usize) void {
@@ -153,7 +164,7 @@ pub fn aggregateType1(
     if (raw_pks.len != raw_sigs.len) return AggregationError.PublicKeysSignatureLengthMismatch;
     if (children_pks.len != children_proofs.len) return AggregationError.Type1AggregateFailed;
 
-    try setupProver();
+    try ensureProverReady();
 
     const allocator = std.heap.c_allocator;
     const num_children = children_pks.len;
@@ -190,6 +201,7 @@ pub fn aggregateType1(
     const buf = allocator.alloc(u8, MAX_AGGREGATE_PROOF_SIZE) catch return AggregationError.Type1AggregateFailed;
     defer allocator.free(buf);
     var written: usize = 0;
+    const prove_start_ns = zeam_utils.monotonicTimestampNs();
     const rc = xmss_aggregate_type_1(
         raw_pks.ptr,
         raw_sigs.ptr,
@@ -208,7 +220,15 @@ pub fn aggregateType1(
     );
     if (rc == -2) return AggregationError.ProofTooLarge;
     if (rc != 0) return AggregationError.Type1AggregateFailed;
+    recordXmssProveDuration(prove_start_ns);
     try appendAll(out, buf[0..written]);
+}
+
+fn recordXmssProveDuration(start_ns: i128) void {
+    const end_ns = zeam_utils.monotonicTimestampNs();
+    const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
+    const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    zeam_metrics.observeXmssRecAggregateProve(elapsed_s);
 }
 
 /// Verify a Type-1 proof. `pks` are the participants' public-key handles; the (message, slot)
@@ -241,7 +261,7 @@ pub fn mergeType1ToType2(
     if (parts.len != pks_per_part.len) return AggregationError.Type2MergeFailed;
     if (parts.len == 0) return AggregationError.Type2MergeFailed;
 
-    try setupProver();
+    try ensureProverReady();
 
     const allocator = std.heap.c_allocator;
     const num_parts = parts.len;
@@ -305,7 +325,7 @@ pub fn splitType2ByMessage(
     log_inv_rate: usize,
     out: *ByteList512KiB,
 ) AggregationError!void {
-    try setupProver();
+    try ensureProverReady();
 
     const allocator = std.heap.c_allocator;
     const num_messages = pks_per_message.len;
