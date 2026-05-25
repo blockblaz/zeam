@@ -122,6 +122,21 @@ pub unsafe extern "C" fn xmss_aggregate(
         Err(_) => return std::ptr::null(),
     };
 
+    if num_children == 0 && num_raw == 1 {
+        if raw_pub_keys.is_null() || raw_signatures.is_null() {
+            return std::ptr::null();
+        }
+        let pk_ptr = unsafe { *raw_pub_keys };
+        let sig_ptr = unsafe { *raw_signatures };
+        if pk_ptr.is_null() || sig_ptr.is_null() {
+            return std::ptr::null();
+        }
+        let raw_xmss = vec![((*pk_ptr).inner.clone(), (*sig_ptr).inner.clone())];
+        let (_pub_keys, agg_sig) =
+            rec_xmss_aggregate(&[], raw_xmss, message_hash, slot, log_inv_rate);
+        return Box::into_raw(Box::new(agg_sig));
+    }
+
     // Build raw XMSS pairs: (XmssPublicKey, XmssSignature)
     let mut raw_xmss: Vec<(XmssPublicKey, XmssSignature)> = Vec::with_capacity(num_raw);
     if num_raw > 0 {

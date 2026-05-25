@@ -488,7 +488,7 @@ pub const Node = struct {
         // Aggregators: XMSS recursive prove (rayon) is the per-slot bottleneck. Keep a
         // small Zig pool for capped in-flight aggregate workers (#907).
         const worker_count = if (options.is_aggregator) blk: {
-            const aggregator_zig_workers = @max(@as(usize, 2), desired_workers / 4);
+            const aggregator_zig_workers = @max(@as(usize, 2), desired_workers / 3);
             break :blk @min(@as(usize, ThreadPool.max_thread_count), aggregator_zig_workers);
         } else blk: {
             const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
@@ -555,6 +555,9 @@ pub const Node = struct {
         if (options.is_aggregator) {
             xmss.setupProver() catch |err| {
                 self.logger.warn("xmss prover setup failed: {any}; aggregation may be unavailable", .{err});
+            };
+            xmss.prewarmProver() catch |err| {
+                self.logger.warn("xmss prover prewarm failed: {any}", .{err});
             };
         }
 

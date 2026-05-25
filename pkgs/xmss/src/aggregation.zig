@@ -85,6 +85,12 @@ fn ensureProverReady() !void {
     prover_ready.store(true, .release);
 }
 
+/// Idempotent prover warm-up for aggregators. Call at startup (before the
+/// first slot trigger) so the first real aggregate does not pay cold-init tail.
+pub fn prewarmProver() !void {
+    try ensureProverReady();
+}
+
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
 /// Must be called before `setupProver` and before any aggregation work begins.
 /// `num_threads = 0` means "use rayon's default" (one thread per logical CPU).

@@ -494,8 +494,9 @@ pub const AggregatedAttestationsResult = struct {
     ///         optionally restricted to the supplied attestation slots.
     /// Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
     /// Step 3: Collect individual gossip signatures not covered by children
-    /// Step 4: Lone-child clone fast path: `0 gossip + 1 child` clones the
-    ///         lone child as the result without invoking the prover.
+    /// Step 4: Single-source fast paths without child payloads:
+    ///         `0 gossip + 1 child` clones the lone child; `1 gossip + 0 children`
+    ///         builds minimal FFI args for leanMultisig's degenerate single-raw prove.
     /// Step 5: Recursive aggregate — combine selected children + remaining gossip sigs.
     ///
     /// Spec-pure: this function aggregates whatever it is given. Callers
@@ -757,6 +758,74 @@ const AggregateAttDataFfiArgs = struct {
     }
 };
 
+/// Build FFI args for the degenerate `1 gossip sig + 0 children` shape. Still
+/// invokes leanMultisig once, but skips child-selection loops entirely.
+fn finishSingleRawAggregatePrep(
+    allocator: Allocator,
+    data: attestation.AttestationData,
+    message_hash: [32]u8,
+    epoch: u64,
+    sigmap_sigs: *std.ArrayList(xmss.Signature),
+    sigmap_pks: *std.ArrayList(xmss.PublicKey),
+    sigmap_vids: *std.ArrayList(usize),
+) !AggregateAttDataPrep {
+    std.debug.assert(sigmap_sigs.items.len == 1);
+    std.debug.assert(sigmap_pks.items.len == 1);
+    std.debug.assert(sigmap_vids.items.len == 1);
+
+    var gp = try attestation.AggregationBits.init(allocator);
+    errdefer gp.deinit();
+    try attestation.aggregationBitsSet(&gp, sigmap_vids.items[0], true);
+
+    const pks = try allocator.alloc(*const xmss.HashSigPublicKey, 1);
+    errdefer allocator.free(pks);
+    const sigs = try allocator.alloc(*const xmss.HashSigSignature, 1);
+    errdefer allocator.free(sigs);
+    pks[0] = sigmap_pks.items[0].handle;
+    sigs[0] = sigmap_sigs.items[0].handle;
+
+    const gossip_sigs = try sigmap_sigs.toOwnedSlice(allocator);
+    errdefer {
+        for (gossip_sigs) |*sig| sig.deinit();
+        allocator.free(gossip_sigs);
+    }
+    sigmap_sigs.* = .empty;
+
+    const gossip_pks = try sigmap_pks.toOwnedSlice(allocator);
+    errdefer {
+        for (gossip_pks) |*pk| pk.deinit();
+        allocator.free(gossip_pks);
+    }
+    sigmap_pks.* = .empty;
+    sigmap_vids.deinit(allocator);
+
+    const empty_children = try allocator.alloc(aggregation.AggregatedSignatureProof, 0);
+    const empty_child_slices = try allocator.alloc([]*const xmss.HashSigPublicKey, 0);
+    const empty_child_allocs = try allocator.alloc([]*const xmss.HashSigPublicKey, 0);
+    const empty_child_wrappers = try allocator.alloc(xmss.PublicKey, 0);
+
+    return .{
+        .data = data,
+        .outcome = .{
+            .ffi = .{
+                .message_hash = message_hash,
+                .epoch = epoch,
+                .xmss_participants = gp,
+                .selected_children = empty_children,
+                .child_pk_slices = empty_child_slices,
+                .pk_handles = pks,
+                .sig_handles = sigs,
+                .child_pk_allocs = empty_child_allocs,
+                .child_pk_wrappers = empty_child_wrappers,
+                .gossip_sig_wrappers = gossip_sigs,
+                .gossip_pk_wrappers = gossip_pks,
+                .pk_handles_buf = pks,
+                .sig_handles_buf = sigs,
+            },
+        },
+    };
+}
+
 fn prepareAggregateAttData(
     allocator: Allocator,
     validators: *const Validators,
@@ -863,6 +932,18 @@ fn prepareAggregateAttData(
                 },
             },
         };
+    }
+
+    if (!has_children and has_gossip and sigmap_sigs.items.len == 1) {
+        return try finishSingleRawAggregatePrep(
+            allocator,
+            data,
+            message_hash,
+            epoch,
+            &sigmap_sigs,
+            &sigmap_pks,
+            &sigmap_vids,
+        );
     }
 
     var xmss_participants: ?attestation.AggregationBits = null;
@@ -1014,6 +1095,22 @@ fn runAggregateAttDataFfi(
 }
 
 fn runAggregateAttDataPreps(allocator: Allocator, preps: []AggregateAttDataPrep, thread_pool: *ThreadPool) !void {
+    var single_ffi_idx: ?usize = null;
+    var ffi_count: usize = 0;
+    for (preps, 0..) |*prep, i| {
+        if (prep.outcome != .ffi) continue;
+        ffi_count += 1;
+        single_ffi_idx = i;
+    }
+
+    if (ffi_count == 1) {
+        const i = single_ffi_idx.?;
+        const result = try runAggregateAttDataFfi(allocator, preps[i].data, &preps[i].outcome.ffi);
+        preps[i].outcome.ffi.deinit(allocator);
+        preps[i].outcome = .{ .done = result };
+        return;
+    }
+
     const slots = try allocator.alloc(AggregateAttDataSlot, preps.len);
     defer allocator.free(slots);
     for (slots) |*slot| slot.* = .{};

@@ -71,8 +71,9 @@ pub const ChainOpts = struct {
     /// default and `isTrivialAggregationInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
-    /// enforced lock-free by `submitAggregateOnInterval`; further submits
-    /// are skipped (counted as `zeam_aggregate_skip_total{reason="in_flight"}`).
+    /// enforced lock-free by `submitAggregateOnInterval`. When the cap is
+    /// reached the trigger is coalesced into `aggregate_reschedule_intervals`
+    /// and retried once when the in-flight worker finishes (see #907).
     /// Kept low (default 4) so the queue drains quickly and the aggregator
     /// stays focused on CURRENT slots rather than catching up old ones — per
     /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
@@ -391,6 +392,10 @@ pub const BeamChain = struct {
     /// in `forkchoice.aggregateUnlocked` (see PR #920 review).
     aggregate_inflight: std.atomic.Value(u32) = .init(0),
 
+    /// Latest slot-driver interval coalesced while an aggregate worker was
+    /// in flight. `aggregateImpl` clears this on exit and re-submits once.
+    aggregate_reschedule_intervals: std.atomic.Value(u64) = .init(0),
+
     /// Joined at `deinit` so aggregate workers cannot outlive chain state.
     aggregate_wg: WaitGroup = .{},
 
@@ -587,6 +592,7 @@ pub const BeamChain = struct {
             // Aggregate worker bookkeeping (issue #907). Counter + WaitGroup
             // backstop the lock-free cap check + `deinit` join — see field docs.
             .aggregate_inflight = .init(0),
+            .aggregate_reschedule_intervals = .init(0),
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
             // leanSpec _pending_attestations / _pending_aggregated_attestations
@@ -4278,10 +4284,10 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
+    /// Submit aggregate work to the dedicated ThreadPool worker (issue #873).
     /// Returns within microseconds; the worker calls `publishProducedAggregations`
-    /// itself. If the previous aggregate is still in-flight, the submit is
-    /// skipped and the skip metric is incremented.
+    /// itself. If the previous aggregate is still in-flight, the trigger is
+    /// coalesced and a catch-up run is scheduled when the worker finishes.
     pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
@@ -4323,8 +4329,12 @@ pub const BeamChain = struct {
         const prev = self.aggregate_inflight.fetchAdd(1, .acq_rel);
         if (prev >= self.aggregate_max_inflight) {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
-            self.logger.info("skipping aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
+            const existing = self.aggregate_reschedule_intervals.load(.monotonic);
+            if (time_intervals > existing) {
+                self.aggregate_reschedule_intervals.store(time_intervals, .release);
+            }
+            self.logger.info("coalescing aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
+            zeam_metrics.metrics.zeam_aggregate_coalesced_total.incr();
             return;
         }
         // Past this point we own one `aggregate_inflight` slot — every
@@ -4362,6 +4372,12 @@ pub const BeamChain = struct {
     /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).
     /// Owns `snapshot` and frees it on exit.
     fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, slot: usize) void {
+        defer {
+            const reschedule = chain.aggregate_reschedule_intervals.swap(0, .acq_rel);
+            if (reschedule != 0) {
+                chain.submitAggregateOnInterval(node, @intCast(reschedule));
+            }
+        }
         defer _ = chain.aggregate_inflight.fetchSub(1, .acq_rel);
         const worker_timer = zeam_metrics.zeam_aggregate_worker_duration_seconds.start();
         defer _ = worker_timer.observe();
