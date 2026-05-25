@@ -4411,7 +4411,7 @@ pub const BeamChain = struct {
                 } else |_| {}
             }
         }
-        publish_ctx.node.publishAggregation(agg) catch |err| {
+        publish_ctx.node.publishLocalProducedAggregation(agg) catch |err| {
             publish_ctx.chain.logger.err(
                 "error publishing aggregation at slot={d}: {any} (continuing worker)",
                 .{ agg.data.slot, err },
