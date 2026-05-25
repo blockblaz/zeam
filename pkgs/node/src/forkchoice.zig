@@ -1744,24 +1744,18 @@ pub const ForkChoice = struct {
     /// If is_from_block, stores in latest_known_aggregated_payloads (immediately available for block building).
     /// Otherwise, stores in latest_new_aggregated_payloads (promoted to known via periodic ticks).
     ///
-    /// Takes ownership of `proof` (no SSZ clone on the primary store path).
+    /// Clones `proof` into fork choice; callers retain ownership of the passed-in value
+    /// (required for gossip/chain-worker paths that deinit the surrounding message later).
     pub fn storeAggregatedPayload(
         self: *Self,
         attestation_data: *const types.AttestationData,
         proof: types.AggregatedSignatureProof,
         is_from_block: bool,
     ) !void {
-        var owned_proof = proof;
-        var proof_owned = true;
-        errdefer if (proof_owned) owned_proof.deinit();
-
-        var block_proof: types.AggregatedSignatureProof = undefined;
-        var block_proof_owned = false;
-        if (is_from_block) {
-            try types.sszClone(self.allocator, types.AggregatedSignatureProof, owned_proof, &block_proof);
-            block_proof_owned = true;
-            errdefer if (block_proof_owned) block_proof.deinit();
-        }
+        var cloned_proof: types.AggregatedSignatureProof = undefined;
+        try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+        var cloned_proof_owned = true;
+        errdefer if (cloned_proof_owned) cloned_proof.deinit();
 
         {
             self.signatures_mutex.lock();
@@ -1779,9 +1773,9 @@ pub const ForkChoice = struct {
 
             try gop.value_ptr.append(self.allocator, .{
                 .slot = attestation_data.slot,
-                .proof = owned_proof,
+                .proof = cloned_proof,
             });
-            proof_owned = false;
+            cloned_proof_owned = false;
 
             if (is_from_block) {
                 if (self.latest_block_aggregated_payloads_slot == null or self.latest_block_aggregated_payloads_slot.? != attestation_data.slot) {
@@ -1789,6 +1783,11 @@ pub const ForkChoice = struct {
                     self.latest_block_aggregated_payloads = AggregatedPayloadsMap.init(self.allocator);
                     self.latest_block_aggregated_payloads_slot = attestation_data.slot;
                 }
+
+                var block_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &block_proof);
+                var block_proof_owned = true;
+                errdefer if (block_proof_owned) block_proof.deinit();
 
                 const block_gop = try self.latest_block_aggregated_payloads.getOrPut(attestation_data.*);
                 if (!block_gop.found_existing) {
