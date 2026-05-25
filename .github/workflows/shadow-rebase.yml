@@ -1,0 +1,71 @@
+name: Shadow Branch Auto-Rebase
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rebase-shadow:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Configure git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Fetch all branches
+      run: git fetch origin
+
+    - name: Rebase shadow onto main
+      id: rebase
+      run: |
+        echo "🔄 Rebasing origin/shadow onto origin/main..."
+        git checkout shadow
+        git rebase origin/main
+        echo "rebase_status=success" >> $GITHUB_OUTPUT
+        echo "✅ Rebase succeeded"
+
+    - name: Push rebased shadow branch
+      if: steps.rebase.outputs.rebase_status == 'success'
+      run: |
+        git push origin shadow --force-with-lease
+        echo "✅ Pushed rebased shadow branch"
+
+    - name: Send Telegram failure notification
+      if: failure()
+      run: |
+        MAIN_SHA="${{ github.sha }}"
+        COMMIT_MSG="${{ github.event.head_commit.message }}"
+        REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+        RUN_URL="$REPO_URL/actions/runs/${{ github.run_id }}"
+
+        MESSAGE="🚨 *Shadow branch rebase FAILED*
+
+        The \`shadow\` branch could not be automatically rebased onto \`main\`.
+        Manual intervention is required.
+
+        *Trigger commit:* \`${MAIN_SHA:0:8}\`
+        *Message:* ${COMMIT_MSG:0:80}
+
+        *🔗 CI Run:* [View logs]($RUN_URL)
+
+        _Please resolve the rebase conflict and push shadow manually._"
+
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+            \"text\": \"$MESSAGE\",
+            \"parse_mode\": \"Markdown\",
+            \"disable_web_page_preview\": true
+          }" && echo "📱 Telegram failure notification sent" || echo "❌ Failed to send Telegram notification"

@@ -241,8 +241,79 @@ jobs:
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.docker_tag }}-amd64 \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.docker_tag }}-arm64
 
+  rebase-shadow:
+    needs: create-tags
+    runs-on: ubuntu-latest
+    if: ${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
+    outputs:
+      shadow_status: ${{ steps.rebase.outputs.shadow_status }}
+      shadow_sha: ${{ steps.rebase.outputs.shadow_sha }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Configure git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Fetch all branches
+      run: git fetch origin
+
+    - name: Rebase shadow onto main and push
+      id: rebase
+      run: |
+        if git ls-remote --heads origin shadow | grep -q 'refs/heads/shadow'; then
+          echo "🔄 Rebasing shadow onto main..."
+          git checkout shadow
+          if git rebase origin/main; then
+            git push origin shadow --force-with-lease
+            NEW_SHA=$(git rev-parse --short HEAD)
+            echo "shadow_status=✅ rebased to $NEW_SHA" >> $GITHUB_OUTPUT
+            echo "shadow_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+            echo "✅ Shadow rebase succeeded: $NEW_SHA"
+          else
+            git rebase --abort || true
+            echo "shadow_status=❌ rebase conflict — manual fix needed" >> $GITHUB_OUTPUT
+            echo "shadow_sha=" >> $GITHUB_OUTPUT
+            echo "❌ Shadow rebase failed"
+            exit 1
+          fi
+        else
+          echo "shadow_status=⚠️ shadow branch not found" >> $GITHUB_OUTPUT
+          echo "shadow_sha=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Send Telegram shadow rebase failure notification
+      if: failure()
+      run: |
+        VERSION="${{ needs.create-tags.outputs.version }}"
+        REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+        RUN_URL="$REPO_URL/actions/runs/${{ github.run_id }}"
+
+        MESSAGE="🚨 *Shadow rebase FAILED during ${{ needs.create-tags.outputs.github_tag }} release*
+
+        The \`shadow\` branch could not be rebased onto \`main\` during the DevNet release.
+        Manual intervention required before deployment.
+
+        *Release:* ${{ needs.create-tags.outputs.github_tag }} v$VERSION
+        *🔗 CI Run:* [View logs]($RUN_URL)"
+
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+            \"text\": \"$MESSAGE\",
+            \"parse_mode\": \"Markdown\",
+            \"disable_web_page_preview\": true
+          }" || true
+
   create-github-release:
-    needs: [ create-tags, build-and-push, create-manifest ]
+    needs: [ create-tags, build-and-push, create-manifest, rebase-shadow ]
     runs-on: ubuntu-latest
     if: ${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
 
@@ -408,6 +479,9 @@ jobs:
 
         *🌿 Deployment:*
         • Code pushed to \`$(echo "$DOCKER_TAG")\` branch
+
+        *🌑 Shadow Branch:*
+        • ${{ needs.rebase-shadow.outputs.shadow_status }}
 
         _🤖 Automated release notification_"
 
