@@ -4329,9 +4329,11 @@ pub const BeamChain = struct {
         const prev = self.aggregate_inflight.fetchAdd(1, .acq_rel);
         if (prev >= self.aggregate_max_inflight) {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
+            const current_interval = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+            const pending_interval = @max(time_intervals, current_interval);
             const existing = self.aggregate_reschedule_intervals.load(.monotonic);
-            if (time_intervals > existing) {
-                self.aggregate_reschedule_intervals.store(time_intervals, .release);
+            if (pending_interval > existing) {
+                self.aggregate_reschedule_intervals.store(pending_interval, .release);
             }
             self.logger.info("coalescing aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
             zeam_metrics.metrics.zeam_aggregate_coalesced_total.incr();
@@ -4339,6 +4341,15 @@ pub const BeamChain = struct {
         }
         // Past this point we own one `aggregate_inflight` slot — every
         // early-return below must release it.
+
+        const current_slot = self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        const work_slot: usize = if (slot + 1 < current_slot) blk: {
+            self.logger.info(
+                "aggregate trigger slot={d} is behind clock slot={d}; worker will use current window",
+                .{ slot, current_slot },
+            );
+            break :blk current_slot;
+        } else slot;
 
         // Snapshot state on the caller's thread (fast path).
         const head_root = self.forkChoice.getHead().blockRoot;
@@ -4359,9 +4370,9 @@ pub const BeamChain = struct {
         // returns immediately; the worker runs on a pool thread. We deliberately
         // do NOT fall back to inline execution on OOM (unlike replay batches)
         // because the ~10s aggregate FFI must not run on the libxev thread.
-        self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, snapshot, slot }) catch {
+        self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, snapshot, work_slot }) catch {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
-            self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
+            self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{work_slot});
             zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
             snapshot.deinit();
             self.allocator.destroy(snapshot);
@@ -4371,11 +4382,12 @@ pub const BeamChain = struct {
 
     /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).
     /// Owns `snapshot` and frees it on exit.
-    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, slot: usize) void {
+    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, trigger_slot: usize) void {
         defer {
-            const reschedule = chain.aggregate_reschedule_intervals.swap(0, .acq_rel);
-            if (reschedule != 0) {
-                chain.submitAggregateOnInterval(node, @intCast(reschedule));
+            const pending = chain.aggregate_reschedule_intervals.swap(0, .acq_rel);
+            if (pending != 0) {
+                const now = chain.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+                chain.submitAggregateOnInterval(node, @intCast(@max(pending, now)));
             }
         }
         defer _ = chain.aggregate_inflight.fetchSub(1, .acq_rel);
@@ -4385,6 +4397,18 @@ pub const BeamChain = struct {
         defer {
             snapshot.deinit();
             chain.allocator.destroy(snapshot);
+        }
+
+        // Re-read the slot clock at worker entry. A slow worker otherwise
+        // aggregates a stale {slot-1, slot} window from enqueue time while
+        // the chain has moved on — wasted FFI that drives coalesce storms (#907).
+        const clock_slot = chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        const slot: usize = if (trigger_slot + 1 < clock_slot) clock_slot else trigger_slot;
+        if (slot != trigger_slot) {
+            chain.logger.info(
+                "aggregate worker slot catch-up: trigger={d} clock={d} using={d}",
+                .{ trigger_slot, clock_slot, slot },
+            );
         }
 
         // Log subnet-wise coverage of current new payloads before starting aggregation.
