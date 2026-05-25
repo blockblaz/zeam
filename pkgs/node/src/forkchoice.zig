@@ -3792,7 +3792,7 @@ test "isAggregatorTrivialInput: any child makes it non-trivial" {
     try std.testing.expect(!isAggregatorTrivialInput(2, 5, 8));
 }
 
-test "isAggregatorTrivialInput default threshold (2): 0 or 1 sig is trivial, 2+ is not" {
+test "isAggregatorTrivialInput threshold=2: 0 or 1 sig is trivial, 2+ is not" {
     try std.testing.expect(isAggregatorTrivialInput(0, 0, 2));
     try std.testing.expect(isAggregatorTrivialInput(0, 1, 2));
     try std.testing.expect(!isAggregatorTrivialInput(0, 2, 2));

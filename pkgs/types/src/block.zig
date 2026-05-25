@@ -45,13 +45,12 @@ const freeJsonValue = utils.freeJsonValue;
 /// `pkgs/cli/src/main.zig`) and consumed by the aggregator wrapper in
 /// `pkgs/node/src/forkchoice.zig` (NOT by `computeAggregatedSignatures`,
 /// which is spec-pure and aggregates whatever it is given). Default
-/// `2`: aggregator skips publishing when an `att_data` has only a
-/// single local gossip sig and no peer payload, since the raw sig is
-/// already on the gossip topic and a 1-validator "aggregate" carries
-/// no consensus signal (#907 finding 4). `1` reverts to pre-#908
-/// behavior (always aggregate ≥1 sig). Higher values trade slot
-/// latency for fewer sub-threshold aggregates on chatty subnets.
-pub const default_min_aggregation_inputs: u32 = 2;
+/// `1` keeps the devnet5 / leanSpec liveness path spec-aligned: a
+/// selected `AttestationData` with one valid local signature still gets
+/// a Type-1 proof that block production can include. Higher values are
+/// an explicit zeam performance optimization for operators willing to
+/// skip sub-threshold aggregates on chatty subnets.
+pub const default_min_aggregation_inputs: u32 = 1;
 
 // signatures_map types for aggregation
 
