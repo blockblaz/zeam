@@ -4225,12 +4225,9 @@ pub const BeamChain = struct {
     pub fn applyAggregatedAttestationTrackers(
         self: *Self,
         data: types.AttestationData,
-        proof: *const types.AggregatedSignatureProof,
-    ) !void {
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-        defer validator_indices.deinit(self.allocator);
-
-        for (validator_indices.items) |vi| {
+        validator_indices: []const usize,
+    ) void {
+        for (validator_indices) |vi| {
             const validator_id: types.ValidatorIndex = @intCast(vi);
             const attestation = types.Attestation{
                 .validator_id = validator_id,
@@ -4244,6 +4241,16 @@ pub const BeamChain = struct {
         }
     }
 
+    /// Per-subnet publish counter for locally committed aggregates.
+    pub fn recordAggregatorPublishMetric(self: *Self, signed: *const types.SignedAggregatedAttestation) void {
+        const committee_count = self.config.spec.attestation_committee_count;
+        if (committee_count == 0) return;
+        const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse return;
+        var label_buf: [16]u8 = undefined;
+        const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch return;
+        zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+    }
+
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
         try self.validateAttestationData(signedAggregation.data, false);
 
@@ -4251,7 +4258,7 @@ pub const BeamChain = struct {
         defer validator_indices.deinit(self.allocator);
 
         try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
-        try self.applyAggregatedAttestationTrackers(signedAggregation.data, &signedAggregation.proof);
+        self.applyAggregatedAttestationTrackers(signedAggregation.data, validator_indices.items);
         try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
     }
 
@@ -4393,36 +4400,9 @@ pub const BeamChain = struct {
         };
     }
 
-    const AggregatePublishCtx = struct {
-        node: *@import("./node.zig").BeamNode,
-        chain: *Self,
-        committee_count: types.SubnetId,
-    };
-
     fn publishOneAggregate(ctx: *anyopaque, signed: types.SignedAggregatedAttestation) void {
-        var agg = signed;
-        const publish_ctx: *AggregatePublishCtx = @ptrCast(@alignCast(ctx));
-        const committee_count = publish_ctx.committee_count;
-        if (committee_count > 0) {
-            if (firstParticipantSubnet(agg.proof.participants, committee_count)) |subnet_id| {
-                var label_buf: [16]u8 = undefined;
-                if (std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id})) |subnet_label| {
-                    zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
-                } else |_| {}
-            }
-        }
-        publish_ctx.node.publishLocalProducedAggregation(agg) catch |err| {
-            publish_ctx.chain.logger.err(
-                "error publishing aggregation at slot={d}: {any} (continuing worker)",
-                .{ agg.data.slot, err },
-            );
-            zeam_metrics.metrics.lean_node_interval_error_total.incr(
-                .{ .site = "publishOneAggregate" },
-            ) catch |me| publish_ctx.chain.logger.warn("metric incr failed: {any}", .{me});
-            agg.deinit();
-            return;
-        };
-        agg.deinit();
+        const node: *@import("./node.zig").BeamNode = @ptrCast(@alignCast(ctx));
+        node.publishCommittedAggregation(signed);
     }
 
     /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).
@@ -4485,16 +4465,10 @@ pub const BeamChain = struct {
         slot_window_buf[slot_window_len] = @intCast(slot);
         slot_window_len += 1;
 
-        var publish_ctx = AggregatePublishCtx{
-            .node = node,
-            .chain = chain,
-            .committee_count = chain.config.spec.attestation_committee_count,
-        };
-
         const aggregations = chain.forkChoice.aggregateForSlots(
             &validators_owned,
             slot_window_buf[0..slot_window_len],
-            &publish_ctx,
+            node,
             publishOneAggregate,
         ) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
@@ -4503,15 +4477,6 @@ pub const BeamChain = struct {
         defer chain.allocator.free(aggregations);
 
         if (aggregations.len > 0) {
-            const committee_count = chain.config.spec.attestation_committee_count;
-            if (committee_count > 0) {
-                for (aggregations) |signed| {
-                    const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse continue;
-                    var label_buf: [16]u8 = undefined;
-                    const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch continue;
-                    zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
-                }
-            }
             node.publishProducedAggregations(aggregations);
         }
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);

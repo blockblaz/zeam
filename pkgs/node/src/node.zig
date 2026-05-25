@@ -3026,20 +3026,11 @@ pub const BeamNode = struct {
         }
     }
 
-    /// Publish an aggregation received from the network: validate, verify, store, then gossip.
+    /// Full local ingestion for aggregations not yet in fork choice (e.g. validator duty output).
     pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         self.logger.info("adding locally produced aggregation to chain: slot={d}", .{signed_aggregation.data.slot});
         try self.chain.onGossipAggregatedAttestation(signed_aggregation);
-
-        const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
-        const aggregation_published = try self.network.publish(&gossip_msg);
-
-        if (aggregation_published) {
-            self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
-        } else {
-            // Issue #808: backend dropped the publish.
-            self.logger.warn("failed to publish aggregation to network (backend dropped publish): slot={d}", .{signed_aggregation.data.slot});
-        }
+        try self.publishAggregationGossip(signed_aggregation);
     }
 
     /// Publish an aggregation already committed by the aggregate worker.
@@ -3048,8 +3039,35 @@ pub const BeamNode = struct {
     /// attestation trackers and encodes to gossip.
     pub fn publishLocalProducedAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         self.logger.info("publishing locally committed aggregation: slot={d}", .{signed_aggregation.data.slot});
-        try self.chain.applyAggregatedAttestationTrackers(signed_aggregation.data, &signed_aggregation.proof);
 
+        var validator_indices = try types.aggregationBitsToValidatorIndices(
+            &signed_aggregation.proof.participants,
+            self.allocator,
+        );
+        defer validator_indices.deinit(self.allocator);
+        self.chain.applyAggregatedAttestationTrackers(signed_aggregation.data, validator_indices.items);
+        try self.publishAggregationGossip(signed_aggregation);
+    }
+
+    /// Publish one worker-committed aggregate: metrics, fast path, then deinit.
+    pub fn publishCommittedAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) void {
+        var agg = signed_aggregation;
+        self.chain.recordAggregatorPublishMetric(&agg);
+        self.publishLocalProducedAggregation(agg) catch |err| {
+            self.logger.err(
+                "error publishing aggregation at slot={d}: {any} (continuing worker)",
+                .{ agg.data.slot, err },
+            );
+            zeam_metrics.metrics.lean_node_interval_error_total.incr(
+                .{ .site = "publishLocalProducedAggregation" },
+            ) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+            agg.deinit();
+            return;
+        };
+        agg.deinit();
+    }
+
+    fn publishAggregationGossip(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
         const aggregation_published = try self.network.publish(&gossip_msg);
 
@@ -3063,16 +3081,7 @@ pub const BeamNode = struct {
     /// Publish every aggregation independently; deinit each entry exactly once.
     pub fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) void {
         for (aggregations) |*signed_aggregation| {
-            self.publishLocalProducedAggregation(signed_aggregation.*) catch |err| {
-                self.logger.err(
-                    "error publishing aggregation at slot={d}: {any} (continuing within slot)",
-                    .{ signed_aggregation.data.slot, err },
-                );
-                zeam_metrics.metrics.lean_node_interval_error_total.incr(
-                    .{ .site = "publishLocalProducedAggregation" },
-                ) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-            };
-            signed_aggregation.deinit();
+            self.publishCommittedAggregation(signed_aggregation.*);
         }
     }
 
