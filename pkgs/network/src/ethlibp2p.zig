@@ -948,14 +948,12 @@ export fn handleRPCResponseFromRustBridge(
         .{ zigHandler.params.networkId, request_id, protocol.protocolId(), response_bytes.len, callback_peer_id, callback_node_name },
     );
 
-    if (handler) |cb| {
-        cb.onReqRespResponse(&event) catch |notify_err| {
-            zigHandler.logger.err(
-                "network-{d}:: Failed to notify RPC success callback for request_id={d} from peer={s}{f}: {any}",
-                .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, notify_err },
-            );
-        };
-    }
+    handler.onReqRespResponse(&event) catch |notify_err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to notify RPC success callback for request_id={d} from peer={s}{f}: {any}",
+            .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, notify_err },
+        );
+    };
 }
 
 export fn handleRPCEndOfStreamFromRustBridge(
@@ -1388,7 +1386,8 @@ pub const EthLibp2p = struct {
 
     fn cancelInflightRpcCallback(self: *Self, request_id: u64) void {
         if (self.takeRpcCallback(request_id)) |callback| {
-            callback.deinit();
+            var owned_callback = callback;
+            owned_callback.deinit();
         }
     }
 
