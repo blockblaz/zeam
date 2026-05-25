@@ -56,8 +56,11 @@ fn getZeamExecutable() ![]const u8 {
 fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
     const io = std.testing.io;
 
-    // Set up process with beam command and mock network
-    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
+    // Set up process with beam command and mock network.
+    // `--log_file_active_level warn`: the default file level is `debug`, so all 3 mock nodes
+    // otherwise write full DEBUG logs synchronously on the single shared libxev loop, starving
+    // the per-slot consensus pipeline (the #863 drain) and flaking justification/finalization.
+    const args = [_][]const u8{ exe_path, "--log_file_active_level", "warn", "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
 
     // Start the process
