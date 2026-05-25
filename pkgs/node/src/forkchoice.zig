@@ -1743,6 +1743,9 @@ pub const ForkChoice = struct {
     /// Store an aggregated signature proof keyed by AttestationData.
     /// If is_from_block, stores in latest_known_aggregated_payloads (immediately available for block building).
     /// Otherwise, stores in latest_new_aggregated_payloads (promoted to known via periodic ticks).
+    ///
+    /// Clones `proof` into fork choice; callers retain ownership of the passed-in value
+    /// (required for gossip/chain-worker paths that deinit the surrounding message later).
     pub fn storeAggregatedPayload(
         self: *Self,
         attestation_data: *const types.AttestationData,
