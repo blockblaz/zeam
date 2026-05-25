@@ -517,18 +517,27 @@ pub const Node = struct {
         //
         // Must be called before setupProver/setupVerifier since rayon’s global
         // pool is initialized lazily on first use.
-        const rayon_threads = if (options.rayon_threads) |override|
-            @max(@as(usize, 1), @as(usize, override))
-        else if (options.is_aggregator)
+        const rayon_threads = if (options.rayon_threads) |override| blk: {
+            const requested = @max(@as(usize, 1), @as(usize, override));
+            // Cap explicit overrides to the post-system budget so devnet hosts
+            // with `--rayon-threads 12` on 8 vCPUs do not oversubscribe XMSS
+            // prove and inflate worker p50 (#925).
+            const effective = @min(requested, desired_workers);
+            if (effective < requested) {
+                self.logger.warn(
+                    "--rayon-threads {d} exceeds post-system budget {d}; using {d} rayon threads",
+                    .{ requested, desired_workers, effective },
+                );
+            }
+            break :blk effective;
+        } else if (options.is_aggregator)
             desired_workers
         else
             @max(@as(usize, 1), desired_workers -| worker_count);
-        // One outer aggregate worker at a time on aggregators. Parallelize the
-        // ~11s STARK work per att_data inside that worker
-        // (`computeAggregatedSignatures` thread pool), not across independent
-        // interval workers. Multiple in-flight outer workers can snapshot the
-        // same gossip sigs before either commits and publish duplicate
-        // aggregates (PR #920 review).
+        // One outer aggregate worker at a time on aggregators. Each att_data
+        // prove runs sequentially inside that worker (ethlambda-style) so
+        // Rayon gets the full CPU budget per job instead of ThreadPool ×
+        // Rayon oversubscription (#925).
         const aggregate_max_inflight: u32 = if (options.is_aggregator) 1 else 4;
         const rayon_source: []const u8 = if (options.rayon_threads != null)
             " (--rayon-threads override)"
@@ -553,8 +562,8 @@ pub const Node = struct {
         xmss.setRayonThreads(rayon_threads);
 
         if (options.is_aggregator) {
-            xmss.setupProver() catch |err| {
-                self.logger.warn("xmss prover setup failed: {any}; aggregation may be unavailable", .{err});
+            xmss.ensureProverReady() catch |err| {
+                self.logger.warn("xmss prover init failed: {any}; aggregation may be unavailable", .{err});
             };
         }
 

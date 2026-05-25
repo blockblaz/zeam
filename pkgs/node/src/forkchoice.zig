@@ -2072,86 +2072,34 @@ pub const ForkChoice = struct {
         }
     }
 
+    /// Optional per-aggregate publish hook (ethlambda `AggregateProduced` path).
+    /// When set, each successful prove is committed and published before the
+    /// next job starts; when null, results are collected into the return slice.
+    pub const AggregatePublishCallback = *const fn (
+        ctx: *anyopaque,
+        signed: types.SignedAggregatedAttestation,
+    ) void;
+
     /// Aggregate attestation signatures using recursive child proofs.
     ///
-    /// **#863 / #890 followup — snapshot-then-release.** The XMSS
-    /// aggregate-proof FFI inside `computeAggregatedSignatures` runs
-    /// for ~18 s per call on devnet aggregators (see
-    /// `lean_committee_signatures_aggregation_time_seconds`). The
-    /// previous shape held `signatures_mutex` for that whole window,
-    /// so libxev's `chain.onInterval` → `tickIntervalUnlocked` →
-    /// `acceptNewAttestationsUnlocked` (which also takes
-    /// `signatures_mutex`) blocked at intervals 0/3/4 every slot an
-    /// aggregation was in flight. The slot-driver watchdog fired
-    /// every i=4 tick during aggregation as a result.
-    ///
-    /// This shape splits the body into three phases:
-    ///
-    ///   1. **Snapshot** (signatures_mutex held briefly, ms-scale):
-    ///      deep-clone `attestation_signatures`, `latest_new_aggregated_payloads`,
-    ///      `latest_known_aggregated_payloads` into owned local copies.
-    ///      Release.
-    ///   2. **Compute** (no lock held, ~18 s):
-    ///      run `computeAggregatedSignatures` and per-result SSZ clones
-    ///      against the owned snapshot. While this runs, `addSignature`
-    ///      / `storeAggregatedPayload` / `acceptNewAttestationsUnlocked`
-    ///      / `pruneStaleAttestationData` are free to mutate the live
-    ///      maps.
-    ///   3. **Commit** (signatures_mutex held briefly, ms-scale):
-    ///      MERGE per-att_data new aggregations into
-    ///      `latest_new_aggregated_payloads` (do NOT REPLACE — gossip-
-    ///      sourced aggregations from other subnets that arrived during
-    ///      phase 2 must survive). Per-validator remove from
-    ///      `attestation_signatures` for the (att_data, validator_id)
-    ///      pairs that existed at snapshot time (entries added during
-    ///      phase 2 stay so the next aggregator pass can consume them).
-    ///
-    /// The three-phase contract (snapshot under `signatures_mutex` → lock-free
-    /// compute on owned clones → merge under `signatures_mutex`) prevents map
-    /// races but not duplicate publishes when two workers snapshot the same
-    /// gossip sigs before either commits. Aggregators keep
-    /// `aggregate_max_inflight` at 1; commit also suppresses merge/publish for
-    /// att_data whose snapshot gossip vids are already gone from the live map.
-    fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState, slot_filter: ?[]const types.Slot) ![]types.SignedAggregatedAttestation {
-        const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
+    /// Ethlambda-style per-job loop: snapshot once, then for each `att_data`
+    /// run one XMSS prove, commit, and optionally publish before starting the
+    /// next job. Sequential proves avoid ThreadPool × Rayon oversubscription.
+    fn aggregateUnlocked(
+        self: *Self,
+        validators: *const types.Validators,
+        slot_filter: ?[]const types.Slot,
+        publish_ctx: ?*anyopaque,
+        publish_fn: ?AggregatePublishCallback,
+    ) ![]types.SignedAggregatedAttestation {
         const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
         defer _ = agg_timer.observe();
 
-        // ─── Phase 1: snapshot ──────────────────────────────────────
-        // Collect in-scope att_data keys under signatures_mutex (ethlambda-
-        // style job scoping) and deep-clone only those entries so we do not
-        // sszClone every stale proof retained in the live maps.
         const snapshot_start_ns = zeam_utils.monotonicTimestampNs();
         var snap = try AggregateSnapshot.takeUnderLock(self, slot_filter);
         observeAggregateBuildPhase("snapshot", snapshot_start_ns);
         defer snap.deinit(self.allocator);
 
-        // ─── Phase 2: compute (no lock held) ────────────────────────
-        var agg = try types.AggregatedAttestationsResult.init(self.allocator);
-        var agg_att_cleanup = true;
-        var agg_sig_cleanup = true;
-        errdefer if (agg_att_cleanup) {
-            for (agg.attestations.slice()) |*att| att.deinit();
-            agg.attestations.deinit();
-        };
-        errdefer if (agg_sig_cleanup) {
-            for (agg.attestation_signatures.slice()) |*sig| sig.deinit();
-            agg.attestation_signatures.deinit();
-        };
-
-        // Aggregator-only policy filter: drop `att_data` entries from the
-        // owned snapshot whose only input is a single (or sub-threshold)
-        // local gossip sig and which have no peer payload to fold into.
-        // This MUST live here in the aggregator wrapper, NOT inside
-        // `computeAggregatedSignatures`: the same FFI function is the
-        // primitive a future block proposer would use to aggregate the
-        // exact `att_data` set it chose to include in a block, and a
-        // proposer must aggregate every chosen `att_data` (blocks carry
-        // aggregated proofs, not raw sigs) — even a 1-validator one. By
-        // filtering the snapshot before the FFI runs, the function
-        // remains spec-pure (aggregate whatever you are given) and the
-        // policy is opt-in per call site. See review on PR #908 and
-        // issue #907 finding 4.
         pruneTrivialFromAggregateSnapshot(
             self.allocator,
             &snap,
@@ -2159,218 +2107,156 @@ pub const ForkChoice = struct {
             self.logger,
         );
 
-        const compute_start_ns = zeam_utils.monotonicTimestampNs();
-        try agg.computeAggregatedSignatures(
-            &state.validators,
-            &snap.signatures,
-            &snap.new_payloads,
-            &snap.known_payloads,
-            slot_filter,
-            self.thread_pool,
-        );
-        observeAggregateBuildPhase("compute_ffi", compute_start_ns);
+        const att_data_keys = try collectAttDataKeysFromSnapshot(self.allocator, &snap, slot_filter);
+        defer self.allocator.free(att_data_keys);
+        std.mem.sort(types.AttestationData, att_data_keys, {}, types.attestationDataLessThan);
 
-        // Build the per-att_data map of fresh aggregations and the
-        // result slice while no lock is held. SSZ-clone per proof
-        // twice (once for our internal map, once for the caller's
-        // slice) — both clones are independent Rust handles.
-        //
-        // `defer` (not `errdefer`) — on the success path the lock
-        // block below transfers ownership of every
-        // `StoredAggregatedPayload` into `self.latest_new_aggregated_payloads`
-        // and resets each value list to `.empty`. The deferred
-        // `deinitAggregatedPayloadsMap` then walks the (now-empty)
-        // value lists, frees their zero-capacity buffers, and frees
-        // the outer hashmap. On any error path before the transfer
-        // completes, any retained `AggregatedSignatureProof` is
-        // released the same way.
-        var new_payloads_local = AggregatedPayloadsMap.init(self.allocator);
-        defer deinitAggregatedPayloadsMap(self.allocator, &new_payloads_local);
-
-        var results: std.ArrayList(types.SignedAggregatedAttestation) = .empty;
+        var collected: std.ArrayList(types.SignedAggregatedAttestation) = .empty;
         errdefer {
-            for (results.items) |*signed| signed.deinit();
-            results.deinit(self.allocator);
+            for (collected.items) |*signed| signed.deinit();
+            collected.deinit(self.allocator);
         }
 
-        var aggregated_att_data_keys: std.ArrayList(types.AttestationData) = .empty;
-        defer aggregated_att_data_keys.deinit(self.allocator);
+        const compute_start_ns = zeam_utils.monotonicTimestampNs();
 
-        {
-            const agg_attestations = agg.attestations.constSlice();
-            const agg_signatures = agg.attestation_signatures.constSlice();
-
-            for (agg_attestations, 0..) |agg_att, index| {
-                const proof = agg_signatures[index];
-
-                try aggregated_att_data_keys.append(self.allocator, agg_att.data);
-
-                // Store proof into new payloads map, preserving source attribution
-                // so block proposal logs can split selected coverage into child-payload
-                // vs raw-gossip origins after this aggregate is promoted to known.
-                const gop = try new_payloads_local.getOrPut(agg_att.data);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-
-                var source_payload_bits = try types.AggregationBits.init(self.allocator);
-                var source_payload_bits_owned = true;
-                errdefer if (source_payload_bits_owned) source_payload_bits.deinit();
-                var source_gossip_bits = try types.AggregationBits.init(self.allocator);
-                var source_gossip_bits_owned = true;
-                errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
-                try self.buildAggregateSourceAttribution(agg_att.data, proof, &source_payload_bits, &source_gossip_bits);
-
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
-                errdefer cloned_proof.deinit();
-                try gop.value_ptr.append(self.allocator, .{
-                    .slot = agg_att.data.slot,
-                    .proof = cloned_proof,
-                    .source_payload_participants = source_payload_bits,
-                    .source_gossip_participants = source_gossip_bits,
-                });
-                source_payload_bits_owned = false;
-                source_gossip_bits_owned = false;
-
-                var output_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
-                errdefer output_proof.deinit();
-                try results.append(self.allocator, .{
-                    .data = agg_att.data,
-                    .proof = output_proof,
-                });
+        for (att_data_keys) |data| {
+            var maybe_result = try types.computeSingleAggregatedSignature(
+                self.allocator,
+                validators,
+                &snap.signatures,
+                &snap.new_payloads,
+                &snap.known_payloads,
+                data,
+            );
+            if (maybe_result) |*result| {
+                defer result.attestation.deinit();
+                if (try self.commitOneAggregateResult(&snap, result)) |signed| {
+                    if (publish_fn) |pfn| {
+                        pfn(publish_ctx.?, signed);
+                    } else {
+                        try collected.append(self.allocator, signed);
+                    }
+                }
             }
         }
+        observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 
-        // ─── Phase 3: commit (signatures_mutex held briefly) ────────
         var new_payloads_count: usize = 0;
         var gossip_sigs_count: usize = 0;
-        const commit_start_ns = zeam_utils.monotonicTimestampNs();
         {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
-
-            // Drop att_data whose snapshot gossip inputs were already consumed
-            // by an earlier in-flight worker (defense when aggregate_max_inflight > 1).
-            var results_write_idx: usize = 0;
-            var results_idx: usize = 0;
-            while (results_idx < results.items.len) : (results_idx += 1) {
-                const att_data = results.items[results_idx].data;
-                if (shouldSuppressDuplicateAggregateCommit(&snap, att_data, &self.attestation_signatures)) {
-                    results.items[results_idx].deinit();
-                    if (new_payloads_local.fetchRemove(att_data)) |kv| {
-                        var list = kv.value;
-                        deinitAggregatedPayloadsList(self.allocator, &list);
-                    }
-                    self.logger.debug(
-                        "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
-                        .{att_data.slot},
-                    );
-                } else {
-                    if (results_write_idx != results_idx) {
-                        results.items[results_write_idx] = results.items[results_idx];
-                    }
-                    results_write_idx += 1;
-                }
-            }
-            results.shrinkRetainingCapacity(results_write_idx);
-
-            // MERGE (NOT replace). The previous shape did
-            //   deinitAggregatedPayloadsMap(allocator, &self.latest_new_aggregated_payloads);
-            //   self.latest_new_aggregated_payloads = new_payloads_local;
-            // which was safe because the lock was held across compute
-            // so nothing could append in between. With phase 2
-            // unlocked, gossip-sourced aggregations (other subnets'
-            // `storeAggregatedPayload(is_from_block=false)`) and
-            // accept's clear/migrate can mutate `latest_new_*` while
-            // we work. Replace would clobber those gossip
-            // aggregations. Merge appends ours instead; greedy proof
-            // selection in `getProposalAttestations` already
-            // de-duplicates overlapping proofs across the resulting
-            // list so the only cost of merge is a slightly larger
-            // payload list per att_data (bounded by
-            // `acceptNewAttestationsUnlocked`'s clear-on-i=0/i=4
-            // tick).
-            var local_iter = new_payloads_local.iterator();
-            while (local_iter.next()) |entry| {
-                const att_data = entry.key_ptr.*;
-                const list = entry.value_ptr;
-
-                const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.appendSlice(self.allocator, list.items);
-
-                // Ownership of every StoredAggregatedPayload moved
-                // into self.latest_new_aggregated_payloads. Free the
-                // local list buffer (no proofs to deinit — they all
-                // moved) and reset to `.empty` so the deferred
-                // `deinitAggregatedPayloadsMap` is a no-op walk over
-                // empty lists.
-                list.deinit(self.allocator);
-                list.* = .empty;
-            }
-
-            // Per-validator remove from live `attestation_signatures`
-            // for every (att_data, vid) pair that EXISTED IN THE
-            // SNAPSHOT for an aggregated key. Snapshot vids are the
-            // upper bound of what compute could have consumed (some
-            // were skipped because already covered by children, but
-            // those are redundant in the live map too — safe to drop).
-            // Vids added by `addSignature` during phase 2 are NOT in
-            // the snapshot, so they survive and feed the next
-            // aggregate cycle.
-            for (aggregated_att_data_keys.items) |att_data| {
-                const snap_inner_kv = snap.signatures.fetchRemove(att_data) orelse continue;
-                var snap_inner = snap_inner_kv.value;
-                defer snap_inner.deinit();
-                if (self.attestation_signatures.getPtr(att_data)) |live_inner| {
-                    var snap_vid_it = snap_inner.iterator();
-                    while (snap_vid_it.next()) |vid_entry| {
-                        _ = live_inner.remove(vid_entry.key_ptr.*);
-                    }
-                    if (live_inner.count() == 0) {
-                        self.attestation_signatures.removeAndDeinit(att_data);
-                    }
-                }
-            }
-
             new_payloads_count = self.latest_new_aggregated_payloads.count();
             gossip_sigs_count = self.attestation_signatures.count();
         }
-        observeAggregateBuildPhase("commit", commit_start_ns);
-
-        // Phase 2 cleanup: free the AggregatedAttestationsResult
-        // local now that ownership of every cloned proof has either
-        // moved into self.latest_new_aggregated_payloads (via the
-        // merge above) or into `results` (returned to caller).
-        agg_att_cleanup = false;
-        agg_sig_cleanup = false;
-        for (agg.attestations.slice()) |*att| att.deinit();
-        agg.attestations.deinit();
-        for (agg.attestation_signatures.slice()) |*sig| sig.deinit();
-        agg.attestation_signatures.deinit();
 
         zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(new_payloads_count));
         zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_sigs_count));
 
-        return results.toOwnedSlice(self.allocator);
+        if (publish_fn != null) {
+            return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
+        }
+        return collected.toOwnedSlice(self.allocator);
+    }
+
+    /// Commit one worker-produced aggregate (ethlambda `apply_aggregated_group`).
+    fn commitOneAggregateResult(
+        self: *Self,
+        snap: *AggregateSnapshot,
+        result: *types.SingleAggregatedSignature,
+    ) !?types.SignedAggregatedAttestation {
+        const att_data = result.attestation.data;
+
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
+        if (shouldSuppressDuplicateAggregateCommit(snap, att_data, &self.attestation_signatures)) {
+            self.logger.debug(
+                "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
+                .{att_data.slot},
+            );
+            return null;
+        }
+
+        var source_payload_bits = try types.AggregationBits.init(self.allocator);
+        var source_payload_bits_owned = true;
+        errdefer if (source_payload_bits_owned) source_payload_bits.deinit();
+        var source_gossip_bits = try types.AggregationBits.init(self.allocator);
+        var source_gossip_bits_owned = true;
+        errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
+        try self.buildAggregateSourceAttribution(att_data, result.signature, &source_payload_bits, &source_gossip_bits);
+
+        var cloned_proof: types.AggregatedSignatureProof = undefined;
+        try types.sszClone(self.allocator, types.AggregatedSignatureProof, result.signature, &cloned_proof);
+        errdefer cloned_proof.deinit();
+
+        const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, .{
+            .slot = att_data.slot,
+            .proof = cloned_proof,
+            .source_payload_participants = source_payload_bits,
+            .source_gossip_participants = source_gossip_bits,
+        });
+        source_payload_bits_owned = false;
+        source_gossip_bits_owned = false;
+
+        if (snap.signatures.fetchRemove(att_data)) |snap_inner_kv| {
+            var snap_inner = snap_inner_kv.value;
+            defer snap_inner.deinit();
+            if (self.attestation_signatures.getPtr(att_data)) |live_inner| {
+                var snap_vid_it = snap_inner.iterator();
+                while (snap_vid_it.next()) |vid_entry| {
+                    _ = live_inner.remove(vid_entry.key_ptr.*);
+                }
+                if (live_inner.count() == 0) {
+                    self.attestation_signatures.removeAndDeinit(att_data);
+                }
+            }
+        }
+
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
+        var participant_count: u64 = 0;
+        for (0..result.signature.participants.len()) |i| {
+            if (result.signature.participants.get(i) catch false) participant_count += 1;
+        }
+        zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
+
+        const proof = result.signature;
+        return .{ .data = att_data, .proof = proof };
     }
 
     /// Produce aggregations only for the caller-supplied attestation slots.
-    ///
-    /// The aggregate worker runs on the shared `ThreadPool` bounded by
-    /// `BeamChain.aggregate_max_inflight`, so a saturated worker pool can skip
-    /// an interval. Callers should pass a small backfill window, e.g.
-    /// `{current_slot - 1, current_slot}`, to recover late or skipped-slot
-    /// attestations without walking every stale/future `AttestationData` key
-    /// retained in the maps.
-    pub fn aggregateForSlots(self: *Self, state_opt: ?*const types.BeamState, slots: []const types.Slot) ![]types.SignedAggregatedAttestation {
-        return self.aggregateUnlocked(state_opt, slots);
+    pub fn aggregateForSlots(
+        self: *Self,
+        validators: *const types.Validators,
+        slots: []const types.Slot,
+        publish_ctx: ?*anyopaque,
+        publish_fn: ?AggregatePublishCallback,
+    ) ![]types.SignedAggregatedAttestation {
+        return self.aggregateUnlocked(validators, slots, publish_ctx, publish_fn);
     }
 
-    /// Convenience wrapper for tests or callers that intentionally want strict
-    /// single-slot aggregation. Production should prefer `aggregateForSlots`.
-    pub fn aggregateForSlot(self: *Self, state_opt: ?*const types.BeamState, slot: types.Slot) ![]types.SignedAggregatedAttestation {
-        return self.aggregateForSlots(state_opt, &.{slot});
+    pub fn aggregateForSlot(
+        self: *Self,
+        validators: *const types.Validators,
+        slot: types.Slot,
+        publish_ctx: ?*anyopaque,
+        publish_fn: ?AggregatePublishCallback,
+    ) ![]types.SignedAggregatedAttestation {
+        return self.aggregateForSlots(validators, &.{slot}, publish_ctx, publish_fn);
+    }
+
+    pub fn aggregateForSlotsFromState(
+        self: *Self,
+        state: *const types.BeamState,
+        slots: []const types.Slot,
+    ) ![]types.SignedAggregatedAttestation {
+        return self.aggregateForSlots(&state.validators, slots, null, null);
+    }
+
+    pub fn aggregateForSlotFromState(self: *Self, state: *const types.BeamState, slot: types.Slot) ![]types.SignedAggregatedAttestation {
+        return self.aggregateForSlotsFromState(state, &.{slot});
     }
 
     /// Remove attestation data that can no longer influence fork choice.
@@ -3064,7 +2950,7 @@ test "aggregate prunes attestation signatures" {
         });
     }
 
-    const aggregations = try fork_choice.aggregateForSlots(&mock_chain.genesis_state, &.{0});
+    const aggregations = try fork_choice.aggregateForSlotsFromState(&mock_chain.genesis_state, &.{0});
     defer {
         for (aggregations) |*signed_aggregation| {
             signed_aggregation.deinit();
@@ -3183,7 +3069,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
         result: anyerror![]types.SignedAggregatedAttestation = undefined,
 
         fn run(ctx: *@This()) void {
-            ctx.result = ctx.fork_choice.aggregateForSlots(ctx.state, &.{0});
+            ctx.result = ctx.fork_choice.aggregateForSlotsFromState(ctx.state, &.{0});
         }
     };
     var worker: Worker = .{ .fork_choice = &fork_choice, .state = &mock_chain.genesis_state };
@@ -3714,6 +3600,39 @@ fn collectAggregationSnapshotKeys(
             if (!gop.found_existing) try out_keys.append(allocator, entry.key_ptr.*);
         }
     }
+}
+
+fn collectAttDataKeysFromSnapshot(
+    allocator: Allocator,
+    snap: *const AggregateSnapshot,
+    slot_filter: ?[]const types.Slot,
+) ![]types.AttestationData {
+    var att_data_set = std.AutoHashMap(types.AttestationData, void).init(allocator);
+    defer att_data_set.deinit();
+
+    {
+        var it = snap.signatures.iterator();
+        while (it.next()) |entry| {
+            if (!aggregationSlotAllowed(entry.key_ptr.slot, slot_filter)) continue;
+            try att_data_set.put(entry.key_ptr.*, {});
+        }
+    }
+    {
+        var it = snap.new_payloads.iterator();
+        while (it.next()) |entry| {
+            if (!aggregationSlotAllowed(entry.key_ptr.slot, slot_filter)) continue;
+            try att_data_set.put(entry.key_ptr.*, {});
+        }
+    }
+
+    const keys = try allocator.alloc(types.AttestationData, att_data_set.count());
+    var idx: usize = 0;
+    var key_it = att_data_set.keyIterator();
+    while (key_it.next()) |key| {
+        keys[idx] = key.*;
+        idx += 1;
+    }
+    return keys;
 }
 
 /// Deep-clone one attestation-data entry from `src` into `dst`.

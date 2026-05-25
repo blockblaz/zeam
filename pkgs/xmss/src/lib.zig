@@ -7,6 +7,7 @@ pub const ByteListMiB = aggregate.ByteListMiB;
 pub const AggregationError = aggregate.AggregationError;
 pub const setRayonThreads = aggregate.setRayonThreads;
 pub const setupProver = aggregate.setupProver;
+pub const ensureProverReady = aggregate.ensureProverReady;
 pub const setupVerifier = aggregate.setupVerifier;
 pub const aggregateSignatures = aggregate.aggregateSignatures;
 pub const verifyAggregatedPayload = aggregate.verifyAggregatedPayload;

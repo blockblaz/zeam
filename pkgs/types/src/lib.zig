@@ -36,6 +36,9 @@ pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
 pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
 pub const compactAttestations = block.compactAttestations;
 pub const default_min_aggregation_inputs = block.default_min_aggregation_inputs;
+pub const SingleAggregatedSignature = block.SingleAggregatedSignature;
+pub const computeSingleAggregatedSignature = block.computeSingleAggregatedSignature;
+pub const attestationDataLessThan = block.attestationDataLessThan;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;

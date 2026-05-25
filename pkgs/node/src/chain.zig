@@ -71,8 +71,9 @@ pub const ChainOpts = struct {
     /// default and `isTrivialAggregationInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
-    /// enforced lock-free by `submitAggregateOnInterval`; further submits
-    /// are skipped (counted as `zeam_aggregate_skip_total{reason="in_flight"}`).
+    /// enforced lock-free by `submitAggregateOnInterval`. When the cap is
+    /// reached the trigger is coalesced into `aggregate_reschedule_intervals`
+    /// and retried once when the in-flight worker finishes (see #907).
     /// Kept low (default 4) so the queue drains quickly and the aggregator
     /// stays focused on CURRENT slots rather than catching up old ones — per
     /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
@@ -391,6 +392,16 @@ pub const BeamChain = struct {
     /// in `forkchoice.aggregateUnlocked` (see PR #920 review).
     aggregate_inflight: std.atomic.Value(u32) = .init(0),
 
+    /// Latest slot-driver interval coalesced while an aggregate worker was
+    /// in flight. `aggregateImpl` clears this on exit and re-submits once.
+    aggregate_reschedule_intervals: std.atomic.Value(u64) = .init(0),
+
+    /// Highest slot successfully published by the most recent aggregate worker.
+    /// Used to skip redundant catch-up resubmits when coalesced triggers
+    /// map to a slot we already handled (#925 coalesce storm). Not advanced
+    /// on failure or empty runs so coalesce can retry.
+    aggregate_last_completed_slot: std.atomic.Value(u64) = .init(0),
+
     /// Joined at `deinit` so aggregate workers cannot outlive chain state.
     aggregate_wg: WaitGroup = .{},
 
@@ -587,6 +598,8 @@ pub const BeamChain = struct {
             // Aggregate worker bookkeeping (issue #907). Counter + WaitGroup
             // backstop the lock-free cap check + `deinit` join — see field docs.
             .aggregate_inflight = .init(0),
+            .aggregate_reschedule_intervals = .init(0),
+            .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
             // leanSpec _pending_attestations / _pending_aggregated_attestations
@@ -4278,10 +4291,37 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
+    /// Monotonic max for coalesced slot-driver intervals (libxev + pool threads).
+    fn storeMaxAggregateRescheduleInterval(self: *Self, candidate: u64) void {
+        var current = self.aggregate_reschedule_intervals.load(.monotonic);
+        while (candidate > current) {
+            const exchanged = self.aggregate_reschedule_intervals.cmpxchgWeak(
+                current,
+                candidate,
+                .release,
+                .monotonic,
+            ) orelse return;
+            current = exchanged;
+        }
+    }
+
+    const AggregateWorkerSlot = struct {
+        slot: usize,
+        is_clock_catch_up: bool,
+    };
+
+    fn resolveAggregateWorkerSlot(trigger_slot: usize, clock_slot: usize) AggregateWorkerSlot {
+        const is_clock_catch_up = trigger_slot + 1 < clock_slot;
+        return .{
+            .slot = if (is_clock_catch_up) clock_slot else trigger_slot,
+            .is_clock_catch_up = is_clock_catch_up,
+        };
+    }
+
+    /// Submit aggregate work to the dedicated ThreadPool worker (issue #873).
     /// Returns within microseconds; the worker calls `publishProducedAggregations`
-    /// itself. If the previous aggregate is still in-flight, the submit is
-    /// skipped and the skip metric is incremented.
+    /// itself. If the previous aggregate is still in-flight, the trigger is
+    /// coalesced and a catch-up run is scheduled when the worker finishes.
     pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
@@ -4315,102 +4355,157 @@ pub const BeamChain = struct {
         }
 
         // Non-blocking cap check on the libxev thread. Done BEFORE the
-        // expensive state borrow + `cloneAndRelease` so a saturated worker
-        // pool doesn't burn deep-clones we'd immediately throw away.
+        // expensive validators clone in the worker so a saturated worker
+        // pool doesn't burn SSZ work we'd immediately throw away.
         // `fetchAdd`-then-compare is a soft ceiling — transient overshoot
         // is bounded by concurrent caller count and self-corrects on the
         // next interval.
         const prev = self.aggregate_inflight.fetchAdd(1, .acq_rel);
         if (prev >= self.aggregate_max_inflight) {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
-            self.logger.info("skipping aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
+            const current_interval = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+            const pending_interval = @max(time_intervals, current_interval);
+            self.storeMaxAggregateRescheduleInterval(pending_interval);
+            self.logger.info("coalescing aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
+            zeam_metrics.metrics.zeam_aggregate_coalesced_total.incr();
             return;
         }
         // Past this point we own one `aggregate_inflight` slot — every
         // early-return below must release it.
 
-        // Snapshot state on the caller's thread (fast path).
-        const head_root = self.forkChoice.getHead().blockRoot;
-        var borrow = self.statesGet(head_root) orelse {
-            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
-            self.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "missing_state" }) catch {};
-            return;
-        };
-        defer borrow.assertReleasedOrPanic();
-        const snapshot = borrow.cloneAndRelease(self.allocator) catch |err| {
-            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
-            self.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
-            return;
-        };
-
-        // Non-blocking enqueue onto the shared ThreadPool. The libxev thread
-        // returns immediately; the worker runs on a pool thread. We deliberately
-        // do NOT fall back to inline execution on OOM (unlike replay batches)
-        // because the ~10s aggregate FFI must not run on the libxev thread.
-        self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, snapshot, slot }) catch {
+        // Non-blocking enqueue onto the shared ThreadPool. Validators are cloned
+        // inside the worker after the slot clock is re-read so a slow or
+        // coalesced trigger does not snapshot stale head state (#925).
+        self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, slot }) catch {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
             zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
-            snapshot.deinit();
-            self.allocator.destroy(snapshot);
             return;
         };
     }
 
+    const AggregatePublishCtx = struct {
+        node: *@import("./node.zig").BeamNode,
+        chain: *Self,
+        committee_count: types.SubnetId,
+    };
+
+    fn publishOneAggregate(ctx: *anyopaque, signed: types.SignedAggregatedAttestation) void {
+        var agg = signed;
+        const publish_ctx: *AggregatePublishCtx = @ptrCast(@alignCast(ctx));
+        const committee_count = publish_ctx.committee_count;
+        if (committee_count > 0) {
+            if (firstParticipantSubnet(agg.proof.participants, committee_count)) |subnet_id| {
+                var label_buf: [16]u8 = undefined;
+                if (std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id})) |subnet_label| {
+                    zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+                } else |_| {}
+            }
+        }
+        publish_ctx.node.publishAggregation(agg) catch |err| {
+            publish_ctx.chain.logger.err(
+                "error publishing aggregation at slot={d}: {any} (continuing worker)",
+                .{ agg.data.slot, err },
+            );
+            zeam_metrics.metrics.lean_node_interval_error_total.incr(
+                .{ .site = "publishOneAggregate" },
+            ) catch |me| publish_ctx.chain.logger.warn("metric incr failed: {any}", .{me});
+            agg.deinit();
+            return;
+        };
+        agg.deinit();
+    }
+
     /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).
-    /// Owns `snapshot` and frees it on exit.
-    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, slot: usize) void {
+    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, trigger_slot: usize) void {
+        defer {
+            const pending = chain.aggregate_reschedule_intervals.swap(0, .acq_rel);
+            if (pending != 0) {
+                const now = chain.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+                const reschedule_interval = @max(pending, now);
+                const pending_slot = @divFloor(reschedule_interval, constants.INTERVALS_PER_SLOT);
+                const last_done = chain.aggregate_last_completed_slot.load(.monotonic);
+                if (pending_slot > last_done) {
+                    chain.submitAggregateOnInterval(node, @intCast(reschedule_interval));
+                }
+            }
+        }
         defer _ = chain.aggregate_inflight.fetchSub(1, .acq_rel);
         const worker_timer = zeam_metrics.zeam_aggregate_worker_duration_seconds.start();
         defer _ = worker_timer.observe();
 
-        defer {
-            snapshot.deinit();
-            chain.allocator.destroy(snapshot);
+        // Re-read the slot clock at worker entry. A slow worker otherwise
+        // aggregates a stale {slot-1, slot} window from enqueue time while
+        // the chain has moved on — wasted FFI that drives coalesce storms (#907).
+        const clock_slot = chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        const work = Self.resolveAggregateWorkerSlot(trigger_slot, clock_slot);
+        const slot = work.slot;
+        if (slot != trigger_slot) {
+            chain.logger.info(
+                "aggregate worker slot catch-up: trigger={d} clock={d} using={d}",
+                .{ trigger_slot, clock_slot, slot },
+            );
         }
+
+        const head_root = chain.forkChoice.getHead().blockRoot;
+        var borrow = chain.statesGet(head_root) orelse {
+            chain.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
+            return;
+        };
+        defer borrow.deinit();
+
+        var validators_owned: types.Validators = undefined;
+        types.sszClone(chain.allocator, types.Validators, borrow.state.validators, &validators_owned) catch |err| {
+            chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
+            return;
+        };
+        defer validators_owned.deinit();
 
         // Log subnet-wise coverage of current new payloads before starting aggregation.
         chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
 
+        // On-time workers use {slot-1, slot}. When the trigger lagged the
+        // clock by 2+ slots, slot-1 att_data is past the merge window — skip
+        // it and prove only the current slot (PR #900 / #925 catch-up storm).
         var slot_window_buf: [2]types.Slot = undefined;
         var slot_window_len: usize = 0;
-        if (slot > 0) {
+        if (!work.is_clock_catch_up and slot > 0) {
             slot_window_buf[slot_window_len] = @intCast(slot - 1);
             slot_window_len += 1;
         }
         slot_window_buf[slot_window_len] = @intCast(slot);
         slot_window_len += 1;
 
-        const aggregations = chain.forkChoice.aggregateForSlots(snapshot, slot_window_buf[0..slot_window_len]) catch |err| {
+        var publish_ctx = AggregatePublishCtx{
+            .node = node,
+            .chain = chain,
+            .committee_count = chain.config.spec.attestation_committee_count,
+        };
+
+        const aggregations = chain.forkChoice.aggregateForSlots(
+            &validators_owned,
+            slot_window_buf[0..slot_window_len],
+            &publish_ctx,
+            publishOneAggregate,
+        ) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return;
         };
         defer chain.allocator.free(aggregations);
 
-        if (aggregations.len == 0) return;
-
-        // Per-subnet publish counter. Operators rely on this to tell whether the
-        // local aggregator is producing for its duty subnet at all; the standard
-        // `lean_pq_sig_aggregated_signatures_total` increments only on the
-        // block-proposal path (see chain.zig produceBlock) and stays near zero on
-        // a healthy aggregator that is not also a recent proposer, which makes it
-        // a poor signal for the aggregator role. Derive the subnet from the
-        // first set participant in each proof: all participants of a single
-        // SignedAggregatedAttestation come from the same committee subnet (cf.
-        // `computeSubnetId` = validator_index % attestation_committee_count).
-        const committee_count = chain.config.spec.attestation_committee_count;
-        if (committee_count > 0) {
-            for (aggregations) |signed| {
-                const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse continue;
-                var label_buf: [16]u8 = undefined;
-                const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch continue;
-                zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+        if (aggregations.len > 0) {
+            const committee_count = chain.config.spec.attestation_committee_count;
+            if (committee_count > 0) {
+                for (aggregations) |signed| {
+                    const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse continue;
+                    var label_buf: [16]u8 = undefined;
+                    const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch continue;
+                    zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+                }
             }
+            node.publishProducedAggregations(aggregations);
         }
-
-        node.publishProducedAggregations(aggregations);
+        chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
     /// Find the subnet of the first set participant in `participants`.
