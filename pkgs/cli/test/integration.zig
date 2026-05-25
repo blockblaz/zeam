@@ -56,8 +56,11 @@ fn getZeamExecutable() ![]const u8 {
 fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
     const io = std.testing.io;
 
-    // Set up process with beam command and mock network
-    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
+    // Set up process with beam command and mock network.
+    // `--log_file_active_level warn`: the default file level is `debug`, so all 3 mock nodes
+    // otherwise write full DEBUG logs synchronously on the single shared libxev loop, starving
+    // the per-slot consensus pipeline (the #863 drain) and flaking justification/finalization.
+    const args = [_][]const u8{ exe_path, "--log_file_active_level", "warn", "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
 
     // Start the process
@@ -717,7 +720,7 @@ test "SSE events integration test - wait for justification and finalization" {
     //   - node3 emits its own new_finalization, or
     //   - global finalization advances beyond the first finalized slot, or
     //   - new_head events keep arriving after node3's delayed start (chain still progressing).
-    const timeout_ms: u64 = 480000; // 480 seconds timeout
+    const timeout_ms: u64 = 120000; // 120s: a healthy chain justifies+finalizes well under 1 min; fail fast otherwise
     const start_ns = zeam_utils.monotonicTimestampNs();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
