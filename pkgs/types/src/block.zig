@@ -506,9 +506,9 @@ pub const AggregatedAttestationsResult = struct {
     /// Block proposers, by contrast, MUST aggregate every `att_data`
     /// they choose to include in a block, even if its only input is a
     /// single gossip signature.
-    /// Aggregator entry point: when more than one `att_data` needs recursive
-    /// FFI, run each prove on `thread_pool` after a serial prep phase (issue
-    /// #907 — worker processes ~2 `att_data` per slot window).
+    /// Aggregator batch entry: serial prep then sequential XMSS proves (ethlambda
+    /// worker loop). Parallel ThreadPool scope was removed — nested Rayon inside
+    /// each prove oversubscribed CPU and inflated p50/p95 on devnet (#925).
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
@@ -683,7 +683,7 @@ const CompactGroupResult = struct {
     signature: aggregation.AggregatedSignatureProof,
 };
 
-fn attestationDataLessThan(_: void, a: attestation.AttestationData, b: attestation.AttestationData) bool {
+pub fn attestationDataLessThan(_: void, a: attestation.AttestationData, b: attestation.AttestationData) bool {
     if (a.slot != b.slot) return a.slot < b.slot;
     const head_cmp = std.mem.order(u8, &a.head.root, &b.head.root);
     if (head_cmp != .eq) return head_cmp == .lt;
@@ -701,6 +701,40 @@ fn observeAggregateAttDataPrepPhase(start_ns: i128) void {
     const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
     const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
     zeam_metrics.observeAggregateAttestationBuildPhase("att_data_prep", elapsed_s);
+}
+
+pub const SingleAggregatedSignature = CompactGroupResult;
+
+/// Single `att_data` aggregation: serial prep then one XMSS prove (ethlambda
+/// `aggregate_job` shape). Used by the aggregator per-job loop.
+pub fn computeSingleAggregatedSignature(
+    allocator: Allocator,
+    validators: *const Validators,
+    signatures_map: *const SignaturesMap,
+    new_payloads: ?*const AggregatedPayloadsMap,
+    known_payloads: ?*const AggregatedPayloadsMap,
+    data: attestation.AttestationData,
+) !?SingleAggregatedSignature {
+    var prep = try prepareAggregateAttData(
+        allocator,
+        validators,
+        signatures_map,
+        new_payloads,
+        known_payloads,
+        data,
+    );
+    defer prep.deinit(allocator);
+
+    return switch (prep.outcome) {
+        .skip => null,
+        .done => |result| result,
+        .ffi => |*args| blk: {
+            const result = try runAggregateAttDataFfi(allocator, prep.data, args);
+            args.deinit(allocator);
+            prep.outcome = .skip;
+            break :blk result;
+        },
+    };
 }
 
 const AggregateAttDataOutcome = union(enum) {
@@ -1014,66 +1048,14 @@ fn runAggregateAttDataFfi(
 }
 
 fn runAggregateAttDataPreps(allocator: Allocator, preps: []AggregateAttDataPrep, thread_pool: *ThreadPool) !void {
-    var single_ffi_idx: ?usize = null;
-    var ffi_count: usize = 0;
-    for (preps, 0..) |*prep, i| {
+    _ = thread_pool;
+    // Ethlambda runs aggregation jobs sequentially on one blocking worker so
+    // Rayon gets the full CPU budget per prove. Parallel scope here nested
+    // ThreadPool workers each calling xmss_aggregate (Rayon inside) and hurt
+    // devnet aggregator p50 (#925).
+    for (preps) |*prep| {
         if (prep.outcome != .ffi) continue;
-        ffi_count += 1;
-        single_ffi_idx = i;
-    }
-
-    if (ffi_count == 1) {
-        const i = single_ffi_idx.?;
-        const result = try runAggregateAttDataFfi(allocator, preps[i].data, &preps[i].outcome.ffi);
-        preps[i].outcome.ffi.deinit(allocator);
-        preps[i].outcome = .{ .done = result };
-        return;
-    }
-
-    const slots = try allocator.alloc(AggregateAttDataSlot, preps.len);
-    defer allocator.free(slots);
-    for (slots) |*slot| slot.* = .{};
-
-    const Runner = struct {
-        fn runScope(
-            scope: anytype,
-            alloc: Allocator,
-            preps_in: []AggregateAttDataPrep,
-            out_slots: []AggregateAttDataSlot,
-            any_err: *std.atomic.Value(bool),
-        ) Allocator.Error!void {
-            for (preps_in, 0..) |*prep, i| {
-                if (prep.outcome != .ffi) continue;
-                try scope.spawn(runOne, .{ alloc, prep, &out_slots[i], any_err });
-            }
-        }
-
-        fn runOne(
-            alloc: Allocator,
-            prep: *AggregateAttDataPrep,
-            out_slot: *AggregateAttDataSlot,
-            any_err: *std.atomic.Value(bool),
-        ) void {
-            if (any_err.load(.acquire)) return;
-            const result = runAggregateAttDataFfi(alloc, prep.data, &prep.outcome.ffi) catch |err| {
-                out_slot.err = err;
-                any_err.store(true, .release);
-                return;
-            };
-            out_slot.result = result;
-        }
-    };
-
-    var any_err = std.atomic.Value(bool).init(false);
-    try thread_pool.scope(Runner.runScope, .{ allocator, preps, slots, &any_err });
-
-    for (slots) |slot| {
-        if (slot.err) |err| return err;
-    }
-
-    for (preps, 0..) |*prep, i| {
-        if (prep.outcome != .ffi) continue;
-        const result = slots[i].result orelse return error.AggregateParallelMissingResult;
+        const result = try runAggregateAttDataFfi(allocator, prep.data, &prep.outcome.ffi);
         prep.outcome.ffi.deinit(allocator);
         prep.outcome = .{ .done = result };
     }

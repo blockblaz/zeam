@@ -534,12 +534,10 @@ pub const Node = struct {
             desired_workers
         else
             @max(@as(usize, 1), desired_workers -| worker_count);
-        // One outer aggregate worker at a time on aggregators. Parallelize the
-        // ~11s STARK work per att_data inside that worker
-        // (`computeAggregatedSignatures` thread pool), not across independent
-        // interval workers. Multiple in-flight outer workers can snapshot the
-        // same gossip sigs before either commits and publish duplicate
-        // aggregates (PR #920 review).
+        // One outer aggregate worker at a time on aggregators. Each att_data
+        // prove runs sequentially inside that worker (ethlambda-style) so
+        // Rayon gets the full CPU budget per job instead of ThreadPool ×
+        // Rayon oversubscription (#925).
         const aggregate_max_inflight: u32 = if (options.is_aggregator) 1 else 4;
         const rayon_source: []const u8 = if (options.rayon_threads != null)
             " (--rayon-threads override)"

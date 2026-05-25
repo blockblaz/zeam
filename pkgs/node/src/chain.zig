@@ -4355,8 +4355,8 @@ pub const BeamChain = struct {
         }
 
         // Non-blocking cap check on the libxev thread. Done BEFORE the
-        // expensive state borrow + `cloneAndRelease` so a saturated worker
-        // pool doesn't burn deep-clones we'd immediately throw away.
+        // expensive validators clone in the worker so a saturated worker
+        // pool doesn't burn SSZ work we'd immediately throw away.
         // `fetchAdd`-then-compare is a soft ceiling — transient overshoot
         // is bounded by concurrent caller count and self-corrects on the
         // next interval.
@@ -4373,7 +4373,7 @@ pub const BeamChain = struct {
         // Past this point we own one `aggregate_inflight` slot — every
         // early-return below must release it.
 
-        // Non-blocking enqueue onto the shared ThreadPool. BeamState is cloned
+        // Non-blocking enqueue onto the shared ThreadPool. Validators are cloned
         // inside the worker after the slot clock is re-read so a slow or
         // coalesced trigger does not snapshot stale head state (#925).
         self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, slot }) catch {
@@ -4382,6 +4382,38 @@ pub const BeamChain = struct {
             zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
             return;
         };
+    }
+
+    const AggregatePublishCtx = struct {
+        node: *@import("./node.zig").BeamNode,
+        chain: *Self,
+        committee_count: types.SubnetId,
+    };
+
+    fn publishOneAggregate(ctx: *anyopaque, signed: types.SignedAggregatedAttestation) void {
+        var agg = signed;
+        const publish_ctx: *AggregatePublishCtx = @ptrCast(@alignCast(ctx));
+        const committee_count = publish_ctx.committee_count;
+        if (committee_count > 0) {
+            if (firstParticipantSubnet(agg.proof.participants, committee_count)) |subnet_id| {
+                var label_buf: [16]u8 = undefined;
+                if (std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id})) |subnet_label| {
+                    zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+                } else |_| {}
+            }
+        }
+        publish_ctx.node.publishAggregation(agg) catch |err| {
+            publish_ctx.chain.logger.err(
+                "error publishing aggregation at slot={d}: {any} (continuing worker)",
+                .{ agg.data.slot, err },
+            );
+            zeam_metrics.metrics.lean_node_interval_error_total.incr(
+                .{ .site = "publishOneAggregate" },
+            ) catch |me| publish_ctx.chain.logger.warn("metric incr failed: {any}", .{me});
+            agg.deinit();
+            return;
+        };
+        agg.deinit();
     }
 
     /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).
@@ -4420,15 +4452,14 @@ pub const BeamChain = struct {
             chain.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
             return;
         };
-        defer borrow.assertReleasedOrPanic();
-        const snapshot = borrow.cloneAndRelease(chain.allocator) catch |err| {
-            chain.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
+        defer borrow.deinit();
+
+        var validators_owned: types.Validators = undefined;
+        types.sszClone(chain.allocator, types.Validators, borrow.state.validators, &validators_owned) catch |err| {
+            chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
             return;
         };
-        defer {
-            snapshot.deinit();
-            chain.allocator.destroy(snapshot);
-        }
+        defer validators_owned.deinit();
 
         // Log subnet-wise coverage of current new payloads before starting aggregation.
         chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
@@ -4445,34 +4476,35 @@ pub const BeamChain = struct {
         slot_window_buf[slot_window_len] = @intCast(slot);
         slot_window_len += 1;
 
-        const aggregations = chain.forkChoice.aggregateForSlots(snapshot, slot_window_buf[0..slot_window_len]) catch |err| {
+        var publish_ctx = AggregatePublishCtx{
+            .node = node,
+            .chain = chain,
+            .committee_count = chain.config.spec.attestation_committee_count,
+        };
+
+        const aggregations = chain.forkChoice.aggregateForSlots(
+            &validators_owned,
+            slot_window_buf[0..slot_window_len],
+            &publish_ctx,
+            publishOneAggregate,
+        ) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return;
         };
         defer chain.allocator.free(aggregations);
 
-        if (aggregations.len == 0) return;
-
-        // Per-subnet publish counter. Operators rely on this to tell whether the
-        // local aggregator is producing for its duty subnet at all; the standard
-        // `lean_pq_sig_aggregated_signatures_total` increments only on the
-        // block-proposal path (see chain.zig produceBlock) and stays near zero on
-        // a healthy aggregator that is not also a recent proposer, which makes it
-        // a poor signal for the aggregator role. Derive the subnet from the
-        // first set participant in each proof: all participants of a single
-        // SignedAggregatedAttestation come from the same committee subnet (cf.
-        // `computeSubnetId` = validator_index % attestation_committee_count).
-        const committee_count = chain.config.spec.attestation_committee_count;
-        if (committee_count > 0) {
-            for (aggregations) |signed| {
-                const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse continue;
-                var label_buf: [16]u8 = undefined;
-                const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch continue;
-                zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+        if (aggregations.len > 0) {
+            const committee_count = chain.config.spec.attestation_committee_count;
+            if (committee_count > 0) {
+                for (aggregations) |signed| {
+                    const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse continue;
+                    var label_buf: [16]u8 = undefined;
+                    const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch continue;
+                    zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+                }
             }
+            node.publishProducedAggregations(aggregations);
         }
-
-        node.publishProducedAggregations(aggregations);
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
