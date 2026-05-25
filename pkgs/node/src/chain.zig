@@ -250,7 +250,7 @@ pub const BeamChain = struct {
     ///      whose `alloc`/`free` are internally serialized; an `ArenaAllocator`
     ///      or any custom non-thread-safe allocator would race. If a future
     ///      change swaps the allocator, audit every consumer of `thread_pool`
-    ///      (`stf.verifySignaturesParallel`, `types.compactAttestations`).
+    ///      (`stf.verifySignatures`, `types.compactAttestations`).
     ///   2. The XMSS verifier must be set up before the pool's first verify.
     ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
     ///      pool construction; without that pre-warm, concurrent first-time
@@ -3268,7 +3268,7 @@ pub const BeamChain = struct {
             // atomic and the loser frees its handle. The previous
             // mutex around this block was the dominant contributor
             // to the ~78ms mean lock hold reported in #863.
-            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool);
+            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
 
             step_watch.lap("verify_signatures");
 
