@@ -517,9 +517,13 @@ pub const Node = struct {
         //
         // Must be called before setupProver/setupVerifier since rayon’s global
         // pool is initialized lazily on first use.
-        const rayon_threads = if (options.rayon_threads) |override|
-            @max(@as(usize, 1), @as(usize, override))
-        else if (options.is_aggregator)
+        const rayon_threads = if (options.rayon_threads) |override| blk: {
+            const requested = @max(@as(usize, 1), @as(usize, override));
+            // Cap explicit overrides to the post-system budget so devnet hosts
+            // with `--rayon-threads 12` on 8 vCPUs do not oversubscribe XMSS
+            // prove and inflate worker p50 (#925).
+            break :blk @min(requested, desired_workers);
+        } else if (options.is_aggregator)
             desired_workers
         else
             @max(@as(usize, 1), desired_workers -| worker_count);
