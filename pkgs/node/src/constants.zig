@@ -108,11 +108,20 @@ pub const MAX_FC_CHAIN_PRINT_DEPTH = 5;
 // stuck sync chains recover quickly.
 pub const RPC_REQUEST_TIMEOUT_SECONDS: i64 = 8;
 
-// How often to re-send status requests to all connected peers when not synced.
-// Ensures that already-connected peers are probed again after a restart, and that
-// a node stuck in fc_initing can recover without waiting for new peer connections.
-// 8 slots = 32 seconds at 4s/slot.
+// How often to re-send status requests to connected peers when sync may need
+// recovery: always while fc_initing/behind_peers, and while synced only after
+// the local head has fallen behind wall-clock slots. Ensures that already-
+// connected peers are probed again after a restart and that early devnets with
+// finalized_slot=0 can recover from a gossip-ingress stall via status-driven
+// RPC catch-up. 8 slots = 32 seconds at 4s/slot.
 pub const SYNC_STATUS_REFRESH_INTERVAL_SLOTS: u64 = 8;
+
+// If the high-level sync state is `synced` but our head is this many wall-clock
+// slots behind, keep probing peers with status RPC anyway. Four slots tolerates
+// normal propagation/missed-slot jitter without waiting for the 64-slot proposer
+// rotation to reveal the stall. With the 8-slot refresh cadence, worst-case first
+// recovery probe is just under 12 slots (~48s) after the node stops advancing.
+pub const SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS: u64 = 4;
 
 // Threshold (in slots) above which we prefer a `blocks_by_range` bulk sync over the
 // recursive head-by-root walk. When the peer's head is more than this many slots

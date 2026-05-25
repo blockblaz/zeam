@@ -2681,15 +2681,34 @@ pub const BeamNode = struct {
                 self.refreshSyncFromPeers();
             }
 
-            // Periodically re-send status to all connected peers when not synced.
-            // This recovers from the case where peers were already connected when
-            // the node was in fc_initing and the status-exchange-triggered sync
-            // was skipped (now fixed, but existing connections need a re-probe).
-            if (interval_in_slot == 0 and slot % constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS == 0) {
-                switch (self.chain.getSyncStatus()) {
-                    .fc_initing, .behind_peers => self.refreshSyncFromPeers(),
-                    .synced, .no_peers => {},
+            // Periodically re-send status to connected peers when sync may need
+            // recovery. Finalization-only sync state can report `synced` on early
+            // devnets while finalized_slot stays at zero; if gossip ingress stalls,
+            // the head then falls behind wall-clock slots but no new status response
+            // arrives to trigger RPC catch-up. Keep the pure policy in
+            // `blocks_by_range_sync.zig`; this tick path only supplies snapshots
+            // and performs the RPC side effect.
+            const sync_status = self.chain.getSyncStatus();
+            const our_head_slot = self.chain.forkChoice.getHead().slot;
+            const wall_slot = self.clock.wallSlotNow();
+            const refresh_decision = blocks_by_range_sync.shouldRefreshPeerStatus(
+                sync_status,
+                interval_in_slot,
+                slot,
+                our_head_slot,
+                wall_slot,
+                constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS,
+                constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+            );
+            if (refresh_decision.refresh) {
+                switch (sync_status) {
+                    .synced => self.logger.info(
+                        "head is {d} wall-clock slots behind while synced; refreshing peer status for catch-up",
+                        .{refresh_decision.wall_head_lag_slots},
+                    ),
+                    else => {},
                 }
+                self.refreshSyncFromPeers();
             }
 
             if (interval_in_slot == 2) {
