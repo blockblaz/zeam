@@ -522,7 +522,14 @@ pub const Node = struct {
             // Cap explicit overrides to the post-system budget so devnet hosts
             // with `--rayon-threads 12` on 8 vCPUs do not oversubscribe XMSS
             // prove and inflate worker p50 (#925).
-            break :blk @min(requested, desired_workers);
+            const effective = @min(requested, desired_workers);
+            if (effective < requested) {
+                self.logger.warn(
+                    "--rayon-threads {d} exceeds post-system budget {d}; using {d} rayon threads",
+                    .{ requested, desired_workers, effective },
+                );
+            }
+            break :blk effective;
         } else if (options.is_aggregator)
             desired_workers
         else

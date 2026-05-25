@@ -396,9 +396,10 @@ pub const BeamChain = struct {
     /// in flight. `aggregateImpl` clears this on exit and re-submits once.
     aggregate_reschedule_intervals: std.atomic.Value(u64) = .init(0),
 
-    /// Highest slot window processed by the most recent aggregate worker.
+    /// Highest slot successfully published by the most recent aggregate worker.
     /// Used to skip redundant catch-up resubmits when coalesced triggers
-    /// map to a slot we already handled (#925 coalesce storm).
+    /// map to a slot we already handled (#925 coalesce storm). Not advanced
+    /// on failure or empty runs so coalesce can retry.
     aggregate_last_completed_slot: std.atomic.Value(u64) = .init(0),
 
     /// Joined at `deinit` so aggregate workers cannot outlive chain state.
@@ -4290,6 +4291,33 @@ pub const BeamChain = struct {
         };
     }
 
+    /// Monotonic max for coalesced slot-driver intervals (libxev + pool threads).
+    fn storeMaxAggregateRescheduleInterval(self: *Self, candidate: u64) void {
+        var current = self.aggregate_reschedule_intervals.load(.monotonic);
+        while (candidate > current) {
+            const exchanged = self.aggregate_reschedule_intervals.cmpxchgWeak(
+                current,
+                candidate,
+                .release,
+                .monotonic,
+            ) orelse return;
+            current = exchanged;
+        }
+    }
+
+    const AggregateWorkerSlot = struct {
+        slot: usize,
+        is_clock_catch_up: bool,
+    };
+
+    fn resolveAggregateWorkerSlot(trigger_slot: usize, clock_slot: usize) AggregateWorkerSlot {
+        const is_clock_catch_up = trigger_slot + 1 < clock_slot;
+        return .{
+            .slot = if (is_clock_catch_up) clock_slot else trigger_slot,
+            .is_clock_catch_up = is_clock_catch_up,
+        };
+    }
+
     /// Submit aggregate work to the dedicated ThreadPool worker (issue #873).
     /// Returns within microseconds; the worker calls `publishProducedAggregations`
     /// itself. If the previous aggregate is still in-flight, the trigger is
@@ -4337,10 +4365,7 @@ pub const BeamChain = struct {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             const current_interval = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
             const pending_interval = @max(time_intervals, current_interval);
-            const existing = self.aggregate_reschedule_intervals.load(.monotonic);
-            if (pending_interval > existing) {
-                self.aggregate_reschedule_intervals.store(pending_interval, .release);
-            }
+            self.storeMaxAggregateRescheduleInterval(pending_interval);
             self.logger.info("coalescing aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
             zeam_metrics.metrics.zeam_aggregate_coalesced_total.incr();
             return;
@@ -4381,8 +4406,8 @@ pub const BeamChain = struct {
         // aggregates a stale {slot-1, slot} window from enqueue time while
         // the chain has moved on — wasted FFI that drives coalesce storms (#907).
         const clock_slot = chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
-        const is_clock_catch_up = trigger_slot + 1 < clock_slot;
-        const slot: usize = if (is_clock_catch_up) clock_slot else trigger_slot;
+        const work = Self.resolveAggregateWorkerSlot(trigger_slot, clock_slot);
+        const slot = work.slot;
         if (slot != trigger_slot) {
             chain.logger.info(
                 "aggregate worker slot catch-up: trigger={d} clock={d} using={d}",
@@ -4393,13 +4418,11 @@ pub const BeamChain = struct {
         const head_root = chain.forkChoice.getHead().blockRoot;
         var borrow = chain.statesGet(head_root) orelse {
             chain.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
-            chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
             return;
         };
         defer borrow.assertReleasedOrPanic();
         const snapshot = borrow.cloneAndRelease(chain.allocator) catch |err| {
             chain.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
-            chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
             return;
         };
         defer {
@@ -4415,7 +4438,7 @@ pub const BeamChain = struct {
         // it and prove only the current slot (PR #900 / #925 catch-up storm).
         var slot_window_buf: [2]types.Slot = undefined;
         var slot_window_len: usize = 0;
-        if (!is_clock_catch_up and slot > 0) {
+        if (!work.is_clock_catch_up and slot > 0) {
             slot_window_buf[slot_window_len] = @intCast(slot - 1);
             slot_window_len += 1;
         }
@@ -4424,12 +4447,9 @@ pub const BeamChain = struct {
 
         const aggregations = chain.forkChoice.aggregateForSlots(snapshot, slot_window_buf[0..slot_window_len]) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
-            chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
             return;
         };
         defer chain.allocator.free(aggregations);
-
-        chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
 
         if (aggregations.len == 0) return;
 
@@ -4453,6 +4473,7 @@ pub const BeamChain = struct {
         }
 
         node.publishProducedAggregations(aggregations);
+        chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
     /// Find the subnet of the first set participant in `participants`.
