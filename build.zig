@@ -742,6 +742,40 @@ pub fn build(b: *Builder) !void {
     setTestRunLabelFromCompile(b, run_xmss_tests, xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
 
+    // ---------------------------------------------------------------
+    // `zig build bench-aggregate`: XMSS aggregation benchmark harness.
+    //
+    // Measures aggregation time, aggregate signature size, and verify
+    // time for the flat and tree aggregation shapes documented in
+    // pkgs/xmss/src/bench_aggregation.zig. Distinct keypairs are
+    // cached in `.bench-cache/xmss-keys/v1/` on first run so subsequent
+    // invocations skip the slow keygen step.
+    //
+    // Run with:
+    //   zig build bench-aggregate -- --iters 1 --json out.json --csv out.csv
+    //
+    // Pass `-- --help` to see all options.
+    // ---------------------------------------------------------------
+    const bench_aggregate_root = b.createModule(.{
+        .root_source_file = b.path("pkgs/xmss/src/bench_aggregation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_aggregate_root.addImport("@zeam/xmss", zeam_xmss);
+    const bench_aggregate_exe = b.addExecutable(.{
+        .name = "zeam-bench-aggregate",
+        .root_module = bench_aggregate_root,
+    });
+    bench_aggregate_exe.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, bench_aggregate_exe, target, prover);
+    const run_bench_aggregate = b.addRunArtifact(bench_aggregate_exe);
+    if (b.args) |args| run_bench_aggregate.addArgs(args);
+    const bench_aggregate_step = b.step(
+        "bench-aggregate",
+        "Run the XMSS aggregation benchmark (see pkgs/xmss/src/bench_aggregation.zig)",
+    );
+    bench_aggregate_step.dependOn(&run_bench_aggregate.step);
+
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
     });
