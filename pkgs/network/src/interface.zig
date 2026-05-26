@@ -68,6 +68,10 @@ pub const GossipSub = struct {
     publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!bool,
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
+    /// Re-send gossipsub mesh subscriptions (optional; no-op when null).
+    refreshMeshFn: ?*const fn (ptr: *anyopaque) void = null,
+    /// Current gossipsub mesh peer count (optional; zero when null).
+    meshPeerCountFn: ?*const fn (ptr: *anyopaque) u64 = null,
 
     pub fn format(self: GossipSub, writer: anytype) !void {
         _ = self;
@@ -76,6 +80,15 @@ pub const GossipSub = struct {
 
     pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);
+    }
+
+    pub fn refreshMesh(self: GossipSub) void {
+        if (self.refreshMeshFn) |refresh| refresh(self.ptr);
+    }
+
+    pub fn meshPeerCount(self: GossipSub) u64 {
+        if (self.meshPeerCountFn) |count_fn| return count_fn(self.ptr);
+        return 0;
     }
 
     /// Publish a gossip message. Returns `true` if the message was successfully

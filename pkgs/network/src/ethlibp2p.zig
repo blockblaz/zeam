@@ -1329,6 +1329,9 @@ pub const EthLibp2p = struct {
     rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
+    /// Topics successfully joined on the Rust gossipsub mesh at startup.
+    subscribed_gossip_topics: std.ArrayListUnmanaged(interface.GossipTopic) = .empty,
+    subscribed_gossip_topics_lock: zeam_utils.SyncMutex = .{},
 
     const Self = @This();
 
@@ -1404,6 +1407,10 @@ pub const EthLibp2p = struct {
 
         self.gossipHandler.deinit();
         self.peerEventHandler.deinit();
+
+        self.subscribed_gossip_topics_lock.lock();
+        self.subscribed_gossip_topics.deinit(self.allocator);
+        self.subscribed_gossip_topics_lock.unlock();
 
         for (self.params.listen_addresses) |addr| addr.deinit();
         self.allocator.free(self.params.listen_addresses);
@@ -1502,8 +1509,54 @@ pub const EthLibp2p = struct {
                 );
                 return error.GossipMeshSubscribeFailed;
             }
+            self.subscribed_gossip_topics_lock.lock();
+            defer self.subscribed_gossip_topics_lock.unlock();
+            var already_subscribed = false;
+            for (self.subscribed_gossip_topics.items) |existing| {
+                if (std.meta.eql(existing, gossip_topic)) {
+                    already_subscribed = true;
+                    break;
+                }
+            }
+            if (!already_subscribed) {
+                try self.subscribed_gossip_topics.append(self.allocator, gossip_topic);
+            }
         }
         try self.gossipHandler.subscribe(topics, handler);
+    }
+
+    fn refreshGossipMeshSubscriptions(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        var topics_copy: std.ArrayListUnmanaged(interface.GossipTopic) = .empty;
+        defer topics_copy.deinit(self.allocator);
+        self.subscribed_gossip_topics_lock.lock();
+        topics_copy.appendSlice(self.allocator, self.subscribed_gossip_topics.items) catch {
+            self.subscribed_gossip_topics_lock.unlock();
+            return;
+        };
+        self.subscribed_gossip_topics_lock.unlock();
+
+        var resubscribed: usize = 0;
+        for (topics_copy.items) |gossip_topic| {
+            var topic = interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest) catch continue;
+            defer topic.deinit();
+            const topic_str = topic.encodeZ() catch continue;
+            defer self.allocator.free(topic_str);
+            if (subscribe_gossip_topic_to_rust_bridge(self.params.networkId, topic_str.ptr)) {
+                resubscribed += 1;
+            }
+        }
+        if (resubscribed > 0) {
+            self.logger.info(
+                "network-{d}:: re-sent gossipsub mesh subscriptions for {d} topic(s)",
+                .{ self.params.networkId, resubscribed },
+            );
+        }
+    }
+
+    fn gossipMeshPeerCount(ptr: *anyopaque) u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return get_mesh_peers_total(self.params.networkId);
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
@@ -1711,6 +1764,8 @@ pub const EthLibp2p = struct {
                 .publishFn = publish,
                 .subscribeFn = subscribe,
                 .onGossipFn = onGossip,
+                .refreshMeshFn = refreshGossipMeshSubscriptions,
+                .meshPeerCountFn = gossipMeshPeerCount,
             },
             .reqresp = .{
                 .ptr = self,

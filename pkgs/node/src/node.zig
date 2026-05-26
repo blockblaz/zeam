@@ -119,6 +119,12 @@ pub const BeamNode = struct {
     /// that preserves that invariant.
     sync_refresh_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Rotating cursor for rate-limited `refreshSyncFromPeers` batches (#926).
+    sync_refresh_peer_cursor: usize = 0,
+
+    /// Monotonic millis of the last inbound gossip delivery (#926).
+    last_gossip_rx_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     const Self = @This();
 
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
@@ -314,6 +320,7 @@ pub const BeamNode = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        self.last_gossip_rx_ms.store(@intCast(zeam_utils.unixTimestampMillis()), .monotonic);
 
         // Lifetime invariant for `data`:
         //   The gossip subsystem (see `pkgs/network/src/ethlibp2p.zig`) owns the
@@ -1233,6 +1240,48 @@ pub const BeamNode = struct {
                 }
             }
 
+            // #894: when the chain-worker is enabled, never inline `onBlock`
+            // on libxev for missing-parent RPC chunks — cache and fetch instead.
+            if (self.chain.chain_worker != null and
+                !self.chain.forkChoice.hasBlock(signed_block.block.parent_root))
+            {
+                if (current_depth >= constants.MAX_BLOCK_FETCH_DEPTH) {
+                    self.logger.warn(
+                        "Reached max block fetch depth ({d}) for block 0x{x}, discarding",
+                        .{ constants.MAX_BLOCK_FETCH_DEPTH, &block_root },
+                    );
+                    return;
+                }
+                if (self.cacheBlockAndFetchParent(block_root, signed_block.*, current_depth + 1)) |parent_root| {
+                    self.logger.debug(
+                        "Cached block 0x{x} at depth {d}, fetching parent 0x{x}",
+                        .{
+                            &block_root,
+                            current_depth,
+                            &parent_root,
+                        },
+                    );
+                } else |cache_err| {
+                    if (cache_err == CacheBlockError.PreFinalized) {
+                        self.logger.info(
+                            "block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
+                            .{
+                                &block_root,
+                                signed_block.block.slot,
+                            },
+                        );
+                        _ = self.network.pruneCachedBlocks(block_root, null);
+                    } else {
+                        self.logger.warn("failed to cache block 0x{x}: {any}", .{
+                            &block_root,
+                            cache_err,
+                        });
+                    }
+                }
+                self.flushPendingParentFetches(block_ctx.peer_id);
+                return;
+            }
+
             // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 // Check if the error is due to missing parent
@@ -1717,6 +1766,27 @@ pub const BeamNode = struct {
                 },
                 .fallback_inline => {},
             }
+        }
+
+        // #894: when the chain-worker is enabled, never inline `onBlock`
+        // on libxev for missing-parent range chunks — cache and fetch instead.
+        if (self.chain.chain_worker != null and
+            !self.chain.forkChoice.hasBlock(signed_block.block.parent_root))
+        {
+            if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
+                self.logger.debug(
+                    "blocks_by_range: cached block 0x{x}, fetching parent 0x{x}",
+                    .{ &block_root, &parent_root },
+                );
+            } else |cache_err| {
+                if (cache_err == CacheBlockError.PreFinalized) {
+                    _ = self.network.pruneCachedBlocks(block_root, null);
+                } else {
+                    self.logger.warn("blocks_by_range: failed to cache block 0x{x}: {any}", .{ &block_root, cache_err });
+                }
+            }
+            self.flushPendingParentFetches(peer_id);
+            return;
         }
 
         const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
@@ -2517,6 +2587,13 @@ pub const BeamNode = struct {
             const client_type = clientTypeFromName(node_name.name);
             zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 0) catch {};
         }
+
+        if (reason == .timeout or reason == .error_) {
+            const wall_slot = self.clock.wallSlotNow();
+            const our_head_slot = self.chain.forkChoice.getHead().slot;
+            const wall_lag = blocks_by_range_sync.cappedSyncGapSlots(wall_slot, our_head_slot, wall_slot);
+            self.maybeHealGossipMesh(wall_lag);
+        }
     }
 
     pub fn onPeerConnectionFailed(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, result: networks.ConnectionResult) !void {
@@ -2691,6 +2768,8 @@ pub const BeamNode = struct {
             const sync_status = self.chain.getSyncStatus();
             const our_head_slot = self.chain.forkChoice.getHead().slot;
             const wall_slot = self.clock.wallSlotNow();
+            const wall_head_lag_slots = blocks_by_range_sync.cappedSyncGapSlots(wall_slot, our_head_slot, wall_slot);
+            self.chain.setWallHeadLagSlots(wall_head_lag_slots);
             const refresh_decision = blocks_by_range_sync.shouldRefreshPeerStatus(
                 sync_status,
                 interval_in_slot,
@@ -2709,6 +2788,11 @@ pub const BeamNode = struct {
                     else => {},
                 }
                 self.refreshSyncFromPeers();
+                self.maybeInitiateProactiveCatchUp(refresh_decision.wall_head_lag_slots);
+            }
+
+            if (interval_in_slot == 0 and slot % constants.GOSSIP_MESH_HEAL_INTERVAL_SLOTS == 0) {
+                self.maybeHealGossipMesh(refresh_decision.wall_head_lag_slots);
             }
 
             if (interval_in_slot == 2) {
@@ -2746,7 +2830,86 @@ pub const BeamNode = struct {
         self.scheduleSyncRefresh();
     }
 
-    /// Re-send our status to every connected peer.
+    fn gossipStallThresholdMs() u64 {
+        return @as(u64, constants.GOSSIP_STALL_THRESHOLD_SLOTS) *
+            @as(u64, @intCast(params.SECONDS_PER_SLOT * std.time.ms_per_s));
+    }
+
+    fn gossipSilentMs(self: *Self) u64 {
+        const now_ms: u64 = @intCast(zeam_utils.unixTimestampMillis());
+        const last_ms = self.last_gossip_rx_ms.load(.monotonic);
+        if (last_ms == 0) return 0;
+        return now_ms -| last_ms;
+    }
+
+    fn maybeInitiateProactiveCatchUp(self: *Self, wall_head_lag_slots: u64) void {
+        const gossip_silent_ms = self.gossipSilentMs();
+        if (!blocks_by_range_sync.shouldInitiateProactiveCatchUp(
+            wall_head_lag_slots,
+            constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+            gossip_silent_ms,
+            Self.gossipStallThresholdMs(),
+        )) return;
+
+        const our_head_slot = self.chain.forkChoice.getHead().slot;
+        const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+
+        var best_peer_id: ?[]const u8 = null;
+        var best_status: ?types.Status = null;
+        {
+            var guard = self.network.connected_peers.iterateLocked();
+            defer guard.deinit();
+            while (guard.iter.next()) |entry| {
+                if (entry.value_ptr.latest_status) |status| {
+                    if (best_status == null or status.head_slot > best_status.?.head_slot) {
+                        best_status = status;
+                        best_peer_id = entry.key_ptr.*;
+                    }
+                }
+            }
+        }
+
+        const peer_id = best_peer_id orelse return;
+        const status = best_status orelse return;
+        const catch_up_status = CatchUpPeerStatus{
+            .peer_id = peer_id,
+            .head_slot = status.head_slot,
+            .head_root = status.head_root,
+            .finalized_slot = status.finalized_slot,
+        };
+        if (!self.shouldCatchUpFromPeerStatus(catch_up_status, our_head_slot, our_finalized_slot)) return;
+
+        self.logger.info(
+            "proactive catch-up: gossip silent for {d}ms, wall lag {d} slots, peer {s}{f} head={d}",
+            .{
+                gossip_silent_ms,
+                wall_head_lag_slots,
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                status.head_slot,
+            },
+        );
+        self.initiateCatchUpFromPeerStatus(catch_up_status, our_head_slot);
+    }
+
+    fn maybeHealGossipMesh(self: *Self, wall_head_lag_slots: u64) void {
+        const mesh_peers = self.network.gossipMeshPeerCount();
+        const gossip_silent_ms = self.gossipSilentMs();
+        if (!blocks_by_range_sync.shouldHealGossipMesh(
+            mesh_peers,
+            constants.GOSSIP_MESH_MIN_PEERS,
+            gossip_silent_ms,
+            Self.gossipStallThresholdMs(),
+        )) return;
+
+        self.logger.info(
+            "gossip mesh heal: mesh_peers={d} gossip_silent_ms={d} wall_lag={d}",
+            .{ mesh_peers, gossip_silent_ms, wall_head_lag_slots },
+        );
+        self.network.refreshGossipMesh();
+    }
+
+    /// Re-send our status to a rotating batch of connected peers.
     ///
     /// Called periodically when the node is not yet synced so that peers
     /// already connected before the sync mechanism became aware of them
@@ -2775,7 +2938,19 @@ pub const BeamNode = struct {
 
         const status = self.chain.getStatus();
         const handler = self.getReqRespResponseHandler();
-        for (peer_ids.items) |peer_id| {
+        const total = peer_ids.items.len;
+        const batch = blocks_by_range_sync.peerBatchWindow(
+            total,
+            self.sync_refresh_peer_cursor,
+            constants.SYNC_STATUS_REFRESH_PEERS_PER_TICK,
+        );
+        self.sync_refresh_peer_cursor = batch.next_cursor;
+
+        var sent: usize = 0;
+        var i: usize = 0;
+        while (i < batch.count) : (i += 1) {
+            const idx = (batch.start + i) % total;
+            const peer_id = peer_ids.items[idx];
             _ = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
                 self.logger.warn("failed to refresh status to peer {s}{f}: {any}", .{
                     peer_id,
@@ -2783,6 +2958,13 @@ pub const BeamNode = struct {
                     err,
                 });
             };
+            sent += 1;
+        }
+        if (sent < total) {
+            self.logger.debug(
+                "status refresh batch: sent {d}/{d} peers (cursor={d})",
+                .{ sent, total, self.sync_refresh_peer_cursor },
+            );
         }
     }
 
