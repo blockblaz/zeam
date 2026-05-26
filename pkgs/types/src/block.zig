@@ -683,6 +683,71 @@ const CompactGroupResult = struct {
     signature: aggregation.AggregatedSignatureProof,
 };
 
+/// Returns true if every bit set in `subset` is also set in `superset`,
+/// i.e. `superset` covers a (non-strict) superset of `subset`'s validators.
+/// Out-of-bounds bits in either bitlist are treated as zero (unset), which
+/// matches `AggregationBits.get(i) catch false` semantics elsewhere in this
+/// file. Pure read-only helper; allocates nothing.
+fn participantsContainsAll(superset: attestation.AggregationBits, subset: attestation.AggregationBits) bool {
+    var i: usize = 0;
+    while (i < subset.len()) : (i += 1) {
+        const sub_bit = subset.get(i) catch false;
+        if (!sub_bit) continue;
+        const sup_bit = if (i < superset.len()) (superset.get(i) catch false) else false;
+        if (!sup_bit) return false;
+    }
+    return true;
+}
+
+/// Drop greedy-selected children whose participant set is fully covered by
+/// another selected child's. `extendProofsGreedily` is called twice in
+/// `prepareAggregateAttData` (new_payloads then known_payloads); each call
+/// only counts new coverage on top of already-selected children from
+/// previous calls, so a proof picked from new_payloads can be strictly
+/// subsumed by a proof later picked from known_payloads — the second pass
+/// could not see new_payloads' candidate to compare against. Both end up
+/// in `selected_children`, and the combined `rec_xmss_aggregate` STARK
+/// merges them into a proof equivalent to the dominating child alone,
+/// paying ~4 s of prove time for no extra validator coverage (#940).
+///
+/// This pass removes any child whose participants are contained in another
+/// selected child's. Validator union is preserved (the dominating child
+/// already covers everything the dropped child did), so `covered_by_children`
+/// stays correct and the gossip-sig filter at the call site is unaffected.
+/// When only one child remains after pruning and there are no gossip sigs,
+/// the existing `!has_gossip and selected_children.len == 1` fast path
+/// below skips the STARK entirely.
+///
+/// Tie-break for equal sets: keep the lower-indexed entry (which comes from
+/// `new_payloads` first, then `known_payloads`) so behaviour is stable.
+fn pruneSubsumedChildren(
+    selected_children: *std.ArrayList(aggregation.AggregatedSignatureProof),
+) void {
+    if (selected_children.items.len < 2) return;
+    var i: usize = 0;
+    while (i < selected_children.items.len) {
+        const i_bits = selected_children.items[i].participants;
+        var subsumed = false;
+        for (selected_children.items, 0..) |*other, j| {
+            if (i == j) continue;
+            const j_bits = other.participants;
+            if (!participantsContainsAll(j_bits, i_bits)) continue;
+            // i ⊆ j. Drop i unless the sets are equal AND j comes after i —
+            // in the equal case keep the lower-indexed entry.
+            const equal = participantsContainsAll(i_bits, j_bits);
+            if (equal and j > i) continue;
+            subsumed = true;
+            break;
+        }
+        if (subsumed) {
+            selected_children.items[i].deinit();
+            _ = selected_children.orderedRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 pub fn attestationDataLessThan(_: void, a: attestation.AttestationData, b: attestation.AttestationData) bool {
     if (a.slot != b.slot) return a.slot < b.slot;
     const head_cmp = std.mem.order(u8, &a.head.root, &b.head.root);
@@ -822,6 +887,15 @@ fn prepareAggregateAttData(
 
     try extendProofsGreedily(allocator, new_payloads, data, &selected_children, &covered_by_children, &empty_available);
     try extendProofsGreedily(allocator, known_payloads, data, &selected_children, &covered_by_children, &empty_available);
+    // Drop children whose participant set is dominated by another selected
+    // child's. The two greedy passes above scan new_payloads and known_payloads
+    // independently and cannot cross-compare candidates, so a small proof from
+    // new_payloads can survive even when a strictly larger known_payloads proof
+    // is later selected on top. Merging dominated children via STARK costs
+    // ~4 s per call for no extra coverage (#940). `covered_by_children` is
+    // unaffected because the dominating child already covers the dropped
+    // child's validators.
+    pruneSubsumedChildren(&selected_children);
 
     var sigmap_sigs: std.ArrayList(xmss.Signature) = .empty;
     errdefer {
