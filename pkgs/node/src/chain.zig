@@ -252,10 +252,12 @@ pub const BeamChain = struct {
     ///      or any custom non-thread-safe allocator would race. If a future
     ///      change swaps the allocator, audit every consumer of `thread_pool`
     ///      (`stf.verifySignaturesParallel`, `types.compactAttestations`).
-    ///   2. The XMSS verifier must be set up before the pool's first verify.
-    ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
-    ///      pool construction; without that pre-warm, concurrent first-time
-    ///      verifies could race the Rust-side initialization.
+    ///   2. The XMSS prover/verifier bytecode must be set up before the pool's
+    ///      first verify. The CLI calls `xmss.setupXmssAggregation()` on the
+    ///      main thread *before* constructing the thread pool, so workers
+    ///      cannot observe uninitialised FFI state. That single setup
+    ///      initialises both prove and verify state so workers can call verify
+    ///      without racing first-time initialization.
     ///   3. `xmss.PublicKeyCache` is lock-free as of P1 of #863
     ///      (per-slot atomic CAS); concurrent `getOrPut` calls are
     ///      safe. The pre-PR-#884 serial-pre-phase constraint no

@@ -17,10 +17,8 @@ pub const AggregatedXMSS = opaque {};
 // External C functions from multisig-glue (uses leanMultisig devnet4 with recursive aggregation)
 /// Returns 0 on success, -1 if the prover bytecode file is missing or initialisation failed.
 /// Never panics — the Rust side wraps the body in catch_unwind (fix for #722).
-extern fn xmss_setup_prover() callconv(.c) c_int;
-/// Returns 0 on success, -1 on failure.
-extern fn xmss_setup_verifier() callconv(.c) c_int;
-/// Configure the global rayon thread pool. Must be called before xmss_setup_prover.
+extern fn setup_xmss_aggregation() callconv(.c) c_int;
+/// Configure the global rayon thread pool. Must be called before setup_xmss_aggregation.
 /// num_threads=0 means use rayon default (one per logical CPU).
 /// Returns 0 always (errors from an already-initialized pool are silently ignored).
 extern fn xmss_set_rayon_threads(num_threads: usize) callconv(.c) c_int;
@@ -76,20 +74,8 @@ extern fn xmss_aggregate_signature_from_bytes(
     bytes_len: usize,
 ) callconv(.c) ?*AggregatedXMSS;
 
-/// Cached after first successful init; Rust side uses OnceLock as well.
-var prover_ready = std.atomic.Value(bool).init(false);
-
-/// Idempotent prover init for aggregators. Calls `setupProver` once and sets
-/// `prover_ready` so the first `aggregateSignatures` does not pay setup on the
-/// hot path. Safe to call at startup before the first slot trigger.
-pub fn ensureProverReady() !void {
-    if (prover_ready.load(.acquire)) return;
-    try setupProver();
-    prover_ready.store(true, .release);
-}
-
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
-/// Must be called before `setupProver` and before any aggregation work begins.
+/// Must be called before `setupXmssAggregation` and before any aggregation work begins.
 /// `num_threads = 0` means "use rayon's default" (one thread per logical CPU).
 /// Typical usage: pass `cpu_count - 3` to reserve cores for libxev, the chain
 /// worker, and the rust-libp2p network thread (see issue #873).
@@ -98,17 +84,11 @@ pub fn setRayonThreads(num_threads: usize) void {
     _ = xmss_set_rayon_threads(num_threads);
 }
 
-/// Initialize the XMSS prover (idempotent — only runs once).
-/// Returns error.ProverSetupFailed when the prover bytecode file is missing or the
-/// underlying Rust initialisation failed. Callers should log a warning and skip
-/// aggregation rather than propagating the error as a fatal failure.
-pub fn setupProver() error{ProverSetupFailed}!void {
-    if (xmss_setup_prover() != 0) return error.ProverSetupFailed;
-}
-
-/// Initialize the XMSS verifier (idempotent — only runs once).
-pub fn setupVerifier() error{VerifierSetupFailed}!void {
-    if (xmss_setup_verifier() != 0) return error.VerifierSetupFailed;
+/// Initialize XMSS aggregation (both prove and verify state). Must be called
+/// exactly once at node startup, before any aggregation or verification work
+/// begins.
+pub fn setupXmssAggregation() error{XmssAggregationSetupFailed}!void {
+    if (setup_xmss_aggregation() != 0) return error.XmssAggregationSetupFailed;
 }
 
 /// Aggregate raw XMSS signatures with optional recursive children.
@@ -133,8 +113,6 @@ pub fn aggregateSignatures(
     if (children_pub_keys.len != children_proofs.len) {
         return AggregationError.AggregationFailed;
     }
-
-    try ensureProverReady();
 
     const num_children = children_pub_keys.len;
     const allocator = std.heap.c_allocator;
@@ -219,8 +197,6 @@ pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, m
     // Get bytes from aggregated signature
     const sig_bytes = agg_sig.constSlice();
 
-    try setupVerifier();
-
     // Verify directly from bytes (Rust deserializes internally)
     const result = xmss_verify_aggregated(
         public_keys.ptr,
@@ -243,8 +219,6 @@ pub const AggregatedPayloadVerifyBatch = struct {
 
 pub fn verifyAggregatedPayloadBatch(allocator: std.mem.Allocator, tasks: []const AggregatedPayloadVerifyBatch) !void {
     if (tasks.len == 0) return;
-
-    try setupVerifier();
 
     var total_keys: usize = 0;
     for (tasks) |task| total_keys += task.public_keys.len;
@@ -319,7 +293,7 @@ test "aggregateSignatures and verifyAggregatedPayload with valid and invalid pub
     var signature = try keypair.sign(&message_hash, epoch);
     defer signature.deinit();
 
-    try setupProver();
+    try setupXmssAggregation();
 
     var public_keys = [_]*const hashsig.HashSigPublicKey{keypair.public_key};
     var signatures = [_]*const hashsig.HashSigSignature{signature.handle};

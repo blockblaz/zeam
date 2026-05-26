@@ -1268,10 +1268,7 @@ pub fn compactAttestations(
     // -------- Serial pre-phase: build CompactGroupPrep for every entry --------
     //
     // All `xmss.PublicKey.fromBytes` calls happen on this thread. The Rust FFI
-    // for pubkey deserialization is not documented as `Send`, and `setupVerifier`
-    // (called transitively) carries first-time-init races. By doing every FFI
-    // construction here we ensure the parallel worker only invokes
-    // `aggregate()` on already-deserialized handles.
+    // for pubkey deserialization is not documented as `Send`.
     //
     // All wrapper handles are owned by `pubkey_wrappers`; we deinit each at the
     // end so Rust handles do not leak. The slice arrays themselves live in a

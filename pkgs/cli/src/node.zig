@@ -494,12 +494,6 @@ pub const Node = struct {
             const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
             break :blk @min(zig_worker_budget, @as(usize, ThreadPool.max_thread_count));
         };
-        self.thread_pool = try ThreadPool.init(.{
-            .allocator = allocator,
-            .io = std.Io.Threaded.global_single_threaded.io(),
-            .thread_count = @intCast(worker_count),
-        });
-        errdefer self.thread_pool.deinit();
 
         // Coordinate the Zig worker pool and the rayon pool used by the XMSS
         // aggregate prover from the same post-system-thread budget so they do
@@ -515,7 +509,7 @@ pub const Node = struct {
         // aggregator that bottleneck is the produce path instead, so giving
         // rayon more cores measurably shortens the per-pass build time.
         //
-        // Must be called before setupProver/setupVerifier since rayon’s global
+        // Must be called before setupXmssAggregation since rayon’s global
         // pool is initialized lazily on first use.
         const rayon_threads = if (options.rayon_threads) |override| blk: {
             const requested = @max(@as(usize, 1), @as(usize, override));
@@ -561,11 +555,15 @@ pub const Node = struct {
         }
         xmss.setRayonThreads(rayon_threads);
 
-        if (options.is_aggregator) {
-            xmss.ensureProverReady() catch |err| {
-                self.logger.warn("xmss prover init failed: {any}; aggregation may be unavailable", .{err});
-            };
-        }
+        // Single XMSS aggregation setup for both prover and verifier paths
+        try xmss.setupXmssAggregation();
+
+        self.thread_pool = try ThreadPool.init(.{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .thread_count = @intCast(worker_count),
+        });
+        errdefer self.thread_pool.deinit();
 
         // Log the aggregator threshold on startup so operators can see
         // exactly how `--min-aggregation-inputs` was resolved (default vs
@@ -582,16 +580,6 @@ pub const Node = struct {
                     "",
             },
         );
-
-        // Pre-warm the XMSS verifier on the main thread before any worker can
-        // call `verifyAggregatedPayload`. The Rust-side verifier setup is
-        // documented as idempotent but is not hardened against first-time-init
-        // races between concurrent callers; doing it once here removes that
-        // race regardless of the Rust implementation.
-        xmss.setupVerifier() catch |err| {
-            // Do not call `thread_pool.deinit()` here — `errdefer` below already tears it down.
-            return err;
-        };
 
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
