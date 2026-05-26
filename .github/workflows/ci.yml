@@ -432,12 +432,11 @@ jobs:
 
     - name: Generate LeanSpec fixtures
       working-directory: leanSpec
-      # Matches the submodule leanSpec's own `just fill-ci` body. Runs SERIALLY
-      # (no -n auto) on purpose: per leanSpec/Justfile, pytest-xdist workers race
-      # on the lean_multisig_py prover's process-global setup and corrupt proofs
-      # intermittently. Restore -n auto only once that is per-process safe upstream.
-      # (This is the matching ci.yml note leanSpec/Justfile points to.)
-      run: uv run --group test fill --clean --fork=Lstar
+      # Generate the Lstar test fixtures in parallel (-n auto --dist=worksteal).
+      # leanSpec #772 set the prover's rayon thread count to 1 and re-enabled
+      # parallel prod fill, so pytest-xdist workers no longer race on the
+      # lean_multisig_py prover's process-global setup.
+      run: uv run --group test fill --fork=Lstar --clean -n auto --dist=worksteal
     
     - name: Generate spec fixtures
       run: zig build spectest:generate --summary all
