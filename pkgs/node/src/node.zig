@@ -2769,6 +2769,13 @@ pub const BeamNode = struct {
                 else => {},
             }
             self.refreshSyncFromPeers();
+        }
+
+        // Proactive catch-up runs every slot rather than at the status-refresh
+        // cadence: when gossip ingress has stalled, waiting up to 8 slots for
+        // the next refresh window defeats the point of acting on cached peer
+        // status. Overlap is filtered inside `initiateBlocksByRangeCatchUp`.
+        if (interval_in_slot == 0) {
             self.maybeInitiateProactiveCatchUp(wall_head_lag_slots);
         }
 
@@ -2777,22 +2784,34 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Snapshot the best (highest head_slot) peer status while holding the
+    /// connected-peers read lock, duplicating peer_id so the caller can
+    /// safely release the lock before issuing RPCs.
+    ///
+    /// Caller owns `result.peer_id` and must free it via `self.allocator`.
+    ///
+    /// Borrowing `entry.key_ptr.*` past `guard.deinit()` would race with
+    /// `onPeerDisconnected` (rust-bridge thread) freeing the hash-map key,
+    /// causing a use-after-free in the downstream RPC dispatch.
     fn findBestCatchUpPeerStatus(self: *Self) ?CatchUpPeerStatus {
         var best: ?CatchUpPeerStatus = null;
+        var best_peer_id_buf: []u8 = &[_]u8{};
         var guard = self.network.connected_peers.iterateLocked();
         defer guard.deinit();
         while (guard.iter.next()) |entry| {
             const peer_info = entry.value_ptr;
-            if (peer_info.latest_status) |status| {
-                if (best == null or status.head_slot > best.?.head_slot) {
-                    best = .{
-                        .peer_id = entry.key_ptr.*,
-                        .head_slot = status.head_slot,
-                        .head_root = status.head_root,
-                        .finalized_slot = status.finalized_slot,
-                    };
-                }
-            }
+            const status = peer_info.latest_status orelse continue;
+            if (best != null and status.head_slot <= best.?.head_slot) continue;
+
+            const owned = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+            if (best_peer_id_buf.len != 0) self.allocator.free(best_peer_id_buf);
+            best_peer_id_buf = owned;
+            best = .{
+                .peer_id = owned,
+                .head_slot = status.head_slot,
+                .head_root = status.head_root,
+                .finalized_slot = status.finalized_slot,
+            };
         }
         return best;
     }
@@ -2809,6 +2828,7 @@ pub const BeamNode = struct {
         const our_head_slot = self.chain.forkChoice.getHead().slot;
         const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
         const catch_up_status = self.findBestCatchUpPeerStatus() orelse return;
+        defer self.allocator.free(catch_up_status.peer_id);
         if (!self.shouldCatchUpFromPeerStatus(catch_up_status, our_head_slot, our_finalized_slot)) return;
 
         self.logger.info(
