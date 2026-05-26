@@ -3964,7 +3964,7 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
