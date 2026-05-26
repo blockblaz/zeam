@@ -2196,6 +2196,8 @@ pub const ForkChoice = struct {
         // ssz.serialize corrupts the source value; clone once for storage and
         // deserialize a second copy from the same bytes for the publish path.
         var stored_proof: types.AggregatedSignatureProof = undefined;
+        var stored_proof_owned = true;
+        errdefer if (stored_proof_owned) stored_proof.deinit();
         const proof_bytes = try types.sszCloneAndGetBytes(
             self.allocator,
             types.AggregatedSignatureProof,
@@ -2204,9 +2206,13 @@ pub const ForkChoice = struct {
         );
         signature_live = false;
         defer self.allocator.free(proof_bytes);
-        errdefer stored_proof.deinit();
 
         try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
+
+        var participant_count: u64 = 0;
+        for (0..stored_proof.participants.len()) |i| {
+            if (stored_proof.participants.get(i) catch false) participant_count += 1;
+        }
 
         const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -2216,6 +2222,7 @@ pub const ForkChoice = struct {
             .source_payload_participants = source_payload_bits,
             .source_gossip_participants = source_gossip_bits,
         });
+        stored_proof_owned = false;
         source_payload_bits_owned = false;
         source_gossip_bits_owned = false;
 
@@ -2234,10 +2241,6 @@ pub const ForkChoice = struct {
         }
 
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
-        var participant_count: u64 = 0;
-        for (0..stored_proof.participants.len()) |i| {
-            if (stored_proof.participants.get(i) catch false) participant_count += 1;
-        }
         zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
 
         var publish_proof: types.AggregatedSignatureProof = undefined;
@@ -3911,6 +3914,99 @@ test "shouldSuppressDuplicateAggregateCommit: snap gossip fully consumed suppres
     var live = types.SignaturesMap.init(allocator);
     defer live.deinit();
     try std.testing.expect(shouldSuppressDuplicateAggregateCommit(&snap, att_data, &live));
+}
+
+// Regression (#933): commit must store one SSZ clone in fork choice and return
+// an independent publish copy; both must remain valid after the map append.
+test "commitOneAggregateResult: stored and publish proofs are independent SSZ copies" {
+    const allocator = std.testing.allocator;
+
+    const validator_count: usize = 2;
+    const num_blocks: usize = 1;
+    var key_manager = try keymanager.getTestKeyManager(allocator, validator_count, num_blocks);
+    defer key_manager.deinit();
+
+    const all_pubkeys = try key_manager.getAllPubkeys(allocator, validator_count);
+    defer allocator.free(all_pubkeys.attestation_pubkeys);
+    defer allocator.free(all_pubkeys.proposal_pubkeys);
+
+    const genesis_spec = types.GenesisSpec{
+        .genesis_time = 1234,
+        .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
+        .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
+    };
+
+    var mock_chain = try stf.genMockChain(allocator, num_blocks, genesis_spec);
+    defer mock_chain.deinit(allocator);
+    defer mock_chain.genesis_state.validators.deinit();
+    defer mock_chain.genesis_state.historical_block_hashes.deinit();
+    defer mock_chain.genesis_state.justified_slots.deinit();
+    defer mock_chain.genesis_state.justifications_roots.deinit();
+    defer mock_chain.genesis_state.justifications_validators.deinit();
+
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    defer allocator.free(spec_name);
+    defer allocator.free(fork_digest);
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const test_thread_pool = try initTestThreadPool();
+    defer test_thread_pool.deinit();
+    var fork_choice = try ForkChoice.init(allocator, .{
+        .config = chain_config,
+        .anchorState = &mock_chain.genesis_state,
+        .logger = zeam_logger_config.logger(.forkchoice),
+        .thread_pool = test_thread_pool,
+    });
+    defer fork_choice.deinit();
+
+    const att_data = types.AttestationData{
+        .slot = 0,
+        .head = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
+        .target = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
+        .source = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
+    };
+
+    var signature = try types.AggregatedSignatureProof.init(allocator);
+    try types.aggregationBitsSet(&signature.participants, 0, true);
+    try signature.proof_data.append(0xAB);
+
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const maybe_signed = try fork_choice.commitOneAggregateResult(&snap, att_data, signature);
+    const signed = maybe_signed orelse return error.TestExpectedSome;
+    defer signed.deinit();
+
+    const payloads = fork_choice.latest_new_aggregated_payloads.get(att_data) orelse return error.TestExpectedSome;
+    try std.testing.expectEqual(@as(usize, 1), payloads.items.len);
+
+    var cloned_stored: types.AggregatedSignatureProof = undefined;
+    try types.sszClone(allocator, types.AggregatedSignatureProof, payloads.items[0].proof, &cloned_stored);
+    defer cloned_stored.deinit();
+
+    var cloned_publish: types.AggregatedSignatureProof = undefined;
+    try types.sszClone(allocator, types.AggregatedSignatureProof, signed.proof, &cloned_publish);
+    defer cloned_publish.deinit();
+
+    try std.testing.expect(try cloned_stored.participants.get(0));
+    try std.testing.expect(try cloned_publish.participants.get(0));
+    try std.testing.expectEqual(cloned_stored.participants.len(), cloned_publish.participants.len());
 }
 
 /// Walk the owned aggregator snapshot and drop every `att_data` entry

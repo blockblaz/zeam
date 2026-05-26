@@ -723,7 +723,8 @@ pub const ReqRespRequestCallback = struct {
     }
 
     pub fn deinit(self: *ReqRespRequestCallback) void {
-        // peer_id is owned by the callback, free it
+        // peer_id is owned by the callback; handler.ptr references the node and
+        // is not freed here (see BeamNode.getReqRespResponseHandler).
         self.allocator.free(self.peer_id);
     }
 

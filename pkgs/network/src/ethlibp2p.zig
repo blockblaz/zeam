@@ -1347,6 +1347,11 @@ pub const EthLibp2p = struct {
     /// Snapshot of an in-flight RPC callback for response delivery while the
     /// entry remains registered (streaming success chunks). `peer_id` is owned
     /// by this snapshot; do not use map pointers after releasing the lock.
+    ///
+    /// `handler.ptr` references the node (`BeamNode` via
+    /// `getReqRespResponseHandler`), not memory owned by `ReqRespRequestCallback`.
+    /// `ReqRespRequestCallback.deinit` only frees `peer_id`, so concurrent
+    /// `cancelInflightRpcCallback` cannot invalidate the handler target.
     const RpcCallbackDeliverySnapshot = struct {
         handler: interface.OnReqRespResponseCbHandler,
         method: interface.LeanSupportedProtocol,
@@ -1384,6 +1389,13 @@ pub const EthLibp2p = struct {
         defer self.rpc_callbacks_lock.unlock();
         const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
         return callback_ptr.method;
+    }
+
+    fn dupeRpcCallbackPeerId(self: *Self, request_id: u64) !?[]const u8 {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
+        return try self.allocator.dupe(u8, callback_ptr.peer_id);
     }
 
     fn putRpcCallback(self: *Self, request_id: u64, callback_entry: interface.ReqRespRequestCallback) !void {
@@ -1714,9 +1726,24 @@ pub const EthLibp2p = struct {
         args: anytype,
     ) void {
         const owned_message = std.fmt.allocPrint(self.allocator, fmt, args) catch |alloc_err| {
+            const peer_id_copy = self.dupeRpcCallbackPeerId(request_id) catch |dup_err| {
+                self.logger.err(
+                    "network-{d}:: Failed to duplicate peer id for RPC error log request_id={d}: {any}",
+                    .{ self.params.networkId, request_id, dup_err },
+                );
+                return;
+            } orelse {
+                self.logger.err(
+                    "network-{d}:: Failed to allocate RPC error message for request_id={d}: {any}",
+                    .{ self.params.networkId, request_id, alloc_err },
+                );
+                return;
+            };
+            defer self.allocator.free(peer_id_copy);
+            const node_name = self.node_registry.getNodeNameFromPeerId(peer_id_copy);
             self.logger.err(
-                "network-{d}:: Failed to allocate RPC error message for request_id={d}: {any}",
-                .{ self.params.networkId, request_id, alloc_err },
+                "network-{d}:: Failed to allocate RPC error message for request_id={d} from peer={s}{f}: {any}",
+                .{ self.params.networkId, request_id, peer_id_copy, node_name, alloc_err },
             );
             return;
         };
