@@ -2197,7 +2197,7 @@ pub const ForkChoice = struct {
         // worker proof, then deserialize separate copies for store and publish
         // so no fallible step runs while signature_live is true.
         var stored_proof: types.AggregatedSignatureProof = undefined;
-        var stored_proof_owned = true;
+        var stored_proof_owned = false;
         errdefer if (stored_proof_owned) stored_proof.deinit();
         const proof_bytes = try types.sszSerializeAndGetBytes(
             self.allocator,
@@ -2208,6 +2208,7 @@ pub const ForkChoice = struct {
         owned_signature.deinit();
         defer self.allocator.free(proof_bytes);
         try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &stored_proof, self.allocator);
+        stored_proof_owned = true;
 
         try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
 
