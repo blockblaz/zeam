@@ -2193,19 +2193,20 @@ pub const ForkChoice = struct {
         var owned_signature = signature;
         var signature_live = true;
         errdefer if (signature_live) owned_signature.deinit();
-        // ssz.serialize corrupts the source value; clone once for storage and
-        // deserialize a second copy from the same bytes for the publish path.
+        // ssz.serialize corrupts the source value; serialize once, mark the
+        // worker proof consumed, then deserialize separate copies for store
+        // and publish so no fallible step runs while signature_live is true.
         var stored_proof: types.AggregatedSignatureProof = undefined;
         var stored_proof_owned = true;
         errdefer if (stored_proof_owned) stored_proof.deinit();
-        const proof_bytes = try types.sszCloneAndGetBytes(
+        const proof_bytes = try types.sszSerializeAndGetBytes(
             self.allocator,
             types.AggregatedSignatureProof,
             owned_signature,
-            &stored_proof,
         );
         signature_live = false;
         defer self.allocator.free(proof_bytes);
+        try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &stored_proof, self.allocator);
 
         try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
 

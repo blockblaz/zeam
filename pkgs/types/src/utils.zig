@@ -228,14 +228,39 @@ pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !vo
 // Using the same ssz.serialize pass for both clone and bytes avoids a second
 // serialize call on the same value, which has been observed to corrupt in-memory
 // List/Bitlist state when the value is later reused (e.g. cached blocks).
+//
+// On success, `data` is corrupted by ssz.serialize and must not be deinit'd.
+// If this function fails after serialization, `data` is still corrupted and
+// must not be deinit'd; callers with errdefer cleanup need sszSerializeAndGetBytes
+// plus a separate deserialize step instead.
 pub fn sszCloneAndGetBytes(allocator: Allocator, comptime T: type, data: T, cloned: *T) ![]u8 {
+    const bytes = try sszSerializeAndGetBytes(allocator, T, data);
+    errdefer allocator.free(bytes);
+    try ssz.deserialize(T, bytes, cloned, allocator);
+    return bytes;
+}
+
+/// Serialize `data` once and return owned SSZ bytes. On success, `data` is
+/// corrupted by ssz.serialize and must not be deinit'd. Use this when the
+/// caller needs to mark the source consumed before any fallible deserialize or
+/// allocation step (see commitOneAggregateResult in forkchoice.zig).
+pub fn sszSerializeAndGetBytes(allocator: Allocator, comptime T: type, data: T) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
-    // Do NOT defer deinit — caller takes ownership of the buffer.
     errdefer bytes.deinit(allocator);
 
     try ssz.serialize(T, data, &bytes, allocator);
-    try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
     return bytes.toOwnedSlice(allocator);
+}
+
+test "sszSerializeAndGetBytes roundtrip" {
+    const allocator = std.testing.allocator;
+    const data: u16 = 0x5566;
+    const bytes = try sszSerializeAndGetBytes(allocator, u16, data);
+    defer allocator.free(bytes);
+
+    var cloned: u16 = undefined;
+    try ssz.deserialize(u16, bytes, &cloned, allocator);
+    try std.testing.expectEqual(data, cloned);
 }
 
 test "isSlotJustified treats finalized boundary as implicit" {
