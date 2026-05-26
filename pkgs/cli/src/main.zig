@@ -633,22 +633,22 @@ fn mainInner(init: std.process.Init) !void {
             const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
             const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
             const worker_count = @min(desired_workers, @as(usize, 4));
+            const rayon_threads = @max(@as(usize, 1), desired_workers -| worker_count);
+
+            // Coordinate rayon before XMSS setup, then run setup before the Zig
+            // thread pool exists so workers cannot observe uninitialised FFI state.
+            xmss.setRayonThreads(rayon_threads);
+            xmss.setupXmssAggregation() catch |err| {
+                std.debug.print("xmss.setupXmssAggregation failed: {any}\n", .{err});
+                return err;
+            };
+
             const thread_pool = try ThreadPool.init(.{
                 .allocator = allocator,
                 .io = init.io,
                 .thread_count = @intCast(worker_count),
             });
             defer thread_pool.deinit();
-
-            // Pre-warm the XMSS verifier on the main thread before any worker
-            // can call `verifyAggregatedPayload`. The Rust-side verifier setup
-            // is documented as idempotent but is not hardened against
-            // first-time-init races between concurrent callers; doing it once
-            // here removes that race regardless of the Rust implementation.
-            xmss.setupVerifier() catch |err| {
-                std.debug.print("xmss.setupVerifier failed: {any}\n", .{err});
-                return err;
-            };
 
             // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
             var validator_ids_1 = [_]usize{0};
