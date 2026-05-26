@@ -1526,7 +1526,12 @@ fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloads
     });
 }
 
-fn initTestThreadPool(allocator: Allocator) !*ThreadPool {
+fn setupTestPrimitives(allocator: Allocator) !*ThreadPool {
+    // Initialise XMSS aggregation FFI for tests that call
+    // `computeAggregatedSignatures` through this pool. Both calls are
+    // process-idempotent (`OnceLock` on the Rust side; rayon ignores repeats).
+    xmss.setRayonThreads(1);
+    try xmss.setupXmssAggregation();
     return ThreadPool.init(.{
         .allocator = allocator,
         .io = std.Io.Threaded.global_single_threaded.io(),
@@ -1554,7 +1559,7 @@ test "computeAggregatedSignatures filters attestation data by slot list" {
     var result = try AggregatedAttestationsResult.init(allocator);
     defer result.deinit();
 
-    const thread_pool = try initTestThreadPool(allocator);
+    const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
 
     const allowed_slots = [_]Slot{10};
@@ -1588,7 +1593,7 @@ test "computeAggregatedSignatures slot filter matches unfiltered for same-slot i
     var unfiltered = try AggregatedAttestationsResult.init(allocator);
     defer unfiltered.deinit();
 
-    const thread_pool = try initTestThreadPool(allocator);
+    const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
     try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool);
 
@@ -1622,7 +1627,7 @@ test "computeAggregatedSignatures empty slot filter result is clean" {
     defer result.deinit();
 
     const allowed_slots = [_]Slot{14};
-    const thread_pool = try initTestThreadPool(allocator);
+    const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
     try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
 

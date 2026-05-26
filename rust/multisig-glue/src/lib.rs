@@ -5,6 +5,7 @@ use rec_aggregation::{
     AggregatedXMSS,
 };
 use std::slice;
+use std::sync::OnceLock;
 
 // Mirror hashsig-glue's struct layout with #[repr(C)]
 // These must match hashsig-glue/src/lib.rs exactly
@@ -20,14 +21,22 @@ pub struct Signature {
 
 /// Initialize XMSS aggregation (both prove and verify state). Returns 0 on success, -1 on panic.
 ///
+/// Idempotent: the underlying init runs at most once per process. Subsequent calls return 0
+/// without re-running `init_aggregation_bytecode()` or the DFT-twiddle precompute. This is
+/// defensive — the production caller invokes this exactly once at node startup, but tests
+/// and refactors are guarded so a second call cannot double-init global state.
+///
 /// `catch_unwind` is required because a Rust panic through an `extern "C"` boundary is UB —
 /// `init_aggregation_bytecode()` panics when the compiled prover bytecode file is missing.
-/// The caller (Zig) is expected to invoke this exactly once at node startup.
+/// A panicking first call leaves the `OnceLock` empty, so a later call can retry.
 #[no_mangle]
 pub extern "C" fn setup_xmss_aggregation() -> i32 {
+    static INIT: OnceLock<()> = OnceLock::new();
     match std::panic::catch_unwind(|| {
-        init_aggregation_bytecode();
-        backend::precompute_dft_twiddles::<backend::KoalaBear>(1 << 24);
+        INIT.get_or_init(|| {
+            init_aggregation_bytecode();
+            backend::precompute_dft_twiddles::<backend::KoalaBear>(1 << 24);
+        });
     }) {
         Ok(()) => 0,
         Err(_) => -1,

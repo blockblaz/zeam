@@ -193,6 +193,7 @@ fn recordXmssProveDuration(start_ns: i128) void {
     zeam_metrics.observeXmssRecAggregateProve(elapsed_s);
 }
 
+/// Precondition: `setupXmssAggregation` must have been called once in this process.
 pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, message_hash: *const [32]u8, epoch: u32, agg_sig: *const ByteListMiB) !void {
     // Get bytes from aggregated signature
     const sig_bytes = agg_sig.constSlice();
@@ -217,6 +218,7 @@ pub const AggregatedPayloadVerifyBatch = struct {
     agg_sig: *const ByteListMiB,
 };
 
+/// Precondition: `setupXmssAggregation` must have been called once in this process.
 pub fn verifyAggregatedPayloadBatch(allocator: std.mem.Allocator, tasks: []const AggregatedPayloadVerifyBatch) !void {
     if (tasks.len == 0) return;
 
@@ -293,6 +295,7 @@ test "aggregateSignatures and verifyAggregatedPayload with valid and invalid pub
     var signature = try keypair.sign(&message_hash, epoch);
     defer signature.deinit();
 
+    setRayonThreads(1);
     try setupXmssAggregation();
 
     var public_keys = [_]*const hashsig.HashSigPublicKey{keypair.public_key};
@@ -330,6 +333,9 @@ test "aggregateSignatures recursively aggregates child payloads and verifies wit
     const allocator = std.testing.allocator;
     const message_hash = [_]u8{7} ** 32;
     const epoch: u32 = 3;
+
+    setRayonThreads(1);
+    try setupXmssAggregation();
 
     // Build two independent child proofs (each child has one raw signer).
     var child1_kp = try hashsig.KeyPair.generate(allocator, "child1_keypair", 0, 10);
@@ -414,6 +420,9 @@ test "verifyAggregatedPayload fails for recursively aggregated payload with miss
     const allocator = std.testing.allocator;
     const message_hash = [_]u8{11} ** 32;
     const epoch: u32 = 5;
+
+    setRayonThreads(1);
+    try setupXmssAggregation();
 
     var child1_kp = try hashsig.KeyPair.generate(allocator, "verify_child1_keypair", 0, 10);
     defer child1_kp.deinit();
