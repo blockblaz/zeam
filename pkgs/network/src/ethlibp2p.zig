@@ -825,28 +825,24 @@ export fn handleRPCResponseFromRustBridge(
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
 
-    const callback_peer_id = zigHandler.getRpcCallbackPeerId(request_id) orelse {
+    var callback_snap = zigHandler.snapshotRpcCallbackForDelivery(request_id) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to snapshot RPC callback for request_id={d} protocol={s} from peer={s}{f}: {any}",
+            .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name, err },
+        );
+        return;
+    } orelse {
         zigHandler.logger.warn(
             "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name },
         );
         return;
     };
+    defer callback_snap.deinit(zigHandler.allocator);
+    const callback_peer_id = callback_snap.peer_id;
     const callback_node_name = zigHandler.node_registry.getNodeNameFromPeerId(callback_peer_id);
-    const method = zigHandler.getRpcCallbackMethod(request_id) orelse {
-        zigHandler.logger.warn(
-            "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name },
-        );
-        return;
-    };
-    const handler = zigHandler.getRpcCallbackHandler(request_id) orelse {
-        zigHandler.logger.warn(
-            "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name },
-        );
-        return;
-    };
+    const method = callback_snap.method;
+    const handler = callback_snap.handler;
     const protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
         zigHandler.notifyRpcErrorFmt(
             request_id,
@@ -1348,6 +1344,19 @@ pub const EthLibp2p = struct {
 
     const Self = @This();
 
+    /// Snapshot of an in-flight RPC callback for response delivery while the
+    /// entry remains registered (streaming success chunks). `peer_id` is owned
+    /// by this snapshot; do not use map pointers after releasing the lock.
+    const RpcCallbackDeliverySnapshot = struct {
+        handler: interface.OnReqRespResponseCbHandler,
+        method: interface.LeanSupportedProtocol,
+        peer_id: []const u8,
+
+        fn deinit(self: *RpcCallbackDeliverySnapshot, allocator: Allocator) void {
+            allocator.free(self.peer_id);
+        }
+    };
+
     fn takeRpcCallback(self: *Self, request_id: u64) ?interface.ReqRespRequestCallback {
         self.rpc_callbacks_lock.lock();
         defer self.rpc_callbacks_lock.unlock();
@@ -1357,18 +1366,17 @@ pub const EthLibp2p = struct {
         return null;
     }
 
-    fn getRpcCallbackHandler(self: *Self, request_id: u64) ?interface.OnReqRespResponseCbHandler {
+    fn snapshotRpcCallbackForDelivery(self: *Self, request_id: u64) !?RpcCallbackDeliverySnapshot {
         self.rpc_callbacks_lock.lock();
         defer self.rpc_callbacks_lock.unlock();
         const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
-        return callback_ptr.handler;
-    }
-
-    fn getRpcCallbackPeerId(self: *Self, request_id: u64) ?[]const u8 {
-        self.rpc_callbacks_lock.lock();
-        defer self.rpc_callbacks_lock.unlock();
-        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
-        return callback_ptr.peer_id;
+        const handler = callback_ptr.handler orelse return null;
+        const peer_id = try self.allocator.dupe(u8, callback_ptr.peer_id);
+        return .{
+            .handler = handler,
+            .method = callback_ptr.method,
+            .peer_id = peer_id,
+        };
     }
 
     fn getRpcCallbackMethod(self: *Self, request_id: u64) ?interface.LeanSupportedProtocol {
@@ -1705,15 +1713,10 @@ pub const EthLibp2p = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        const peer_id = self.getRpcCallbackPeerId(request_id) orelse "unknown";
-        const node_name = if (self.getRpcCallbackPeerId(request_id)) |pid|
-            self.node_registry.getNodeNameFromPeerId(pid)
-        else
-            zeam_utils.OptionalNode.init(null);
         const owned_message = std.fmt.allocPrint(self.allocator, fmt, args) catch |alloc_err| {
             self.logger.err(
-                "network-{d}:: Failed to allocate RPC error message for request_id={d} from peer={s}{f}: {any}",
-                .{ self.params.networkId, request_id, peer_id, node_name, alloc_err },
+                "network-{d}:: Failed to allocate RPC error message for request_id={d}: {any}",
+                .{ self.params.networkId, request_id, alloc_err },
             );
             return;
         };

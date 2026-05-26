@@ -2133,7 +2133,9 @@ pub const ForkChoice = struct {
             );
             if (maybe_result) |*result| {
                 defer result.attestation.deinit();
-                if (try self.commitOneAggregateResult(&snap, result)) |signed| {
+                const att_data = result.attestation.data;
+                const signature = result.signature;
+                if (try self.commitOneAggregateResult(&snap, att_data, signature)) |signed| {
                     if (publish_fn) |pfn| {
                         pfn(publish_ctx.?, signed);
                     } else {
@@ -2166,10 +2168,9 @@ pub const ForkChoice = struct {
     fn commitOneAggregateResult(
         self: *Self,
         snap: *AggregateSnapshot,
-        result: *types.SingleAggregatedSignature,
+        att_data: types.AttestationData,
+        signature: types.AggregatedSignatureProof,
     ) !?types.SignedAggregatedAttestation {
-        const att_data = result.attestation.data;
-
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
@@ -2178,6 +2179,8 @@ pub const ForkChoice = struct {
                 "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
                 .{att_data.slot},
             );
+            var owned_signature = signature;
+            owned_signature.deinit();
             return null;
         }
 
@@ -2187,15 +2190,19 @@ pub const ForkChoice = struct {
         var source_gossip_bits = try types.AggregationBits.init(self.allocator);
         var source_gossip_bits_owned = true;
         errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
+        var owned_signature = signature;
+        var signature_live = true;
+        errdefer if (signature_live) owned_signature.deinit();
         // ssz.serialize corrupts the source value; clone once for storage and
         // deserialize a second copy from the same bytes for the publish path.
         var stored_proof: types.AggregatedSignatureProof = undefined;
         const proof_bytes = try types.sszCloneAndGetBytes(
             self.allocator,
             types.AggregatedSignatureProof,
-            result.signature,
+            owned_signature,
             &stored_proof,
         );
+        signature_live = false;
         defer self.allocator.free(proof_bytes);
         errdefer stored_proof.deinit();
 
