@@ -2193,9 +2193,9 @@ pub const ForkChoice = struct {
         var owned_signature = signature;
         var signature_live = true;
         errdefer if (signature_live) owned_signature.deinit();
-        // ssz.serialize corrupts the source value; serialize once, mark the
-        // worker proof consumed, then deserialize separate copies for store
-        // and publish so no fallible step runs while signature_live is true.
+        // ssz.serialize corrupts the source value; serialize once, deinit the
+        // worker proof, then deserialize separate copies for store and publish
+        // so no fallible step runs while signature_live is true.
         var stored_proof: types.AggregatedSignatureProof = undefined;
         var stored_proof_owned = true;
         errdefer if (stored_proof_owned) stored_proof.deinit();
@@ -2205,6 +2205,7 @@ pub const ForkChoice = struct {
             owned_signature,
         );
         signature_live = false;
+        owned_signature.deinit();
         defer self.allocator.free(proof_bytes);
         try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &stored_proof, self.allocator);
 
