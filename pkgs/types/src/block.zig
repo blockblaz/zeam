@@ -1865,7 +1865,7 @@ test "computeSingleAggregatedSignature: single-child passthrough survives prep d
         null,
         att_data,
     );
-    const result = maybe_result orelse return error.TestExpectedSome;
+    var result = maybe_result orelse return error.TestExpectedSome;
     defer {
         result.attestation.deinit();
         result.signature.deinit();
