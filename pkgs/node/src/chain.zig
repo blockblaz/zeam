@@ -399,14 +399,6 @@ pub const BeamChain = struct {
     /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
     aggregate_max_inflight: u32,
 
-    /// Dedicated Io.Threaded for the block-proposal worker.
-    /// `concurrent_limit = .limited(1)` enforces at most one in-flight
-    /// proposal task; a second submit returns `error.ConcurrencyUnavailable`.
-    propose_io: *std.Io.Threaded,
-
-    /// Long-lived group hosting submitted proposal tasks.
-    propose_group: std.Io.Group = .init,
-
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -552,18 +544,6 @@ pub const BeamChain = struct {
         errdefer anchor_rc.release();
         try states.put(fork_choice.head.blockRoot, anchor_rc);
 
-        // Dedicated Io.Threaded for the block-proposal prover worker (#863):
-        // produceBlock + buildBlockProof drive the recursive prover, which must run
-        // off the slot-driver loop. concurrent_limit = .limited(1) caps in-flight to one.
-        // (Aggregate work uses main's #907 counter + WaitGroup model, below.)
-        const prop_io = try allocator.create(std.Io.Threaded);
-        errdefer allocator.destroy(prop_io);
-        prop_io.* = std.Io.Threaded.init(allocator, .{
-            .async_limit = .nothing,
-            .concurrent_limit = .limited(1),
-        });
-        errdefer prop_io.deinit();
-
         var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
@@ -606,9 +586,6 @@ pub const BeamChain = struct {
             // at its final heap location), so the worker's ctx pointer
             // remains stable for its entire lifetime.
             .chain_worker = null,
-            // Block-proposal prover worker (#863): offloaded off the slot driver.
-            .propose_io = prop_io,
-            .propose_group = .init,
             // Aggregate worker bookkeeping (issue #907). Counter + WaitGroup
             // backstop the lock-free cap check + `deinit` join — see field docs.
             .aggregate_inflight = .init(0),
@@ -1532,9 +1509,8 @@ pub const BeamChain = struct {
         // never called.)
         self.stopChainStateRefcountObserver();
 
-        // Wait for any in-flight proposal worker (#863) and aggregate workers
-        // (#907) before tearing down chain state they reference.
-        self.propose_group.cancel(self.propose_io.io());
+        // Wait for in-flight aggregate workers (#907) before tearing down
+        // chain state they reference.
         self.thread_pool.waitAndWork(&self.aggregate_wg);
 
         // Stop and free the chain-worker FIRST (before any chain
@@ -1548,11 +1524,6 @@ pub const BeamChain = struct {
             self.allocator.destroy(w);
             self.chain_worker = null;
         }
-
-        // Tear down the proposal worker pool (#863) after chain_worker is
-        // stopped and propose_group is cancelled.
-        self.propose_io.deinit();
-        self.allocator.destroy(self.propose_io);
 
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
@@ -4340,24 +4311,20 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Submit block proposal work to the dedicated Io.Threaded worker.
-    /// Returns quickly; the worker runs the existing validator proposal path
-    /// and publishes any produced block itself. If the previous proposal is
-    /// still in-flight, the submit is skipped.
+    /// Run block proposal work for this slot on the slot-driver (main loop) thread.
+    /// Skipped unless this node is the proposer for `slot`.
     pub fn submitProposeOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const validator = if (node.validator) |*validator| validator else return;
         if (validator.getSlotProposer(slot) == null) return;
 
-        // DIAGNOSTIC (0f778f94 cross-thread libxev bug): run proposeImpl SYNCHRONOUSLY on the
-        // slot-driver (main loop) thread instead of offloading to propose_io. proposeImpl calls
-        // node.publishBlock + forkChoice.onInterval, which touch the single-threaded libxev loop;
-        // doing that from the propose_io worker corrupts the loop's timer pairing-heap (infinite
-        // loop in combine_siblings). Synchronous == pre-0f778f94 behavior.
+        // proposeImpl runs synchronously on the slot-driver (main loop) thread: it calls
+        // node.publishBlock + forkChoice.onInterval, which touch the single-threaded libxev loop
+        // and therefore must not run on a worker thread.
         proposeImpl(self, node, slot);
     }
 
-    /// Worker body for block proposal/proving (runs on `propose_io` thread).
+    /// Block proposal/proving body. Runs on the slot-driver (main loop) thread.
     fn proposeImpl(chain: *Self, node: *@import("./node.zig").BeamNode, slot: usize) void {
         var maybe_validator_output = node.validator.?.maybeDoProposal(slot) catch |err| blk: {
             chain.logger.err("error producing block proposal at slot={d}: {any} (continuing tick)", .{ slot, err });
