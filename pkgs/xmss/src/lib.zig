@@ -57,7 +57,13 @@ pub const PublicKeyCache = struct {
         for (self.slots) |*s| {
             const ptr_int = s.load(.monotonic);
             if (ptr_int != EMPTY) {
-                var pk = PublicKey{ .handle = @ptrFromInt(ptr_int) };
+                // `handle` and `_buf` both point to the same C-heap allocation
+                // (handle = @ptrCast(_buf) at construction time).
+                const raw: [*]u8 = @ptrFromInt(ptr_int);
+                var pk = PublicKey{
+                    ._buf = raw,
+                    .handle = @ptrCast(raw),
+                };
                 pk.deinit();
             }
         }
