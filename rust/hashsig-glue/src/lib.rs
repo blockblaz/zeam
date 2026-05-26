@@ -148,88 +148,134 @@ fn xmss_secret_key_to_ssz(sk: &HashSigPrivateKey) -> Vec<u8> {
 
 // FFI Functions for Zig interop
 
-/// Generate a new key pair
-/// Returns a pointer to the KeyPair or null on error
-/// # Safety
-/// This is meant to be called from zig, so the pointers will always dereference correctly
+// ─── Layout queries ──────────────────────────────────────────────────────────
+//
+// Zig callers query these at startup so they can pre-allocate correctly-sized
+// and correctly-aligned storage, then pass it to the `_into` init functions
+// below.  Rust never Box-allocates the outer KeyPair / Signature / PublicKey
+// structs; allocation and lifetime are owned entirely by the Zig side.
+
+/// Size in bytes of the KeyPair struct.
 #[no_mangle]
-pub unsafe extern "C" fn hashsig_keypair_generate(
+pub extern "C" fn hashsig_sizeof_keypair() -> usize {
+    std::mem::size_of::<KeyPair>()
+}
+
+/// Required alignment in bytes of the KeyPair struct.
+#[no_mangle]
+pub extern "C" fn hashsig_alignof_keypair() -> usize {
+    std::mem::align_of::<KeyPair>()
+}
+
+/// Size in bytes of the Signature struct.
+#[no_mangle]
+pub extern "C" fn hashsig_sizeof_signature() -> usize {
+    std::mem::size_of::<Signature>()
+}
+
+/// Required alignment in bytes of the Signature struct.
+#[no_mangle]
+pub extern "C" fn hashsig_alignof_signature() -> usize {
+    std::mem::align_of::<Signature>()
+}
+
+/// Size in bytes of the PublicKey struct.
+#[no_mangle]
+pub extern "C" fn hashsig_sizeof_public_key() -> usize {
+    std::mem::size_of::<PublicKey>()
+}
+
+/// Required alignment in bytes of the PublicKey struct.
+#[no_mangle]
+pub extern "C" fn hashsig_alignof_public_key() -> usize {
+    std::mem::align_of::<PublicKey>()
+}
+
+// ─── Placement-init (no Rust heap allocation for the outer struct) ────────────
+//
+// Each `_into` function writes a fully-initialised struct into caller-supplied
+// storage.  The inner XMSS types still carry their own heap-allocated data
+// (leansig `Vec<u8>`), but the outer wrapper struct itself lives in Zig memory.
+// Callers must later call the matching `_deinit` to run Rust Drop in-place,
+// then free the buffer themselves.
+
+/// Generate a new key pair into caller-supplied storage.
+///
+/// `out` must point to at least `hashsig_sizeof_keypair()` bytes aligned to at
+/// least `hashsig_alignof_keypair()` (C `malloc` always satisfies this).  On
+/// success the struct is written in-place and the caller must later call
+/// `hashsig_keypair_deinit` before freeing `out`.  Returns 0 on success, -1 on
+/// error; on error the storage is left uninitialised.
+///
+/// # Safety
+/// `out` must be a valid, properly-aligned, non-null pointer to at least
+/// `hashsig_sizeof_keypair()` bytes.  `seed_phrase` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_keypair_generate_into(
+    out: *mut KeyPair,
     seed_phrase: *const c_char,
     activation_epoch: usize,
     num_active_epochs: usize,
-) -> *mut KeyPair {
-    let seed_phrase = unsafe { CStr::from_ptr(seed_phrase).to_string_lossy().into_owned() };
-
-    // Hash the seed phrase to get a 32-byte seed
+) -> i32 {
+    if out.is_null() || seed_phrase.is_null() {
+        return -1;
+    }
+    let seed_phrase = CStr::from_ptr(seed_phrase).to_string_lossy().into_owned();
     let mut hasher = Sha256::new();
     hasher.update(seed_phrase.as_bytes());
     let seed = hasher.finalize().into();
-
     let (public_key, private_key) = PrivateKey::generate(
         &mut StdRng::from_seed(seed),
         activation_epoch as u32,
         num_active_epochs as u32,
     );
-
-    let keypair = Box::new(KeyPair {
-        public_key,
-        private_key,
-    });
-
-    Box::into_raw(keypair)
+    std::ptr::write(out, KeyPair { public_key, private_key });
+    0
 }
 
-/// Reconstruct a key pair from SSZ-encoded secret and public keys
-/// Returns a pointer to the KeyPair or null on error
+/// Reconstruct a key pair from SSZ-encoded bytes into caller-supplied storage.
+/// Returns 0 on success, -1 on error.
+///
 /// # Safety
-/// This is meant to be called from zig, so the pointers will always dereference correctly
+/// `out` must be a valid, properly-aligned, non-null pointer to at least
+/// `hashsig_sizeof_keypair()` bytes.  Key byte pointers must be valid for their
+/// respective lengths.
 #[no_mangle]
-pub unsafe extern "C" fn hashsig_keypair_from_ssz(
+pub unsafe extern "C" fn hashsig_keypair_from_ssz_into(
+    out: *mut KeyPair,
     private_key_ptr: *const u8,
     private_key_len: usize,
     public_key_ptr: *const u8,
     public_key_len: usize,
-) -> *mut KeyPair {
-    if private_key_ptr.is_null() || public_key_ptr.is_null() {
-        return ptr::null_mut();
+) -> i32 {
+    if out.is_null() || private_key_ptr.is_null() || public_key_ptr.is_null() {
+        return -1;
     }
-
-    unsafe {
-        let sk_slice = slice::from_raw_parts(private_key_ptr, private_key_len);
-        let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
-
-        let private_key: HashSigPrivateKey = match xmss_secret_key_from_ssz(sk_slice) {
-            Ok(key) => key,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        let public_key: HashSigPublicKey = match xmss_public_key_from_ssz(pk_slice) {
-            Ok(key) => key,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        let keypair = Box::new(KeyPair {
-            public_key: PublicKey::new(public_key),
-            private_key: PrivateKey::new(private_key),
-        });
-
-        Box::into_raw(keypair)
-    }
+    let sk_slice = slice::from_raw_parts(private_key_ptr, private_key_len);
+    let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
+    let private_key = match xmss_secret_key_from_ssz(sk_slice) {
+        Ok(k) => PrivateKey::new(k),
+        Err(_) => return -1,
+    };
+    let public_key = match xmss_public_key_from_ssz(pk_slice) {
+        Ok(k) => PublicKey::new(k),
+        Err(_) => return -1,
+    };
+    std::ptr::write(out, KeyPair { public_key, private_key });
+    0
 }
 
-/// Free a key pair
+/// Destroy a KeyPair in-place (runs Rust `Drop`).  Does NOT free the storage —
+/// the caller owns and must free it after this call.  Safe to call with null
+/// (no-op).
+///
 /// # Safety
-/// This is meant to be called from zig, so the pointers will always dereference correctly
+/// `kp` must either be null or point to a fully-initialised `KeyPair` previously
+/// set up by `hashsig_keypair_generate_into` or `hashsig_keypair_from_ssz_into`.
 #[no_mangle]
-pub unsafe extern "C" fn hashsig_keypair_free(keypair: *mut KeyPair) {
-    if !keypair.is_null() {
-        unsafe {
-            let _ = Box::from_raw(keypair);
-        }
+pub unsafe extern "C" fn hashsig_keypair_deinit(kp: *mut KeyPair) {
+    if !kp.is_null() {
+        std::ptr::drop_in_place(kp);
     }
 }
 
@@ -265,117 +311,109 @@ pub unsafe extern "C" fn hashsig_keypair_get_private_key(
     &(*keypair).private_key
 }
 
-/// Construct a standalone public key from SSZ-encoded bytes.
-/// Returns a pointer to PublicKey or null on error.
+/// Deserialize a PublicKey from SSZ bytes into caller-supplied storage.
+/// Returns 0 on success, -1 on error; on error the storage is left uninitialised.
+///
 /// # Safety
-/// Inputs must be valid pointers and buffers.
+/// `out` must be a valid, properly-aligned, non-null pointer to at least
+/// `hashsig_sizeof_public_key()` bytes.  `bytes` must be valid for `len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn hashsig_public_key_from_ssz(
-    public_key_ptr: *const u8,
-    public_key_len: usize,
-) -> *mut PublicKey {
-    if public_key_ptr.is_null() {
-        return ptr::null_mut();
+pub unsafe extern "C" fn hashsig_public_key_from_ssz_into(
+    out: *mut PublicKey,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if out.is_null() || bytes.is_null() || len == 0 {
+        return -1;
     }
+    let slice = slice::from_raw_parts(bytes, len);
+    let pk = match xmss_public_key_from_ssz(slice) {
+        Ok(k) => PublicKey::new(k),
+        Err(_) => return -1,
+    };
+    std::ptr::write(out, pk);
+    0
+}
 
-    unsafe {
-        let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
-        let public_key: HashSigPublicKey = match xmss_public_key_from_ssz(pk_slice) {
-            Ok(key) => key,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        Box::into_raw(Box::new(PublicKey::new(public_key)))
+/// Destroy a PublicKey in-place.  Does NOT free the storage.
+/// Safe to call with null (no-op).
+///
+/// # Safety
+/// `pk` must either be null or point to a fully-initialised `PublicKey`.
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_public_key_deinit(pk: *mut PublicKey) {
+    if !pk.is_null() {
+        std::ptr::drop_in_place(pk);
     }
 }
 
-/// Free a public key created via hashsig_public_key_from_ssz.
+/// Sign a message, placing the result into caller-supplied Signature storage.
+///
+/// `out` must point to at least `hashsig_sizeof_signature()` bytes aligned to
+/// at least `hashsig_alignof_signature()`.  Returns 0 on success, -1 on error.
+///
 /// # Safety
-/// Pointer must be valid or null.
+/// `out` must be a valid, properly-aligned, non-null pointer.  `private_key`
+/// and `message_ptr` must be valid non-null pointers; `message_ptr` must point
+/// to at least `MESSAGE_LENGTH` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn hashsig_public_key_free(public_key: *mut PublicKey) {
-    if !public_key.is_null() {
-        unsafe {
-            let _ = Box::from_raw(public_key);
-        }
-    }
-}
-
-/// Sign a message using a private key directly
-/// Returns pointer to Signature on success, null on error
-/// # Safety
-/// This is meant to be called from zig, so it's safe as the pointer will always exist
-#[no_mangle]
-pub unsafe extern "C" fn hashsig_sign(
+pub unsafe extern "C" fn hashsig_sign_into(
+    out: *mut Signature,
     private_key: *const PrivateKey,
     message_ptr: *const u8,
     epoch: u32,
-) -> *mut Signature {
-    if private_key.is_null() || message_ptr.is_null() {
-        return ptr::null_mut();
+) -> i32 {
+    if out.is_null() || private_key.is_null() || message_ptr.is_null() {
+        return -1;
     }
+    let private_key_ref = &*private_key;
+    let message_slice = slice::from_raw_parts(message_ptr, MESSAGE_LENGTH);
+    let message_array: &[u8; MESSAGE_LENGTH] = match message_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return -1,
+    };
+    let signature = match private_key_ref.sign(message_array, epoch) {
+        Ok(sig) => sig,
+        Err(_) => return -1,
+    };
+    std::ptr::write(out, signature);
+    0
+}
 
-    unsafe {
-        let private_key_ref = &*private_key;
-        let message_slice = slice::from_raw_parts(message_ptr, MESSAGE_LENGTH);
-
-        // Convert slice to array
-        let message_array: &[u8; MESSAGE_LENGTH] = match message_slice.try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        let signature = match private_key_ref.sign(message_array, epoch) {
-            Ok(sig) => sig,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        Box::into_raw(Box::new(signature))
+/// Destroy a Signature in-place.  Does NOT free the storage.
+/// Safe to call with null (no-op).
+///
+/// # Safety
+/// `sig` must either be null or point to a fully-initialised `Signature`.
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_signature_deinit(sig: *mut Signature) {
+    if !sig.is_null() {
+        std::ptr::drop_in_place(sig);
     }
 }
 
-/// Free a signature
+/// Deserialize a Signature from SSZ bytes into caller-supplied storage.
+/// Returns 0 on success, -1 on error.
+///
 /// # Safety
-/// This is meant to be called from zig, so it's safe as the pointer will always exist
+/// `out` must be a valid, properly-aligned, non-null pointer to at least
+/// `hashsig_sizeof_signature()` bytes.  `bytes` must be valid for `len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn hashsig_signature_free(signature: *mut Signature) {
-    if !signature.is_null() {
-        unsafe {
-            let _ = Box::from_raw(signature);
-        }
+pub unsafe extern "C" fn hashsig_signature_from_ssz_into(
+    out: *mut Signature,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if out.is_null() || bytes.is_null() || len == 0 {
+        return -1;
     }
-}
-
-/// Construct a signature from SSZ-encoded bytes.
-/// Returns a pointer to Signature or null on error.
-/// # Safety
-/// Inputs must be valid pointers and buffers.
-#[no_mangle]
-pub unsafe extern "C" fn hashsig_signature_from_ssz(
-    signature_ptr: *const u8,
-    signature_len: usize,
-) -> *mut Signature {
-    if signature_ptr.is_null() || signature_len == 0 {
-        return ptr::null_mut();
-    }
-
-    unsafe {
-        let sig_slice = slice::from_raw_parts(signature_ptr, signature_len);
-        let signature: HashSigSignature = match xmss_signature_from_ssz(sig_slice) {
-            Ok(sig) => sig,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        Box::into_raw(Box::new(Signature { inner: signature }))
-    }
+    let slice = slice::from_raw_parts(bytes, len);
+    let sig = match xmss_signature_from_ssz(slice) {
+        Ok(s) => Signature::new(s),
+        Err(_) => return -1,
+    };
+    std::ptr::write(out, sig);
+    0
 }
 
 /// Verify a signature using a public key directly
