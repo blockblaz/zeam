@@ -3991,7 +3991,7 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
     defer snap.deinit(allocator);
 
     const maybe_signed = try fork_choice.commitOneAggregateResult(&snap, att_data, signature);
-    const signed = maybe_signed orelse return error.TestExpectedSome;
+    var signed = maybe_signed orelse return error.TestExpectedSome;
     defer signed.deinit();
 
     const payloads = fork_choice.latest_new_aggregated_payloads.get(att_data) orelse return error.TestExpectedSome;
