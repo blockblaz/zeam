@@ -5,6 +5,7 @@ use rec_aggregation::{
     AggregatedXMSS,
 };
 use std::slice;
+use std::sync::OnceLock;
 
 // Mirror hashsig-glue's struct layout with #[repr(C)]
 // These must match hashsig-glue/src/lib.rs exactly
@@ -18,55 +19,27 @@ pub struct Signature {
     pub inner: XmssSignature,
 }
 
-// Cached init results: true = succeeded, false = failed.
-// Using OnceLock<bool> instead of Once so we can distinguish "succeeded" from "panicked"
-// without poisoning the guard. The closure is called exactly once; subsequent calls return
-// the cached result without any computation.
-static PROVER_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static VERIFIER_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// Initialize the prover (idempotent - only runs once).
+/// Initialize XMSS aggregation (both prove and verify state). Returns 0 on success, -1 on panic.
 ///
-/// Returns 0 on success, -1 on failure.
+/// Idempotent: the underlying init runs at most once per process. Subsequent calls return 0
+/// without re-running `init_aggregation_bytecode()` or the DFT-twiddle precompute. This is
+/// defensive — the production caller invokes this exactly once at node startup, but tests
+/// and refactors are guarded so a second call cannot double-init global state.
 ///
-/// Previously used `Once::call_once` which allowed `init_aggregation_bytecode()` to panic
-/// (e.g. when the compiled prover bytecode file is missing — ENOENT). A Rust panic through
-/// an `extern "C"` boundary is undefined behaviour and aborted the process.
-///
-/// Fix: wrap the init body in `catch_unwind` and cache the boolean result in a `OnceLock`.
-/// The caller (Zig) checks the return code and skips aggregation gracefully instead of crashing.
+/// `catch_unwind` is required because a Rust panic through an `extern "C"` boundary is UB —
+/// `init_aggregation_bytecode()` panics when the compiled prover bytecode file is missing.
+/// A panicking first call leaves the `OnceLock` empty, so a later call can retry.
 #[no_mangle]
-pub extern "C" fn xmss_setup_prover() -> i32 {
-    let ready = PROVER_READY.get_or_init(|| {
-        std::panic::catch_unwind(|| {
+pub extern "C" fn setup_xmss_aggregation() -> i32 {
+    static INIT: OnceLock<()> = OnceLock::new();
+    match std::panic::catch_unwind(|| {
+        INIT.get_or_init(|| {
             init_aggregation_bytecode();
             backend::precompute_dft_twiddles::<backend::KoalaBear>(1 << 24);
-        })
-        .is_ok()
-    });
-    if *ready {
-        0
-    } else {
-        -1
-    }
-}
-
-/// Initialize the verifier (idempotent - only runs once).
-///
-/// Returns 0 on success, -1 on failure.
-/// Same panic-safety rationale as `xmss_setup_prover`.
-#[no_mangle]
-pub extern "C" fn xmss_setup_verifier() -> i32 {
-    let ready = VERIFIER_READY.get_or_init(|| {
-        std::panic::catch_unwind(|| {
-            init_aggregation_bytecode();
-        })
-        .is_ok()
-    });
-    if *ready {
-        0
-    } else {
-        -1
+        });
+    }) {
+        Ok(()) => 0,
+        Err(_) => -1,
     }
 }
 
@@ -410,7 +383,7 @@ pub unsafe extern "C" fn xmss_free_aggregate_signature(agg_sig: *mut AggregatedX
 
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
 ///
-/// Must be called **before** `xmss_setup_prover` and before any aggregation work
+/// Must be called **before** `setup_xmss_aggregation` and before any aggregation work
 /// begins. The rayon global pool can only be configured once; subsequent calls
 /// are silently ignored (rayon returns `ThreadPoolBuildError` which we discard).
 ///

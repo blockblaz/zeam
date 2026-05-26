@@ -282,7 +282,7 @@ fn runCase(
     var logger_config = zeam_utils.getTestLoggerConfig();
     defer logger_config.deinit();
 
-    var test_thread_pool = @import("@zeam/node").testing.initTestThreadPool(allocator) catch |err| {
+    var test_thread_pool = @import("@zeam/node").testing.setupTestPrimitives(allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}: thread pool init failed ({s})\n",
             .{ ctx.fixture_label, ctx.case_name, @errorName(err) },

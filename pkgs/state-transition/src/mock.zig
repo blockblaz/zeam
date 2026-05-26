@@ -6,6 +6,7 @@ const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
+const xmss = @import("@zeam/xmss");
 
 const transition = @import("./transition.zig");
 
@@ -40,6 +41,8 @@ pub const MockChainData = struct {
 };
 
 pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types.GenesisSpec) !MockChainData {
+    try xmss.setupXmssAggregation();
+
     // Determine num_validators early
     const num_validators: usize = if (from_genesis) |gen| @intCast(gen.numValidators()) else 4;
     std.debug.assert(num_validators > 0); // A chain must have at least one validator.

@@ -727,7 +727,10 @@ pub fn computeSingleAggregatedSignature(
 
     return switch (prep.outcome) {
         .skip => null,
-        .done => |result| result,
+        .done => |result| blk: {
+            prep.outcome = .skip;
+            break :blk result;
+        },
         .ffi => |*args| blk: {
             const result = try runAggregateAttDataFfi(allocator, prep.data, args);
             args.deinit(allocator);
@@ -1268,10 +1271,7 @@ pub fn compactAttestations(
     // -------- Serial pre-phase: build CompactGroupPrep for every entry --------
     //
     // All `xmss.PublicKey.fromBytes` calls happen on this thread. The Rust FFI
-    // for pubkey deserialization is not documented as `Send`, and `setupVerifier`
-    // (called transitively) carries first-time-init races. By doing every FFI
-    // construction here we ensure the parallel worker only invokes
-    // `aggregate()` on already-deserialized handles.
+    // for pubkey deserialization is not documented as `Send`.
     //
     // All wrapper handles are owned by `pubkey_wrappers`; we deinit each at the
     // end so Rust handles do not leak. The slice arrays themselves live in a
@@ -1529,7 +1529,12 @@ fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloads
     });
 }
 
-fn initTestThreadPool(allocator: Allocator) !*ThreadPool {
+fn setupTestPrimitives(allocator: Allocator) !*ThreadPool {
+    // Initialise XMSS aggregation FFI for tests that call
+    // `computeAggregatedSignatures` through this pool. Both calls are
+    // process-idempotent (`OnceLock` on the Rust side; rayon ignores repeats).
+    xmss.setRayonThreads(1);
+    try xmss.setupXmssAggregation();
     return ThreadPool.init(.{
         .allocator = allocator,
         .io = std.Io.Threaded.global_single_threaded.io(),
@@ -1557,7 +1562,7 @@ test "computeAggregatedSignatures filters attestation data by slot list" {
     var result = try AggregatedAttestationsResult.init(allocator);
     defer result.deinit();
 
-    const thread_pool = try initTestThreadPool(allocator);
+    const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
 
     const allowed_slots = [_]Slot{10};
@@ -1591,7 +1596,7 @@ test "computeAggregatedSignatures slot filter matches unfiltered for same-slot i
     var unfiltered = try AggregatedAttestationsResult.init(allocator);
     defer unfiltered.deinit();
 
-    const thread_pool = try initTestThreadPool(allocator);
+    const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
     try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool);
 
@@ -1625,7 +1630,7 @@ test "computeAggregatedSignatures empty slot filter result is clean" {
     defer result.deinit();
 
     const allowed_slots = [_]Slot{14};
-    const thread_pool = try initTestThreadPool(allocator);
+    const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
     try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
 
@@ -1835,4 +1840,42 @@ test "compactSingleProof: aggregation_bits matches participants when participant
     );
 
     try std.testing.expectEqualSlices(u8, participants_bytes.items, bits_bytes.items);
+}
+
+// Regression (#929): single-child passthrough (.done) must not double-free when
+// computeSingleAggregatedSignature returns and prep.deinit runs.
+test "computeSingleAggregatedSignature: single-child passthrough survives prep deinit" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures = SignaturesMap.init(allocator);
+    defer signatures.deinit();
+
+    var payloads = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads);
+
+    const att_data = testAttestationData(7);
+    try testPutSingleChildPayload(allocator, &payloads, att_data, 0);
+
+    const maybe_result = try computeSingleAggregatedSignature(
+        allocator,
+        &validators,
+        &signatures,
+        &payloads,
+        null,
+        att_data,
+    );
+    var result = maybe_result orelse return error.TestExpectedSome;
+    defer {
+        result.attestation.deinit();
+        result.signature.deinit();
+    }
+
+    var cloned: aggregation.AggregatedSignatureProof = undefined;
+    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, result.signature, &cloned);
+    defer cloned.deinit();
+
+    try std.testing.expect(cloned.participants.len() > 0);
 }
