@@ -103,6 +103,14 @@ const Metrics = struct {
     /// Buckets are deliberately low-cardinality — see `numRawBucket` /
     /// `numChildrenBucket` below for the exact mapping.
     zeam_xmss_rec_aggregate_prove_by_input_seconds: XmssRecAggregateProveByInputHistogram,
+    /// Per-phase breakdown inside `xmss_aggregate` reported back from the
+    /// Rust FFI via out-pointers. The three phases ("marshal", "stark",
+    /// "post") sum to a value very close to one observation on
+    /// `zeam_xmss_rec_aggregate_prove_seconds` (delta is the FFI call/return
+    /// overhead, sub-microsecond). This lets us tell whether zeam's per-call
+    /// cost lives in argument deserialization or in the leanMultisig STARK
+    /// itself — the two have very different fixes. See #940.
+    zeam_xmss_rec_aggregate_phase_seconds: XmssRecAggregatePhaseHistogram,
     lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
@@ -450,6 +458,11 @@ const Metrics = struct {
     const XmssRecAggregateProveHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0 });
     const XmssRecAggregateProveByInputLabel = struct { num_raw: []const u8, num_children: []const u8 };
     const XmssRecAggregateProveByInputHistogram = metrics_lib.HistogramVec(f32, XmssRecAggregateProveByInputLabel, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0 });
+    // Buckets span sub-millisecond (post phase = pointer wrap, typically ns)
+    // through multi-second STARK proves. Phase label values are
+    // "marshal" | "stark" | "post" — see XmssRecAggregatePhaseLabel below.
+    const XmssRecAggregatePhaseLabel = struct { phase: []const u8 };
+    const XmssRecAggregatePhaseHistogram = metrics_lib.HistogramVec(f32, XmssRecAggregatePhaseLabel, &[_]f32{ 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0 });
     const PQSigAggregatedVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
     const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
@@ -945,6 +958,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_pq_sig_aggregated_signatures_building_phase_seconds = try Metrics.PQSigBuildingPhaseHistogram.init(allocator, io, "zeam_pq_sig_aggregated_signatures_building_phase_seconds", .{ .help = "Phase-level time for aggregate production, labeled by phase (snapshot|att_data_prep|xmss_prove|compute_ffi|commit). See #899 / #907." }, .{}),
         .zeam_xmss_rec_aggregate_prove_seconds = Metrics.XmssRecAggregateProveHistogram.init("zeam_xmss_rec_aggregate_prove_seconds", .{ .help = "Wall time inside xmss_aggregate (leanMultisig rec_xmss_aggregate STARK prove + FFI key clones, one att_data). Compare to leanBench aggregate.flat_*_r2; worker/phase metrics add snapshot, prep, child-proof deserialize, and serialize." }, .{}),
         .zeam_xmss_rec_aggregate_prove_by_input_seconds = try Metrics.XmssRecAggregateProveByInputHistogram.init(allocator, io, "zeam_xmss_rec_aggregate_prove_by_input_seconds", .{ .help = "Same observation as zeam_xmss_rec_aggregate_prove_seconds, additionally labeled by num_raw (count of raw gossip XMSS signatures) and num_children (count of recursive child STARK proofs) input-size buckets (#940). Buckets: num_raw in {0,1,2,3,4,5,6,7,8,9-15,16-31,32+}; num_children in {0,1,2,3-4,5-7,8+}. Used to classify the aggregate build histogram tail (steady-state full-committee prove vs partial-input reprove)." }, .{}),
+        .zeam_xmss_rec_aggregate_phase_seconds = try Metrics.XmssRecAggregatePhaseHistogram.init(allocator, io, "zeam_xmss_rec_aggregate_phase_seconds", .{ .help = "Per-phase wall time inside xmss_aggregate FFI (#940), reported back from Rust via out-pointers. phase=\"marshal\" covers argument deserialization (raw XMSS PK/sig clones + child PK collection + child proof deserialize). phase=\"stark\" is the leanMultisig rec_xmss_aggregate STARK call — expected to scale linearly with num_raw per lean-bench (~3.6 ms/sig at log_inv_rate=2 on Hetzner 16-core). phase=\"post\" is Box::into_raw of the returned aggregate (pointer wrap, typically nanoseconds). The three phases sum to ~zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
         .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature" }, .{}),
         .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures" }, .{}),
         .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures" }, .{}),
@@ -1278,6 +1292,20 @@ fn numRawBucket(n: usize) []const u8 {
         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 => "16-31",
         else => "32+",
     };
+}
+
+/// Record one phase of `xmss_aggregate`'s internal timing breakdown
+/// (`zeam_xmss_rec_aggregate_phase_seconds`). `phase` must be one of the
+/// constants documented on the metric (currently "marshal", "stark", "post");
+/// callers are the xmss aggregation module on a successful prove only.
+/// `elapsed_ns` is the value the Rust FFI wrote into its out-pointer.
+pub fn observeXmssRecAggregatePhase(phase: []const u8, elapsed_ns: u64) void {
+    if (!g_initialized or isZKVM()) return;
+    const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    metrics.zeam_xmss_rec_aggregate_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_s,
+    ) catch {};
 }
 
 /// Coarse low-cardinality bucket for the `num_children` label on
