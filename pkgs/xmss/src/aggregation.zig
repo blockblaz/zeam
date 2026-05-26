@@ -167,7 +167,7 @@ pub fn aggregateSignatures(
         epoch,
         log_inv_rate,
     ) orelse return AggregationError.AggregationFailed;
-    recordXmssProveDuration(prove_start_ns);
+    recordXmssProveDuration(prove_start_ns, public_keys.len, num_children);
 
     // Serialize the aggregate signature to bytes
     var buffer: [MAX_AGGREGATE_SIGNATURE_SIZE]u8 = undefined;
@@ -186,11 +186,11 @@ pub fn aggregateSignatures(
     }
 }
 
-fn recordXmssProveDuration(start_ns: i128) void {
+fn recordXmssProveDuration(start_ns: i128, num_raw: usize, num_children: usize) void {
     const end_ns = zeam_utils.monotonicTimestampNs();
     const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
     const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-    zeam_metrics.observeXmssRecAggregateProve(elapsed_s);
+    zeam_metrics.observeXmssRecAggregateProve(elapsed_s, num_raw, num_children);
 }
 
 /// Precondition: `setupXmssAggregation` must have been called once in this process.
