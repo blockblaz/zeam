@@ -2757,8 +2757,8 @@ pub const ForkChoiceError = error{
     TooManyAttestationData,
 };
 
-fn initTestThreadPool() !*ThreadPool {
-    return @import("./testing.zig").initTestThreadPool(std.testing.allocator);
+fn setupTestPrimitives() !*ThreadPool {
+    return @import("./testing.zig").setupTestPrimitives(std.testing.allocator);
 }
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
@@ -2788,7 +2788,7 @@ test "forkchoice block tree" {
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
@@ -2842,7 +2842,7 @@ test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence sem
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
@@ -2930,7 +2930,7 @@ test "aggregate prunes attestation signatures" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
@@ -3046,7 +3046,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
@@ -3262,7 +3262,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .latest_finalized = anchorCP,
     };
 
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = ForkChoice{
         .allocator = allocator,
@@ -4406,7 +4406,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
 
     const module_logger = rebase_test_logger_config.logger(.forkchoice);
 
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     errdefer test_thread_pool.deinit();
     const fork_choice = ForkChoice{
         .allocator = allocator,
@@ -5389,7 +5389,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);
 
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = ForkChoice{
         .allocator = allocator,
