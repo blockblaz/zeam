@@ -122,6 +122,12 @@ pub fn shouldHealGossipMesh(
     return gossip_silent_ms >= gossip_stall_threshold_ms;
 }
 
+/// Milliseconds since `last_gossip_rx_ms` (0 when no gossip received yet).
+pub fn gossipSilentMs(now_ms: u64, last_gossip_rx_ms: u64) u64 {
+    if (last_gossip_rx_ms == 0) return 0;
+    return now_ms -| last_gossip_rx_ms;
+}
+
 /// Whether a peer status should trigger proactive catch-up (issue #893 / PR #894).
 /// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` only selects range vs by-root inside `initiateCatchUpFromPeerStatus`.
 pub fn shouldCatchUpFromPeerStatus(
@@ -429,6 +435,11 @@ test "shouldHealGossipMesh on low mesh or gossip stall" {
     try std.testing.expect(shouldHealGossipMesh(3, 4, 0, threshold_ms));
     try std.testing.expect(shouldHealGossipMesh(10, 4, threshold_ms, threshold_ms));
     try std.testing.expect(!shouldHealGossipMesh(10, 4, 0, threshold_ms));
+}
+
+test "gossipSilentMs handles never-received and elapsed silence" {
+    try std.testing.expectEqual(@as(u64, 0), gossipSilentMs(10_000, 0));
+    try std.testing.expectEqual(@as(u64, 3_000), gossipSilentMs(10_000, 7_000));
 }
 
 test "classifyChunkImport: queue_full drops, never falls back to inline (#894 regression guard)" {

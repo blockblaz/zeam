@@ -140,6 +140,12 @@ pub const GOSSIP_MESH_HEAL_INTERVAL_SLOTS: u64 = 32;
 // Total gossipsub mesh peers below this triggers a mesh resubscribe attempt.
 pub const GOSSIP_MESH_MIN_PEERS: u64 = 4;
 
+/// Wall-clock silence duration that indicates gossip ingress has stalled (#926).
+pub fn gossipStallThresholdMs() u64 {
+    return GOSSIP_STALL_THRESHOLD_SLOTS *
+        @as(u64, @intCast(params.SECONDS_PER_SLOT * std.time.ms_per_s));
+}
+
 // Threshold (in slots) above which we prefer a `blocks_by_range` bulk sync over the
 // recursive head-by-root walk. When the peer's head is more than this many slots
 // ahead of ours, we issue a single ranged request to catch up efficiently rather

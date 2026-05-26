@@ -4763,20 +4763,12 @@ pub const BeamChain = struct {
 
         // Check 1: our head is behind peer finalization — we don't even have finalized blocks
         if (our_head_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
         if (our_finalized_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         // Check 3: pre-finalization devnets — wall-clock head lag means we are
@@ -4788,14 +4780,24 @@ pub const BeamChain = struct {
             wall_lag,
             constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
         )) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         return .synced;
+    }
+
+    fn behindPeersStatus(
+        self: *Self,
+        head_slot: types.Slot,
+        finalized_slot: types.Slot,
+        max_peer_finalized_slot: types.Slot,
+    ) SyncStatus {
+        _ = self;
+        return .{ .behind_peers = .{
+            .head_slot = head_slot,
+            .finalized_slot = finalized_slot,
+            .max_peer_finalized_slot = max_peer_finalized_slot,
+        } };
     }
 
     pub fn setWallHeadLagSlots(self: *Self, lag_slots: u64) void {
