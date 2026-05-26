@@ -572,8 +572,8 @@ pub const AggregatedAttestationsResult = struct {
     ///         optionally restricted to the supplied attestation slots.
     /// Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
     /// Step 3: Collect individual gossip signatures not covered by children
-    /// Step 4: Lone-child clone fast path: `0 gossip + 1 child` clones the
-    ///         lone child as the result without invoking the prover.
+    /// Step 4: Single-source fast path without child payloads:
+    ///         `0 gossip + 1 child` clones the lone child.
     /// Step 5: Recursive aggregate — combine selected children + remaining gossip sigs.
     ///
     /// Spec-pure: this function aggregates whatever it is given. Callers
@@ -584,6 +584,9 @@ pub const AggregatedAttestationsResult = struct {
     /// Block proposers, by contrast, MUST aggregate every `att_data`
     /// they choose to include in a block, even if its only input is a
     /// single gossip signature.
+    /// Aggregator batch entry: serial prep then sequential XMSS proves (ethlambda
+    /// worker loop). Parallel ThreadPool scope was removed — nested Rayon inside
+    /// each prove oversubscribed CPU and inflated p50/p95 on devnet (#925).
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,

@@ -189,9 +189,12 @@ const Metrics = struct {
     /// plus `publishProducedAggregations` when the aggregator produces gossip aggregates.
     zeam_node_aggregation_interval_tick_seconds: AggregationIntervalTickHistogram,
     /// Counter for skipped aggregate submissions, labeled by reason.
-    /// Reasons: "in_flight", "not_aggregator", "not_synced", "missing_state",
-    /// "spawn_failed".
+    /// Reasons: "not_aggregator", "not_synced", "missing_state", "spawn_failed".
+    /// (In-flight triggers are coalesced via `zeam_aggregate_coalesced_total`.)
     zeam_aggregate_skip_total: AggregateSkipCounter,
+    /// Slot-driver aggregation triggers coalesced while a worker was in flight.
+    /// A single catch-up run is scheduled when the worker finishes.
+    zeam_aggregate_coalesced_total: AggregateCoalescedCounter,
     /// Histogram for the wall-clock duration of the aggregate FFI worker.
     zeam_aggregate_worker_duration_seconds: AggregateWorkerDurationHistogram,
     /// Counter for SignedAggregatedAttestation messages published by the local
@@ -545,6 +548,7 @@ const Metrics = struct {
     // Issue #837 — see `lean_node_interval_error_total` field doc.
     const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const AggregateCoalescedCounter = metrics_lib.Counter(u64);
     const AggregateWorkerDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
     const AggregatorPublishAggregationsCounter = metrics_lib.CounterVec(u64, struct { subnet: []const u8 });
     // Validator status gauge types
@@ -991,7 +995,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
-        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: in_flight, not_aggregator, not_synced, missing_state, spawn_failed." }, .{}),
+        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
+        .zeam_aggregate_coalesced_total = Metrics.AggregateCoalescedCounter.init("zeam_aggregate_coalesced_total", .{ .help = "Aggregation slot triggers coalesced while a worker was in flight; one catch-up run is scheduled when the worker finishes." }, .{}),
         .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of one aggregate worker run (snapshot through publishProducedAggregations), including all XMSS recursive STARK FFI inside computeAggregatedSignatures. Primary latency signal for aggregator slot budget (issue #907)." }, .{}),
         .zeam_aggregator_publish_aggregations_total = try Metrics.AggregatorPublishAggregationsCounter.init(allocator, io, "zeam_aggregator_publish_aggregations_total", .{ .help = "SignedAggregatedAttestation messages published by the local aggregator worker, labeled by attestation subnet. Distinct from lean_pq_sig_aggregated_signatures_total (block-proposal path only) so cross-client dashboards keep the standard metric's semantics intact." }, .{}),
         // BeamNode mutex contention metrics (issue #786)
@@ -1023,7 +1028,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_attestations_evicted_total = try Metrics.LeanPendingAttsEvictedCounter.init(allocator, io, "lean_pending_attestations_evicted_total", .{ .help = "Pending-attestation buffer FIFO evictions when MAX_PENDING_ATTESTATIONS (1024, leanSpec subspecs/sync/config.py) is reached. Labeled by kind={attestation,aggregation}." }, .{}),
         .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts. Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
         .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),
-        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
+        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, publishLocalProducedAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
     };
     metrics.zeam_blocks_by_root_inflight.set(0);
     metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};

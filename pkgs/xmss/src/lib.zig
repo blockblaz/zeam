@@ -8,6 +8,7 @@ pub const MessageBinding = aggregate.MessageBinding;
 pub const AggregationError = aggregate.AggregationError;
 pub const setRayonThreads = aggregate.setRayonThreads;
 pub const setupProver = aggregate.setupProver;
+pub const ensureProverReady = aggregate.ensureProverReady;
 pub const setupVerifier = aggregate.setupVerifier;
 pub const aggregateType1 = aggregate.aggregateType1;
 pub const verifyType1 = aggregate.verifyType1;
