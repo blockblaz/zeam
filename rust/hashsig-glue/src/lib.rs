@@ -233,7 +233,13 @@ pub unsafe extern "C" fn hashsig_keypair_generate_into(
         activation_epoch as u32,
         num_active_epochs as u32,
     );
-    std::ptr::write(out, KeyPair { public_key, private_key });
+    std::ptr::write(
+        out,
+        KeyPair {
+            public_key,
+            private_key,
+        },
+    );
     0
 }
 
@@ -265,7 +271,13 @@ pub unsafe extern "C" fn hashsig_keypair_from_ssz_into(
         Ok(k) => PublicKey::new(k),
         Err(_) => return -1,
     };
-    std::ptr::write(out, KeyPair { public_key, private_key });
+    std::ptr::write(
+        out,
+        KeyPair {
+            public_key,
+            private_key,
+        },
+    );
     0
 }
 
