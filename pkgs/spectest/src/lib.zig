@@ -13,6 +13,17 @@ pub const networking_codec_runner = @import("./runner/networking_codec_runner.zi
 pub const skip = @import("./skip.zig");
 pub const generated = @import("./generated/index.zig");
 
+/// Bench-facing surface — only the fixture-loading helpers, not the
+/// verification glue. See bench/stf_bench.zig.
+pub const fixtures = struct {
+    pub const Context = state_transition_runner.Context;
+    pub const buildState = state_transition_runner.buildState;
+    pub const buildBlock = state_transition_runner.buildBlock;
+    pub const decodeBlock = state_transition_runner.decodeBlock;
+    pub const loadFixturePayload = state_transition_runner.loadFixturePayload;
+    pub const runFixturePayload = state_transition_runner.runFixturePayload;
+};
+
 // Local replacement for `std.testing.refAllDeclsRecursive`, which was
 // removed in Zig 0.16. The generated index is a deeply nested struct
 // tree (kind → fork → suite → handler → tests.zig), so the shallow

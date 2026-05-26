@@ -42,7 +42,7 @@ const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const zeam_utils = @import("@zeam/utils");
 const JsonValue = std.json.Value;
-const Context = expect.Context;
+pub const Context = expect.Context;
 
 pub const RunnerError = error{
     IoFailure,
@@ -91,7 +91,7 @@ pub fn TestCase(
     };
 }
 
-fn loadFixturePayload(
+pub fn loadFixturePayload(
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,
     rel_path: []const u8,
@@ -519,6 +519,24 @@ pub fn buildBlock(
         .state_root = state_root,
         .body = .{ .attestations = attestations },
     };
+}
+
+/// Decode a single block from a JSON value. Convenience wrapper around
+/// `buildBlock` for bench/fixture-loading callers that don't have a
+/// surrounding `runCase` context.
+pub fn decodeBlock(
+    allocator: std.mem.Allocator,
+    value: JsonValue,
+) FixtureError!types.BeamBlock {
+    const ctx = Context{ .fixture_label = "bench", .case_name = "bench" };
+    const obj = switch (value) {
+        .object => |map| map,
+        else => {
+            std.debug.print("decodeBlock: expected JSON object\n", .{});
+            return FixtureError.InvalidFixture;
+        },
+    };
+    return buildBlock(allocator, ctx, 0, obj);
 }
 
 pub fn parseAggregationBits(

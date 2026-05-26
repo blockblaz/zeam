@@ -60,6 +60,10 @@
             .url = "git+https://github.com/anshalshukla/zig-thread-pool#ac7d6c72f8eef147e2fb0b93e2dbb725f52d314f",
             .hash = "thread_pool-0.1.0-m6B8f9j4AAAWx5c9ytLrH_NlntTMxSg049v76xVsgoSw",
         },
+        .zbench = .{
+            .url = "git+https://github.com/hendriknielaender/zbench#b2b89c475e3ef1bb2bd71255c80478a82d3e0ca8",
+            .hash = "zbench-0.13.0-YTdc7xVBAQCCMC-IdLLuotBeiNNNm8k9Pi2V4VYqrwfI",
+        },
     },
     .paths = .{""},
 }
