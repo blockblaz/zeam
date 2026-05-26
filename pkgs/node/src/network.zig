@@ -364,6 +364,14 @@ pub const Network = struct {
         return self.backend.gossip.publish(data);
     }
 
+    pub fn refreshGossipMesh(self: *Self) void {
+        self.backend.gossip.refreshMesh();
+    }
+
+    pub fn gossipMeshPeerCount(self: *Self) u64 {
+        return self.backend.gossip.meshPeerCount();
+    }
+
     pub fn sendStatus(
         self: *Self,
         peer_id: []const u8,

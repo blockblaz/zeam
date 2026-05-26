@@ -30,6 +30,7 @@ const LockTimer = locking.LockTimer;
 const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -204,6 +205,11 @@ pub const BeamChain = struct {
     /// `iterateLocked()` for sync-status decisions. Mutation is the
     /// network's responsibility — the chain only consumes.
     connected_peers: *ConnectedPeers,
+    /// Wall-clock head lag in slots, updated each libxev tick by `BeamNode`
+    /// from `Clock.wallSlotNow()`. Read by `getSyncStatus()` to detect
+    /// pre-finalization devnets that report `synced` while gossip ingress
+    /// has stalled (#926).
+    wall_head_lag_slots: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
     // Aggregator role flag, toggleable at runtime via `setAggregator`.
@@ -4759,23 +4765,45 @@ pub const BeamChain = struct {
 
         // Check 1: our head is behind peer finalization — we don't even have finalized blocks
         if (our_head_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
         if (our_finalized_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
+        }
+
+        // Check 3: pre-finalization devnets — wall-clock head lag means we are
+        // not at chain tip even though finalization gaps are zero (#926).
+        const wall_lag = self.wall_head_lag_slots.load(.monotonic);
+        if (blocks_by_range_sync.isWallHeadLagSyncing(
+            our_finalized_slot,
+            max_peer_finalized_slot,
+            wall_lag,
+            constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+        )) {
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         return .synced;
+    }
+
+    fn behindPeersStatus(
+        self: *Self,
+        head_slot: types.Slot,
+        finalized_slot: types.Slot,
+        max_peer_finalized_slot: types.Slot,
+    ) SyncStatus {
+        _ = self;
+        return .{ .behind_peers = .{
+            .head_slot = head_slot,
+            .finalized_slot = finalized_slot,
+            .max_peer_finalized_slot = max_peer_finalized_slot,
+        } };
+    }
+
+    pub fn setWallHeadLagSlots(self: *Self, lag_slots: u64) void {
+        self.wall_head_lag_slots.store(lag_slots, .monotonic);
     }
 };
 
