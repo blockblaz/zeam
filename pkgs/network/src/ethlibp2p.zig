@@ -825,28 +825,34 @@ export fn handleRPCResponseFromRustBridge(
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
 
-    const callback_ptr = zigHandler.rpcCallbacks.getPtr(request_id) orelse {
+    var callback_snap = zigHandler.snapshotRpcCallbackForDelivery(request_id) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to snapshot RPC callback for request_id={d} protocol={s} from peer={s}{f}: {any}",
+            .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name, err },
+        );
+        return;
+    } orelse {
         zigHandler.logger.warn(
             "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name },
         );
         return;
     };
-    // Use peer_id from callback if available, otherwise use the one passed from Rust
-    // (They should match, but callback takes precedence for consistency)
-    const callback_peer_id = callback_ptr.peer_id;
+    defer callback_snap.deinit(zigHandler.allocator);
+    const callback_peer_id = callback_snap.peer_id;
     const callback_node_name = zigHandler.node_registry.getNodeNameFromPeerId(callback_peer_id);
+    const method = callback_snap.method;
+    const handler = callback_snap.handler;
     const protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
         zigHandler.notifyRpcErrorFmt(
             request_id,
-            callback_ptr.method,
+            method,
             2,
             "Unsupported RPC protocol in response: {s}",
             .{protocol_slice},
         );
         return;
     };
-    const method = callback_ptr.method;
     if (protocol != method) {
         zigHandler.logger.warn(
             "network-{d}:: RPC protocol/method mismatch for request_id={d}: protocol={s} method={s} from peer={s}{f}",
@@ -938,7 +944,7 @@ export fn handleRPCResponseFromRustBridge(
         .{ zigHandler.params.networkId, request_id, protocol.protocolId(), response_bytes.len, callback_peer_id, callback_node_name },
     );
 
-    callback_ptr.notify(&event) catch |notify_err| {
+    handler.onReqRespResponse(&event) catch |notify_err| {
         zigHandler.logger.err(
             "network-{d}:: Failed to notify RPC success callback for request_id={d} from peer={s}{f}: {any}",
             .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, notify_err },
@@ -957,10 +963,10 @@ export fn handleRPCEndOfStreamFromRustBridge(
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
 
-    if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
-        var callback = entry.value;
-        const method = callback.method;
-        const callback_peer_id = callback.peer_id;
+    if (zigHandler.takeRpcCallback(request_id)) |callback| {
+        var owned_callback = callback;
+        const method = owned_callback.method;
+        const callback_peer_id = owned_callback.peer_id;
         const callback_node_name = zigHandler.node_registry.getNodeNameFromPeerId(callback_peer_id);
 
         var event = interface.ReqRespResponseEvent.initCompleted(request_id, method);
@@ -971,13 +977,13 @@ export fn handleRPCEndOfStreamFromRustBridge(
             .{ zigHandler.params.networkId, request_id, protocol_str, callback_peer_id, callback_node_name },
         );
 
-        callback.notify(&event) catch |notify_err| {
+        owned_callback.notify(&event) catch |notify_err| {
             zigHandler.logger.err(
                 "network-{d}:: Failed to notify RPC completion for request_id={d}: {any}",
                 .{ zigHandler.params.networkId, request_id, notify_err },
             );
         };
-        callback.deinit();
+        owned_callback.deinit();
     } else {
         zigHandler.logger.warn(
             "network-{d}:: Received RPC end-of-stream for unknown request_id={d} protocol={s} from peer={s}{f}",
@@ -997,10 +1003,10 @@ export fn handleRPCErrorFromRustBridge(
     const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
     const message_slice = std.mem.span(message_ptr);
 
-    if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
-        var callback = entry.value;
-        const method = callback.method;
-        const peer_id = callback.peer_id;
+    if (zigHandler.takeRpcCallback(request_id)) |callback| {
+        var owned_callback = callback;
+        const method = owned_callback.method;
+        const peer_id = owned_callback.peer_id;
         const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id);
 
         const owned_message = zigHandler.allocator.dupe(u8, message_slice) catch |alloc_err| {
@@ -1008,7 +1014,7 @@ export fn handleRPCErrorFromRustBridge(
                 "network-{d}:: Failed to duplicate RPC error message for request_id={d} from peer={s}{f}: {any}",
                 .{ zigHandler.params.networkId, request_id, peer_id, node_name, alloc_err },
             );
-            callback.deinit();
+            owned_callback.deinit();
             return;
         };
 
@@ -1023,13 +1029,13 @@ export fn handleRPCErrorFromRustBridge(
             .{ zigHandler.params.networkId, request_id, protocol_str, code, peer_id, node_name },
         );
 
-        callback.notify(&event) catch |notify_err| {
+        owned_callback.notify(&event) catch |notify_err| {
             zigHandler.logger.err(
                 "network-{d}:: Failed to notify RPC error for request_id={d} from peer={s}{f}: {any}",
                 .{ zigHandler.params.networkId, request_id, peer_id, node_name, notify_err },
             );
         };
-        callback.deinit();
+        owned_callback.deinit();
     } else {
         zigHandler.logger.warn(
             "network-{d}:: Dropping RPC error for unknown request_id={d} protocol={s} code={d}",
@@ -1327,10 +1333,93 @@ pub const EthLibp2p = struct {
     params: EthLibp2pParams,
     rustBridgeThread: ?Thread = null,
     rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
+    /// Guards `rpcCallbacks` against concurrent mutation from the libxev
+    /// thread (status refresh, block fetch dispatch) and the rust-bridge
+    /// thread (response / EOS / error delivery). Unsynchronized access
+    /// corrupts callback entries and has produced GPEs in onReqRespResponse
+    /// during status RPC bursts (#933).
+    rpc_callbacks_lock: zeam_utils.SyncMutex = .{},
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
 
     const Self = @This();
+
+    /// Snapshot of an in-flight RPC callback for response delivery while the
+    /// entry remains registered (streaming success chunks). `peer_id` is owned
+    /// by this snapshot; do not use map pointers after releasing the lock.
+    ///
+    /// `handler.ptr` references the node (`BeamNode` via
+    /// `getReqRespResponseHandler`), not memory owned by `ReqRespRequestCallback`.
+    /// `ReqRespRequestCallback.deinit` only frees `peer_id`, so concurrent
+    /// `cancelInflightRpcCallback` cannot invalidate the handler target.
+    const RpcCallbackDeliverySnapshot = struct {
+        handler: interface.OnReqRespResponseCbHandler,
+        method: interface.LeanSupportedProtocol,
+        peer_id: []const u8,
+
+        fn deinit(self: *RpcCallbackDeliverySnapshot, allocator: Allocator) void {
+            allocator.free(self.peer_id);
+        }
+    };
+
+    fn takeRpcCallback(self: *Self, request_id: u64) ?interface.ReqRespRequestCallback {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        if (self.rpcCallbacks.fetchRemove(request_id)) |entry| {
+            return entry.value;
+        }
+        return null;
+    }
+
+    fn snapshotRpcCallbackForDelivery(self: *Self, request_id: u64) !?RpcCallbackDeliverySnapshot {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
+        const handler = callback_ptr.handler orelse return null;
+        const peer_id = try self.allocator.dupe(u8, callback_ptr.peer_id);
+        return .{
+            .handler = handler,
+            .method = callback_ptr.method,
+            .peer_id = peer_id,
+        };
+    }
+
+    fn getRpcCallbackMethod(self: *Self, request_id: u64) ?interface.LeanSupportedProtocol {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
+        return callback_ptr.method;
+    }
+
+    fn dupeRpcCallbackPeerId(self: *Self, request_id: u64) !?[]const u8 {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
+        return try self.allocator.dupe(u8, callback_ptr.peer_id);
+    }
+
+    fn putRpcCallback(self: *Self, request_id: u64, callback_entry: interface.ReqRespRequestCallback) !void {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        try self.rpcCallbacks.put(self.allocator, request_id, callback_entry);
+    }
+
+    fn cancelInflightRpcCallback(self: *Self, request_id: u64) void {
+        if (self.takeRpcCallback(request_id)) |callback| {
+            var owned_callback = callback;
+            owned_callback.deinit();
+        }
+    }
+
+    fn deinitAllRpcCallbacks(self: *Self) void {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        var it = self.rpcCallbacks.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.rpcCallbacks.deinit(self.allocator);
+    }
 
     pub fn init(
         allocator: Allocator,
@@ -1415,11 +1504,7 @@ pub const EthLibp2p = struct {
 
         self.allocator.free(self.params.fork_digest);
 
-        var it = self.rpcCallbacks.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        self.rpcCallbacks.deinit(self.allocator);
+        self.deinitAllRpcCallbacks();
     }
 
     pub fn run(self: *Self) !void {
@@ -1582,7 +1667,7 @@ pub const EthLibp2p = struct {
             var callback_entry = interface.ReqRespRequestCallback.init(method, self.allocator, handler, peer_id_copy);
             errdefer callback_entry.deinit();
 
-            self.rpcCallbacks.put(self.allocator, request_id, callback_entry) catch |err| {
+            self.putRpcCallback(request_id, callback_entry) catch |err| {
                 self.allocator.free(peer_id_copy);
                 self.logger.err(
                     "network-{d}:: Failed to register RPC callback for request_id={d} peer={s}{f}: {any}",
@@ -1593,6 +1678,11 @@ pub const EthLibp2p = struct {
         }
 
         return request_id;
+    }
+
+    pub fn cancelInflightRpcCallbackFn(ptr: *anyopaque, request_id: u64) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.cancelInflightRpcCallback(request_id);
     }
 
     fn notifyRpcErrorWithOwnedMessage(
@@ -1608,17 +1698,17 @@ pub const EthLibp2p = struct {
         });
         defer event.deinit(self.allocator);
 
-        if (self.rpcCallbacks.fetchRemove(request_id)) |entry| {
-            var callback = entry.value;
-            const peer_id = callback.peer_id;
+        if (self.takeRpcCallback(request_id)) |callback| {
+            var owned_callback = callback;
+            const peer_id = owned_callback.peer_id;
             const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-            callback.notify(&event) catch |notify_err| {
+            owned_callback.notify(&event) catch |notify_err| {
                 self.logger.err(
                     "network-{d}:: Failed to deliver RPC error callback for request_id={d} from peer={s}{f}: {any}",
                     .{ self.params.networkId, request_id, peer_id, node_name, notify_err },
                 );
             };
-            callback.deinit();
+            owned_callback.deinit();
         } else {
             self.logger.warn(
                 "network-{d}:: Dropping RPC error for unknown request_id={d}",
@@ -1635,13 +1725,25 @@ pub const EthLibp2p = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        const callback_ptr = self.rpcCallbacks.getPtr(request_id);
-        const peer_id = if (callback_ptr) |cb| cb.peer_id else "unknown";
-        const node_name = if (callback_ptr) |cb| self.node_registry.getNodeNameFromPeerId(cb.peer_id) else zeam_utils.OptionalNode.init(null);
         const owned_message = std.fmt.allocPrint(self.allocator, fmt, args) catch |alloc_err| {
+            const peer_id_copy = self.dupeRpcCallbackPeerId(request_id) catch |dup_err| {
+                self.logger.err(
+                    "network-{d}:: Failed to duplicate peer id for RPC error log request_id={d}: {any}",
+                    .{ self.params.networkId, request_id, dup_err },
+                );
+                return;
+            } orelse {
+                self.logger.err(
+                    "network-{d}:: Failed to allocate RPC error message for request_id={d}: {any}",
+                    .{ self.params.networkId, request_id, alloc_err },
+                );
+                return;
+            };
+            defer self.allocator.free(peer_id_copy);
+            const node_name = self.node_registry.getNodeNameFromPeerId(peer_id_copy);
             self.logger.err(
                 "network-{d}:: Failed to allocate RPC error message for request_id={d} from peer={s}{f}: {any}",
-                .{ self.params.networkId, request_id, peer_id, node_name, alloc_err },
+                .{ self.params.networkId, request_id, peer_id_copy, node_name, alloc_err },
             );
             return;
         };
@@ -1664,10 +1766,14 @@ pub const EthLibp2p = struct {
         var matching: std.ArrayList(u64) = .empty;
         defer matching.deinit(self.allocator);
 
-        var it = self.rpcCallbacks.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
-                try matching.append(self.allocator, entry.key_ptr.*);
+        {
+            self.rpc_callbacks_lock.lock();
+            defer self.rpc_callbacks_lock.unlock();
+            var it = self.rpcCallbacks.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
+                    try matching.append(self.allocator, entry.key_ptr.*);
+                }
             }
         }
 
@@ -1677,11 +1783,10 @@ pub const EthLibp2p = struct {
         const PEER_DISCONNECTED_CODE: u32 = 499;
 
         for (matching.items) |request_id| {
-            const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse continue;
-            const method = callback_ptr.method;
+            const callback_method = self.getRpcCallbackMethod(request_id) orelse continue;
             self.notifyRpcErrorFmt(
                 request_id,
-                method,
+                callback_method,
                 PEER_DISCONNECTED_CODE,
                 "peer disconnected before responding (peer={s})",
                 .{peer_id},
@@ -1717,6 +1822,7 @@ pub const EthLibp2p = struct {
                 .sendRequestFn = sendRPCRequest,
                 .onReqRespRequestFn = onRPCRequest,
                 .subscribeFn = subscribeReqResp,
+                .cancelInflightRequestFn = cancelInflightRpcCallbackFn,
             },
             .peers = .{
                 .ptr = self,

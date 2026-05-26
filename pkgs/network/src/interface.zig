@@ -94,6 +94,10 @@ pub const ReqResp = struct {
     sendRequestFn: *const fn (ptr: *anyopaque, peer_id: []const u8, req: *const ReqRespRequest, callback: ?OnReqRespResponseCbHandler) anyerror!u64,
     onReqRespRequestFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest, stream: ReqRespServerStream) anyerror!void,
     subscribeFn: *const fn (ptr: *anyopaque, handler: OnReqRespRequestCbHandler) anyerror!void,
+    /// Drop a registered response callback without notifying the handler.
+    /// Used when the node layer finalizes a pending RPC (timeout, completed
+    /// bookkeeping) so a late bridge response cannot invoke a stale callback.
+    cancelInflightRequestFn: *const fn (ptr: *anyopaque, request_id: u64) void,
 
     pub fn subscribe(self: ReqResp, handler: OnReqRespRequestCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, handler);
@@ -101,6 +105,10 @@ pub const ReqResp = struct {
 
     pub fn sendRequest(self: ReqResp, peer_id: []const u8, req: *const ReqRespRequest, callback: ?OnReqRespResponseCbHandler) anyerror!u64 {
         return self.sendRequestFn(self.ptr, peer_id, req, callback);
+    }
+
+    pub fn cancelInflightRequest(self: ReqResp, request_id: u64) void {
+        self.cancelInflightRequestFn(self.ptr, request_id);
     }
 };
 
@@ -715,7 +723,8 @@ pub const ReqRespRequestCallback = struct {
     }
 
     pub fn deinit(self: *ReqRespRequestCallback) void {
-        // peer_id is owned by the callback, free it
+        // peer_id is owned by the callback; handler.ptr references the node and
+        // is not freed here (see BeamNode.getReqRespResponseHandler).
         self.allocator.free(self.peer_id);
     }
 

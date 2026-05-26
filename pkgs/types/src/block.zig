@@ -727,7 +727,10 @@ pub fn computeSingleAggregatedSignature(
 
     return switch (prep.outcome) {
         .skip => null,
-        .done => |result| result,
+        .done => |result| blk: {
+            prep.outcome = .skip;
+            break :blk result;
+        },
         .ffi => |*args| blk: {
             const result = try runAggregateAttDataFfi(allocator, prep.data, args);
             args.deinit(allocator);
@@ -1837,4 +1840,42 @@ test "compactSingleProof: aggregation_bits matches participants when participant
     );
 
     try std.testing.expectEqualSlices(u8, participants_bytes.items, bits_bytes.items);
+}
+
+// Regression (#929): single-child passthrough (.done) must not double-free when
+// computeSingleAggregatedSignature returns and prep.deinit runs.
+test "computeSingleAggregatedSignature: single-child passthrough survives prep deinit" {
+    const allocator = std.testing.allocator;
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var signatures = SignaturesMap.init(allocator);
+    defer signatures.deinit();
+
+    var payloads = AggregatedPayloadsMap.init(allocator);
+    defer testDeinitPayloadsMap(allocator, &payloads);
+
+    const att_data = testAttestationData(7);
+    try testPutSingleChildPayload(allocator, &payloads, att_data, 0);
+
+    const maybe_result = try computeSingleAggregatedSignature(
+        allocator,
+        &validators,
+        &signatures,
+        &payloads,
+        null,
+        att_data,
+    );
+    var result = maybe_result orelse return error.TestExpectedSome;
+    defer {
+        result.attestation.deinit();
+        result.signature.deinit();
+    }
+
+    var cloned: aggregation.AggregatedSignatureProof = undefined;
+    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, result.signature, &cloned);
+    defer cloned.deinit();
+
+    try std.testing.expect(cloned.participants.len() > 0);
 }
