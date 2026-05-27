@@ -23,6 +23,13 @@ pub const MAX_REQUEST_BLOCKS = activePresetValues.MAX_REQUEST_BLOCKS;
 // merge cost and importer verify cost.
 pub const MAX_ATTESTATIONS_DATA: usize = 8;
 
+// devnet5: soft wall-clock budget for one aggregation pass. The per-att_data Type-1 aggregation is
+// a recursive-STARK prove whose cost grows with the number of distinct AttestationData groups; left
+// unbounded it can run past the slot and starve justification. Matching ethlambda, an aggregation
+// worker stops scheduling new groups once this budget is spent and emits the aggregations it has
+// already committed (a partial pass), keeping aggregates timely enough to finalize.
+pub const AGGREGATION_DEADLINE_MS: u64 = 750;
+
 test "test preset loading" {
     try std.testing.expect(SECONDS_PER_SLOT == mainnetPreset.preset.SECONDS_PER_SLOT);
 }

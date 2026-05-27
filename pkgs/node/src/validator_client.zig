@@ -3,7 +3,6 @@ const json = std.json;
 const Allocator = std.mem.Allocator;
 const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
-const xmss = @import("@zeam/xmss");
 const zeam_utils = @import("@zeam/utils");
 const jsonToString = zeam_utils.jsonToString;
 const key_manager_lib = @import("@zeam/key-manager");
@@ -88,7 +87,10 @@ pub const ValidatorClient = struct {
 
         // if a new slot interval may be do a proposal
         switch (interval) {
-            0 => return self.maybeDoProposal(slot),
+            // devnet5 (#14): block production runs off the slot loop on a thread_pool worker
+            // (chain.submitProposeOnInterval), since the prod-scheme Type-2 merge is multi-second
+            // and would freeze gossip/tick handling here. Interval 0 therefore emits nothing.
+            0 => return null,
             1 => return self.mayBeDoAttestation(slot),
             2 => return null,
             3 => return null,
@@ -108,69 +110,10 @@ pub const ValidatorClient = struct {
         }
     }
 
-    pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
-        if (self.getSlotProposer(slot)) |slot_proposer_id| {
-            // Check if chain is synced before producing a block
-            const sync_status = self.chain.getSyncStatus();
-            switch (sync_status) {
-                .synced => {},
-                .fc_initing => {
-                    self.logger.info("skipping block production for slot={d} proposer={d}: forkchoice still initing (awaiting first justified checkpoint)", .{ slot, slot_proposer_id });
-                    return null;
-                },
-                .no_peers => {
-                    // A validator has a duty to propose at its assigned slot regardless of
-                    // peer connectivity. The block is self-imported (advancing local
-                    // fork-choice and persisted to DB) and will be gossiped once peers
-                    // connect. This also enables reqresp tests that isolate zeam from
-                    // the gossip mesh while still expecting block production.
-                    self.logger.info("producing block for slot={d} proposer={d} with no peers (self-import only)", .{ slot, slot_proposer_id });
-                },
-                .behind_peers => |info| {
-                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
-                        slot,
-                        slot_proposer_id,
-                        info.head_slot,
-                        info.finalized_slot,
-                        info.max_peer_finalized_slot,
-                    });
-                    return null;
-                },
-            }
-
-            self.logger.debug("constructing block for slot={d} proposer={d}", .{ slot, slot_proposer_id });
-            var produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
-            self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
-
-            // Sign block root with proposer's proposal key
-            const proposer_signature = try self.key_manager.signBlockRoot(
-                slot_proposer_id,
-                &produced_block.blockRoot,
-                @intCast(slot),
-            );
-
-            // devnet5: merge the per-attestation Type-1 proofs + the proposer's Type-1 into the
-            // single Type-2 block proof. The Type-1 list is consumed here and freed afterwards —
-            // the SignedBlock carries only the merged proof.
-            var proof = try xmss.ByteList512KiB.init(self.allocator);
-            errdefer proof.deinit();
-            try self.chain.buildBlockProof(&produced_block, &proposer_signature, &proof);
-            for (produced_block.attestation_signatures.slice()) |*t1| t1.deinit();
-            produced_block.attestation_signatures.deinit();
-
-            const signed_block = types.SignedBlock{
-                .block = produced_block.block,
-                .proof = proof,
-            };
-
-            self.logger.info("signed produced block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
-
-            var result = ValidatorClientOutput.init(self.allocator);
-            try result.addBlock(signed_block);
-            return result;
-        }
-        return null;
-    }
+    // devnet5 (#14): block production moved off the slot loop to chain.submitProposeOnInterval /
+    // proposeImpl (a thread_pool worker). The old on-loop maybeDoProposal — which built the
+    // multi-second Type-2 merge inline and would freeze gossip/tick handling — was removed in
+    // favour of that single off-loop path.
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;

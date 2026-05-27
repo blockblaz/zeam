@@ -2693,6 +2693,13 @@ pub const BeamNode = struct {
 
             self.runSyncRecoveryOnInterval(slot, interval_in_slot, wall_head_lag_slots);
 
+            if (interval_in_slot == 0) {
+                // devnet5 (#14): block production is offloaded to a thread_pool worker so the
+                // multi-second prod-scheme Type-2 merge never freezes this slot loop. Returns
+                // within microseconds; the worker produces, merges, and publishes itself.
+                self.chain.submitProposeOnInterval(self, interval);
+            }
+
             if (interval_in_slot == 2) {
                 const agg_timer = zeam_metrics.zeam_node_aggregation_interval_tick_seconds.start();
                 defer _ = agg_timer.observe();

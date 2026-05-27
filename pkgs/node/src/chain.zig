@@ -418,6 +418,17 @@ pub const BeamChain = struct {
     /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
     aggregate_max_inflight: u32,
 
+    /// devnet5 (#14): the block proof is a recursive-STARK Type-2 merge that takes seconds at the
+    /// prod scheme — far longer than an 800ms interval. Running it on the libxev slot loop would
+    /// freeze gossip/tick handling, so `submitProposeOnInterval` offloads the whole propose
+    /// (produceBlock + buildBlockProof + publishBlock) to a `thread_pool` worker, mirroring the
+    /// aggregate worker. At most one propose runs at a time; a second trigger is dropped (the next
+    /// slot re-proposes). `proposeImpl` decrements on exit.
+    propose_inflight: std.atomic.Value(u32) = .init(0),
+
+    /// Joined at `deinit` so propose workers cannot outlive chain state.
+    propose_wg: WaitGroup = .{},
+
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -1533,6 +1544,10 @@ pub const BeamChain = struct {
         // Issue #907: join any in-flight aggregate workers before
         // tearing down chain state they reference.
         self.thread_pool.waitAndWork(&self.aggregate_wg);
+
+        // devnet5 (#14): same for in-flight propose workers (produceBlock + Type-2 merge +
+        // publishBlock) — they reference chain state and must not outlive it.
+        self.thread_pool.waitAndWork(&self.propose_wg);
 
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
@@ -3507,9 +3522,38 @@ pub const BeamChain = struct {
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
 
-                // devnet5: per-attestation Type-1 proofs are NOT recovered from the block's Type-2
-                // and stored here. Re-aggregation by a later proposer draws from the gossip payload
-                // pool (matching ethlambda devnet5, which defers block deconstruction).
+            }
+
+            // devnet5 (#16): re-aggregation. Split the block's single Type-2 proof back into one
+            // Type-1 per body attestation and store them in latest_known so a later proposer can
+            // re-aggregate the block's attestations. Bounded by MAX_ATTESTATIONS_DATA (enforced
+            // above) and run in-sync here — this path is already off the libxev loop (chain-worker
+            // for gossip blocks, propose worker for locally produced ones). Best-effort: a split
+            // failure is logged and skipped, never fatal to import.
+            if (aggregated_attestations.len > 0) reagg: {
+                var recovered_list = types.Type1ProofList.init(self.allocator) catch break :reagg;
+                defer {
+                    for (recovered_list.slice()) |*t1| t1.deinit();
+                    recovered_list.deinit();
+                }
+                types.deconstructType2BlockProof(
+                    self.allocator,
+                    &post_state.validators,
+                    &block.body.attestations,
+                    @intCast(block.proposer_index),
+                    signedBlock.proof.constSlice(),
+                    &recovered_list,
+                ) catch |e| {
+                    self.logger.warn("failed to deconstruct block Type-2 proof for re-aggregation (root=0x{x}): {any}", .{ &block_root, e });
+                    break :reagg;
+                };
+                for (aggregated_attestations, 0..) |agg_att, i| {
+                    if (i >= recovered_list.len()) break;
+                    const t1 = recovered_list.get(i) catch continue;
+                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, true) catch |e| {
+                        self.logger.warn("failed to store re-aggregated payload for block attestation index={d}: {any}", .{ i, e });
+                    };
+                }
             }
 
             // 5. fc update head
@@ -4500,6 +4544,106 @@ pub const BeamChain = struct {
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
+    /// devnet5 (#14): trigger off-loop block production for `time_intervals` if this node is the
+    /// proposer for the slot. Called from the libxev interval tick at interval-in-slot 0; returns
+    /// within microseconds. The whole propose (produceBlock + Type-2 merge + publishBlock) runs on
+    /// a `thread_pool` worker so the multi-second prod-scheme merge never freezes the slot loop.
+    /// At most one propose is in flight; a second trigger is dropped (the next slot re-proposes).
+    pub fn submitProposeOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
+        if (time_intervals % constants.INTERVALS_PER_SLOT != 0) return;
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+
+        // Only the node running this slot's proposer does anything.
+        const validator = if (node.validator) |*v| v else return;
+        const proposer_id = validator.getSlotProposer(slot) orelse return;
+
+        // Sync gating (the checks the old on-loop maybeDoProposal performed).
+        switch (self.getSyncStatus()) {
+            .synced => {},
+            .no_peers => {
+                // A proposer has a duty regardless of peers: self-import and gossip once peers join.
+                self.logger.info("producing block for slot={d} proposer={d} with no peers (self-import only)", .{ slot, proposer_id });
+            },
+            .fc_initing => {
+                self.logger.info("skipping block production for slot={d} proposer={d}: forkchoice still initing", .{ slot, proposer_id });
+                return;
+            },
+            .behind_peers => |info| {
+                self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{ slot, proposer_id, info.head_slot, info.finalized_slot, info.max_peer_finalized_slot });
+                return;
+            },
+        }
+
+        // Single-flight: at most one propose at a time. fetchAdd-then-compare is a soft ceiling,
+        // released on every early return below.
+        const prev = self.propose_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= 1) {
+            _ = self.propose_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("skipping propose for slot={d}: previous propose still in flight", .{slot});
+            return;
+        }
+
+        self.thread_pool.spawnWg(&self.propose_wg, proposeImpl, .{ self, node, slot, proposer_id }) catch {
+            _ = self.propose_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue propose for slot={d}; skipping", .{slot});
+            return;
+        };
+    }
+
+    /// Worker body for off-loop block production (runs on a shared `ThreadPool` worker).
+    /// produceBlock advances local fork-choice; buildBlockProof does the recursive-STARK Type-2
+    /// merge; publishBlock verifies + persists + gossips. The SignedBlock is freed here — onBlock
+    /// consumes it as input and does not retain its allocations (see publishBlock).
+    fn proposeImpl(chain: *Self, node: *@import("./node.zig").BeamNode, slot: usize, proposer_id: usize) void {
+        defer _ = chain.propose_inflight.fetchSub(1, .acq_rel);
+        const worker_timer = zeam_metrics.lean_block_building_time_seconds.start();
+        defer _ = worker_timer.observe();
+
+        const validator = if (node.validator) |*v| v else return;
+
+        var produced_block = chain.produceBlock(.{ .slot = slot, .proposer_index = proposer_id }) catch |e| {
+            chain.logger.err("propose worker: produceBlock failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+        // Owns block + per-att Type-1 list until handed to the SignedBlock below.
+        var produced_owned = true;
+        defer if (produced_owned) produced_block.deinit();
+
+        chain.logger.info("produced block for slot={d} proposer={d} root={x}", .{ slot, proposer_id, &produced_block.blockRoot });
+
+        const proposer_signature = validator.key_manager.signBlockRoot(proposer_id, &produced_block.blockRoot, @intCast(slot)) catch |e| {
+            chain.logger.err("propose worker: signBlockRoot failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+
+        var proof = xmss.ByteList512KiB.init(chain.allocator) catch return;
+        var proof_owned = true;
+        defer if (proof_owned) proof.deinit();
+        chain.buildBlockProof(&produced_block, &proposer_signature, &proof) catch |e| {
+            chain.logger.err("propose worker: buildBlockProof failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+
+        // The Type-1 list is now folded into the Type-2 proof; free it. The block moves into the
+        // SignedBlock (which we free after publishing).
+        for (produced_block.attestation_signatures.slice()) |*t1| t1.deinit();
+        produced_block.attestation_signatures.deinit();
+
+        var signed_block = types.SignedBlock{
+            .block = produced_block.block,
+            .proof = proof,
+        };
+        produced_owned = false; // block now owned by signed_block
+        proof_owned = false; // proof now owned by signed_block
+        defer signed_block.deinit();
+
+        node.publishBlock(signed_block) catch |e| {
+            chain.logger.err("propose worker: publishBlock failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+        chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+    }
+
     /// Find the subnet of the first set participant in `participants`.
     /// All participants in a single aggregated attestation come from the same
     /// committee subnet, so the first one is representative. Returns null if
@@ -4745,8 +4889,9 @@ pub const BeamChain = struct {
         const our_head_slot = self.forkChoice.getHead().slot;
         const our_finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
-        // Find the maximum finalized slot reported by any peer
+        // Find the maximum finalized AND head slot reported by any peer.
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
+        var max_peer_head_slot: types.Slot = our_head_slot;
 
         var peer_guard = self.connected_peers.iterateLocked();
         defer peer_guard.deinit();
@@ -4756,6 +4901,9 @@ pub const BeamChain = struct {
             if (peer_info.latest_status) |status| {
                 if (status.finalized_slot > max_peer_finalized_slot) {
                     max_peer_finalized_slot = status.finalized_slot;
+                }
+                if (status.head_slot > max_peer_head_slot) {
+                    max_peer_head_slot = status.head_slot;
                 }
             }
         }
@@ -4785,8 +4933,16 @@ pub const BeamChain = struct {
 
         // Check 3: pre-finalization devnets — wall-clock head lag means we are
         // not at chain tip even though finalization gaps are zero (#926).
+        //
+        // BUT only if a peer is actually ahead of our head — i.e. there is someone to sync FROM.
+        // In a uniformly-slow network (e.g. the prod XMSS scheme, where each block's Type-2 merge
+        // can exceed an interval), every node's head lags the wall clock equally while all agree on
+        // the tip. Tripping behind_peers there disables propose+aggregate on ALL nodes with no peer
+        // to catch up from — a pre-finalization deadlock that prevents the FIRST finalization from
+        // ever happening. If no peer reports a higher head, we ARE the tip: stay synced and keep
+        // producing/aggregating so the chain can progress and finalize. (#717 devnet5.)
         const wall_lag = self.wall_head_lag_slots.load(.monotonic);
-        if (blocks_by_range_sync.isWallHeadLagSyncing(
+        if (max_peer_head_slot > our_head_slot and blocks_by_range_sync.isWallHeadLagSyncing(
             our_finalized_slot,
             max_peer_finalized_slot,
             wall_lag,

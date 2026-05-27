@@ -527,6 +527,88 @@ pub fn buildType2BlockProof(
     for (encoded.items) |b| try out_proof.append(b);
 }
 
+/// Inverse of `buildType2BlockProof` (leanSpec #717 re-aggregation): split the single Type-2 block
+/// proof back into one Type-1 proof per body attestation, in body order. Each recovered Type-1 has
+/// its `participants` restored from the matching attestation's aggregation bits (the FFI split
+/// leaves them empty). The proposer component is not recovered — only the attestation components,
+/// which is what a later proposer re-aggregates.
+///
+/// `out_type1s` must be an empty `Type1ProofList`; on success it holds `agg_attestations.len()`
+/// proofs parallel with the body. Bounded by the caller's MAX_ATTESTATIONS_DATA cap.
+pub fn deconstructType2BlockProof(
+    allocator: Allocator,
+    validators: *const Validators,
+    agg_attestations: *const AggregatedAttestations,
+    proposer_index: usize,
+    proof_bytes: []const u8,
+    out_type1s: *Type1ProofList,
+) !void {
+    const atts = agg_attestations.constSlice();
+
+    var t2: aggregation.TypeTwoMultiSignature = undefined;
+    try ssz.deserialize(aggregation.TypeTwoMultiSignature, proof_bytes, &t2, allocator);
+    defer t2.deinit();
+
+    // Reconstruct the exact per-component pubkey layout the Type-2 was built with: each body
+    // attestation's participant attestation-pubkeys (body order), then the proposer's proposal key.
+    var pk_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+    defer {
+        for (pk_wrappers.items) |*w| w.deinit();
+        pk_wrappers.deinit(allocator);
+    }
+
+    const pks_per_part = try allocator.alloc([]*const xmss.HashSigPublicKey, atts.len + 1);
+    defer {
+        for (pks_per_part) |slice| {
+            if (slice.len > 0) allocator.free(slice);
+        }
+        allocator.free(pks_per_part);
+    }
+    for (pks_per_part) |*s| s.* = &.{};
+
+    for (atts, 0..) |agg_att, i| {
+        var vids = try attestation.aggregationBitsToValidatorIndices(&agg_att.aggregation_bits, allocator);
+        defer vids.deinit(allocator);
+        const handles = try allocator.alloc(*const xmss.HashSigPublicKey, vids.items.len);
+        for (vids.items, 0..) |vid, j| {
+            const val = try validators.get(@intCast(vid));
+            const pk = try xmss.PublicKey.fromBytes(&val.attestation_pubkey);
+            try pk_wrappers.append(allocator, pk);
+            handles[j] = pk.handle;
+        }
+        pks_per_part[i] = handles;
+    }
+    {
+        const proposer_val = try validators.get(@intCast(proposer_index));
+        const proposer_pk = try xmss.PublicKey.fromBytes(&proposer_val.proposal_pubkey);
+        try pk_wrappers.append(allocator, proposer_pk);
+        const handles = try allocator.alloc(*const xmss.HashSigPublicKey, 1);
+        handles[0] = proposer_pk.handle;
+        pks_per_part[atts.len] = handles;
+    }
+
+    // Split each attestation component out of the Type-2 (keyed by its message hash) and restore
+    // participants from the body attestation's bits.
+    var committed: usize = 0;
+    errdefer {
+        for (out_type1s.slice()[0..committed]) |*t1| t1.deinit();
+    }
+    for (atts) |agg_att| {
+        var message_hash: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(attestation.AttestationData, agg_att.data, &message_hash, allocator);
+
+        var recovered = try aggregation.TypeOneMultiSignature.init(allocator);
+        errdefer recovered.deinit();
+        try t2.splitByMessage(pks_per_part, &message_hash, &recovered);
+
+        recovered.participants.deinit();
+        try utils.sszClone(allocator, attestation.AggregationBits, agg_att.aggregation_bits, &recovered.participants);
+
+        try out_type1s.append(recovered);
+        committed += 1;
+    }
+}
+
 fn slotAllowed(slot: Slot, slot_filter: ?[]const Slot) bool {
     const slots = slot_filter orelse return true;
     for (slots) |allowed| {

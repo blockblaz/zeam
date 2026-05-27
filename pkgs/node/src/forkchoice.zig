@@ -1477,6 +1477,9 @@ pub const ForkChoice = struct {
         var target_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
         const nodes = self.protoArray.nodes.items;
 
+        // Walk the head down toward the safe target — bounded to JUSTIFICATION_LOOKBACK_SLOTS (3)
+        // steps, matching leanSpec get_attestation_target's `for _ in range(JUSTIFICATION_LOOKBACK_SLOTS)`.
+        // The spec relies on safe_target tracking within this many slots of head in a healthy network.
         for (0..3) |i| {
             _ = i;
             if (nodes[target_idx].slot > self.safeTarget.slot) {
@@ -2121,8 +2124,21 @@ pub const ForkChoice = struct {
         }
 
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
+        // devnet5: cap the pass at AGGREGATION_DEADLINE_MS. The per-att_data prove is multi-second
+        // at the prod scheme, so an unbounded pass over every group can run past the slot and
+        // starve justification. Once the budget is spent we stop scheduling new groups and emit the
+        // aggregations already committed below (a partial pass) — matching ethlambda.
+        const deadline_ns = compute_start_ns + @as(i128, @intCast(params.AGGREGATION_DEADLINE_MS)) * std.time.ns_per_ms;
 
-        for (att_data_keys) |data| {
+        for (att_data_keys, 0..) |data, processed| {
+            if (processed > 0 and zeam_utils.monotonicTimestampNs() >= deadline_ns) {
+                self.logger.warn(
+                    "aggregation deadline {d}ms reached after {d}/{d} att_data groups; emitting partial pass",
+                    .{ params.AGGREGATION_DEADLINE_MS, processed, att_data_keys.len },
+                );
+                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "deadline" }) catch {};
+                break;
+            }
             var maybe_result = try types.computeSingleAggregatedSignature(
                 self.allocator,
                 validators,

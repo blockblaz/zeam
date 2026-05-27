@@ -30,6 +30,7 @@ pub const AggregatedAttestations = block.AggregatedAttestations;
 pub const AggregatedAttestationsResult = block.AggregatedAttestationsResult;
 pub const Type1ProofList = block.Type1ProofList;
 pub const buildType2BlockProof = block.buildType2BlockProof;
+pub const deconstructType2BlockProof = block.deconstructType2BlockProof;
 pub const StoredSignature = block.StoredSignature;
 pub const SignaturesMap = block.SignaturesMap;
 pub const aggregateInnerMap = block.AggregateInnerMap;
