@@ -174,6 +174,16 @@ const Metrics = struct {
     lean_gossip_block_size_bytes: GossipBlockSizeBytesHistogram,
     lean_gossip_attestation_size_bytes: GossipAttestationSizeBytesHistogram,
     lean_gossip_aggregation_size_bytes: GossipAggregationSizeBytesHistogram,
+    /// Issue #942: count gossip-ingress decode rejections, labeled by
+    /// `topic_kind` (block | attestation | aggregation) and `reason`
+    /// (snappy_empty | snappy_varint | snappy_oversized | snappy_truncated |
+    /// snappy_decode | ssz_decode). Without this counter, the only operator-
+    /// visible signal that zeam has stopped accepting gossip is `lean_head_slot`
+    /// drifting behind wall-clock — by which point the node is already off
+    /// consensus. With it, the failure mode is dashboard-visible the moment
+    /// decode starts failing, and the `reason` label attributes upstream
+    /// vs. our-side framing mismatches vs. SSZ-body issues separately.
+    zeam_gossip_decode_failures_total: ZeamGossipDecodeFailuresCounter,
     // Attestation production time histogram
     lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
     // compactAttestations metrics
@@ -515,6 +525,7 @@ const Metrics = struct {
     const LeanNodeSyncStatusGauge = metrics_lib.GaugeVec(u64, struct { status: []const u8 });
     // Gossip message size histogram types
     const GossipBlockSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000 });
+    const ZeamGossipDecodeFailuresCounter = metrics_lib.CounterVec(u64, struct { topic_kind: []const u8, reason: []const u8 });
     const GossipAttestationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 512, 1_024, 2_048, 4_096, 8_192, 16_384 });
     const GossipAggregationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1_024, 4_096, 16_384, 65_536, 131_072, 262_144, 524_288, 1_048_576 });
     // Attestation production time histogram type
@@ -1003,6 +1014,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Bytes size of a gossip block message" }, .{}),
         .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Bytes size of a gossip attestation message" }, .{}),
         .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Bytes size of a gossip aggregated attestation message" }, .{}),
+        .zeam_gossip_decode_failures_total = try Metrics.ZeamGossipDecodeFailuresCounter.init(allocator, io, "zeam_gossip_decode_failures_total", .{ .help = "Gossip-ingress decode rejections, labeled by topic_kind (block|attestation|aggregation) and reason (snappy_empty|snappy_varint|snappy_oversized|snappy_truncated|snappy_decode|ssz_decode). Operator-visible signal that zeam has stopped accepting gossip BEFORE lean_head_slot drifts off wall-clock. See issue #942." }, .{}),
         .lean_attestations_production_time_seconds = Metrics.AttestationProductionTimeHistogram.init("lean_attestations_production_time_seconds", .{ .help = "Time taken to produce attestation" }, .{}),
         // compactAttestations metrics
         .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
@@ -1305,6 +1317,23 @@ pub fn observeXmssRecAggregatePhase(phase: []const u8, elapsed_ns: u64) void {
     metrics.zeam_xmss_rec_aggregate_phase_seconds.observe(
         .{ .phase = phase },
         elapsed_s,
+    ) catch {};
+}
+
+/// Issue #942: record one gossip-ingress decode rejection. `topic_kind` must
+/// be one of "block" | "attestation" | "aggregation"; `reason` is one of
+/// "snappy_empty" | "snappy_varint" | "snappy_oversized" | "snappy_truncated"
+/// | "snappy_decode" | "ssz_decode" — see the metric help text on
+/// `zeam_gossip_decode_failures_total` for the full enumeration.
+///
+/// Safe to call from FFI / network callback contexts: no allocation, label
+/// keys are interned by the registry. Silently no-ops before
+/// `metrics.init()` so test runs that haven't started the registry don't
+/// crash. Cardinality bound: 3 topic_kinds × 6 reasons = 18 series.
+pub fn incrGossipDecodeFailure(topic_kind: []const u8, reason: []const u8) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_gossip_decode_failures_total.incr(
+        .{ .topic_kind = topic_kind, .reason = reason },
     ) catch {};
 }
 
