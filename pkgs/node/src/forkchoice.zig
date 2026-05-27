@@ -1035,7 +1035,7 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     pub const ProposalAttestationsResult = struct {
         attestations: types.AggregatedAttestations,
-        signatures: types.AttestationSignatures,
+        signatures: types.Type1ProofList,
     };
 
     /// Checks whether `slot` is justified under the given tracking state,
@@ -1117,7 +1117,7 @@ pub const ForkChoice = struct {
             agg_attestations.deinit();
         };
 
-        var attestation_signatures = try types.AttestationSignatures.init(self.allocator);
+        var attestation_signatures = try types.Type1ProofList.init(self.allocator);
         var agg_sig_cleanup = true;
         errdefer if (agg_sig_cleanup) {
             for (attestation_signatures.slice()) |*sig| sig.deinit();

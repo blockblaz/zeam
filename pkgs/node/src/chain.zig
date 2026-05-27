@@ -101,8 +101,10 @@ pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
 
-    // Aggregated signatures corresponding to attestations in the block body.
-    attestation_signatures: types.AttestationSignatures,
+    // devnet5: per-attestation Type-1 proofs (one per body AttestationData, parallel with the body
+    // attestations). Merged with the proposer's Type-1 into the single Type-2 SignedBlock.proof
+    // when the block is finalized for publishing.
+    attestation_signatures: types.Type1ProofList,
 
     pub fn deinit(self: *ProducedBlock) void {
         self.block.deinit();
@@ -2656,6 +2658,38 @@ pub const BeamChain = struct {
         };
     }
 
+    /// devnet5 / leanSpec #717: merge a produced block's per-attestation Type-1 proofs with the
+    /// proposer's signature over the block root into the single Type-2 `SignedBlock.proof`.
+    ///
+    /// This is the expensive recursive-STARK merge. It is invoked off the slot-driver loop (the
+    /// propose worker) so a long merge cannot freeze gossip/tick handling.
+    pub fn buildBlockProof(
+        self: *Self,
+        produced: *const ProducedBlock,
+        proposer_sig: *const types.SIGBYTES,
+        out_proof: *xmss.ByteList512KiB,
+    ) !void {
+        var borrow = self.statesGet(produced.blockRoot) orelse return BlockProductionError.MissingPreState;
+        defer borrow.assertReleasedOrPanic();
+        const state_snapshot = try borrow.cloneAndRelease(self.allocator);
+        defer {
+            state_snapshot.deinit();
+            self.allocator.destroy(state_snapshot);
+        }
+
+        try types.buildType2BlockProof(
+            self.allocator,
+            &state_snapshot.validators,
+            &produced.block.body.attestations,
+            produced.attestation_signatures.constSlice(),
+            @intCast(produced.block.proposer_index),
+            &produced.blockRoot,
+            @intCast(produced.block.slot),
+            proposer_sig,
+            out_proof,
+        );
+    }
+
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
         const slot = opts.slot;
 
@@ -3289,7 +3323,9 @@ pub const BeamChain = struct {
             // atomic and the loser frees its handle. The previous
             // mutex around this block was the dominant contributor
             // to the ~78ms mean lock hold reported in #863.
-            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool);
+            // devnet5: a block carries ONE merged Type-2 proof, so verification is a single
+            // container.verify (no per-attestation parallel batch). thread_pool no longer needed here.
+            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
 
             step_watch.lap("verify_signatures");
 
@@ -3391,15 +3427,10 @@ pub const BeamChain = struct {
             });
 
             const aggregated_attestations = block.body.attestations.constSlice();
-            const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
 
-            if (aggregated_attestations.len != signature_groups.len) {
-                self.logger.err(
-                    "signature group count mismatch for block root=0x{x}: attestations={d} signature_groups={d}",
-                    .{ &freshFcBlock.blockRoot, aggregated_attestations.len, signature_groups.len },
-                );
-                return BlockProcessingError.InvalidSignatureGroups;
-            }
+            // devnet5: the block carries a single merged Type-2 proof (already verified above), not
+            // per-attestation signature groups. Each attestation's participants come straight from
+            // its own aggregation_bits, so there is no per-group count or participant cross-check.
 
             // Each unique AttestationData must appear at most once per block.
             {
@@ -3443,24 +3474,9 @@ pub const BeamChain = struct {
                 }
             }
 
-            for (aggregated_attestations, 0..) |aggregated_attestation, index| {
+            for (aggregated_attestations) |aggregated_attestation| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
-
-                // Get participant indices from the signature proof, length already validated
-                const signature_proof = &signature_groups[index];
-
-                var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
-                defer participant_indices.deinit(self.allocator);
-
-                if (validator_indices.items.len != participant_indices.items.len or !std.mem.eql(usize, validator_indices.items, participant_indices.items)) {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                    self.logger.err(
-                        "attestation signature mismatch index={d} validators={d} participants={d}",
-                        .{ index, validator_indices.items.len, participant_indices.items.len },
-                    );
-                    continue;
-                }
 
                 // Validate aggregated attestation data once before processing individual validators
                 self.validateAttestationData(aggregated_attestation.data, true) catch |e| {
@@ -3491,15 +3507,9 @@ pub const BeamChain = struct {
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
 
-                // store the aggregated payloads in known
-                var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-                defer self.allocator.free(validator_ids);
-                for (validator_indices.items, 0..) |vi, i| {
-                    validator_ids[i] = @intCast(vi);
-                }
-                self.forkChoice.storeAggregatedPayload(&aggregated_attestation.data, signature_proof.*, true) catch |e| {
-                    self.logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
-                };
+                // devnet5: per-attestation Type-1 proofs are NOT recovered from the block's Type-2
+                // and stored here. Re-aggregation by a later proposer draws from the gossip payload
+                // pool (matching ethlambda devnet5, which defers block deconstruction).
             }
 
             // 5. fc update head

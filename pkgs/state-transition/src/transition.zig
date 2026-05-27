@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const ssz = @import("ssz");
 const types = @import("@zeam/types");
 
 const params = @import("@zeam/params");
@@ -54,246 +55,125 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     block.state_root = state_root;
 }
 
-// Verify aggregated signatures using AggregatedSignatureProof
-// If pubkey_cache is provided, public keys are cached to avoid repeated SSZ deserialization.
-// This can significantly reduce CPU overhead when processing many blocks.
-// TODO: benchmark and compare with verifySignaturesParallel, see if the scheduling overhead
-// on thread pool overcomes the benefit of parallelizing the verification.
+// devnet5 / leanSpec #717: verify the single merged Type-2 proof on SignedBlock.proof — split by
+// per-component message binding (attestations then proposer) and run one container.verify.
 pub fn verifySignatures(
     allocator: Allocator,
     state: *const types.BeamState,
     signed_block: *const types.SignedBlock,
     pubkey_cache: ?*xmss.PublicKeyCache,
 ) !void {
-    const attestations = signed_block.block.body.attestations.constSlice();
-    const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
-
-    if (attestations.len != signature_proofs.len) {
-        return StateTransitionError.InvalidBlockSignatures;
-    }
-
+    const block = &signed_block.block;
+    const attestations = block.body.attestations.constSlice();
     const validators = state.validators.constSlice();
 
-    for (attestations, signature_proofs) |aggregated_attestation, signature_proof| {
-        // Get validator indices from the attestation's aggregation bits
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-        defer validator_indices.deinit(allocator);
-
-        // Get validator indices from the signature proof's participants
-        var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
-        defer participant_indices.deinit(allocator);
-
-        // Verify that the participants EXACTLY match the attestation aggregation bits.
-        if (validator_indices.items.len != participant_indices.items.len) {
-            return StateTransitionError.InvalidBlockSignatures;
-        }
-        for (validator_indices.items, participant_indices.items) |att_idx, proof_idx| {
-            if (att_idx != proof_idx) {
-                return StateTransitionError.InvalidBlockSignatures;
-            }
-        }
-
-        // Convert validator pubkey bytes to HashSigPublicKey handles
-        var public_keys: std.ArrayList(*const xmss.HashSigPublicKey) = .empty;
-        try public_keys.ensureTotalCapacity(allocator, validator_indices.items.len);
-        defer public_keys.deinit(allocator);
-
-        // Store the PublicKey wrappers so we can free the Rust handles after verification
-        // Only used when cache is not provided
-        var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
-        try pubkey_wrappers.ensureTotalCapacity(allocator, validator_indices.items.len);
-        defer {
-            // Only free wrappers if we're not using a cache
-            // When using cache, the cache owns the handles
-            if (pubkey_cache == null) {
-                for (pubkey_wrappers.items) |*wrapper| {
-                    wrapper.deinit();
-                }
-            }
-            pubkey_wrappers.deinit(allocator);
-        }
-
-        for (validator_indices.items) |validator_index| {
-            if (validator_index >= validators.len) {
-                return StateTransitionError.InvalidValidatorId;
-            }
-            const validator = &validators[validator_index];
-            const pubkey_bytes = validator.getAttestationPubkey();
-
-            if (pubkey_cache) |cache| {
-                // Use cached public key (deserialize on first access, reuse on subsequent)
-                const pk_handle = cache.getOrPut(validator_index, pubkey_bytes) catch {
-                    return StateTransitionError.InvalidBlockSignatures;
-                };
-                try public_keys.append(allocator, pk_handle);
-            } else {
-                // No cache - deserialize each time (legacy behavior)
-                const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
-                    return StateTransitionError.InvalidBlockSignatures;
-                };
-                try public_keys.append(allocator, pubkey.handle);
-                try pubkey_wrappers.append(allocator, pubkey);
-            }
-        }
-
-        // Compute message hash from attestation data
-        var message_hash: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
-
-        const epoch: u64 = aggregated_attestation.data.slot;
-
-        // Verify the aggregated signature proof
-        const agg_verification_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
-        signature_proof.verify(public_keys.items, &message_hash, epoch) catch |err| {
-            _ = agg_verification_timer.observe();
-            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
-            return err;
-        };
-        _ = agg_verification_timer.observe();
-        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
+    // Reject over-cap blocks before the expensive Type-2 verify (a 9-15-attestation block is still
+    // a structurally valid Type-2, so verify alone would accept it).
+    if (attestations.len > params.MAX_ATTESTATIONS_DATA) {
+        return StateTransitionError.TooManyAttestationData;
     }
 
-    // Verify proposer signature over hash_tree_root(block) using proposal key
-    const proposer_index: usize = @intCast(signed_block.block.proposer_index);
-    if (proposer_index >= validators.len) {
-        return StateTransitionError.InvalidValidatorId;
-    }
-    const proposer = &validators[proposer_index];
-    const proposal_pubkey = proposer.getProposalPubkey();
+    // Per-component scratch (pubkey handle arrays, message bindings) lives in this arena.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
 
-    var block_root: [32]u8 = undefined;
-    try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, allocator);
-
-    const block_epoch: u32 = @intCast(signed_block.block.slot);
-    try xmss.verifySsz(proposal_pubkey, &block_root, block_epoch, &signed_block.signature.proposer_signature);
-}
-
-// Parallel version of verifySignatures.
-//
-// Phase 1 (serial): validates indices, warms pubkey_cache, and computes attestation-data
-// message hashes — all work that touches the non-thread-safe PublicKeyCache or may short-circuit
-// on structural errors. Produces a list of prepared tasks.
-//
-// Phase 2 (parallel): hands the prepared batch to Rust so XMSS verification runs on the same
-// capped rayon pool as recursive aggregation. `thread_pool` is intentionally unused here; it is
-// kept in the signature so call sites do not need a separate serial/parallel dispatch surface.
-// Proposer signature is verified serially at the end (single sig — not worth batching).
-pub fn verifySignaturesParallel(
-    allocator: Allocator,
-    state: *const types.BeamState,
-    signed_block: *const types.SignedBlock,
-    pubkey_cache: ?*xmss.PublicKeyCache,
-    thread_pool: anytype,
-) !void {
-    const attestations = signed_block.block.body.attestations.constSlice();
-    const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
-
-    if (attestations.len != signature_proofs.len) {
-        return StateTransitionError.InvalidBlockSignatures;
-    }
-
-    const validators = state.validators.constSlice();
-    _ = thread_pool;
-
-    // All per-task scratch (pubkey handle arrays, pubkey_wrappers when cache is absent)
-    // lives in this arena and is freed with one call after the parallel phase returns.
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const scratch_alloc = scratch.allocator();
-
-    // If no cache is provided we must keep the PublicKey wrappers alive until after verify;
-    // collect them here so their Rust handles are freed when we unwind.
+    // Without a cache we keep the PublicKey wrappers alive until after verify so their Rust
+    // handles can be freed. Storage is in the arena; handles need explicit deinit.
     var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
-    // The ArrayList storage itself lives in scratch and is freed with scratch.deinit(), but
-    // the Rust handles wrapped by each PublicKey require explicit deinit on every path out.
     defer if (pubkey_cache == null) {
         for (pubkey_wrappers.items) |*wrapper| wrapper.deinit();
     };
 
-    const tasks = try scratch_alloc.alloc(xmss.AggregatedPayloadVerifyBatch, attestations.len);
+    // Component layout: one entry per body attestation in body order, then the proposer LAST.
+    const num_messages = attestations.len + 1;
+    const pks_per_message = try ar.alloc([]*const xmss.HashSigPublicKey, num_messages);
+    const messages = try ar.alloc(xmss.MessageBinding, num_messages);
 
-    // -------- Phase 1: serial pre-warm --------
-    for (attestations, signature_proofs, 0..) |aggregated_attestation, *signature_proof, i| {
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-        defer validator_indices.deinit(allocator);
+    // Reject duplicate AttestationData: each must appear at most once. Type-2 binds components by
+    // (message, slot), so duplicates would be ambiguous.
+    var seen_roots = std.AutoHashMap([32]u8, void).init(ar);
 
-        var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
-        defer participant_indices.deinit(allocator);
+    for (attestations, 0..) |aggregated_attestation, i| {
+        const validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ar);
 
-        if (validator_indices.items.len != participant_indices.items.len) {
+        // aggregation_bits is the SOLE binding to pubkeys (Type-2 carries no participants), so
+        // validate it explicitly: non-empty, every index in range.
+        if (validator_indices.items.len == 0) {
             return StateTransitionError.InvalidBlockSignatures;
         }
-        for (validator_indices.items, participant_indices.items) |att_idx, proof_idx| {
-            if (att_idx != proof_idx) {
-                return StateTransitionError.InvalidBlockSignatures;
-            }
-        }
 
-        const public_keys = try scratch_alloc.alloc(*const xmss.HashSigPublicKey, validator_indices.items.len);
-
+        const public_keys = try ar.alloc(*const xmss.HashSigPublicKey, validator_indices.items.len);
         for (validator_indices.items, 0..) |validator_index, j| {
             if (validator_index >= validators.len) {
                 return StateTransitionError.InvalidValidatorId;
             }
-            const validator = &validators[validator_index];
-            const pubkey_bytes = validator.getAttestationPubkey();
-
+            const pubkey_bytes = validators[validator_index].getAttestationPubkey();
             if (pubkey_cache) |cache| {
-                const pk_handle = cache.getOrPut(validator_index, pubkey_bytes) catch {
+                public_keys[j] = cache.getOrPut(validator_index, pubkey_bytes) catch {
                     return StateTransitionError.InvalidBlockSignatures;
                 };
-                public_keys[j] = pk_handle;
             } else {
                 const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
                     return StateTransitionError.InvalidBlockSignatures;
                 };
                 public_keys[j] = pubkey.handle;
-                try pubkey_wrappers.append(scratch_alloc, pubkey);
+                try pubkey_wrappers.append(ar, pubkey);
             }
         }
+        pks_per_message[i] = public_keys;
 
         var message_hash: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
-
-        tasks[i] = .{
-            .public_keys = public_keys,
-            .message_hash = message_hash,
-            .epoch = @intCast(aggregated_attestation.data.slot),
-            .agg_sig = &signature_proof.proof_data,
-        };
+        try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, ar);
+        const gop = try seen_roots.getOrPut(message_hash);
+        if (gop.found_existing) {
+            return StateTransitionError.InvalidBlockSignatures;
+        }
+        messages[i] = .{ .hash = message_hash, .slot = @intCast(aggregated_attestation.data.slot) };
     }
 
-    // -------- Phase 2: rayon batch verify --------
-    const start_ns = zeam_utils.monotonicTimestampNs();
-    xmss.verifyAggregatedPayloadBatch(scratch_alloc, tasks) catch |err| {
-        const end_ns = zeam_utils.monotonicTimestampNs();
-        const elapsed_s: f32 = @as(f32, @floatFromInt(if (end_ns >= start_ns) end_ns - start_ns else 0)) / std.time.ns_per_s;
-        zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.record(elapsed_s);
-        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
-        return err;
-    };
-    const end_ns = zeam_utils.monotonicTimestampNs();
-    const elapsed_s: f32 = @as(f32, @floatFromInt(if (end_ns >= start_ns) end_ns - start_ns else 0)) / std.time.ns_per_s;
-    const per_task_elapsed_s = if (tasks.len > 0) elapsed_s / @as(f32, @floatFromInt(tasks.len)) else 0;
-    for (tasks) |_| {
-        zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.record(per_task_elapsed_s);
-        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
-    }
-
-    // Proposer signature — single verify, do it serially.
-    const proposer_index: usize = @intCast(signed_block.block.proposer_index);
+    // Proposer component (last): proposal key, resolved outside the attestation cache.
+    const proposer_index: usize = @intCast(block.proposer_index);
     if (proposer_index >= validators.len) {
         return StateTransitionError.InvalidValidatorId;
     }
-    const proposer = &validators[proposer_index];
-    const proposal_pubkey = proposer.getProposalPubkey();
+    // A malformed registered proposal key is invalid validator state, not a bad signature.
+    var proposer_pk = xmss.PublicKey.fromBytes(validators[proposer_index].getProposalPubkey()) catch {
+        return StateTransitionError.InvalidValidatorId;
+    };
+    defer proposer_pk.deinit();
+    const proposer_handles = try ar.alloc(*const xmss.HashSigPublicKey, 1);
+    proposer_handles[0] = proposer_pk.handle;
+    pks_per_message[attestations.len] = proposer_handles;
 
     var block_root: [32]u8 = undefined;
-    try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, allocator);
+    try zeam_utils.hashTreeRoot(types.BeamBlock, block.*, &block_root, ar);
+    // Reject a block_root that collides with any attestation data root, so the per-message
+    // split/verify stays unambiguous (cryptographically negligible).
+    const proposer_gop = try seen_roots.getOrPut(block_root);
+    if (proposer_gop.found_existing) {
+        return StateTransitionError.InvalidBlockSignatures;
+    }
+    messages[attestations.len] = .{ .hash = block_root, .slot = @intCast(block.slot) };
 
-    const block_epoch: u32 = @intCast(signed_block.block.slot);
-    try xmss.verifySsz(proposal_pubkey, &block_root, block_epoch, &signed_block.signature.proposer_signature);
+    // SSZ-decode the Type-2 container (the on-wire form of SignedBlock.proof); the FFI consumes
+    // the inner raw wire. A malformed blob is a structural rejection.
+    var container: types.TypeTwoMultiSignature = undefined;
+    ssz.deserialize(types.TypeTwoMultiSignature, signed_block.proof.constSlice(), &container, allocator) catch {
+        return StateTransitionError.InvalidBlockSignatures;
+    };
+    defer container.deinit();
+
+    const verify_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
+    container.verify(pks_per_message, messages) catch {
+        _ = verify_timer.observe();
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
+        return StateTransitionError.InvalidBlockSignatures;
+    };
+    _ = verify_timer.observe();
+    zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
 }
+
 
 pub fn verifySingleAttestation(
     allocator: Allocator,
