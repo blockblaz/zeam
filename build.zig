@@ -657,6 +657,21 @@ pub fn build(b: *Builder) !void {
     setTestRunLabelFromCompile(b, run_node_test, node_tests);
     test_step.dependOn(&run_node_test.step);
 
+    const zeam_shadow_cost = b.createModule(.{
+        .root_source_file = b.path("pkgs/xmss/src/shadow_cost.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_shadow_cost.link_libc = true; // shadow_cost reads env via libc getenv
+    const shadow_cost_tests = b.addTest(.{
+        .root_module = zeam_shadow_cost,
+    });
+    const run_shadow_cost_test = b.addRunArtifact(shadow_cost_tests);
+    setTestRunLabelFromCompile(b, run_shadow_cost_test, shadow_cost_tests);
+    test_step.dependOn(&run_shadow_cost_test.step);
+    const shadow_cost_test_step = b.step("test-shadow-cost", "Run shadow sim-cost unit tests");
+    shadow_cost_test_step.dependOn(&run_shadow_cost_test.step);
+
     const cli_tests = b.addTest(.{
         .root_module = cli_exe.root_module,
     });
