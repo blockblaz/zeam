@@ -121,6 +121,14 @@ pub const NodeOptions = struct {
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
     /// issue #907 finding 4.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Cap on the number of child STARK proofs merged with raw signatures
+    /// by the aggregator-worker path. Threaded through to
+    /// `ForkChoice.max_aggregation_children` and applied by
+    /// `prepareAggregateAttData` after greedy + subset-prune. Surfaced as
+    /// `--max-aggregation-children` on the `zeam node` CLI; default is
+    /// `pkgs/types/src/block.zig:default_max_aggregation_children` (0 —
+    /// flat-only worker path). See #940 follow-up.
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -597,6 +605,7 @@ pub const Node = struct {
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
             .min_aggregation_inputs = options.min_aggregation_inputs,
+            .max_aggregation_children = options.max_aggregation_children,
             .aggregate_max_inflight = aggregate_max_inflight,
         });
         errdefer self.beam_node.deinit();
