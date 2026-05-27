@@ -713,7 +713,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "backend"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
@@ -2664,7 +2664,7 @@ name = "hashsig-glue"
 version = "0.1.0"
 dependencies = [
  "ethereum_ssz",
- "leansig 0.1.0 (git+https://github.com/leanEthereum/leanSig?branch=devnet4)",
+ "leansig",
  "rand 0.10.1",
  "sha2 0.9.9",
  "thiserror 2.0.18",
@@ -3121,6 +3121,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee796ad498c8d9a1d68e477df8f754ed784ef875de1414ebdaf169f70a6a784"
 
 [[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "indenter"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3330,9 +3349,10 @@ dependencies = [
 [[package]]
 name = "lean_compiler"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "backend",
+ "include_dir",
  "lean_vm",
  "pest",
  "pest_derive",
@@ -3345,7 +3365,7 @@ dependencies = [
 [[package]]
 name = "lean_prover"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3354,6 +3374,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "rand 0.10.1",
+ "serde",
  "sub_protocols",
  "tracing",
  "utils",
@@ -3362,7 +3383,7 @@ dependencies = [
 [[package]]
 name = "lean_vm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3379,26 +3400,6 @@ dependencies = [
 name = "leansig"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanSig?branch=devnet4#15cbdd43ec8525aa43fea2f42cafc5ed366084ae"
-dependencies = [
- "dashmap",
- "ethereum_ssz",
- "num-bigint 0.4.6",
- "num-traits",
- "p3-baby-bear 0.5.1",
- "p3-field 0.5.1",
- "p3-koala-bear 0.5.1",
- "p3-symmetric 0.5.1",
- "rand 0.10.1",
- "rayon",
- "serde",
- "sha3 0.10.8",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "leansig"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanSig#c08a3bae74b0d85379cab72dcbefa4091546ecbb"
 dependencies = [
  "dashmap",
  "ethereum_ssz",
@@ -3438,11 +3439,11 @@ dependencies = [
 [[package]]
 name = "leansig_wrapper"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "backend",
  "ethereum_ssz",
- "leansig 0.1.0 (git+https://github.com/leanEthereum/leanSig)",
+ "leansig",
  "leansig_fast_keygen",
  "p3-field 0.5.1",
  "rand 0.10.1",
@@ -4129,7 +4130,7 @@ dependencies = [
 [[package]]
 name = "mt-air"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "mt-field",
  "mt-poly",
@@ -4138,7 +4139,7 @@ dependencies = [
 [[package]]
 name = "mt-fiat-shamir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
@@ -4146,16 +4147,17 @@ dependencies = [
  "mt-utils",
  "rayon",
  "serde",
+ "tracing",
 ]
 
 [[package]]
 name = "mt-field"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "itertools 0.14.0",
  "mt-utils",
- "num-bigint 0.4.6",
+ "num-bigint 0.3.3",
  "paste",
  "rand 0.10.1",
  "rayon",
@@ -4166,12 +4168,12 @@ dependencies = [
 [[package]]
 name = "mt-koala-bear"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
  "mt-utils",
- "num-bigint 0.4.6",
+ "num-bigint 0.3.3",
  "paste",
  "rand 0.10.1",
  "rayon",
@@ -4182,7 +4184,7 @@ dependencies = [
 [[package]]
 name = "mt-poly"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
@@ -4190,12 +4192,13 @@ dependencies = [
  "rand 0.10.1",
  "rayon",
  "serde",
+ "system-info",
 ]
 
 [[package]]
 name = "mt-sumcheck"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
@@ -4208,7 +4211,7 @@ dependencies = [
 [[package]]
 name = "mt-symetric"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
@@ -4218,7 +4221,7 @@ dependencies = [
 [[package]]
 name = "mt-utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "serde",
 ]
@@ -4226,7 +4229,7 @@ dependencies = [
 [[package]]
 name = "mt-whir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "itertools 0.14.0",
  "mt-fiat-shamir",
@@ -4238,6 +4241,7 @@ dependencies = [
  "mt-utils",
  "rand 0.10.1",
  "rayon",
+ "system-info",
  "tracing",
 ]
 
@@ -4558,6 +4562,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "915b1b472bc21c53464d6c8461c9d3af805ba1ef837e1cac254428f4a77177b1"
 dependencies = [
  "malloc_buf",
+]
+
+[[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags 2.11.1",
+ "objc2",
 ]
 
 [[package]]
@@ -6732,14 +6761,17 @@ dependencies = [
 [[package]]
 name = "rec_aggregation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "backend",
+ "include_dir",
  "lean_compiler",
  "lean_prover",
  "lean_vm",
  "leansig_wrapper",
  "lz4_flex",
+ "objc2",
+ "objc2-foundation",
  "postcard",
  "rand 0.10.1",
  "serde",
@@ -6747,6 +6779,7 @@ dependencies = [
  "sub_protocols",
  "tracing",
  "utils",
+ "zk-alloc",
 ]
 
 [[package]]
@@ -7806,7 +7839,7 @@ dependencies = [
 [[package]]
 name = "sub_protocols"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "backend",
  "lean_vm",
@@ -7881,6 +7914,15 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "system-info"
+version = "0.1.0"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
+dependencies = [
+ "libc",
+ "rayon",
 ]
 
 [[package]]
@@ -8461,7 +8503,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
 dependencies = [
  "backend",
  "tracing",
@@ -9312,6 +9354,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zk-alloc"
+version = "0.1.0"
+source = "git+https://github.com/anshalshukla/leanMultisig.git?rev=f33a0775e4f88ec8b23b2cb8282a4472c145fb93#f33a0775e4f88ec8b23b2cb8282a4472c145fb93"
+dependencies = [
+ "libc",
+ "system-info",
 ]
 
 [[package]]

@@ -424,17 +424,20 @@ pub const BlockSignatures = struct {
 
 pub const SignedBlock = struct {
     block: BeamBlock,
-    signature: BlockSignatures,
+    // devnet5 / leanSpec #717: the single merged Type-2 proof over all attestation Type-1s + the
+    // proposer's Type-1, SSZ-encoded into this byte list (replaces devnet4's BlockSignatures).
+    proof: xmss.ByteList512KiB,
 
     pub fn deinit(self: *SignedBlock) void {
         self.block.deinit();
-        self.signature.deinit();
+        self.proof.deinit();
     }
 
     pub fn toJson(self: *const SignedBlock, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.empty;
         try obj.put(allocator, "block", try self.block.toJson(allocator));
-        try obj.put(allocator, "signature", try self.signature.toJson(allocator));
+        const proof_hex = try utils.BytesToHex(allocator, self.proof.constSlice());
+        try obj.put(allocator, "proof", json.Value{ .string = proof_hex });
         return json.Value{ .object = obj };
     }
 

@@ -10,7 +10,9 @@ const json = std.json;
 const attestation = @import("./attestation.zig");
 
 const AggregationBits = attestation.AggregationBits;
-const ByteListMiB = xmss.ByteListMiB;
+const ByteList512KiB = xmss.ByteList512KiB;
+
+pub const MessageBinding = xmss.MessageBinding;
 
 const freeJsonValue = utils.freeJsonValue;
 
@@ -18,10 +20,12 @@ const freeJsonValue = utils.freeJsonValue;
 pub const LOG_INV_RATE_TEST: usize = 1;
 pub const LOG_INV_RATE_PROD: usize = 2;
 
-// Types
-pub const AggregatedSignatureProof = struct {
+/// A single-message multi-signature proof: many validators over one message+slot.
+/// `participants` is the validator bitfield; `proof` is the compact no-pubkeys wire form.
+/// Replaces devnet4's `AggregatedSignatureProof`.
+pub const TypeOneMultiSignature = struct {
     participants: attestation.AggregationBits,
-    proof_data: ByteListMiB,
+    proof: ByteList512KiB,
 
     const Self = @This();
 
@@ -29,18 +33,18 @@ pub const AggregatedSignatureProof = struct {
         var participants = try attestation.AggregationBits.init(allocator);
         errdefer participants.deinit();
 
-        var proof_data = try ByteListMiB.init(allocator);
-        errdefer proof_data.deinit();
+        var proof = try ByteList512KiB.init(allocator);
+        errdefer proof.deinit();
 
         return Self{
             .participants = participants,
-            .proof_data = proof_data,
+            .proof = proof,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.participants.deinit();
-        self.proof_data.deinit();
+        self.proof.deinit();
     }
 
     pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
@@ -54,10 +58,10 @@ pub const AggregatedSignatureProof = struct {
         }
         try obj.put(allocator, "participants", json.Value{ .array = participants_array });
 
-        // Serialize proof_data as hex string
-        const proof_bytes = self.proof_data.constSlice();
+        // Serialize proof as hex string
+        const proof_bytes = self.proof.constSlice();
         const proof_hex = try utils.BytesToHex(allocator, proof_bytes);
-        try obj.put(allocator, "proof_data", json.Value{ .string = proof_hex });
+        try obj.put(allocator, "proof", json.Value{ .string = proof_hex });
 
         return json.Value{ .object = obj };
     }
@@ -68,17 +72,18 @@ pub const AggregatedSignatureProof = struct {
         return utils.jsonToString(allocator, json_value);
     }
 
-    /// Recursively aggregate child proofs and raw XMSS signatures into a single proof.
+    /// Recursively aggregate child Type-1 proofs and raw XMSS signatures into a single Type-1.
     ///
     /// - `xmss_participants`: bitfield for validators represented by raw_xmss. null if no raw sigs.
-    /// - `children`: already-aggregated child proofs to include.
+    /// - `children`: already-aggregated child Type-1 proofs to include.
     /// - `children_pub_keys`: per-child arrays of public key handles (parallel with `children`).
     /// - `raw_xmss_pks`/`raw_xmss_sigs`: raw XMSS public key + signature pairs.
-    /// - Validation: at least 1 raw sig or child required; if no raw sigs, need ≥2 children.
+    /// - Validation: at least 1 raw sig or child required; if no raw sigs, need ≥2 children
+    ///   (a lone child is already a valid proof — nothing to re-aggregate).
     pub fn aggregate(
         allocator: Allocator,
         xmss_participants: ?AggregationBits,
-        children: []const AggregatedSignatureProof,
+        children: []const TypeOneMultiSignature,
         children_pub_keys: []const []*const xmss.HashSigPublicKey,
         raw_xmss_pks: []*const xmss.HashSigPublicKey,
         raw_xmss_sigs: []*const xmss.HashSigSignature,
@@ -114,33 +119,131 @@ pub const AggregatedSignatureProof = struct {
             }
         }
 
-        // Build per-child proof data for FFI
-        const children_proof_data = try allocator.alloc(ByteListMiB, children.len);
-        defer allocator.free(children_proof_data);
+        // Build per-child proof wire array for the FFI (parallel with children_pub_keys).
+        const children_proofs = try allocator.alloc(ByteList512KiB, children.len);
+        defer allocator.free(children_proofs);
         for (children, 0..) |child, i| {
-            children_proof_data[i] = child.proof_data;
+            children_proofs[i] = child.proof;
         }
 
-        // FFI call — passes children proofs + their public keys for true recursive aggregation
-        try xmss.aggregateSignatures(
+        // FFI call — recursive Type-1 aggregation over raw sigs + child proofs.
+        try xmss.aggregateType1(
             raw_xmss_pks,
             raw_xmss_sigs,
             children_pub_keys,
-            children_proof_data,
+            children_proofs,
             message_hash,
             @intCast(epoch),
             LOG_INV_RATE_PROD,
-            &result.proof_data,
+            &result.proof,
         );
 
-        // Clean up old result data before overwriting
+        // Clean up old participants before overwriting.
         result.participants.deinit();
-
         result.participants = merged;
     }
 
-    /// Verify this aggregated signature proof.
+    /// Verify this Type-1 proof against the participants' public keys, message, and slot.
     pub fn verify(self: *const Self, public_keys: []*const xmss.HashSigPublicKey, message_hash: *const [32]u8, epoch: u64) !void {
-        try xmss.verifyAggregatedPayload(public_keys, message_hash, @intCast(epoch), &self.proof_data);
+        try xmss.verifyType1(public_keys, message_hash, @intCast(epoch), &self.proof);
+    }
+};
+
+/// Compatibility alias: devnet5 renamed the per-attestation aggregate proof
+/// `AggregatedSignatureProof` → `TypeOneMultiSignature` (same shape: participants + proof bytes,
+/// same `aggregate()` signature). Aliased so main's #916 per-att_data aggregation code keeps
+/// compiling against the new type without a wholesale rename. Field rename `proof_data`→`proof`
+/// and container `ByteListMiB`→`ByteList512KiB` are reconciled at the call sites.
+pub const AggregatedSignatureProof = TypeOneMultiSignature;
+
+/// A multi-message multi-signature proof: a merge of N Type-1 proofs over distinct messages.
+/// On the wire a SignedBlock carries the SSZ-encoded form of this container as its single proof.
+/// `proof` is the compact no-pubkeys wire form (lz4+postcard; NOT SSZ-framed).
+pub const TypeTwoMultiSignature = struct {
+    proof: ByteList512KiB,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) !Self {
+        var proof = try ByteList512KiB.init(allocator);
+        errdefer proof.deinit();
+        return Self{ .proof = proof };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.proof.deinit();
+    }
+
+    pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.empty;
+        const proof_bytes = self.proof.constSlice();
+        const proof_hex = try utils.BytesToHex(allocator, proof_bytes);
+        try obj.put(allocator, "proof", json.Value{ .string = proof_hex });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const Self, allocator: Allocator) ![]const u8 {
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+
+    /// Merge N Type-1 proofs (each over a distinct message) into one Type-2 proof.
+    ///
+    /// - `parts`: the Type-1 proofs to merge, in canonical component order (caller's responsibility:
+    ///   block attestations in body order, then the proposer entry last).
+    /// - `public_keys_per_part`: parallel per-part participant pubkey handles, same order as `parts`.
+    /// - `result` must be an init'd, empty `TypeTwoMultiSignature`.
+    pub fn aggregate(
+        allocator: Allocator,
+        parts: []const TypeOneMultiSignature,
+        public_keys_per_part: []const []*const xmss.HashSigPublicKey,
+        result: *Self,
+    ) !void {
+        if (parts.len != public_keys_per_part.len) return error.AggregationInvalidInput;
+        if (parts.len == 0) return error.AggregationInvalidInput;
+
+        const part_proofs = try allocator.alloc(ByteList512KiB, parts.len);
+        defer allocator.free(part_proofs);
+        for (parts, 0..) |part, i| {
+            part_proofs[i] = part.proof;
+        }
+
+        try xmss.mergeType1ToType2(
+            part_proofs,
+            public_keys_per_part,
+            LOG_INV_RATE_PROD,
+            &result.proof,
+        );
+    }
+
+    /// Verify this Type-2 proof against per-component pubkeys and (message, slot) bindings.
+    /// `public_keys_per_message` and `messages` are parallel, in component order.
+    pub fn verify(
+        self: *const Self,
+        public_keys_per_message: []const []*const xmss.HashSigPublicKey,
+        messages: []const MessageBinding,
+    ) !void {
+        try xmss.verifyType2(&self.proof, public_keys_per_message, messages);
+    }
+
+    /// Recover the Type-1 component bound to `message_hash` out of this Type-2.
+    /// `public_keys_per_message` is the per-component pubkey layout the Type-2 was built with.
+    /// The recovered Type-1's `participants` is left EMPTY — the caller restores it from the
+    /// matching attestation's aggregation bits.
+    /// `result` must be an init'd, empty `TypeOneMultiSignature`.
+    pub fn splitByMessage(
+        self: *const Self,
+        public_keys_per_message: []const []*const xmss.HashSigPublicKey,
+        message_hash: *const [32]u8,
+        result: *TypeOneMultiSignature,
+    ) !void {
+        try xmss.splitType2ByMessage(
+            &self.proof,
+            public_keys_per_message,
+            message_hash,
+            LOG_INV_RATE_PROD,
+            &result.proof,
+        );
     }
 };
