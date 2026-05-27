@@ -925,8 +925,6 @@ fn initTestBlockMessage(allocator: Allocator, slot: types.Slot) !interface.Gossi
     var attestations = try types.AggregatedAttestations.init(allocator);
     errdefer attestations.deinit();
 
-    const signature = try types.createBlockSignatures(allocator, attestations.len());
-
     return .{ .block = .{
         .block = .{
             .slot = slot,
@@ -937,7 +935,7 @@ fn initTestBlockMessage(allocator: Allocator, slot: types.Slot) !interface.Gossi
                 .attestations = attestations,
             },
         },
-        .signature = signature,
+        .proof = try types.ByteList512KiB.init(allocator),
     } };
 }
 
@@ -1456,10 +1454,9 @@ fn buildSyntheticBlock(allocator: Allocator, slot: u64, parent_seed: u8) !types.
     block.parent_root[0] = parent_seed;
     block.state_root[0] = parent_seed +% 1;
 
-    const signatures = try types.createBlockSignatures(allocator, 0);
     return types.SignedBlock{
         .block = block,
-        .signature = signatures,
+        .proof = try types.ByteList512KiB.init(allocator),
     };
 }
 

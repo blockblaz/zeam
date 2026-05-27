@@ -270,7 +270,7 @@ test "sszSerializeAndGetBytes: AggregatedSignatureProof source deinit after seri
 
     var proof = try types.AggregatedSignatureProof.init(allocator);
     try types.aggregationBitsSet(&proof.participants, 0, true);
-    try proof.proof_data.append(0xAB);
+    try proof.proof.append(0xAB);
 
     const bytes = try sszSerializeAndGetBytes(allocator, types.AggregatedSignatureProof, proof);
     defer allocator.free(bytes);
@@ -281,7 +281,7 @@ test "sszSerializeAndGetBytes: AggregatedSignatureProof source deinit after seri
     defer cloned.deinit();
 
     try std.testing.expect(try cloned.participants.get(0));
-    try std.testing.expectEqual(@as(usize, 1), cloned.proof_data.len());
+    try std.testing.expectEqual(@as(usize, 1), cloned.proof.len());
 }
 
 test "isSlotJustified treats finalized boundary as implicit" {

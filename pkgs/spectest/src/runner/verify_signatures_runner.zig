@@ -374,7 +374,7 @@ fn parseAggregatedSignatureProof(
 
     return types.AggregatedSignatureProof{
         .participants = participants,
-        .proof_data = proof_data,
+        .proof = proof_data,
     };
 }
 

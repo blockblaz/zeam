@@ -131,10 +131,10 @@ test "ssz seralize/deserialize signed stf prover input" {
                 .attestations = attestations,
             },
         },
-        .signature = try block.createBlockSignatures(std.testing.allocator, attestations.len()),
+        .proof = try block.ByteList512KiB.init(std.testing.allocator),
     };
     defer test_block.block.body.attestations.deinit();
-    defer test_block.signature.deinit();
+    defer test_block.proof.deinit();
 
     const prover_input = BeamSTFProverInput{
         .state = test_state,

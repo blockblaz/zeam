@@ -22,6 +22,7 @@ const Attestation = attestation.Attestation;
 // per-att_data aggregation), then merges them with the proposer's own Type-1 into the single
 // Type-2 SignedBlock.proof. This list is the intermediate per-attestation Type-1 collection.
 pub const Type1ProofList = ssz.utils.List(aggregation.TypeOneMultiSignature, params.VALIDATOR_REGISTRY_LIMIT);
+pub const ByteList512KiB = xmss.ByteList512KiB;
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;

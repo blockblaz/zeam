@@ -3512,7 +3512,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.ByteList512KiB.init(allocator),
     };
 
     const block2_ptr = try allocator.create(types.SignedBlock);
@@ -3526,7 +3526,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.ByteList512KiB.init(allocator),
     };
 
     // Cache blocks
@@ -3651,7 +3651,7 @@ fn makeTestSignedBlockWithParent(
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.ByteList512KiB.init(allocator),
     };
 
     return block_ptr;
@@ -4099,7 +4099,7 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
     // onInterval is called before block production)
     try node.chain.forkChoice.onInterval(slot * constants.INTERVALS_PER_SLOT, false);
 
-    const produced_block = try node.chain.produceBlock(.{
+    var produced_block = try node.chain.produceBlock(.{
         .slot = slot,
         .proposer_index = validator_ids[0],
     });
@@ -4111,12 +4111,16 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         @intCast(slot),
     );
 
+    // devnet5: merge into the single Type-2 proof and free the consumed Type-1 list.
+    var proof = try types.ByteList512KiB.init(allocator);
+    errdefer proof.deinit();
+    try node.chain.buildBlockProof(&produced_block, &proposer_signature, &proof);
+    for (produced_block.attestation_signatures.slice()) |*t1| t1.deinit();
+    produced_block.attestation_signatures.deinit();
+
     var signed_block = types.SignedBlock{
         .block = produced_block.block,
-        .signature = .{
-            .attestation_signatures = produced_block.attestation_signatures,
-            .proposer_signature = proposer_signature,
-        },
+        .proof = proof,
     };
     defer signed_block.deinit();
 

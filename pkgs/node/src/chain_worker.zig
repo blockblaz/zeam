@@ -1393,7 +1393,7 @@ test "Message.deinit: on_block frees the SignedBlock heap (no leak under testing
     // lists), wrap it in a Message, and verify deinit cleans up.
     // testing.allocator panics on leak so the assertion is implicit.
     const attestations = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures = try types.createBlockSignatures(testing.allocator, attestations.len());
+    const proof = try types.ByteList512KiB.init(testing.allocator);
 
     var msg: Message = .{
         .on_block = .{
@@ -1405,7 +1405,7 @@ test "Message.deinit: on_block frees the SignedBlock heap (no leak under testing
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations },
                 },
-                .signature = signatures,
+                .proof = proof,
             },
             .prune_forkchoice = false,
         },
@@ -1421,7 +1421,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
     // contract that lets new callers thread their precomputed root
     // through the queue without it getting silently dropped.
     const attestations1 = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures1 = try types.createBlockSignatures(testing.allocator, attestations1.len());
+    const proof1 = try types.ByteList512KiB.init(testing.allocator);
     var msg_default: Message = .{
         .on_block = .{
             .signed_block = .{
@@ -1432,7 +1432,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations1 },
                 },
-                .signature = signatures1,
+                .proof = proof1,
             },
             .prune_forkchoice = false,
         },
@@ -1442,7 +1442,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
 
     // Carry an explicit precomputed root.
     const attestations2 = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures2 = try types.createBlockSignatures(testing.allocator, attestations2.len());
+    const proof2 = try types.ByteList512KiB.init(testing.allocator);
     var sentinel: types.Root = undefined;
     var k: u8 = 0;
     for (sentinel[0..]) |*b| {
@@ -1459,7 +1459,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations2 },
                 },
-                .signature = signatures2,
+                .proof = proof2,
             },
             .prune_forkchoice = true,
             .block_root = sentinel,
@@ -1523,7 +1523,7 @@ test "ChainWorker.drainOnStop: pending messages freed on shutdown (no leak)" {
     // worker may or may not have popped the message before stop;
     // either way, no heap should leak.
     const attestations = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures = try types.createBlockSignatures(testing.allocator, attestations.len());
+    const proof = try types.ByteList512KiB.init(testing.allocator);
     const msg: Message = .{
         .on_block = .{
             .signed_block = .{
@@ -1534,7 +1534,7 @@ test "ChainWorker.drainOnStop: pending messages freed on shutdown (no leak)" {
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations },
                 },
-                .signature = signatures,
+                .proof = proof,
             },
             .prune_forkchoice = false,
         },

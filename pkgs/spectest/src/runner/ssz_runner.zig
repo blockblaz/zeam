@@ -120,31 +120,8 @@ const TestSignedAttestation = struct {
     signature: TEST_SIGBYTES,
 };
 
-/// Mirror of types.BlockSignatures with test-sized proposer_signature.
-/// attestation_signatures uses AggregatedSignatureProof (ByteListMiB) which
-/// has no SIGBYTES dependency, so it stays unchanged.
-const TestBlockSignatures = struct {
-    attestation_signatures: types.AttestationSignatures,
-    proposer_signature: TEST_SIGBYTES,
-
-    pub fn deinit(self: *TestBlockSignatures) void {
-        for (self.attestation_signatures.slice()) |*group| {
-            group.deinit();
-        }
-        self.attestation_signatures.deinit();
-    }
-};
-
-/// Mirror of types.SignedBlock with test-sized BlockSignatures.
-const TestSignedBlock = struct {
-    block: types.BeamBlock,
-    signature: TestBlockSignatures,
-
-    pub fn deinit(self: *TestSignedBlock) void {
-        self.block.deinit();
-        self.signature.deinit();
-    }
-};
+// devnet5: SignedBlock carries a single opaque Type-2 `proof` byte list (no SIGBYTES dependency),
+// so it needs no test-sized mirror — the real types.SignedBlock is used directly below.
 
 // ---------------------------------------------------------------------------
 // SSZ type map — maps fixture `typeName` to Zig types.
@@ -176,9 +153,8 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "BlocksByRootRequest", .zig_type = types.BlockByRootRequest, .has_deinit = false },
     .{ .name = "AggregatedSignatureProof", .zig_type = types.AggregatedSignatureProof, .has_deinit = true },
     .{ .name = "PublicKey", .zig_type = types.Bytes52, .has_deinit = false },
-    .{ .name = "SignedBlock", .zig_type = types.SignedBlock, .has_deinit = true, .test_zig_type = TestSignedBlock, .test_has_deinit = true },
+    .{ .name = "SignedBlock", .zig_type = types.SignedBlock, .has_deinit = true },
     .{ .name = "SignedAttestation", .zig_type = types.SignedAttestation, .has_deinit = false, .test_zig_type = TestSignedAttestation, .test_has_deinit = false },
-    .{ .name = "BlockSignatures", .zig_type = types.BlockSignatures, .has_deinit = true, .test_zig_type = TestBlockSignatures, .test_has_deinit = true },
     .{ .name = "Signature", .zig_type = types.SIGBYTES, .has_deinit = false, .test_zig_type = TEST_SIGBYTES, .test_has_deinit = false },
     .{ .name = "SignedAggregatedAttestation", .zig_type = types.SignedAggregatedAttestation, .has_deinit = true },
     // SSZ basic scalar types from leanSpec's test_basic_types fixtures.

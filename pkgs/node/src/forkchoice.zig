@@ -3983,7 +3983,7 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
 
     var signature = try types.AggregatedSignatureProof.init(allocator);
     try types.aggregationBitsSet(&signature.participants, 0, true);
-    try signature.proof_data.append(0xAB);
+    try signature.proof.append(0xAB);
 
     var snap = AggregateSnapshot{
         .signatures = types.SignaturesMap.init(allocator),

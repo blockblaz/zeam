@@ -10,7 +10,7 @@ const json = std.json;
 const attestation = @import("./attestation.zig");
 
 const AggregationBits = attestation.AggregationBits;
-const ByteList512KiB = xmss.ByteList512KiB;
+pub const ByteList512KiB = xmss.ByteList512KiB;
 
 pub const MessageBinding = xmss.MessageBinding;
 

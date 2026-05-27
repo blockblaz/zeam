@@ -213,78 +213,69 @@ pub const NodeTestContext = struct {
         allocator: Allocator,
         block: *types.SignedBlock,
     ) !void {
-        var attestation_signatures = try types.AttestationSignatures.init(allocator);
-        errdefer attestation_signatures.deinit();
+        // devnet5: build one Type-1 proof per body attestation, then merge them with the
+        // proposer's Type-1 into the single Type-2 block proof — the same path production uses.
+        // Validators are reconstructed from the test genesis spec to feed buildType2BlockProof.
+        var validators = try types.Validators.init(allocator);
+        defer validators.deinit();
+        for (0..self.genesis_config.numValidators()) |i| {
+            try validators.append(.{
+                .attestation_pubkey = self.genesis_config.validator_attestation_pubkeys[i],
+                .proposal_pubkey = self.genesis_config.validator_proposal_pubkeys[i],
+                .index = @intCast(i),
+            });
+        }
 
+        // Sign each participating validator's attestation into a SignaturesMap keyed by data.
+        var signatures_map = types.SignaturesMap.init(allocator);
+        defer signatures_map.deinit();
         for (block.block.body.attestations.constSlice()) |aggregated_attestation| {
-            var signature_proof = try types.AggregatedSignatureProof.init(allocator);
-            errdefer signature_proof.deinit();
-
             var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
             defer indices.deinit(allocator);
-
-            // Collect signature handles for aggregation
-            var signature_handles: std.ArrayList(xmss.Signature) = .empty;
-            defer {
-                for (signature_handles.items) |*sig| {
-                    sig.deinit();
-                }
-                signature_handles.deinit(allocator);
-            }
-
-            // Sign attestation for each validator and set participant bits
             for (indices.items) |validator_index| {
-                try types.aggregationBitsSet(&signature_proof.participants, validator_index, true);
-
-                // Create attestation for this validator
                 const attestation = types.Attestation{
                     .validator_id = @intCast(validator_index),
                     .data = aggregated_attestation.data,
                 };
-
-                // Sign and keep the handle for aggregation
-                const sig = try self.key_manager.signAttestationWithHandle(&attestation, allocator);
-                try signature_handles.append(allocator, sig);
+                const sig_buffer = try self.key_manager.signAttestation(&attestation, allocator);
+                try signatures_map.addSignature(aggregated_attestation.data, @intCast(validator_index), .{
+                    .slot = aggregated_attestation.data.slot,
+                    .signature = sig_buffer,
+                });
             }
+        }
 
-            // Perform actual aggregation if we have signatures
-            if (signature_handles.items.len > 0) {
-                const num_sigs = signature_handles.items.len;
-                const pub_keys = try allocator.alloc(*const xmss.HashSigPublicKey, num_sigs);
-                defer allocator.free(pub_keys);
-                const sig_ptrs = try allocator.alloc(*const xmss.HashSigSignature, num_sigs);
-                defer allocator.free(sig_ptrs);
-
-                for (indices.items, 0..) |val_idx, i| {
-                    pub_keys[i] = try self.key_manager.getAttestationPubkeyHandle(val_idx);
-                    sig_ptrs[i] = signature_handles.items[i].handle;
-                }
-
-                // Compute message hash
-                var message_hash: [32]u8 = undefined;
-                try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
-
-                const epoch: u32 = @intCast(aggregated_attestation.data.slot);
-
-                // Perform the actual aggregation (no children in testing mode)
-                const empty_children_pks: [][]*const xmss.HashSigPublicKey = &.{};
-                const empty_children_proofs: []const xmss.ByteListMiB = &.{};
-                try xmss.aggregateSignatures(pub_keys, sig_ptrs, empty_children_pks, empty_children_proofs, &message_hash, epoch, types.LOG_INV_RATE_TEST, &signature_proof.proof_data);
-            }
-
-            try attestation_signatures.append(signature_proof);
+        // Aggregate a Type-1 proof per body attestation, in body order (parallel with the body).
+        var agg_signatures = try types.Type1ProofList.init(allocator);
+        defer {
+            for (agg_signatures.slice()) |*sig| sig.deinit();
+            agg_signatures.deinit();
+        }
+        for (block.block.body.attestations.constSlice()) |aggregated_attestation| {
+            const inner = signatures_map.getPtr(aggregated_attestation.data) orelse unreachable;
+            const proof_t1 = try types.aggregateInnerMap(allocator, inner, aggregated_attestation.data, &validators);
+            try agg_signatures.append(proof_t1);
         }
 
         var block_root: types.Root = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &block_root, allocator);
         const proposer_signature = try self.key_manager.signBlockRoot(block.block.proposer_index, &block_root, @intCast(block.block.slot));
 
-        const signatures = types.BlockSignatures{
-            .attestation_signatures = attestation_signatures,
-            .proposer_signature = proposer_signature,
-        };
+        var proof = try types.ByteList512KiB.init(allocator);
+        errdefer proof.deinit();
+        try types.buildType2BlockProof(
+            allocator,
+            &validators,
+            &block.block.body.attestations,
+            agg_signatures.constSlice(),
+            @intCast(block.block.proposer_index),
+            &block_root,
+            @intCast(block.block.slot),
+            &proposer_signature,
+            &proof,
+        );
 
-        block.signature.deinit();
-        block.signature = signatures;
+        block.proof.deinit();
+        block.proof = proof;
     }
 };
