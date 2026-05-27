@@ -6,6 +6,7 @@ use rec_aggregation::{
 };
 use std::slice;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 // Mirror hashsig-glue's struct layout with #[repr(C)]
 // These must match hashsig-glue/src/lib.rs exactly
@@ -74,10 +75,30 @@ pub unsafe extern "C" fn xmss_aggregate(
     message_hash_ptr: *const u8,
     slot: u32,
     log_inv_rate: usize,
+    // Phase timing out-params (#940). Each pointer is optional (null = ignored).
+    // On a successful call, the function writes elapsed nanoseconds for each
+    // internal phase:
+    //   * `out_marshal_ns`  — Rust-side argument deserialize: raw XMSS clones,
+    //                         child public-key collection, child proof
+    //                         deserialize (the work between FFI entry and the
+    //                         `rec_xmss_aggregate` call).
+    //   * `out_stark_ns`    — `rec_xmss_aggregate` itself (leanMultisig STARK
+    //                         prove). This is the only phase whose cost is
+    //                         expected to scale with `num_raw` per lean-bench.
+    //   * `out_post_ns`     — `Box::into_raw` of the returned aggregate (no
+    //                         work beyond a pointer wrap; instrumented for
+    //                         completeness so the three buckets sum to the
+    //                         total observed externally on
+    //                         `zeam_xmss_rec_aggregate_prove_seconds`).
+    // On the early-return error paths the out-pointers are left untouched.
+    out_marshal_ns: *mut u64,
+    out_stark_ns: *mut u64,
+    out_post_ns: *mut u64,
 ) -> *const AggregatedXMSS {
     if message_hash_ptr.is_null() {
         return std::ptr::null();
     }
+    let t_entry = Instant::now();
     if num_raw > 0 && (raw_pub_keys.is_null() || raw_signatures.is_null()) {
         return std::ptr::null();
     }
@@ -156,6 +177,8 @@ pub unsafe extern "C" fn xmss_aggregate(
         .map(|(pks, proof)| (pks.as_slice(), proof))
         .collect();
 
+    let t_marshal_done = Instant::now();
+
     // Call rec_aggregation
     let (_pub_keys, agg_sig) = rec_xmss_aggregate(
         &children_with_keys,
@@ -165,7 +188,24 @@ pub unsafe extern "C" fn xmss_aggregate(
         log_inv_rate,
     );
 
-    Box::into_raw(Box::new(agg_sig))
+    let t_stark_done = Instant::now();
+
+    let result = Box::into_raw(Box::new(agg_sig));
+
+    let t_post_done = Instant::now();
+
+    // Write phase timings if the caller passed non-null out-pointers.
+    if !out_marshal_ns.is_null() {
+        *out_marshal_ns = t_marshal_done.duration_since(t_entry).as_nanos() as u64;
+    }
+    if !out_stark_ns.is_null() {
+        *out_stark_ns = t_stark_done.duration_since(t_marshal_done).as_nanos() as u64;
+    }
+    if !out_post_ns.is_null() {
+        *out_post_ns = t_post_done.duration_since(t_stark_done).as_nanos() as u64;
+    }
+
+    result
 }
 
 /// Verify aggregated signatures.
