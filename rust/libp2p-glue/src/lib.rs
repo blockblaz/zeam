@@ -339,6 +339,97 @@ fn record_mesh_peers(network_id: u32, count: u64) {
     }
 }
 
+/// #942 diagnostic: hard-capped counter for the per-failure gossip-byte
+/// dumps written by `dump_failed_gossip_payload`. The cap exists so a
+/// runaway corruption event can't fill the operator's disk with a few
+/// megabytes per failed receipt — once the limit is hit, the function
+/// becomes a no-op (the failure is still logged via the existing
+/// `[gossip ingress]` line, just not dumped).
+const MAX_FAILED_GOSSIP_DUMPS: u64 = 50;
+static FAILED_GOSSIP_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// #942 diagnostic: persist the full `message.data` bytes of a gossip
+/// message that `snap::raw::Decoder` rejected. Filename is structured
+/// `failed_gossip_<topic>_<data_len>_<sha256_first32>_<seq>.bin` with
+/// a sibling `.meta.txt` so the operator can group different receipts
+/// of the same logical message (same `data_len` and same prefix hash)
+/// and `cmp -l` them byte-by-byte to locate exactly where the corruption
+/// enters. Without this, we only see varying `dst_pos` values in the log
+/// — we never get the raw bytes that produced each one.
+///
+/// Best-effort: failures to write are silently swallowed because this is
+/// a diagnostic path and must not impact the live gossip pipeline.
+fn dump_failed_gossip_payload(
+    network_id: u32,
+    topic_kind: &str,
+    propagation_peer: &str,
+    data: &[u8],
+) {
+    let seq = FAILED_GOSSIP_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if seq >= MAX_FAILED_GOSSIP_DUMPS {
+        return;
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    let prefix_len = std::cmp::min(data.len(), 32);
+    hasher.update(&data[..prefix_len]);
+    let prefix_hash_bytes = hasher.finalize();
+    let prefix_hash = hex::encode(&prefix_hash_bytes[..8]); // 16 hex chars
+
+    let dir = std::path::Path::new("/data/deserialization_dumps");
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        logger::rustLogger.warn(
+            network_id,
+            &format!("[#942 dump] could not create dump dir: {}", e),
+        );
+        return;
+    }
+
+    let bin_name = format!(
+        "failed_gossip_{}_{}_{}_seq{:03}.bin",
+        topic_kind,
+        data.len(),
+        prefix_hash,
+        seq,
+    );
+    let meta_name = format!(
+        "failed_gossip_{}_{}_{}_seq{:03}.meta.txt",
+        topic_kind,
+        data.len(),
+        prefix_hash,
+        seq,
+    );
+    let bin_path = dir.join(&bin_name);
+    let meta_path = dir.join(&meta_name);
+
+    if let Err(e) = std::fs::write(&bin_path, data) {
+        logger::rustLogger.warn(
+            network_id,
+            &format!("[#942 dump] write {} failed: {}", bin_name, e),
+        );
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let meta = format!(
+        "wall_time_unix={}\ntopic_kind={}\ndata_len={}\nprefix_sha256_64bit={}\npropagation_peer={}\nseq={}\n",
+        now, topic_kind, data.len(), prefix_hash, propagation_peer, seq,
+    );
+    let _ = std::fs::write(&meta_path, meta);
+    logger::rustLogger.info(
+        network_id,
+        &format!(
+            "[#942 dump] wrote {} ({} bytes, seq {}/{})",
+            bin_name,
+            data.len(),
+            seq + 1,
+            MAX_FAILED_GOSSIP_DUMPS
+        ),
+    );
+}
+
 /// FFI getter: cumulative count of dropped swarm commands for the given
 /// reason tag (see `SwarmCommandDropReason`). Returns 0 for unknown tags so
 /// future Zig builds compiled against an older Rust glue do not panic.
@@ -1787,7 +1878,7 @@ impl Network {
                                 record_mesh_peers(self.network_id, mesh_count);
                             }
 
-                            if let gossipsub::Event::Message { propagation_source, message, .. } = gossipsub_event {
+                            if let gossipsub::Event::Message { propagation_source, message_id, message, .. } = gossipsub_event {
                                 let topic_str = message.topic.as_str().to_string();
                                 let topic = match CString::new(topic_str.as_str()) {
                                     Ok(cstr) => cstr,
@@ -1841,10 +1932,29 @@ impl Network {
                                     }
                                     s
                                 };
-                                let rust_decode_status = match Decoder::new().decompress_vec(&message.data) {
+                                let rust_decode_result = Decoder::new().decompress_vec(&message.data);
+                                let rust_decode_status = match &rust_decode_result {
                                     Ok(decoded) => format!("rust_snap=ok decoded_len={}", decoded.len()),
                                     Err(e) => format!("rust_snap=err({:?})", e),
                                 };
+                                // #942 diagnostic: on a Rust-side decode failure, capture the
+                                // full message.data bytes (and a metadata sidecar) so we can
+                                // diff multiple receipts of the "same" logical message
+                                // (identified by topic + data_len + sha256 of first 32 bytes)
+                                // offline and see exactly where the byte stream diverges.
+                                // Capped at 50 dumps total to bound disk usage.
+                                if rust_decode_result.is_err() {
+                                    let topic_kind_short = match topic_str.split('/').nth(3) {
+                                        Some(k) => k.split('_').next().unwrap_or("unk"),
+                                        None => "unk",
+                                    };
+                                    dump_failed_gossip_payload(
+                                        self.network_id,
+                                        topic_kind_short,
+                                        &propagation_source.to_string(),
+                                        &message.data,
+                                    );
+                                }
                                 // #942 (follow-up): also log the gossipsub `propagation_source`
                                 // — the *connected* peer that just forwarded this message to
                                 // us. Unlike `message.source` (which is always None under
@@ -1859,10 +1969,11 @@ impl Network {
                                 logger::rustLogger.info(
                                     self.network_id,
                                     &format!(
-                                        "[gossip ingress] topic={} sender={} propagation_peer={} data_len={} {} first{}={}",
+                                        "[gossip ingress] topic={} sender={} propagation_peer={} msg_id={} data_len={} {} first{}={}",
                                         topic_str,
                                         sender_peer_id_string,
                                         propagation_peer,
+                                        message_id,
                                         message_len,
                                         rust_decode_status,
                                         preview_len,
