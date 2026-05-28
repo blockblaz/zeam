@@ -274,12 +274,6 @@ const AttestationTracker = struct {
     latestKnown: ?ProtoAttestation = null,
     // nlatest new attestation of validator not yet seen on-chain
     latestNew: ?ProtoAttestation = null,
-    // devnet5: block-imported attestation pending deferred head-weight. Block votes land here
-    // (NOT directly in latestKnown) so they contribute ZERO head weight on import and instead fold
-    // into latestKnown at the next acceptNewAttestations tick — matching leanSpec/ethlambda, which
-    // defer block-vote head weight by ~1 slot. Kept out of latestNew so it never reaches
-    // safe_target (PR #680: safe_target ignores on-chain weight).
-    latestBlock: ?ProtoAttestation = null,
 };
 
 pub const ForkChoiceParams = struct {
@@ -843,16 +837,6 @@ pub const ForkChoice = struct {
                     entry.value_ptr.latestNew = null;
                 }
             }
-
-            // fix latestBlock (devnet5 deferred block-vote bucket) — same remap as the others.
-            if (entry.value_ptr.latestBlock) |*latest_block| {
-                const new_index_lookup = old_indices_to_new.get(latest_block.index);
-                if (new_index_lookup) |new_index| {
-                    latest_block.index = new_index;
-                } else {
-                    entry.value_ptr.latestBlock = null;
-                }
-            }
         }
 
         if (canonicalViewOrNull == null) {
@@ -1023,24 +1007,10 @@ pub const ForkChoice = struct {
 
         // Promote latestNew → latestKnown in attestation tracker.
         // Attestations that were "new" (gossip) are now "known" (accepted).
-        //
-        // devnet5: also fold in latestBlock here (deferred block-vote head weight). A validator's
-        // own gossip vote (latestNew) takes priority — it reflects that validator's current view —
-        // so latestBlock only wins when it is STRICTLY ahead (e.g. for a validator whose recent
-        // gossip we have not seen). This is the tick where block votes finally gain head weight,
-        // ~1 slot after import; latestBlock is consumed (cleared) so it counts once.
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
             // latestNew is always ahead of latestKnown (and will be non null if latestknown is not null)
             tracker.latestKnown = tracker.latestNew;
-            if (tracker.latestBlock) |block_vote| {
-                const promoted_slot = (tracker.latestKnown orelse ProtoAttestation{}).slot;
-                // Gossip wins ties: only take the block vote when it is strictly fresher.
-                if (tracker.latestKnown == null or block_vote.slot > promoted_slot) {
-                    tracker.latestKnown = block_vote;
-                }
-                tracker.latestBlock = null;
-            }
             try self.attestations.put(validator_id, tracker);
         }
 
@@ -1212,6 +1182,19 @@ pub const ForkChoice = struct {
             while (payload_it.next()) |entry| {
                 const att_data = entry.key_ptr;
 
+                // Ensure time flows forward: a target must lie strictly after its source. An
+                // attestation with target.slot <= source.slot can NEVER justify a new checkpoint —
+                // process_attestations provably drops it (target_not_ahead) — so selecting it only
+                // wastes a MAX_ATTESTATIONS_DATA slot. This is a builder-side optimization NOT in
+                // leanSpec build_block (which keeps genesis self-votes for head-vote weight), but it
+                // is necessary here, confirmed by experiment: zeam accumulates one distinct
+                // genesis-target self-vote att_data PER early slot (source=target=0, differing .slot),
+                // and by ~slot 9 there are more than MAX_ATTESTATIONS_DATA of them. Without this guard
+                // they fill the whole cap → blocks carry 0 justifying coverage → justification stalls
+                // and nodes diverge (reverting it reproduced a hard stall at cap=8: finalized=0,
+                // justified frozen ~9, heads forked).
+                if (att_data.target.slot <= att_data.source.slot) continue;
+
                 // Source slot must already be justified on this chain (leanSpec build_block).
                 if (!isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.source.slot)) continue;
 
@@ -1220,13 +1203,9 @@ pub const ForkChoice = struct {
                 // Also rejects zero-hash source or target roots inline.
                 if (!attestationDataMatchesChainExtended(&pre_state.historical_block_hashes, parent_root, att_data.*)) continue;
 
-                // Skip attestations whose target slot is already justified on this chain, except
-                // genesis self-votes (source.slot==target.slot==0) — leanSpec build_block keeps them.
-                // EXPERIMENT (deferred-LMD): with block votes now deferred via latestBlock, the
-                // build_block time-forward guard is dropped to test whether deferral alone prevents
-                // the genesis-self-vote stall.
-                const is_genesis_self_vote = att_data.source.slot == 0 and att_data.target.slot == 0;
-                if (!is_genesis_self_vote and isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
+                // Skip attestations whose target slot is already justified on this chain. (No
+                // genesis self-vote exemption: the time-forward guard above already excludes them.)
+                if (isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
 
                 if (!self.protoArray.indices.contains(att_data.head.root)) continue;
                 // Spec divergence (intentional): leanSpec removed the processed_att_data
@@ -1738,21 +1717,24 @@ pub const ForkChoice = struct {
         };
 
         var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
-        // update latest attested head of the validator
+        // update latest known attested head of the validator if already included on chain
         if (is_from_block) {
-            // devnet5: block votes get DEFERRED head weight. They land in latestBlock (not
-            // latestKnown) so they contribute zero weight to the head computed by this import; they
-            // fold into latestKnown at the next acceptNewAttestations tick. This matches leanSpec
-            // (block attestations carry zero head weight on import, deferred ~1 slot) and avoids the
-            // eager-pollution failure mode where block-carried genesis self-votes pull heads back to
-            // genesis. latestBlock never feeds latestNew/safe_target (PR #680).
-            const attestation_tracker_latest_block_slot = (attestation_tracker.latestBlock orelse ProtoAttestation{}).slot;
-            if (attestation_slot > attestation_tracker_latest_block_slot) {
-                attestation_tracker.latestBlock = .{
+            const attestation_tracker_latest_known_slot = (attestation_tracker.latestKnown orelse ProtoAttestation{}).slot;
+            if (attestation_slot > attestation_tracker_latest_known_slot) {
+                attestation_tracker.latestKnown = .{
                     .index = new_head_index,
                     .slot = attestation_slot,
                     .attestation_data = attestation_data,
                 };
+
+                // leanSpec PR #680 keeps the gossip ("new") and on-chain
+                // ("known") pools strictly separate: `update_safe_target`
+                // operates on the new pool only, while head selection uses
+                // the known pool. Mirroring `latestKnown → latestNew` here
+                // would smuggle on-chain weight back into the safe-target
+                // computation and break the
+                // `test_safe_target_ignores_known_pool_at_interval_3`
+                // contract from the spec test vectors.
             }
         } else {
             // leanSpec allows attestations up to 1 slot in the future:

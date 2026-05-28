@@ -6746,15 +6746,15 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     try std.testing.expect(found_valid);
 }
 
-test "produceBlock - already-justified target skipped, genesis self-vote exemption" {
+test "produceBlock - already-justified target skipped, genesis self-vote filtered by time-forward guard" {
     // Two assertions:
     //   (a) NEGATIVE: a non-genesis attestation whose target slot is already justified
     //       must be excluded from the produced block.
-    //   (b) POSITIVE: a genesis self-vote (source.slot==0, target.slot==0) must be
-    //       included even though slot 0 is already justified — leanSpec build_block keeps it
-    //       (it carries head-vote weight + propagates to peers). Its head weight is deferred:
-    //       block votes land in the tracker's latestBlock bucket, not latestKnown.
-    // Both attestations are stored; the test asserts (a) is absent and (b) is present.
+    //   (b) NEGATIVE: a genesis self-vote (source.slot==0, target.slot==0) must be
+    //       excluded too — getProposalAttestations drops any attestation with
+    //       target.slot <= source.slot (time-forward guard), so a self-vote
+    //       (target.slot == source.slot == 0) never reaches the block.
+    // Both attestations are stored; the test asserts both are absent.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -6796,11 +6796,10 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
 
-    // (b) POSITIVE: genesis self-vote — source.slot==0, target.slot==0.
-    // leanSpec build_block keeps it past the target-already-justified filter (its head weight is
-    // deferred via the tracker's latestBlock bucket, so it cannot poison the head). It must appear
-    // in the produced block. historical_block_hashes[0] == blockRoots[0] once block 1 is applied,
-    // so the chain-match check passes too.
+    // (b) NEGATIVE: genesis self-vote — source.slot==0, target.slot==0.
+    // getProposalAttestations drops any attestation with target.slot <= source.slot
+    // (time-forward guard), so a self-vote (target.slot == source.slot) is filtered
+    // out and must NOT reach the block.
     const genesis_root = mock_chain.blockRoots[0];
     const att_genesis_self_vote = types.AttestationData{
         .slot = 0,
@@ -6828,8 +6827,8 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
         }
     }
 
-    // (b) Positive: the genesis self-vote must appear — leanSpec build_block keeps it (its head
-    // weight is deferred via latestBlock, so including it is safe).
+    // (b) Negative: the genesis self-vote must NOT appear — the time-forward guard
+    // (target.slot <= source.slot) drops it before any justification check.
     var found_genesis_sv = false;
     for (atts) |att| {
         if (att.data.source.slot == 0 and att.data.target.slot == 0 and
@@ -6839,7 +6838,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
             found_genesis_sv = true;
         }
     }
-    try std.testing.expect(found_genesis_sv);
+    try std.testing.expect(!found_genesis_sv);
 }
 test "BorrowedState: cloneAndRelease success path against real BeamState" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
