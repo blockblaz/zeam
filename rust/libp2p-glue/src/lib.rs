@@ -1787,12 +1787,12 @@ impl Network {
                                 record_mesh_peers(self.network_id, mesh_count);
                             }
 
-                            if let gossipsub::Event::Message { message, .. } = gossipsub_event {
-                                let topic = message.topic.as_str();
-                                let topic = match CString::new(topic) {
+                            if let gossipsub::Event::Message { propagation_source, message, .. } = gossipsub_event {
+                                let topic_str = message.topic.as_str().to_string();
+                                let topic = match CString::new(topic_str.as_str()) {
                                     Ok(cstr) => cstr,
                                     Err(_) => {
-                                        logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic));
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic_str));
                                         continue;
                                     }
                                 };
@@ -1812,6 +1812,63 @@ impl Network {
                                         continue;
                                     }
                                 };
+
+                                // #942 diagnostic: log the first 32 bytes of `message.data`
+                                // as gossipsub delivered it, IMMEDIATELY before the FFI handoff
+                                // to `handleMsgFromRustBridge`. The Zig side already logs
+                                // `first32=...` from inside the snappy-decode error path
+                                // (PR #945). If the two previews match exactly, the FFI is
+                                // faithful and any decode failure originates upstream of the
+                                // bridge (peer publish or gossipsub itself). If they differ,
+                                // there is a slice / pointer bug in the bridge handoff.
+                                //
+                                // Also report whether `snap::raw::Decoder` can decode the
+                                // payload at the Rust side (same crate ethlambda uses
+                                // successfully). A mismatch between Rust-side decode result
+                                // and Zig-side `snappyz.decodeWithMax` would indicate the
+                                // two decoders disagree on this byte sequence — strong
+                                // signal that the Zig snappy library has a bug specific to
+                                // this payload shape.
+                                let preview_len = std::cmp::min(message_len, 32);
+                                let preview_hex = {
+                                    use std::fmt::Write as _;
+                                    let mut s = String::with_capacity(preview_len * 3);
+                                    for (i, b) in message.data[..preview_len].iter().enumerate() {
+                                        if i != 0 {
+                                            s.push(' ');
+                                        }
+                                        let _ = write!(&mut s, "{:02x}", b);
+                                    }
+                                    s
+                                };
+                                let rust_decode_status = match Decoder::new().decompress_vec(&message.data) {
+                                    Ok(decoded) => format!("rust_snap=ok decoded_len={}", decoded.len()),
+                                    Err(e) => format!("rust_snap=err({:?})", e),
+                                };
+                                // #942 (follow-up): also log the gossipsub `propagation_source`
+                                // — the *connected* peer that just forwarded this message to
+                                // us. Unlike `message.source` (which is always None under
+                                // `ValidationMode::Anonymous`, line 2216), propagation_source
+                                // is always a real PeerId we can correlate against
+                                // `lean_connected_peers{client=...}` to identify the
+                                // forwarder's client family. With this in place, if every
+                                // failing-decode log has `propagation_source` resolving to a
+                                // zeam_* peer, we can attribute the bad-byte origin to a
+                                // zeam-only code path with high confidence.
+                                let propagation_peer = propagation_source.to_string();
+                                logger::rustLogger.info(
+                                    self.network_id,
+                                    &format!(
+                                        "[gossip ingress] topic={} sender={} propagation_peer={} data_len={} {} first{}={}",
+                                        topic_str,
+                                        sender_peer_id_string,
+                                        propagation_peer,
+                                        message_len,
+                                        rust_decode_status,
+                                        preview_len,
+                                        preview_hex,
+                                    ),
+                                );
 
                                 unsafe {
                                     handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
@@ -2182,21 +2239,38 @@ impl From<MessageDomain> for [u8; 4] {
 
 impl Behaviour {
     fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
-        // Try to decompress; fallback to raw data
-        let (data_for_hash, domain): (Vec<u8>, [u8; 4]) =
-            match Decoder::new().decompress_vec(&message.data) {
-                Ok(decoded) => (decoded, MessageDomain::ValidSnappy.into()),
-                Err(_) => (message.data.clone(), MessageDomain::InvalidSnappy.into()),
-            };
-
-        // Prepare hashing
+        // #942: hash raw gossip bytes only. The previous implementation ran
+        // `snap::raw::Decoder::decompress_vec(&message.data)` on every inbound
+        // gossip message to content-address by uncompressed bytes (so two
+        // different snappy encodings of the same SSZ block would share a
+        // message-id and dedupe correctly). On the live devnet that
+        // synchronous decompress on 1–3 MB broken-snappy payloads (with the
+        // decoder walking hundreds of KB of valid tags before failing on a
+        // bad copy offset) blocked the gossipsub event loop long enough that
+        // libxev ticks on the Zig side spiked into the 0.5–1 s bucket en
+        // masse (~2700 slow ticks on a 30 min run), libp2p's flow control
+        // observed the slowness and silently demoted zeam's mesh share, and
+        // zeam stopped receiving ANY gossip — including small / well-formed
+        // messages on unrelated topics — for 20+ minutes.
+        //
+        // Raw-bytes hashing fixes the hot path: no decompress on ingress,
+        // no per-message CPU spike, no `Decoder` allocation. Cost: two
+        // peers publishing the same SSZ block with DIFFERENT snappy encoders
+        // get DIFFERENT message-ids and we'd forward both. In practice mesh
+        // forwarding propagates the original publisher's bytes verbatim, so
+        // duplicates almost always hit the existing identical-bytes path
+        // (`duplicate_cache_time` in `ConfigBuilder` catches those).
+        //
+        // The `MessageDomain` enum and the `Decoder` import become dead
+        // code with this change but are intentionally left in place — the
+        // long-term direction is to add a fast pre-check (e.g. only verify
+        // the snappy header varint and topic-specific size bounds) before
+        // delivery, which will re-use this scaffolding. Removing them in
+        // a follow-up.
         let mut hasher = sha2::Sha256::new();
-        hasher.update(domain);
         hasher.update(message.topic.as_str().len().to_le_bytes());
         hasher.update(message.topic.as_str().as_bytes());
-        hasher.update(&data_for_hash);
-
-        // Take first 20 bytes as message-id
+        hasher.update(&message.data);
         let digest = hasher.finalize();
         gossipsub::MessageId::from(&digest[..20])
     }
