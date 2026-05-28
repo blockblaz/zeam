@@ -2342,21 +2342,23 @@ fn build_transport(
     local_private_key: Keypair,
     quic_support: bool,
 ) -> std::io::Result<BoxedTransport> {
-    // mplex config
-    let mut mplex_config = libp2p_mplex::Config::new();
-    mplex_config.set_max_buffer_size(256);
-    mplex_config.set_max_buffer_behaviour(libp2p_mplex::MaxBufferBehaviour::Block);
-
-    // yamux config
+    // #942: yamux-only on the TCP side. Previously this transport also
+    // negotiated `libp2p-mplex` via `SelectUpgrade::new(yamux, mplex)`, which
+    // caused gossip messages larger than ~100 KB to arrive corrupted at the
+    // gossipsub layer — `snap::raw::Decoder` rejected 38 of 72 incoming
+    // blocks and 28 of 402 incoming aggregations on the 2026-05-28 devnet
+    // while ream / grandine on the same network saw zero gossip decode
+    // failures. mplex is deprecated upstream and is the only differing
+    // transport feature between zeam and the clients that worked. Dropping
+    // it means TCP connections use yamux exclusively, QUIC keeps its native
+    // streams, and the gossipsub ingress path stops fragmenting/reassembling
+    // large messages through the buggy code path.
     let yamux_config = yamux::Config::default();
     // Creates the TCP transport layer
     let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
         .upgrade(core::upgrade::Version::V1)
         .authenticate(generate_noise_config(&local_private_key))
-        .multiplex(core::upgrade::SelectUpgrade::new(
-            yamux_config,
-            mplex_config,
-        ))
+        .multiplex(yamux_config)
         .timeout(Duration::from_secs(10));
     let transport = if quic_support {
         // Enables Quic
