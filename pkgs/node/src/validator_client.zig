@@ -81,16 +81,21 @@ pub const ValidatorClient = struct {
         };
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize) !?ValidatorClientOutput {
+    pub fn onInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) !?ValidatorClientOutput {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
 
         // if a new slot interval may be do a proposal
         switch (interval) {
-            // devnet5 (#14): block production runs off the slot loop on a thread_pool worker
-            // (chain.submitProposeOnInterval), since the prod-scheme Type-2 merge is multi-second
-            // and would freeze gossip/tick handling here. Interval 0 therefore emits nothing.
-            0 => return null,
+            // devnet5 (#14): block production is a proposer duty — the "am I proposer this slot?"
+            // decision lives here (chain.submitProposeOnInterval consults getSlotProposer). It is
+            // executed OFF the slot loop on a thread_pool worker, since the prod-scheme Type-2 merge
+            // is multi-second and would freeze gossip/tick handling if run inline. The worker
+            // produces, merges, and publishes itself, so this interval emits no synchronous output.
+            0 => {
+                self.chain.submitProposeOnInterval(node, time_intervals);
+                return null;
+            },
             1 => return self.mayBeDoAttestation(slot),
             2 => return null,
             3 => return null,
