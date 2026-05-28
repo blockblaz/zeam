@@ -1007,11 +1007,25 @@ pub const ForkChoice = struct {
 
         // Promote latestNew → latestKnown in attestation tracker.
         // Attestations that were "new" (gossip) are now "known" (accepted).
+        //
+        // MERGE, do not overwrite. Block-recorded head votes land directly in
+        // latestKnown (onAttestation is_from_block) with latestNew==null. A blind
+        // `latestKnown = latestNew` would clobber them at the acceptance tick — so a
+        // block vote would only survive while re-included in every later block, and
+        // the first attestation-free block on a competing fork would erase the heavier
+        // fork's weight (head then falls to the lexicographic tie-break / deeper fork).
+        // leanSpec accept_new_attestations unions latest_new into latest_known
+        // (head reads the highest-slot vote per validator), so mirror that: keep the
+        // fresher of the two, gossip winning ties as it reflects the validator's
+        // current view, and never drop a known vote when latestNew is null/older.
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
-            // latestNew is always ahead of latestKnown (and will be non null if latestknown is not null)
-            tracker.latestKnown = tracker.latestNew;
-            try self.attestations.put(validator_id, tracker);
+            const new_vote = tracker.latestNew orelse continue;
+            const known_slot = (tracker.latestKnown orelse ProtoAttestation{}).slot;
+            if (tracker.latestKnown == null or new_vote.slot >= known_slot) {
+                tracker.latestKnown = new_vote;
+                try self.attestations.put(validator_id, tracker);
+            }
         }
 
         return self.updateHeadUnlocked();
