@@ -3,6 +3,7 @@ const hashsig = @import("hashsig.zig");
 const ssz = @import("ssz");
 const zeam_metrics = @import("@zeam/metrics");
 const zeam_utils = @import("@zeam/utils");
+pub const shadow_cost = @import("shadow_cost.zig");
 
 pub const AggregationError = error{ SerializationFailed, DeserializationFailed, PublicKeysSignatureLengthMismatch, AggregationFailed, InvalidAggregateSignature };
 
@@ -203,6 +204,11 @@ pub fn aggregateSignatures(
     for (buffer[0..bytes_written]) |byte| {
         try multisig_aggregated_signature.append(byte);
     }
+
+    // Shadow sim-cost: model aggregation CPU time on the virtual clock (no-op unless a
+    // rate is configured). Sleeps on the calling (aggregation worker) thread.
+    const shadow_delay_ns = shadow_cost.aggregateDelayNs(public_keys.len);
+    if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
 
 fn recordXmssProveDuration(start_ns: i128, num_raw: usize, num_children: usize) void {
@@ -228,6 +234,10 @@ pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, m
     );
 
     if (!result) return AggregationError.InvalidAggregateSignature;
+
+    // Shadow sim-cost: model verification CPU time on the virtual clock.
+    const shadow_delay_ns = shadow_cost.verifyDelayNs(public_keys.len);
+    if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
 
 pub const AggregatedPayloadVerifyBatch = struct {
