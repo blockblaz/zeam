@@ -1180,6 +1180,16 @@ pub const ForkChoice = struct {
             while (payload_it.next()) |entry| {
                 const att_data = entry.key_ptr;
 
+                // Ensure time flows forward: a target must lie strictly after its source (leanSpec
+                // build_block). An attestation with target.slot <= source.slot can never justify a
+                // new checkpoint — process_attestations skips it (target_not_ahead) — so selecting
+                // it only wastes a MAX_ATTESTATIONS_DATA slot. This also drops lingering genesis
+                // self-votes (target==source==genesis), which sort first by ascending target slot
+                // and, under a low cap, otherwise consume the whole selection budget and starve
+                // justification. zeam previously omitted this guard (it kept only the genesis
+                // self-vote exception below, which the spec's earlier time-forward check makes moot).
+                if (att_data.target.slot <= att_data.source.slot) continue;
+
                 // Source slot must already be justified on this chain (leanSpec build_block).
                 if (!isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.source.slot)) continue;
 
@@ -1188,10 +1198,8 @@ pub const ForkChoice = struct {
                 // Also rejects zero-hash source or target roots inline.
                 if (!attestationDataMatchesChainExtended(&pre_state.historical_block_hashes, parent_root, att_data.*)) continue;
 
-                // Skip attestations whose target slot is already justified on this chain,
-                // except for genesis self-votes used for fork-choice bootstrapping.
-                const is_genesis_self_vote = att_data.source.slot == 0 and att_data.target.slot == 0;
-                if (!is_genesis_self_vote and isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
+                // Skip attestations whose target slot is already justified on this chain.
+                if (isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
 
                 if (!self.protoArray.indices.contains(att_data.head.root)) continue;
                 // Spec divergence (intentional): leanSpec removed the processed_att_data
