@@ -30,7 +30,16 @@ pub const ChainConfig = struct {
                         chainOpts.attestation_committee_count = 1;
                     }
                     if (chainOpts.max_attestations_data == null) {
-                        chainOpts.max_attestations_data = 16;
+                        // leanSpec chain/config.py: MAX_ATTESTATIONS_DATA = 8. Keep the fallback in
+                        // lockstep with params.MAX_ATTESTATIONS_DATA so the builder (config-driven)
+                        // and verifySignatures (params constant) agree when config.yaml omits it.
+                        chainOpts.max_attestations_data = @intCast(params.MAX_ATTESTATIONS_DATA);
+                    } else if (chainOpts.max_attestations_data.? > params.MAX_ATTESTATIONS_DATA) {
+                        // params.MAX_ATTESTATIONS_DATA is the spec ceiling AND the verifySignatures
+                        // hard cap. config.yaml may only LOWER it (e.g. cap=1 for tests); a higher
+                        // value would let the builder assemble blocks the verify path rejects, so
+                        // clamp here — the builder never exceeds what verify accepts.
+                        chainOpts.max_attestations_data = @intCast(params.MAX_ATTESTATIONS_DATA);
                     }
                     if (chainOpts.fork_digest == null) {
                         return ChainConfigError.InvalidChainSpec;

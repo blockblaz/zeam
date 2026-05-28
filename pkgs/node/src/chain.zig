@@ -5108,7 +5108,7 @@ test "process and add mock blocks into a node's chain" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5202,7 +5202,7 @@ test "printSlot output demonstration" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5286,7 +5286,7 @@ test "buildTreeVisualization integration test" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5382,7 +5382,7 @@ test "attestation validation - comprehensive" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5679,7 +5679,7 @@ test "attestation validation - gossip future-slot bound" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -5815,7 +5815,7 @@ const FutureSlotTestFixture = struct {
                 .name = spec_name,
                 .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
-                .max_attestations_data = 16,
+                .max_attestations_data = 8,
             },
         };
         fx.beam_state = fx.mock_chain.genesis_state;
@@ -6293,7 +6293,7 @@ test "attestation processing - valid block attestation" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -6399,7 +6399,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -6539,7 +6539,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     // Heap-allocate beam_state and zeam_logger_config so their addresses are
@@ -6752,8 +6752,8 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     //   (a) NEGATIVE: a non-genesis attestation whose target slot is already justified
     //       must be excluded from the produced block.
     //   (b) NEGATIVE: a genesis self-vote (source.slot==0, target.slot==0) must be
-    //       excluded too — leanSpec build_block skips any attestation with
-    //       target.slot <= source.slot before the justification checks, so a self-vote
+    //       excluded too — getProposalAttestations drops any attestation with
+    //       target.slot <= source.slot (time-forward guard), so a self-vote
     //       (target.slot == source.slot == 0) never reaches the block.
     // Both attestations are stored; the test asserts both are absent.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6798,9 +6798,9 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
 
     // (b) NEGATIVE: genesis self-vote — source.slot==0, target.slot==0.
-    // leanSpec build_block skips any attestation with target.slot <= source.slot
-    // before the justification checks, so a self-vote (target.slot == source.slot)
-    // is filtered out by the time-forward guard and must NOT reach the block.
+    // getProposalAttestations drops any attestation with target.slot <= source.slot
+    // (time-forward guard), so a self-vote (target.slot == source.slot) is filtered
+    // out and must NOT reach the block.
     const genesis_root = mock_chain.blockRoots[0];
     const att_genesis_self_vote = types.AttestationData{
         .slot = 0,
@@ -7270,7 +7270,7 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -7464,7 +7464,7 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -7631,7 +7631,7 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
                 .name = spec_name,
                 .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
-                .max_attestations_data = 16,
+                .max_attestations_data = 8,
             },
         };
 
@@ -7792,7 +7792,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
                 .name = spec_name,
                 .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
-                .max_attestations_data = 16,
+                .max_attestations_data = 8,
             },
         };
 
@@ -8027,7 +8027,7 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8248,7 +8248,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8377,7 +8377,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
             .name = spec_name_2,
             .fork_digest = fork_digest_2,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8534,7 +8534,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8651,7 +8651,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8762,7 +8762,7 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8875,7 +8875,7 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -8978,7 +8978,7 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 

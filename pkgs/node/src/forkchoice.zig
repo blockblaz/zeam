@@ -20,8 +20,10 @@ const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
 /// Maximum number of distinct AttestationData entries a single block may
-/// include, matching leanSpec's chain.config.MAX_ATTESTATIONS_DATA.
-pub const MAX_ATTESTATIONS_DATA: usize = 16;
+/// include, matching leanSpec's chain.config.MAX_ATTESTATIONS_DATA (8).
+/// Single source of truth: re-export the params constant so the block-validation
+/// guard, verifySignatures, and the builder cap can never drift apart.
+pub const MAX_ATTESTATIONS_DATA: usize = params.MAX_ATTESTATIONS_DATA;
 
 fn validateAttestationDataLimits(
     allocator: Allocator,
@@ -1180,14 +1182,17 @@ pub const ForkChoice = struct {
             while (payload_it.next()) |entry| {
                 const att_data = entry.key_ptr;
 
-                // Ensure time flows forward: a target must lie strictly after its source (leanSpec
-                // build_block). An attestation with target.slot <= source.slot can never justify a
-                // new checkpoint — process_attestations skips it (target_not_ahead) — so selecting
-                // it only wastes a MAX_ATTESTATIONS_DATA slot. This also drops lingering genesis
-                // self-votes (target==source==genesis), which sort first by ascending target slot
-                // and, under a low cap, otherwise consume the whole selection budget and starve
-                // justification. zeam previously omitted this guard (it kept only the genesis
-                // self-vote exception below, which the spec's earlier time-forward check makes moot).
+                // Ensure time flows forward: a target must lie strictly after its source. An
+                // attestation with target.slot <= source.slot can NEVER justify a new checkpoint —
+                // process_attestations provably drops it (target_not_ahead) — so selecting it only
+                // wastes a MAX_ATTESTATIONS_DATA slot. This is a builder-side optimization NOT in
+                // leanSpec build_block (which keeps genesis self-votes for head-vote weight), but it
+                // is necessary here, confirmed by experiment: zeam accumulates one distinct
+                // genesis-target self-vote att_data PER early slot (source=target=0, differing .slot),
+                // and by ~slot 9 there are more than MAX_ATTESTATIONS_DATA of them. Without this guard
+                // they fill the whole cap → blocks carry 0 justifying coverage → justification stalls
+                // and nodes diverge (reverting it reproduced a hard stall at cap=8: finalized=0,
+                // justified frozen ~9, heads forked).
                 if (att_data.target.slot <= att_data.source.slot) continue;
 
                 // Source slot must already be justified on this chain (leanSpec build_block).
@@ -1198,7 +1203,8 @@ pub const ForkChoice = struct {
                 // Also rejects zero-hash source or target roots inline.
                 if (!attestationDataMatchesChainExtended(&pre_state.historical_block_hashes, parent_root, att_data.*)) continue;
 
-                // Skip attestations whose target slot is already justified on this chain.
+                // Skip attestations whose target slot is already justified on this chain. (No
+                // genesis self-vote exemption: the time-forward guard above already excludes them.)
                 if (isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
 
                 if (!self.protoArray.indices.contains(att_data.head.root)) continue;
@@ -2425,7 +2431,7 @@ pub const ForkChoice = struct {
             }
 
             // Per leanSpec store.process_block: a block may include at most
-            // MAX_ATTESTATIONS_DATA (16) distinct AttestationData entries, and
+            // MAX_ATTESTATIONS_DATA (8) distinct AttestationData entries, and
             // each distinct entry must appear exactly once. Enforce this before
             // registering the block in protoArray so rejected blocks leave no
             // residue in fork choice state.
@@ -2834,7 +2840,7 @@ test "forkchoice block tree" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2888,7 +2894,7 @@ test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence sem
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2977,7 +2983,7 @@ test "aggregate prunes attestation signatures" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3093,7 +3099,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3266,7 +3272,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -4011,7 +4017,7 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -4429,7 +4435,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -5417,7 +5423,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 

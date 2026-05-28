@@ -33,7 +33,7 @@ const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 ///
 /// XMSS/post-quantum signatures are substantially larger than BLS: a single
 /// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
-/// MAX_ATTESTATIONS_DATA (16) attestations each with such a proof.  On devnet4
+/// MAX_ATTESTATIONS_DATA (8) attestations each with such a proof.  On devnet4
 /// a legitimate block reached ~9.37 MB, exceeding the 4 MB RPC limit and
 /// triggering error.TooLarge (issue #723).
 ///

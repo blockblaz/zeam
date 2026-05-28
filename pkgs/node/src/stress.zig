@@ -561,7 +561,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -1068,7 +1068,7 @@ fn runStressSaturation(allocator: Allocator, cfg: SaturationConfig) !SaturationS
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
