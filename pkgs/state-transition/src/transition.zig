@@ -354,8 +354,100 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         var state_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-            opts.logger.debug("state root={x} block root={x}\n", .{ &state_root, &block.state_root });
+            // #942 follow-up: when the post-state root doesn't match the
+            // proposer's claim, log per-field hashTreeRoots of OUR computed
+            // post-state. Comparing these across nodes (or against a known
+            // healthy node's post-state at the same slot) pins down exactly
+            // which `BeamState` field is the divergent one. Without this,
+            // operators can only see "state_root mismatch" — they can't tell
+            // whether it's `historical_block_hashes`, `latest_justified`,
+            // `justifications_*`, etc. that drifted, so root-cause analysis
+            // stalls. Fail-soft on per-field hash failures — still return the
+            // primary error so the chain-worker handler logic is unchanged.
+            opts.logger.err(
+                "InvalidPostState slot={d} computed={x} expected={x}",
+                .{ block.slot, &state_root, &block.state_root },
+            );
+            logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger);
             return StateTransitionError.InvalidPostState;
         }
     }
+}
+
+/// #942 follow-up: emit per-field hashTreeRoots of a post-state so
+/// `InvalidPostState` failures can be triangulated to a single divergent
+/// field. Errors are logged-and-swallowed — the caller still reports the
+/// underlying state-root mismatch as before.
+fn logBeamStatePerFieldRoots(
+    allocator: Allocator,
+    state: *const types.BeamState,
+    block_slot: u64,
+    logger: zeam_utils.ModuleLogger,
+) void {
+    var slot_root: [32]u8 = undefined;
+    var lbh_root: [32]u8 = undefined;
+    var lj_root: [32]u8 = undefined;
+    var lf_root: [32]u8 = undefined;
+    var hbh_root: [32]u8 = undefined;
+    var js_root: [32]u8 = undefined;
+    var v_root: [32]u8 = undefined;
+    var jr_root: [32]u8 = undefined;
+    var jv_root: [32]u8 = undefined;
+
+    zeam_utils.hashTreeRoot(u64, state.slot, &slot_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: slot hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &lbh_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: latest_block_header hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.Checkpoint, state.latest_justified, &lj_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: latest_justified hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.Checkpoint, state.latest_finalized, &lf_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: latest_finalized hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.HistoricalBlockHashes, state.historical_block_hashes, &hbh_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: historical_block_hashes hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.JustifiedSlots, state.justified_slots, &js_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: justified_slots hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.Validators, state.validators, &v_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: validators hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.JustificationRoots, state.justifications_roots, &jr_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: justifications_roots hash failed: {any}", .{e});
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.JustificationValidators, state.justifications_validators, &jv_root, allocator) catch |e| {
+        logger.err("InvalidPostState per-field: justifications_validators hash failed: {any}", .{e});
+        return;
+    };
+
+    logger.err(
+        "InvalidPostState per-field block_slot={d} state_slot={d} hbh_len={d} js_len={d} jr_len={d} | slot={x} lbh={x} lj={x} lf={x} hbh={x} js={x} v={x} jr={x} jv={x}",
+        .{
+            block_slot,
+            state.slot,
+            state.historical_block_hashes.len(),
+            state.justified_slots.len(),
+            state.justifications_roots.len(),
+            &slot_root,
+            &lbh_root,
+            &lj_root,
+            &lf_root,
+            &hbh_root,
+            &js_root,
+            &v_root,
+            &jr_root,
+            &jv_root,
+        },
+    );
 }
