@@ -1813,6 +1813,34 @@ pub const ForkChoice = struct {
         }
     }
 
+    /// leanSpec `_deconstruct_block_into_store` coverage gate: returns true if the local
+    /// aggregated-payload pools (new + known) already cover every validator set in `agg_bits` for
+    /// `att_data`. When true, re-aggregating this block attestation would add nothing locally, so
+    /// the caller skips the expensive Type-2 split ("only act when the block covers validators we do
+    /// not already hold"). An att_data never seen locally is NOT fully covered → returns false.
+    pub fn blockAttestationFullyCoveredLocally(self: *Self, att_data: *const types.AttestationData, agg_bits: *const types.AggregationBits) bool {
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
+        const want = agg_bits.len();
+        var bit: usize = 0;
+        bits: while (bit < want) : (bit += 1) {
+            if (!(agg_bits.get(bit) catch false)) continue;
+            if (self.latest_known_aggregated_payloads.get(att_data.*)) |list| {
+                for (list.items) |stored| {
+                    if (bit < stored.proof.participants.len() and (stored.proof.participants.get(bit) catch false)) continue :bits;
+                }
+            }
+            if (self.latest_new_aggregated_payloads.get(att_data.*)) |list| {
+                for (list.items) |stored| {
+                    if (bit < stored.proof.participants.len() and (stored.proof.participants.get(bit) catch false)) continue :bits;
+                }
+            }
+            return false; // this validator is not covered by any local proof for att_data
+        }
+        return true;
+    }
+
     /// Format the full per-slot attestation aggregate coverage report.
     ///
     /// Sections:

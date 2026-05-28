@@ -527,20 +527,25 @@ pub fn buildType2BlockProof(
     for (encoded.items) |b| try out_proof.append(b);
 }
 
-/// Inverse of `buildType2BlockProof` (leanSpec #717 re-aggregation): split the single Type-2 block
-/// proof back into one Type-1 proof per body attestation, in body order. Each recovered Type-1 has
-/// its `participants` restored from the matching attestation's aggregation bits (the FFI split
-/// leaves them empty). The proposer component is not recovered — only the attestation components,
-/// which is what a later proposer re-aggregates.
+/// Inverse of `buildType2BlockProof` (leanSpec `_deconstruct_block_into_store`): split the single
+/// Type-2 block proof back into per-attestation Type-1 proofs, but only for the attestations the
+/// caller selected via `split_mask` (the FFI split is an expensive recursive-STARK prove, so the
+/// caller skips attestations whose target is at/behind justified or already covered locally —
+/// matching the spec's "only spend a split on attestations that can still move justification
+/// forward / cover validators we don't already hold"). Each recovered Type-1 has its `participants`
+/// restored from the matching attestation's aggregation bits (the FFI split leaves them empty).
 ///
-/// `out_type1s` must be an empty `Type1ProofList`; on success it holds `agg_attestations.len()`
-/// proofs parallel with the body. Bounded by the caller's MAX_ATTESTATIONS_DATA cap.
+/// `split_mask` is parallel with `agg_attestations`. `out_type1s` must be an empty `Type1ProofList`;
+/// on success it holds one proof per masked attestation, in body order (so the caller iterates the
+/// body and pops a recovered proof for each masked index in sequence). The full per-component pubkey
+/// layout is still reconstructed for ALL components (splitByMessage needs it to recover any one).
 pub fn deconstructType2BlockProof(
     allocator: Allocator,
     validators: *const Validators,
     agg_attestations: *const AggregatedAttestations,
     proposer_index: usize,
     proof_bytes: []const u8,
+    split_mask: []const bool,
     out_type1s: *Type1ProofList,
 ) !void {
     const atts = agg_attestations.constSlice();
@@ -587,13 +592,15 @@ pub fn deconstructType2BlockProof(
         pks_per_part[atts.len] = handles;
     }
 
-    // Split each attestation component out of the Type-2 (keyed by its message hash) and restore
-    // participants from the body attestation's bits.
+    // Split out only the masked attestation components (keyed by message hash) and restore
+    // participants from the body attestation's bits. Unmasked attestations skip the expensive split.
     var committed: usize = 0;
     errdefer {
         for (out_type1s.slice()[0..committed]) |*t1| t1.deinit();
     }
-    for (atts) |agg_att| {
+    for (atts, 0..) |agg_att, i| {
+        if (i >= split_mask.len or !split_mask[i]) continue;
+
         var message_hash: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(attestation.AttestationData, agg_att.data, &message_hash, allocator);
 

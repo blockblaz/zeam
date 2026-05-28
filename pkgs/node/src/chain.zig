@@ -22,6 +22,12 @@ const ThreadPool = thread_pool_pkg.ThreadPool;
 const WaitGroup = thread_pool_pkg.WaitGroup;
 
 pub const fcFactory = @import("./forkchoice.zig");
+
+/// devnet5 (#16): cap on how many block attestations a single import may split back into Type-1s
+/// (`_deconstruct_block_into_store`). Each split is an expensive recursive-STARK prove, so even when
+/// in-sync we bound the per-block cost so re-aggregation never starves the propose merge. ethlambda
+/// uses the same per-block cap in its in-sync reaggregation path.
+const MAX_REAGGREGATIONS_PER_BLOCK: usize = 4;
 const constants = @import("./constants.zig");
 const tree_visualizer = @import("./tree_visualizer.zig");
 const locking = @import("./locking.zig");
@@ -428,6 +434,16 @@ pub const BeamChain = struct {
 
     /// Joined at `deinit` so propose workers cannot outlive chain state.
     propose_wg: WaitGroup = .{},
+
+    /// devnet5: serialize the rayon-heavy recursive-STARK proves so each gets the FULL rayon thread
+    /// budget instead of fighting for it. Three paths now enter the prover concurrently — the
+    /// propose worker (Type-2 merge in `buildBlockProof`), the aggregate worker
+    /// (`aggregateForSlots`), and block import (#16 `deconstructType2BlockProof`). Without this gate
+    /// they over-subscribe rayon and each prove runs ~Nx slower, which inflates block latency and
+    /// makes safe_target lag (breaking finalization). Acquired ONLY around the leaf FFI prove (no
+    /// other zeam lock co-held) or, for aggregate, as the OUTERMOST lock before forkChoice.mutex —
+    /// never `fcmutex -> prove_gate` — so there is no lock cycle.
+    prove_gate: zeam_utils.SyncMutex = .{},
 
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
@@ -2692,6 +2708,11 @@ pub const BeamChain = struct {
             self.allocator.destroy(state_snapshot);
         }
 
+        // Serialize the recursive-STARK merge against the aggregate/deconstruct proves so it gets
+        // the full rayon budget. State is already cloned+released above, so no other zeam lock is
+        // co-held while we wait on prove_gate (leaf acquisition — no deadlock).
+        self.prove_gate.lock();
+        defer self.prove_gate.unlock();
         try types.buildType2BlockProof(
             self.allocator,
             &state_snapshot.validators,
@@ -3524,33 +3545,76 @@ pub const BeamChain = struct {
 
             }
 
-            // devnet5 (#16): re-aggregation. Split the block's single Type-2 proof back into one
-            // Type-1 per body attestation and store them in latest_known so a later proposer can
-            // re-aggregate the block's attestations. Bounded by MAX_ATTESTATIONS_DATA (enforced
-            // above) and run in-sync here — this path is already off the libxev loop (chain-worker
-            // for gossip blocks, propose worker for locally produced ones). Best-effort: a split
-            // failure is logged and skipped, never fatal to import.
-            if (aggregated_attestations.len > 0) reagg: {
+            // devnet5 (#16): re-aggregation (leanSpec `_deconstruct_block_into_store`). Split the
+            // block's single Type-2 proof back into a Type-1 per selected body attestation and store
+            // them in latest_new so a later aggregator/proposer can fold the block's coverage into
+            // its own aggregate. Selection is gated to keep the (expensive recursive-STARK) split
+            // off the critical path:
+            //   * in-sync only — a syncing node is replaying history, not contributing aggregates
+            //     (ethlambda gates its reaggregation path the same way);
+            //   * skip target.slot <= latest_justified.slot — already-decided coverage adds nothing;
+            //   * skip attestations the local pools already fully cover — re-deriving a Type-1 we
+            //     already hold is wasted prove work;
+            //   * cap at MAX_REAGGREGATIONS_PER_BLOCK splits per import.
+            // This path is already off the libxev loop (chain-worker for gossip blocks, propose
+            // worker for locally produced ones). Best-effort: a split failure is logged, never fatal.
+            reagg: {
+                switch (self.getSyncStatus()) {
+                    .synced => {},
+                    else => break :reagg,
+                }
+                if (aggregated_attestations.len == 0) break :reagg;
+
+                const justified_slot = self.forkChoice.getLatestJustified().slot;
+                var split_mask = self.allocator.alloc(bool, aggregated_attestations.len) catch break :reagg;
+                defer self.allocator.free(split_mask);
+                var selected: usize = 0;
+                for (aggregated_attestations, 0..) |agg_att, i| {
+                    split_mask[i] = false;
+                    if (selected >= MAX_REAGGREGATIONS_PER_BLOCK) continue;
+                    if (agg_att.data.target.slot <= justified_slot) continue;
+                    if (self.forkChoice.blockAttestationFullyCoveredLocally(&agg_att.data, &agg_att.aggregation_bits)) continue;
+                    split_mask[i] = true;
+                    selected += 1;
+                }
+                if (selected == 0) break :reagg;
+
                 var recovered_list = types.Type1ProofList.init(self.allocator) catch break :reagg;
                 defer {
                     for (recovered_list.slice()) |*t1| t1.deinit();
                     recovered_list.deinit();
                 }
-                types.deconstructType2BlockProof(
+                // Serialize the split proves against the propose-merge / aggregate proves for full
+                // rayon budget. No forkChoice.mutex is held here (the surrounding forkchoice calls
+                // each lock internally), so prove_gate is a leaf acquisition — no deadlock.
+                self.prove_gate.lock();
+                const deco_result = types.deconstructType2BlockProof(
                     self.allocator,
                     &post_state.validators,
                     &block.body.attestations,
                     @intCast(block.proposer_index),
                     signedBlock.proof.constSlice(),
+                    split_mask,
                     &recovered_list,
-                ) catch |e| {
+                );
+                self.prove_gate.unlock();
+                deco_result catch |e| {
                     self.logger.warn("failed to deconstruct block Type-2 proof for re-aggregation (root=0x{x}): {any}", .{ &block_root, e });
                     break :reagg;
                 };
+                // recovered_list holds one Type-1 per MASKED attestation, in body order; walk the
+                // mask in lockstep to pair each recovered proof with its attestation data. Store to
+                // latest_new (is_from_block=false) so it re-enters the aggregation pool.
+                var rec_idx: usize = 0;
                 for (aggregated_attestations, 0..) |agg_att, i| {
-                    if (i >= recovered_list.len()) break;
-                    const t1 = recovered_list.get(i) catch continue;
-                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, true) catch |e| {
+                    if (!split_mask[i]) continue;
+                    if (rec_idx >= recovered_list.len()) break;
+                    const t1 = recovered_list.get(rec_idx) catch {
+                        rec_idx += 1;
+                        continue;
+                    };
+                    rec_idx += 1;
+                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false) catch |e| {
                         self.logger.warn("failed to store re-aggregated payload for block attestation index={d}: {any}", .{ i, e });
                     };
                 }
@@ -4527,15 +4591,22 @@ pub const BeamChain = struct {
         slot_window_buf[slot_window_len] = @intCast(slot);
         slot_window_len += 1;
 
+        // Serialize against the propose-merge / deconstruct proves for full rayon budget. Acquired
+        // as the OUTERMOST lock here — aggregateForSlots takes forkChoice.mutex INSIDE — so the
+        // order is always prove_gate -> fcmutex, never the reverse (no cycle with the leaf
+        // acquisitions in buildBlockProof / deconstruct).
+        chain.prove_gate.lock();
         const aggregations = chain.forkChoice.aggregateForSlots(
             &validators_owned,
             slot_window_buf[0..slot_window_len],
             node,
             publishOneAggregate,
         ) catch |err| {
+            chain.prove_gate.unlock();
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return;
         };
+        chain.prove_gate.unlock();
         defer chain.allocator.free(aggregations);
 
         if (aggregations.len > 0) {
@@ -6676,14 +6747,15 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     try std.testing.expect(found_valid);
 }
 
-test "produceBlock - already-justified target skipped, genesis self-vote exemption" {
+test "produceBlock - already-justified target skipped, genesis self-vote filtered by time-forward guard" {
     // Two assertions:
     //   (a) NEGATIVE: a non-genesis attestation whose target slot is already justified
     //       must be excluded from the produced block.
-    //   (b) POSITIVE: a genesis self-vote (source.slot==0, target.slot==0) must be
-    //       included even though slot 0 is already justified — the exemption in
-    //       isSlotJustifiedForBuild explicitly allows it for fork-choice bootstrapping.
-    // Both attestations are stored; the test asserts (a) is absent and (b) is present.
+    //   (b) NEGATIVE: a genesis self-vote (source.slot==0, target.slot==0) must be
+    //       excluded too — leanSpec build_block skips any attestation with
+    //       target.slot <= source.slot before the justification checks, so a self-vote
+    //       (target.slot == source.slot == 0) never reaches the block.
+    // Both attestations are stored; the test asserts both are absent.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -6725,11 +6797,10 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
 
-    // (b) POSITIVE: genesis self-vote — source.slot==0, target.slot==0.
-    // Slot 0 is already justified (finalized genesis slot), but the exemption
-    // must let this through the target-already-justified filter.
-    // historical_block_hashes[0] == blockRoots[0] once block 1 is applied,
-    // so the chain-match check passes too.
+    // (b) NEGATIVE: genesis self-vote — source.slot==0, target.slot==0.
+    // leanSpec build_block skips any attestation with target.slot <= source.slot
+    // before the justification checks, so a self-vote (target.slot == source.slot)
+    // is filtered out by the time-forward guard and must NOT reach the block.
     const genesis_root = mock_chain.blockRoots[0];
     const att_genesis_self_vote = types.AttestationData{
         .slot = 0,
@@ -6757,8 +6828,8 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
         }
     }
 
-    // (b) Positive: the genesis self-vote must appear — this exercises the
-    // positive path of the exemption.
+    // (b) Negative: the genesis self-vote must NOT appear — the time-forward guard
+    // (target.slot <= source.slot) drops it before any justification check.
     var found_genesis_sv = false;
     for (atts) |att| {
         if (att.data.source.slot == 0 and att.data.target.slot == 0 and
@@ -6768,7 +6839,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote exempti
             found_genesis_sv = true;
         }
     }
-    try std.testing.expect(found_genesis_sv);
+    try std.testing.expect(!found_genesis_sv);
 }
 test "BorrowedState: cloneAndRelease success path against real BeamState" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
