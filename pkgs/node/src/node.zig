@@ -326,34 +326,24 @@ pub const BeamNode = struct {
         //   The gossip subsystem (see `pkgs/network/src/ethlibp2p.zig`) owns the
         //   `GossipMessage` for the entire duration of this callback. It is the
         //   standard libp2p callback contract: the buffer is not recycled, freed
-        //   or mutated until `onGossip` returns. We rely on this twice — once
-        //   for the pre-lock `hashTreeRoot` read of `data.block.block` and again
-        //   inside the locked section for the same field. If a future refactor
-        //   ever changes that contract (e.g. arena-pooled message buffers), the
-        //   pre-lock read becomes a use-after-free and this comment must be the
-        //   place to revisit. Do NOT cache or stash `data` past this scope.
+        //   or mutated until `onGossip` returns. Do NOT cache or stash `data`
+        //   past this scope.
         //
-        // Pre-lock work (issue #786): hashTreeRoot over a BeamBlock is pure CPU
-        // work that does not touch any shared state, but it can be expensive on
-        // large blocks (up to MAX_ATTESTATIONS_DATA aggregated XMSS proofs ⇒
-        // hundreds of KB to MBs of tree-hashing). Computing it before locking
-        // shrinks the critical section and lets `onInterval` make progress on
-        // the libxev thread in parallel. The computed root is reused in every
-        // downstream branch (success path + error paths) so we never recompute
-        // under the lock.
+        // `precomputed_block_root` is computed lazily — only when the block's
+        // parent is NOT already in fork-choice (the orphan-cache path, where the
+        // root is needed as a cache key synchronously on the libxev thread).
         //
-        // `precomputed_block_root` stays `undefined` for non-block gossip
-        // messages and is read only inside the `.block` arm of the switch
-        // below (and its error sub-branches). Any future code path that reads
-        // it outside that arm will hit Zig's `undefined` poison in debug
-        // builds — intentional defensive behavior.
-        var precomputed_block_root: types.Root = undefined;
-        if (data.* == .block) {
-            zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
-                self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
-                return;
-            };
-        }
+        // For the common case (parent present, block dispatched to chain-worker),
+        // we skip hashTreeRoot on libxev entirely (#942): the chain-worker thunk
+        // computes the root off-thread inside `onBlock`. The libxev-side hasBlock
+        // dedup is also skipped in this path; `protoArray.onBlock` performs the
+        // same dedup on the worker thread (early-out at line 97-101 of
+        // forkchoice.zig). The trade-off is that re-arriving gossip blocks whose
+        // root is already in protoArray will run STF on the worker before the
+        // protoArray no-op dedup fires; this is rare and accepted (#942 follow-up
+        // data from `zeam_libxev_callback_duration_seconds` will confirm).
+        //
+        // `precomputed_block_root` is null for all non-block gossip types.
 
         // Slice (a-3): the outer BeamNode.mutex is gone. Each chain entry
         // point inside the switch arms takes its own per-resource locks
@@ -361,6 +351,8 @@ pub const BeamNode = struct {
         // root_to_slot_lock, events_lock, forkChoice}); network state
         // mutations go through `Network`'s LockedMap / BlockCache /
         // ConnectedPeers helpers. See docs/threading_refactor_slice_a.md.
+
+        var precomputed_block_root: ?types.Root = null;
 
         switch (data.*) {
             .block => |signed_block| {
@@ -378,12 +370,24 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // Reuse the root we computed before taking the lock.
-                const block_root = precomputed_block_root;
-
-                _ = self.network.removePendingBlockRoot(block_root);
-
                 if (!hasParentBlock) {
+                    // Orphan path: compute block_root on libxev — needed as cache
+                    // key for `cacheBlockAndFetchParent` and `removePendingBlockRoot`.
+                    // This is a rare path (parent not yet imported), so the hash cost
+                    // here is acceptable.
+                    const hash_start_ns = zeam_utils.monotonicTimestampNs();
+                    var orphan_block_root: types.Root = undefined;
+                    zeam_utils.hashTreeRoot(types.BeamBlock, block, &orphan_block_root, self.allocator) catch |err| {
+                        self.logger.warn("failed to compute block root for orphan gossip block slot={d}: {any}", .{ block.slot, err });
+                        return;
+                    };
+                    const hash_elapsed_s = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - hash_start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                    zeam_metrics.observeLibxevCallback("onGossip.block.hash_tree_root", hash_elapsed_s);
+                    precomputed_block_root = orphan_block_root;
+                    const block_root = orphan_block_root;
+
+                    _ = self.network.removePendingBlockRoot(block_root);
+
                     // Cache this block for later processing when parent arrives
                     if (self.cacheBlockAndFetchParent(block_root, signed_block, 0)) |_| {
                         self.logger.debug(
@@ -417,6 +421,8 @@ pub const BeamNode = struct {
                     // Return early - don't pass to chain until parent arrives
                     return;
                 }
+                // hasParentBlock==true: fall through with precomputed_block_root=null.
+                // chain.onGossip and the chain-worker compute the root off libxev.
             },
             .attestation => |signed_attestation| {
                 const slot = signed_attestation.message.message.slot;
@@ -442,25 +448,36 @@ pub const BeamNode = struct {
             },
         }
 
-        // Slice (e) of #803: thread `precomputed_block_root` through
-        // chain.onGossip so the chain layer doesn't recompute the
-        // hash-tree root we already have. For non-block gossip
-        // (attestation/aggregation) we pass `null`; the chain layer
-        // ignores it on those branches.
-        const root_for_chain: ?types.Root = if (data.* == .block) precomputed_block_root else null;
+        // Issue #942: for the common gossip-block path (parent present),
+        // `precomputed_block_root` is null — chain.onGossip defers the hash to
+        // the chain-worker. For the orphan path and non-block gossip it is either
+        // the root computed above or null respectively; chain.onGossip ignores it
+        // on attestation/aggregation branches.
+        const root_for_chain: ?types.Root = precomputed_block_root;
         const result = self.chain.onGossip(data, sender_peer_id, root_for_chain) catch |err| {
             switch (err) {
                 // Block rejected because it's before finalized - drop it and prune any cached
                 // descendants we might still be holding onto.
                 error.PreFinalizedSlot => {
                     if (data.* == .block) {
-                        // Reuse the root we computed before taking the lock (issue #786).
-                        const block_root = precomputed_block_root;
-                        self.logger.info(
-                            "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
-                            .{&block_root},
-                        );
-                        _ = self.network.pruneCachedBlocks(block_root, null);
+                        // For the orphan path precomputed_block_root is non-null; for
+                        // the common (parent-present) path it is null — chain.onGossip
+                        // computed the root on libxev via its own lazy path. Skip
+                        // pruneCachedBlocks in the null case; any cached descendants
+                        // will age out naturally (block was pre-finalized so they are
+                        // all stale anyway — no liveness impact).
+                        if (precomputed_block_root) |block_root| {
+                            self.logger.info(
+                                "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
+                                .{&block_root},
+                            );
+                            _ = self.network.pruneCachedBlocks(block_root, null);
+                        } else {
+                            self.logger.info(
+                                "gossip block slot={d} rejected as pre-finalized (root not computed on libxev)",
+                                .{data.block.block.slot},
+                            );
+                        }
                     }
                     return;
                 },
@@ -2588,6 +2605,12 @@ pub const BeamNode = struct {
 
         var current_interval: isize = start_interval;
         while (current_interval <= itime_intervals) : (current_interval += 1) {
+            // Issue #942: measure how long each interval tick keeps the libxev thread busy.
+            const interval_tick_start_ns = zeam_utils.monotonicTimestampNs();
+            defer {
+                const elapsed_s = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - interval_tick_start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                zeam_metrics.observeLibxevCallback("onInterval.tick", elapsed_s);
+            }
             const interval: usize = @intCast(current_interval);
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
