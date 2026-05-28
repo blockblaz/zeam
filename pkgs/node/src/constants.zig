@@ -150,7 +150,12 @@ pub fn gossipStallThresholdMs() u64 {
 // recursive head-by-root walk. When the peer's head is more than this many slots
 // ahead of ours, we issue a single ranged request to catch up efficiently rather
 // than chasing the parent chain one block at a time.
-pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 64;
+//
+// Kept small: the head-by-root walk fetches one block per request (with peer-rotation
+// retries), so it is only cheap for a handful of recently-missed blocks. A
+// meaningfully-behind node (e.g. a late joiner) catches up far faster via a single
+// batched `blocks_by_range` request, so anything beyond a few slots prefers range sync.
+pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 4;
 
 // Maximum `blocks_by_range` catch-up attempts (peer rotation + fallback) before
 // switching to head-by-root parent walk. Issue #893.

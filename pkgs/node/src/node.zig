@@ -2106,7 +2106,16 @@ pub const BeamNode = struct {
                 }
 
                 const end_slot_exclusive: types.Slot = start_slot + count;
-                const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+                // Use the DB-PERSISTED finalized slot as the index/walk boundary, NOT the in-memory
+                // forkChoice value. processFinalizationAdvancement updates in-memory finalization,
+                // then (later) commits the finalized slot index + persisted-slot in one batch, then
+                // prunes forkChoice. During that lag the in-memory finalized is ahead of the DB
+                // index: trusting it makes the finalized loop below skip slots whose index is not yet
+                // written, producing a response that starts past start_slot → the requester sees a
+                // fork mismatch and aborts to the slow blocks_by_root walk. The persisted value, by
+                // contrast, always matches what the index actually holds, and during the lag the
+                // still-unpruned forkChoice walk covers the remaining (lower) slots contiguously.
+                const finalized_slot = self.chain.db.loadLatestFinalizedSlot(database.DbDefaultNamespace) orelse 0;
 
                 // ---- Finalized range: use DB slot index ----
                 // Slots <= finalized_slot are indexed in DbFinalizedSlotsNamespace (slot → root).
