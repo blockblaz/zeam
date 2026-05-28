@@ -174,7 +174,6 @@ pub fn verifySignatures(
     zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
 }
 
-
 pub fn verifySingleAttestation(
     allocator: Allocator,
     state: *const types.BeamState,

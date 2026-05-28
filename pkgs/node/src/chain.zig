@@ -3542,7 +3542,6 @@ pub const BeamChain = struct {
 
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
-
             }
 
             // devnet5 (#16): re-aggregation (leanSpec `_deconstruct_block_into_store`). Split the
