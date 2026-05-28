@@ -839,6 +839,103 @@ const CompactGroupResult = struct {
     signature: aggregation.AggregatedSignatureProof,
 };
 
+/// Returns true if every bit set in `subset` is also set in `superset`,
+/// i.e. `superset` covers a (non-strict) superset of `subset`'s validators.
+/// Out-of-bounds bits in either bitlist are treated as zero (unset), which
+/// matches `AggregationBits.get(i) catch false` semantics elsewhere in this
+/// file. Pure read-only helper; allocates nothing.
+pub fn participantsContainsAll(superset: attestation.AggregationBits, subset: attestation.AggregationBits) bool {
+    var i: usize = 0;
+    while (i < subset.len()) : (i += 1) {
+        const sub_bit = subset.get(i) catch false;
+        if (!sub_bit) continue;
+        const sup_bit = if (i < superset.len()) (superset.get(i) catch false) else false;
+        if (!sup_bit) return false;
+    }
+    return true;
+}
+
+/// Drop greedy-selected children whose participant set is fully covered by
+/// another selected child's. `extendProofsGreedily` is called twice in
+/// `prepareAggregateAttData` (new_payloads then known_payloads); each call
+/// only counts new coverage on top of already-selected children from
+/// previous calls, so a proof picked from new_payloads can be strictly
+/// subsumed by a proof later picked from known_payloads — the second pass
+/// could not see new_payloads' candidate to compare against. Both end up
+/// in `selected_children`, and the combined `rec_xmss_aggregate` STARK
+/// merges them into a proof equivalent to the dominating child alone,
+/// paying ~4 s of prove time for no extra validator coverage (#940).
+///
+/// This pass removes any child whose participants are contained in another
+/// selected child's. Validator union is preserved (the dominating child
+/// already covers everything the dropped child did), so `covered_by_children`
+/// stays correct and the gossip-sig filter at the call site is unaffected.
+/// When only one child remains after pruning and there are no gossip sigs,
+/// the existing `!has_gossip and selected_children.len == 1` fast path
+/// below skips the STARK entirely.
+///
+/// Tie-break for equal sets: keep the lower-indexed entry (which comes from
+/// `new_payloads` first, then `known_payloads`) so behaviour is stable.
+fn pruneSubsumedChildren(
+    selected_children: *std.ArrayList(aggregation.AggregatedSignatureProof),
+) void {
+    if (selected_children.items.len < 2) return;
+    var i: usize = 0;
+    while (i < selected_children.items.len) {
+        const i_bits = selected_children.items[i].participants;
+        var subsumed = false;
+        for (selected_children.items, 0..) |*other, j| {
+            if (i == j) continue;
+            const j_bits = other.participants;
+            if (!participantsContainsAll(j_bits, i_bits)) continue;
+            // i ⊆ j. Drop i unless the sets are equal AND j comes after i —
+            // in the equal case keep the lower-indexed entry.
+            const equal = participantsContainsAll(i_bits, j_bits);
+            if (equal and j > i) continue;
+            subsumed = true;
+            break;
+        }
+        if (subsumed) {
+            selected_children.items[i].deinit();
+            _ = selected_children.orderedRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Returns true if any stored aggregate for `data` in `payloads_map` already
+/// covers every validator id in `raw_vids` (i.e. running an aggregator pass
+/// would not add any new coverage). #940 deferred-aggregation guard: once
+/// an aggregate dominates the raw signature set we hold, the next slot tick
+/// should skip and let the next gossip arrival re-fire the aggregator. An
+/// empty `raw_vids` is treated as "covered" (vacuously true for any stored
+/// proof, including no proofs — but the caller's other early-exit paths
+/// already handle that no-input case).
+fn anyStoredProofCoversAll(
+    raw_vids: *const std.DynamicBitSet,
+    payloads_map: ?*const AggregatedPayloadsMap,
+    data: attestation.AttestationData,
+) bool {
+    const pm = payloads_map orelse return false;
+    const candidates = pm.get(data) orelse return false;
+    for (candidates.items) |*stored| {
+        const p = &stored.proof.participants;
+        var all_covered = true;
+        var bit_idx: usize = 0;
+        while (bit_idx < raw_vids.capacity()) : (bit_idx += 1) {
+            if (!raw_vids.isSet(bit_idx)) continue;
+            const covered_by_proof = bit_idx < p.len() and (p.get(bit_idx) catch false);
+            if (!covered_by_proof) {
+                all_covered = false;
+                break;
+            }
+        }
+        if (all_covered) return true;
+    }
+    return false;
+}
+
 pub fn attestationDataLessThan(_: void, a: attestation.AttestationData, b: attestation.AttestationData) bool {
     if (a.slot != b.slot) return a.slot < b.slot;
     const head_cmp = std.mem.order(u8, &a.head.root, &b.head.root);
@@ -962,22 +1059,67 @@ fn prepareAggregateAttData(
     var message_hash: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(attestation.AttestationData, data, &message_hash, allocator);
 
+    const max_validator = validators.len();
+
+    // Collect the validator ids backed by a raw XMSS signature for this att_data
+    // up front (#940 deferred-aggregation path). Two uses below:
+    //   1. If any single stored aggregate already covers every raw vid, the
+    //      worker has nothing new to add — skip.
+    //   2. Otherwise, pass `raw_vids` as the `gossip_available` argument to
+    //      `extendProofsGreedily` so the greedy pick does not select children
+    //      whose only validator coverage is already in the raw set. Combined
+    //      with the change in `commitOneAggregateResult` to no longer delete
+    //      live raws after a commit, this converts the previously dominant
+    //      "recursive merge of stored aggregate + new raws" pattern (mean
+    //      ~4.5 s per call on devnet) into a flat re-prove over the raw set
+    //      (~0.5 s).
+    var raw_vids = try std.DynamicBitSet.initEmpty(allocator, max_validator);
+    defer raw_vids.deinit();
+
+    if (signatures_map.get(data)) |im| {
+        var vid_it = im.iterator();
+        while (vid_it.next()) |entry| {
+            const vid: usize = @intCast(entry.key_ptr.*);
+            const sig_entry = entry.value_ptr.*;
+            if (std.mem.eql(u8, &sig_entry.signature, &ZERO_SIGBYTES)) continue;
+            if (vid >= max_validator) continue;
+            if (vid >= raw_vids.capacity()) try raw_vids.resize(vid + 1, false);
+            raw_vids.set(vid);
+        }
+    }
+
+    // Skip when an existing stored aggregate already dominates our raw set.
+    // Empty raw_vids would also short-circuit here, but the existing
+    // `!has_gossip and !has_children` branch below covers that case more
+    // cleanly (after greedy runs and decides whether to bring in children).
+    if (raw_vids.count() > 0) {
+        if (anyStoredProofCoversAll(&raw_vids, new_payloads, data) or
+            anyStoredProofCoversAll(&raw_vids, known_payloads, data))
+        {
+            return .{ .data = data, .outcome = .skip };
+        }
+    }
+
     var selected_children: std.ArrayList(aggregation.AggregatedSignatureProof) = .empty;
     errdefer {
         for (selected_children.items) |*child| child.deinit();
         selected_children.deinit(allocator);
     }
 
-    const max_validator = validators.len();
-
     var covered_by_children = try std.DynamicBitSet.initEmpty(allocator, max_validator);
     defer covered_by_children.deinit();
 
-    var empty_available = try std.DynamicBitSet.initEmpty(allocator, max_validator);
-    defer empty_available.deinit();
-
-    try extendProofsGreedily(allocator, new_payloads, data, &selected_children, &covered_by_children, &empty_available);
-    try extendProofsGreedily(allocator, known_payloads, data, &selected_children, &covered_by_children, &empty_available);
+    try extendProofsGreedily(allocator, new_payloads, data, &selected_children, &covered_by_children, &raw_vids);
+    try extendProofsGreedily(allocator, known_payloads, data, &selected_children, &covered_by_children, &raw_vids);
+    // Drop children whose participant set is dominated by another selected
+    // child's. The two greedy passes above scan new_payloads and known_payloads
+    // independently and cannot cross-compare candidates, so a small proof from
+    // new_payloads can survive even when a strictly larger known_payloads proof
+    // is later selected on top. Merging dominated children via STARK costs
+    // ~4 s per call for no extra coverage (#940). `covered_by_children` is
+    // unaffected because the dominating child already covers the dropped
+    // child's validators.
+    pruneSubsumedChildren(&selected_children);
 
     var sigmap_sigs: std.ArrayList(xmss.Signature) = .empty;
     errdefer {

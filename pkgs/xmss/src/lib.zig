@@ -18,6 +18,7 @@ pub const mergeType1ToType2 = aggregate.mergeType1ToType2;
 pub const splitType2ByMessage = aggregate.splitType2ByMessage;
 pub const verifyType2 = aggregate.verifyType2;
 pub const aggregate_module = aggregate;
+pub const shadow_cost = aggregate.shadow_cost;
 
 const hashsig = @import("hashsig.zig");
 pub const KeyPair = hashsig.KeyPair;

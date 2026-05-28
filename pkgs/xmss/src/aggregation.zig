@@ -3,6 +3,7 @@ const hashsig = @import("hashsig.zig");
 const ssz = @import("ssz");
 const zeam_metrics = @import("@zeam/metrics");
 const zeam_utils = @import("@zeam/utils");
+pub const shadow_cost = @import("shadow_cost.zig");
 
 pub const AggregationError = error{
     PublicKeysSignatureLengthMismatch,
@@ -235,15 +236,23 @@ pub fn aggregateType1(
     );
     if (rc == -2) return AggregationError.ProofTooLarge;
     if (rc != 0) return AggregationError.Type1AggregateFailed;
-    recordXmssProveDuration(prove_start_ns);
+    // #940 labeled wall-time metric (num_raw / num_children buckets), measured Zig-side so it is
+    // independent of the FFI internals. (The 3-way FFI phase split was an investigation tool tied
+    // to the pre-devnet5 FFI and is not ported onto the new aggregate_type_1 surface.)
+    recordXmssProveDuration(prove_start_ns, raw_pks.len, num_children);
     try appendAll(out, buf[0..written]);
+
+    // #944 shadow sim-cost: model aggregation CPU time on the virtual clock (no-op unless a rate
+    // is configured). Sleeps on the calling (aggregation worker) thread.
+    const shadow_delay_ns = shadow_cost.aggregateDelayNs(raw_pks.len);
+    if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
 
-fn recordXmssProveDuration(start_ns: i128) void {
+fn recordXmssProveDuration(start_ns: i128, num_raw: usize, num_children: usize) void {
     const end_ns = zeam_utils.monotonicTimestampNs();
     const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
     const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-    zeam_metrics.observeXmssRecAggregateProve(elapsed_s);
+    zeam_metrics.observeXmssRecAggregateProve(elapsed_s, num_raw, num_children);
 }
 
 /// Verify a Type-1 proof. `pks` are the participants' public-key handles; the (message, slot)
@@ -258,6 +267,12 @@ pub fn verifyType1(
     const wire = proof.constSlice();
     const ok = xmss_verify_type_1(pks.ptr, pks.len, message_hash, slot, wire.ptr, wire.len);
     if (!ok) return AggregationError.Type1VerifyFailed;
+
+    // #944 shadow sim-cost: model verification CPU time on the virtual clock (no-op unless a rate
+    // is configured). devnet5 replaced verifyAggregatedPayload with verifyType1, so the verify-cost
+    // injection moves here.
+    const shadow_delay_ns = shadow_cost.verifyDelayNs(pks.len);
+    if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
 
 /// Merge N Type-1 proofs (each over a distinct message) into one Type-2 proof.
