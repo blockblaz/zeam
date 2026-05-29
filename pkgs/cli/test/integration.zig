@@ -526,7 +526,7 @@ const SSEClient = struct {
 
         // The SSE stream is intentionally long-lived, so a plain blocking read
         // can hang forever when the simulator stops emitting events before the
-        // test's outer deadline is reached (observed on macOS CI in #900). Use
+        // test's outer deadline is reached (observed on macOS CI). Use
         // the std.Io timeout path directly rather than poll+Reader: on macOS CI
         // the stream reader can still block after readiness, preventing the
         // outer deadline from being checked.

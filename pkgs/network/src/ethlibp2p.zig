@@ -33,15 +33,15 @@ const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 ///
 /// XMSS/post-quantum signatures are substantially larger than BLS: a single
 /// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
-/// MAX_ATTESTATIONS_DATA (8) attestations each with such a proof.  On devnet4
-/// a legitimate block reached ~9.37 MB, exceeding the 4 MB RPC limit and
-/// triggering error.TooLarge (issue #723).
+/// MAX_ATTESTATIONS_DATA (8) attestations each with such a proof. A legitimate
+/// block has been observed at ~9.37 MB, exceeding the 4 MB RPC limit and
+/// triggering error.TooLarge.
 ///
-/// Set to 50 MB to accommodate current devnet block sizes with room to grow.
-/// Revisit once the leanSpec formalises a MAX_GOSSIP_BLOCK_SIZE constant.
+/// Set to 50 MB to accommodate current block sizes with room to grow.
+/// Revisit once a MAX_GOSSIP_BLOCK_SIZE constant is formalised.
 ///
-/// TODO(#855 review #14): 50 MB × N peers is a real memory-pressure surface.
-/// Track in a follow-up issue once the spec lands and we can lower this.
+/// TODO: 50 MB × N peers is a real memory-pressure surface; lower it once
+/// the limit is formalised.
 const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
@@ -134,8 +134,8 @@ fn validateSnappyHeader(
 
 /// RPC frame snappy-header validator. Used by `parseRequestFrame` and
 /// `parseResponseFrame` to bound declared sizes before snappy-frame decode.
-/// (Renamed from `validateGossipSnappyHeader` in PR #855: the original
-/// name was inverted — it was always RPC, never gossip.)
+/// (Renamed from `validateGossipSnappyHeader`: the original name was
+/// inverted — it was always RPC, never gossip.)
 fn validateRpcSnappyHeader(message_bytes: []const u8) FrameDecodeError!SnappyHeader {
     return validateSnappyHeader(message_bytes, MAX_RPC_MESSAGE_SIZE) catch |e| switch (e) {
         error.EmptyMessage => return error.EmptyFrame,
@@ -158,8 +158,8 @@ fn validateRpcSnappyHeader(message_bytes: []const u8) FrameDecodeError!SnappyHea
 /// sizes; it does not (and cannot) verify body integrity — that's the
 /// decoder's job.
 ///
-/// Two-layer defense exit criteria (PR #855 review #6): keep this guard
-/// permanently. It serves three purposes the upstream zig-snappy library
+/// Two-layer defense: keep this guard permanently. It serves three purposes
+/// the upstream zig-snappy library
 /// can't: (a) rejects oversized declared sizes pre-allocation using zeam's
 /// per-topic limits, (b) gives callers a typed error so we can attribute
 /// attacker shapes in logs/metrics, (c) acts as a safety net if a future
@@ -373,7 +373,7 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
 
 /// 1-of-N sample counter for malformed-message debug dumps. Without this gate,
 /// a peer spamming garbage gossip (e.g. sustained 1k msg/s) would fill the
-/// disk with one debug file per message (PR #855 review #5). We only persist
+/// disk with one debug file per message. We only persist
 /// `1` of every `MALFORMED_DUMP_SAMPLE_RATE` rejections; the rest are logged
 /// inline. The counter is process-local and racy across threads, which is
 /// fine — the goal is *not* exact 1:1024 sampling, just bounded disk pressure.
@@ -394,7 +394,7 @@ fn shouldPersistMalformedDump() bool {
 /// Previously returned `?[]const u8` (the allocated filename) while also doing
 /// `defer allocator.free(filename)` — so callers received a dangling pointer and
 /// segfaulted when logging it.  The fix: log from inside this function and return
-/// a plain bool; callers no longer touch the filename string at all (#725).
+/// a plain bool; callers no longer touch the filename string at all.
 fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
     const io = std.Io.Threaded.global_single_threaded.io();
     // Create dumps directory if it doesn't exist
@@ -502,13 +502,13 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     const topic_slice = std.mem.span(topic_str);
 
     // Block gossip messages carry XMSS/post-quantum aggregated signatures and can be
-    // substantially larger than the 4 MB RPC limit (devnet4 saw ~9.37 MB — issue #723).
+    // substantially larger than the 4 MB RPC limit (observed at ~9.37 MB).
     // Use the larger MAX_GOSSIP_BLOCK_SIZE for block topics; keep the tighter limit for
     // small messages (attestations, aggregations) to bound memory use.
     //
-    // TODO(#855 review #9): attestations/aggregations rarely approach
-    // MAX_RPC_MESSAGE_SIZE (4 MB). Tighter per-kind ceilings would let us
-    // reject earlier and reduce attacker amplification. Track separately.
+    // TODO: attestations/aggregations rarely approach MAX_RPC_MESSAGE_SIZE
+    // (4 MB). Tighter per-kind ceilings would let us reject earlier and
+    // reduce attacker amplification.
     const decode_limit: usize = switch (topic.gossip_topic.kind) {
         .block => MAX_GOSSIP_BLOCK_SIZE,
         else => MAX_RPC_MESSAGE_SIZE,
@@ -520,7 +520,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     // typed errors so we can attribute attacker shapes (corrupt varint vs.
     // oversized claim vs. truncated body) in logs and — eventually — metrics.
     //
-    // Note (PR #855 review #8): this decodes the leading varint, and so does
+    // Note: this decodes the leading varint, and so does
     // `snappyz.decodeWithMax` further down. The duplication is intentional and
     // worth O(10ns) per gossip message; both decoders MUST agree on the same
     // size-limit comparison (strict `>`, see `SnappyHeaderValidationError`).
@@ -528,10 +528,9 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     // pinned in the test block below will go red.
     _ = validateGossipSnappyHeader(message_bytes, decode_limit) catch |e| {
         rejectMalformedGossip(zigHandler, e, topic_slice, sender_peer_id_slice, message_bytes);
-        // TODO(#855 review #4): apply a libp2p gossipsub score penalty here
-        // so a peer spamming malformed gossip is ejected by the protocol
-        // instead of getting unlimited free retries. Out of scope for the
-        // panic fix; tracked separately.
+        // TODO: apply a libp2p gossipsub score penalty here so a peer
+        // spamming malformed gossip is ejected by the protocol instead of
+        // getting unlimited free retries.
         return;
     };
 
@@ -1165,9 +1164,9 @@ pub extern fn wait_for_network_ready(
 pub extern fn stop_network(network_id: u32) callconv(.c) void;
 /// Returns `true` when the publish was successfully enqueued onto the Rust-side
 /// swarm command channel, `false` when the command was dropped (network not
-/// initialized, channel full / closed, or null topic). See issue #808 — under
-/// load the bounded command channel can drop our own attestations and the
-/// caller needs to know rather than logging "published" unconditionally.
+/// initialized, channel full / closed, or null topic). Under load the bounded
+/// command channel can drop our own attestations and the caller needs to know
+/// rather than logging "published" unconditionally.
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
@@ -1204,8 +1203,8 @@ pub extern fn send_rpc_error_response(
     frame_len: usize,
 ) callconv(.c) void;
 
-/// Issue #808: tag space for `get_swarm_command_dropped_total`. Mirrors the
-/// `SwarmCommandDropReason` enum on the Rust side. **Stable wire contract** —
+/// Tag space for `get_swarm_command_dropped_total`. Mirrors the
+/// `SwarmCommandDropReason` enum on the Rust side. Stable wire contract:
 /// these tags are passed by value across FFI; do not renumber. Adding a new
 /// reason is fine; existing reasons must keep their tag.
 pub const SwarmCommandDropReason = enum(u32) {
@@ -1218,7 +1217,7 @@ pub const SwarmCommandDropReason = enum(u32) {
 /// Rust event loop, for the given reason tag. Counts are global across all
 /// networks; the metrics layer scrapes once per Prometheus hit and turns the
 /// monotonic count into a labeled `zeam_libp2p_swarm_command_dropped_total`
-/// counter via deltas (see `pkgs/metrics`).
+/// counter via deltas.
 pub extern fn get_swarm_command_dropped_total(reason_tag: u32) callconv(.c) u64;
 
 /// Last cumulative drop count we observed from the Rust side, per reason
@@ -1242,13 +1241,13 @@ fn refreshSwarmCommandDropMetric() void {
     }
 }
 
-/// leanMetrics PR #35: current number of remote peers in this node's
-/// gossipsub mesh, across all subscribed topics. Kept fresh from inside the
+/// Current number of remote peers in this node's gossipsub mesh, across all
+/// subscribed topics. Kept fresh from inside the
 /// rust-libp2p swarm task (gossipsub events, connection closes, 1s tick) and
 /// read here on every Prometheus scrape — "on scrape" semantics.
 pub extern fn get_mesh_peers_total(network_id: u32) callconv(.c) u64;
 
-/// leanMetrics PR #35 — `lean_gossip_mesh_peers`.
+/// `lean_gossip_mesh_peers`.
 ///
 /// The Rust glue keeps `MESH_PEERS_TOTAL` as a fixed-size
 /// `[AtomicU64; MAX_NETWORKS]` (slots for `network_id` 0…MAX_NETWORKS-1,
@@ -1280,7 +1279,7 @@ fn refreshMeshPeersMetric() void {
 /// `registerScrapeRefresher` stored a single callback, so this fan-out
 /// existed because registering each refresher individually would silently
 /// overwrite the previous one. The metrics module now keeps an append-only
-/// list of refreshers (see `pkgs/metrics/src/lib.zig`), so individual
+/// list of refreshers, so individual
 /// registration would also be safe — but we keep the fan-out for two
 /// reasons:
 ///   * one callback per module makes the registration site (below) easier
@@ -1337,7 +1336,7 @@ pub const EthLibp2p = struct {
     /// thread (status refresh, block fetch dispatch) and the rust-bridge
     /// thread (response / EOS / error delivery). Unsynchronized access
     /// corrupts callback entries and has produced GPEs in onReqRespResponse
-    /// during status RPC bursts (#933).
+    /// during status RPC bursts.
     rpc_callbacks_lock: zeam_utils.SyncMutex = .{},
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -1433,12 +1432,12 @@ pub const EthLibp2p = struct {
         const owned_fork_digest = try allocator.dupe(u8, params.fork_digest);
         errdefer allocator.free(owned_fork_digest);
 
-        // Issue #808: hand the metrics layer a callback so every Prometheus
+        // Hand the metrics layer a callback so every Prometheus
         // scrape pulls the latest cumulative drop counts from the Rust side
         // and turns them into deltas on `zeam_libp2p_swarm_command_dropped_total`.
         // Counts are global; registering once is enough even with multiple
         // EthLibp2p instances (the call is idempotent).
-        // leanMetrics PR #35: register the network-layer scrape
+        // Register the network-layer scrape
         // refresher. `registerScrapeRefresher` is now append-only (the
         // metrics module keeps a bounded list); we still register a
         // single network-layer fan-out (`refreshNetworkMetrics`) for
@@ -1531,9 +1530,7 @@ pub const EthLibp2p = struct {
         // mesh to every subnet on every node and defeated the bandwidth
         // savings of attestation subnets; the intermediate fix (read the
         // handler map after BeamNode.run()) required a strict startup order
-        // and did not surface late changes to the subscription set. See
-        // https://github.com/leanEthereum/leanSpec/blob/main/src/lean_spec/__main__.py
-        // for the spec-conformant selective subscribe.
+        // and did not surface late changes to the subscription set.
         self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetworkThread, .{CreateNetworkThreadArgs{
             .network_id = self.params.networkId,
             .handle = self,
@@ -1697,7 +1694,7 @@ pub const EthLibp2p = struct {
         );
 
         if (request_id == 0) {
-            // Issue #808: send_rpc_request returns 0 when the Rust-side swarm
+            // send_rpc_request returns 0 when the Rust-side swarm
             // command channel is uninitialized / full / closed, i.e. the
             // request never reached the wire. The Rust layer already logs
             // the specific reason and bumps `get_swarm_command_dropped_total`,
@@ -1924,7 +1921,7 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
     // node became unreachable.
     //
     // Each sub-case asserts both the rejection AND its specific error variant
-    // so log/metric attribution stays distinct (PR #855 review #2).
+    // so log/metric attribution stays distinct.
 
     // 1024 bytes of 0xef: the original Hive panic payload. Rejected as
     // InvalidVarint (every byte is a continuation byte; no terminator).
@@ -1961,7 +1958,7 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
 
     // Header-only buffer for a non-zero declared size: header is valid, body
     // is missing. Distinct error so callers can attribute truncated streams
-    // separately from corrupt headers (PR #855 review #7).
+    // separately from corrupt headers.
     var header_only_buf: [MAX_VARINT_BYTES]u8 = undefined;
     const header_only = uvarint.encode(usize, 32, &header_only_buf);
     try std.testing.expectError(
@@ -1972,7 +1969,7 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
     // Well-formed header followed by at least one payload byte: accepted.
     // The validator does *not* check that the body length matches the
     // declared uncompressed size — that's the decoder's job. See doc comment
-    // on `validateSnappyHeader` (PR #855 review #12).
+    // on `validateSnappyHeader`.
     var ok_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
     const ok_header = uvarint.encode(usize, 32, ok_buf[0..MAX_VARINT_BYTES]);
     ok_buf[ok_header.len] = 0x00;
@@ -2000,8 +1997,8 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
 
     // Boundary: declared == max_size is accepted (strict `>`); declared ==
     // max_size + 1 is rejected. Pinned to match upstream
-    // `snappyz.decodeWithMax`'s `if (block.blockLen > max_size)` contract
-    // (PR #855 review #13). If upstream ever flips to `>=` this test will
+    // `snappyz.decodeWithMax`'s `if (block.blockLen > max_size)` contract.
+    // If upstream ever flips to `>=` this test will
     // fail loudly instead of the validator silently disagreeing across a
     // 1-byte gap.
     var boundary_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
@@ -2015,7 +2012,7 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
 }
 
 test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic" {
-    // REGRESSION CANARY (PR #855 review #11): if this test ever panics the
+    // Regression canary: if this test ever panics the
     // whole test binary instead of returning `error.Corrupt`, the upstream
     // `zig-snappy` dependency has been downgraded below v0.0.5 and the
     // uvarint integer-overflow fix is gone. Restore the pin in `build.zig.zon`

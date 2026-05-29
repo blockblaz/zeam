@@ -40,11 +40,11 @@ pub const HashSigPrivateKey = hashsig.HashSigPrivateKey;
 /// `PublicKey.fromBytes` and CAS-installs the handle; lost-race writers
 /// free their handle and adopt the winner's.
 ///
-/// Replaces the previous `std.AutoHashMap` + `pubkey_cache_lock` design
-/// (P1 of #863). The cache backing is sized to `numValidators()` at
+/// Replaces the previous `std.AutoHashMap` + `pubkey_cache_lock` design.
+/// The cache backing is sized to `numValidators()` at
 /// chain init; out-of-range indices fall through to a non-cached
 /// deserialise. Validator-set growth (post-genesis additions) is not
-/// supported here yet — we expect that when leanSpec adds it, the
+/// supported here yet — when it lands, the
 /// fork-boundary handler will rebuild the cache with the new size.
 pub const PublicKeyCache = struct {
     /// One atomic per validator index; stores `@intFromPtr(handle)` or 0.
@@ -78,12 +78,11 @@ pub const PublicKeyCache = struct {
     ///
     /// Returns `HashSigError.ValidatorIndexOutOfRange` when
     /// `validator_index >= capacity`. The cache is sized at
-    /// `BeamChain.init` from `genesis.numValidators()`; lean spec does
-    /// not currently grow the validator set after genesis. If/when
+    /// chain init from `genesis.numValidators()`; the validator set
+    /// does not currently grow after genesis. If/when
     /// post-genesis growth lands, the fork-boundary handler must
     /// rebuild the cache with the new size — until then we fail loudly
-    /// rather than fall back to a leaky uncached deserialise (PR #884
-    /// review by @zclawz).
+    /// rather than fall back to a leaky uncached deserialise.
     pub fn getOrPut(self: *Self, validator_index: usize, pubkey_bytes: []const u8) HashSigError!*const HashSigPublicKey {
         if (validator_index >= self.slots.len) {
             return HashSigError.ValidatorIndexOutOfRange;

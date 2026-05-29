@@ -18,14 +18,13 @@ pub const AggregationError = error{
 };
 
 /// Maximum size of a compact (no-pubkeys) Type-1/Type-2 proof on the wire (512 KiB).
-/// Matches the leanSpec `ByteList512KiB` cap for `SignedBlock.proof` and proof payloads.
+/// Matches the `ByteList512KiB` cap for `SignedBlock.proof` and proof payloads.
 pub const MAX_AGGREGATE_PROOF_SIZE: usize = 512 * 1024;
 
 /// Variable-length byte list for compact Type-1/Type-2 proofs.
 pub const ByteList512KiB = ssz.utils.List(u8, MAX_AGGREGATE_PROOF_SIZE);
-/// Compat alias: devnet4 used `ByteListMiB` (1 MiB) for proof bytes; devnet5 standardizes on
-/// `ByteList512KiB` (leanSpec #717). Aliased so test/spectest infra referencing the old name keeps
-/// compiling against the devnet5 container.
+/// Compat alias: the old name used `ByteListMiB` (1 MiB) for proof bytes; the proof cap is now
+/// `ByteList512KiB`. Aliased so test/spectest infra referencing the old name keeps compiling.
 pub const ByteListMiB = ByteList512KiB;
 
 /// Per-component (message hash, slot) binding used when verifying a Type-2 proof.
@@ -34,11 +33,11 @@ pub const MessageBinding = struct {
     slot: u32,
 };
 
-// --- multisig-glue FFI (leanMultisig devnet5 Type-1/Type-2 surface) ---
+// --- multisig-glue FFI (leanMultisig Type-1/Type-2 surface) ---
 //
-// All wrappers are pure Zig + extern calls and are safe to call from any thread, BUT each one
-// drives the leanMultisig zk prover/verifier — they are heavy and MUST NOT be called from the
-// libxev thread. Run them on the chain worker / Io.Threaded pool (see issue #873).
+// All wrappers are pure Zig + extern calls and are safe to call from any thread, but each one
+// drives the leanMultisig zk prover/verifier — they are heavy and must not be called from the
+// libxev thread. Run them on the chain worker / Io.Threaded pool instead.
 
 /// Returns 0 on success, -1 if the prover bytecode is missing or init failed (never panics).
 extern fn xmss_setup_prover() callconv(.c) c_int;
@@ -136,7 +135,7 @@ pub fn setRayonThreads(num_threads: usize) void {
 }
 
 /// Initialize the XMSS prover (idempotent). Hard error on failure — the caller (block production
-/// / aggregation) must surface this, not silently skip (devnet5 no-fallback policy).
+/// / aggregation) must surface it rather than silently skip.
 pub fn setupProver() AggregationError!void {
     if (xmss_setup_prover() != 0) return AggregationError.ProverSetupFailed;
 }
@@ -147,7 +146,7 @@ pub fn setupVerifier() AggregationError!void {
     if (xmss_setup_verifier() != 0) return AggregationError.VerifierSetupFailed;
 }
 
-/// Compat wrapper: devnet5 split XMSS setup into separate `setupProver`/`setupVerifier`. main's
+/// Compat wrapper: XMSS setup is now split into separate `setupProver`/`setupVerifier`. Older
 /// call sites (CLI startup, test helpers) did one combined setup — this preserves that so they
 /// compile unchanged.
 pub fn setupXmssAggregation() AggregationError!void {
@@ -250,9 +249,9 @@ pub fn aggregateType1(
     );
     if (rc == -2) return AggregationError.ProofTooLarge;
     if (rc != 0) return AggregationError.Type1AggregateFailed;
-    // #940 labeled wall-time metric (num_raw / num_children buckets), measured Zig-side so it is
-    // independent of the FFI internals. (The 3-way FFI phase split was an investigation tool tied
-    // to the pre-devnet5 FFI and is not ported onto the new aggregate_type_1 surface.)
+    // Labeled wall-time metric (num_raw / num_children buckets), measured Zig-side so it is
+    // independent of the FFI internals. (The old 3-way FFI phase split was an investigation tool
+    // and is not ported onto the new aggregate_type_1 surface.)
     recordXmssProveDuration(prove_start_ns, raw_pks.len, num_children);
     try appendAll(out, buf[0..written]);
 

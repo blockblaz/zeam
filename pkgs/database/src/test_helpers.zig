@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
-/// Helper function to create a dummy block for testing. `proof` is the devnet5 Type-2 proof blob
+/// Helper function to create a dummy block for testing. `proof` is the Type-2 proof blob
 /// carried by `SignedBlock.proof`; ownership is moved into the returned block.
 pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, proof: types.ByteList512KiB) !types.SignedBlock {
     const attestations_list = try types.AggregatedAttestations.init(allocator);
@@ -72,7 +72,7 @@ pub fn createDummyRoot(fill_byte: u8) types.Root {
     return root;
 }
 
-/// Helper function to create a dummy devnet5 Type-2 proof blob with `num_bytes` filler bytes.
+/// Helper function to create a dummy Type-2 proof blob with `num_bytes` filler bytes.
 pub fn createDummyProof(allocator: Allocator, num_bytes: usize) !types.ByteList512KiB {
     var proof = try types.ByteList512KiB.init(allocator);
     errdefer proof.deinit();

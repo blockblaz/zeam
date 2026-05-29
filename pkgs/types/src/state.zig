@@ -24,7 +24,7 @@ const Validators = validator.Validators;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-// PQ devnet0 config
+// PQ config
 pub const BeamStateConfig = struct {
     genesis_time: u64,
 
@@ -381,7 +381,7 @@ pub const BeamState = struct {
         defer if (owned_cache) |*oc| oc.deinit();
         const block_cache = cache orelse &(owned_cache.?);
         if (owned_cache != null) {
-            // Only populate cache in fallback path (tests). Chain.zig maintains the global cache.
+            // Only populate cache in fallback path (tests). The chain layer maintains the global cache.
             try self.initRootToSlotCache(block_cache);
         }
 
@@ -480,8 +480,8 @@ pub const BeamState = struct {
             if (3 * target_justifications_count >= 2 * num_validators) {
                 // Record the justified target in the per-slot bitfield regardless of order.
                 try utils.setSlotJustified(finalized_slot, &self.justified_slots, target_slot, true);
-                // leanSpec PR #781: advance the latest_justified POINTER only when the new target is
-                // STRICTLY ahead. A block can carry supermajority attestations for several targets
+                // Advance the latest_justified pointer only when the new target is
+                // strictly ahead. A block can carry supermajority attestations for several targets
                 // processed in non-increasing slot order (e.g. 4, 9, 6); assigning unconditionally
                 // would drag latest_justified backward to 6 after 9, regressing the checkpoint and
                 // freezing finalization. The bitfield above still records every justified target.
@@ -1090,7 +1090,7 @@ test "root_to_slot_cache lifecycle" {
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
 
-    // Simulate chain.zig adding parent to cache before STF.
+    // Simulate the chain layer adding parent to cache before STF.
     try cache.put(block_1.parent_root, 0);
     try state.process_block(std.testing.allocator, block_1, logger, &cache);
 
@@ -1116,7 +1116,7 @@ test "root_to_slot_cache lifecycle" {
     att_0_to_1_transferred = true;
     defer block_2.deinit();
 
-    // Simulate chain.zig adding parent to cache before STF.
+    // Simulate the chain layer adding parent to cache before STF.
     try cache.put(block_2_parent_root, 1);
     try state.process_block(std.testing.allocator, block_2, logger, &cache);
 

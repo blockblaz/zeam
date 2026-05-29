@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 const AggregatedAttestation = attestation.AggregatedAttestation;
 pub const AggregatedAttestations = ssz.utils.List(AggregatedAttestation, params.VALIDATOR_REGISTRY_LIMIT);
 const Attestation = attestation.Attestation;
-// devnet5: a proposer assembles one Type-1 proof per body attestation (produced by the parallel
+// A proposer assembles one Type-1 proof per body attestation (produced by the parallel
 // per-att_data aggregation), then merges them with the proposer's own Type-1 into the single
 // Type-2 SignedBlock.proof. This list is the intermediate per-attestation Type-1 collection.
 pub const Type1ProofList = ssz.utils.List(aggregation.TypeOneMultiSignature, params.VALIDATOR_REGISTRY_LIMIT);
@@ -40,16 +40,14 @@ const freeJsonValue = utils.freeJsonValue;
 
 /// Default `min_aggregation_inputs` for the aggregator-role pre-filter.
 ///
-/// Surfaced on the CLI as `--min-aggregation-inputs` (see
-/// `pkgs/cli/src/main.zig`) and consumed by the aggregator wrapper in
-/// `pkgs/node/src/forkchoice.zig` (NOT by `computeAggregatedSignatures`,
-/// which is spec-pure and aggregates whatever it is given). Default
-/// `2`: aggregator skips publishing when an `att_data` has only a
-/// single local gossip sig and no peer payload, since the raw sig is
-/// already on the gossip topic and a 1-validator "aggregate" carries
-/// no consensus signal (#907 finding 4). `1` reverts to pre-#908
-/// behavior (always aggregate ≥1 sig). Higher values trade slot
-/// latency for fewer sub-threshold aggregates on chatty subnets.
+/// Surfaced on the CLI as `--min-aggregation-inputs` and consumed by the
+/// aggregator wrapper (NOT by `computeAggregatedSignatures`, which
+/// aggregates whatever it is given). Default `2`: aggregator skips
+/// publishing when an `att_data` has only a single local gossip sig and
+/// no peer payload, since the raw sig is already on the gossip topic and
+/// a 1-validator "aggregate" carries no consensus signal. `1` reverts to
+/// always aggregating ≥1 sig. Higher values trade slot latency for fewer
+/// sub-threshold aggregates on chatty subnets.
 pub const default_min_aggregation_inputs: u32 = 2;
 
 // signatures_map types for aggregation
@@ -395,8 +393,8 @@ pub const BeamBlock = struct {
 
 pub const SignedBlock = struct {
     block: BeamBlock,
-    // devnet5 / leanSpec #717: the single merged Type-2 proof over all attestation Type-1s + the
-    // proposer's Type-1, SSZ-encoded into this byte list (replaces devnet4's BlockSignatures).
+    // The single merged Type-2 proof over all attestation Type-1s + the proposer's Type-1,
+    // SSZ-encoded into this byte list (replaces the older per-block BlockSignatures).
     proof: xmss.ByteList512KiB,
 
     pub fn deinit(self: *SignedBlock) void {
@@ -419,7 +417,7 @@ pub const SignedBlock = struct {
     }
 };
 
-/// Build the single Type-2 block proof carried by `SignedBlock.proof` (leanSpec #717).
+/// Build the single Type-2 block proof carried by `SignedBlock.proof`.
 ///
 /// Inputs: one per-attestation Type-1 proof per body attestation (in body order, produced by the
 /// parallel per-att_data aggregation), plus the proposer's raw signature over the block root. We
@@ -527,12 +525,12 @@ pub fn buildType2BlockProof(
     for (encoded.items) |b| try out_proof.append(b);
 }
 
-/// Inverse of `buildType2BlockProof` (leanSpec `_deconstruct_block_into_store`): split the single
+/// Inverse of `buildType2BlockProof`: split the single
 /// Type-2 block proof back into per-attestation Type-1 proofs, but only for the attestations the
 /// caller selected via `split_mask` (the FFI split is an expensive recursive-STARK prove, so the
 /// caller skips attestations whose target is at/behind justified or already covered locally —
-/// matching the spec's "only spend a split on attestations that can still move justification
-/// forward / cover validators we don't already hold"). Each recovered Type-1 has its `participants`
+/// only spend a split on attestations that can still move justification
+/// forward / cover validators we don't already hold). Each recovered Type-1 has its `participants`
 /// restored from the matching attestation's aggregation bits (the FFI split leaves them empty).
 ///
 /// `split_mask` is parallel with `agg_attestations`. `out_type1s` must be an empty `Type1ProofList`;
@@ -657,14 +655,14 @@ pub const AggregatedAttestationsResult = struct {
     /// Spec-pure: this function aggregates whatever it is given. Callers
     /// that want to skip trivially-shaped inputs (e.g. the aggregator
     /// role wanting to avoid spending the full STARK prover budget on a
-    /// single-validator "aggregate" that carries no consensus signal —
-    /// see issue #907 finding 4) must filter the inputs they pass in.
+    /// single-validator "aggregate" that carries no consensus signal)
+    /// must filter the inputs they pass in.
     /// Block proposers, by contrast, MUST aggregate every `att_data`
     /// they choose to include in a block, even if its only input is a
     /// single gossip signature.
-    /// Aggregator batch entry: serial prep then sequential XMSS proves (ethlambda
-    /// worker loop). Parallel ThreadPool scope was removed — nested Rayon inside
-    /// each prove oversubscribed CPU and inflated p50/p95 on devnet (#925).
+    /// Aggregator batch entry: serial prep then sequential XMSS proves on the
+    /// worker loop. Parallel ThreadPool scope was removed — nested parallelism
+    /// inside each prove oversubscribed CPU and inflated p50/p95.
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
@@ -864,7 +862,7 @@ pub fn participantsContainsAll(superset: attestation.AggregationBits, subset: at
 /// could not see new_payloads' candidate to compare against. Both end up
 /// in `selected_children`, and the combined `rec_xmss_aggregate` STARK
 /// merges them into a proof equivalent to the dominating child alone,
-/// paying ~4 s of prove time for no extra validator coverage (#940).
+/// paying ~4 s of prove time for no extra validator coverage.
 ///
 /// This pass removes any child whose participants are contained in another
 /// selected child's. Validator union is preserved (the dominating child
@@ -906,7 +904,7 @@ fn pruneSubsumedChildren(
 
 /// Returns true if any stored aggregate for `data` in `payloads_map` already
 /// covers every validator id in `raw_vids` (i.e. running an aggregator pass
-/// would not add any new coverage). #940 deferred-aggregation guard: once
+/// would not add any new coverage). Deferred-aggregation guard: once
 /// an aggregate dominates the raw signature set we hold, the next slot tick
 /// should skip and let the next gossip arrival re-fire the aggregator. An
 /// empty `raw_vids` is treated as "covered" (vacuously true for any stored
@@ -1062,7 +1060,7 @@ fn prepareAggregateAttData(
     const max_validator = validators.len();
 
     // Collect the validator ids backed by a raw XMSS signature for this att_data
-    // up front (#940 deferred-aggregation path). Two uses below:
+    // up front (deferred-aggregation path). Two uses below:
     //   1. If any single stored aggregate already covers every raw vid, the
     //      worker has nothing new to add — skip.
     //   2. Otherwise, pass `raw_vids` as the `gossip_available` argument to
@@ -1071,7 +1069,7 @@ fn prepareAggregateAttData(
     //      with the change in `commitOneAggregateResult` to no longer delete
     //      live raws after a commit, this converts the previously dominant
     //      "recursive merge of stored aggregate + new raws" pattern (mean
-    //      ~4.5 s per call on devnet) into a flat re-prove over the raw set
+    //      ~4.5 s per call) into a flat re-prove over the raw set
     //      (~0.5 s).
     var raw_vids = try std.DynamicBitSet.initEmpty(allocator, max_validator);
     defer raw_vids.deinit();
@@ -1116,7 +1114,7 @@ fn prepareAggregateAttData(
     // independently and cannot cross-compare candidates, so a small proof from
     // new_payloads can survive even when a strictly larger known_payloads proof
     // is later selected on top. Merging dominated children via STARK costs
-    // ~4 s per call for no extra coverage (#940). `covered_by_children` is
+    // ~4 s per call for no extra coverage. `covered_by_children` is
     // unaffected because the dominating child already covers the dropped
     // child's validators.
     pruneSubsumedChildren(&selected_children);
@@ -1350,10 +1348,10 @@ fn runAggregateAttDataFfi(
 
 fn runAggregateAttDataPreps(allocator: Allocator, preps: []AggregateAttDataPrep, thread_pool: *ThreadPool) !void {
     _ = thread_pool;
-    // Ethlambda runs aggregation jobs sequentially on one blocking worker so
-    // Rayon gets the full CPU budget per prove. Parallel scope here nested
-    // ThreadPool workers each calling xmss_aggregate (Rayon inside) and hurt
-    // devnet aggregator p50 (#925).
+    // Run aggregation jobs sequentially on one blocking worker so each prove
+    // gets the full CPU budget. A parallel scope here nested ThreadPool workers
+    // each calling xmss_aggregate (already internally parallel) and hurt
+    // aggregator p50.
     for (preps) |*prep| {
         if (prep.outcome != .ffi) continue;
         const result = try runAggregateAttDataFfi(allocator, prep.data, &prep.outcome.ffi);
@@ -2025,7 +2023,7 @@ test "encode decode signed block with non-empty proof" {
     var attestations = try AggregatedAttestations.init(std.testing.allocator);
     errdefer attestations.deinit();
 
-    // devnet5: SignedBlock.proof is the opaque SSZ-encoded Type-2 proof blob. Round-trip a
+    // SignedBlock.proof is the opaque SSZ-encoded Type-2 proof blob. Round-trip a
     // non-empty payload and assert it survives byte-for-byte.
     var proof = try xmss.ByteList512KiB.init(std.testing.allocator);
     errdefer proof.deinit();
@@ -2125,7 +2123,7 @@ test "compactSingleProof: aggregation_bits matches participants when participant
     try std.testing.expectEqualSlices(u8, participants_bytes.items, bits_bytes.items);
 }
 
-// Regression (#929): single-child passthrough (.done) must not double-free when
+// Regression: single-child passthrough (.done) must not double-free when
 // computeSingleAggregatedSignature returns and prep.deinit runs.
 test "computeSingleAggregatedSignature: single-child passthrough survives prep deinit" {
     const allocator = std.testing.allocator;

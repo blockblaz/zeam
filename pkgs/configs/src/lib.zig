@@ -30,7 +30,7 @@ pub const ChainConfig = struct {
                         chainOpts.attestation_committee_count = 1;
                     }
                     if (chainOpts.max_attestations_data == null) {
-                        // leanSpec chain/config.py: MAX_ATTESTATIONS_DATA = 8. Keep the fallback in
+                        // MAX_ATTESTATIONS_DATA = 8. Keep the fallback in
                         // lockstep with params.MAX_ATTESTATIONS_DATA so the builder (config-driven)
                         // and verifySignatures (params constant) agree when config.yaml omits it.
                         chainOpts.max_attestations_data = @intCast(params.MAX_ATTESTATIONS_DATA);
@@ -85,7 +85,7 @@ const GenesisConfigError = error{
 ///   - `attestation_pubkey`: 52-byte public key as 104-char hex string
 ///   - `proposal_pubkey`: 52-byte public key as 104-char hex string
 ///
-/// This matches the cross-client genesis YAML convention defined by leanSpec.
+/// This matches the cross-client genesis YAML convention.
 ///
 /// Returns `GenesisSpec` with genesis time and validator pubkeys.
 /// Errors: `InvalidYamlShape`, `MissingGenesisTime`, `InvalidGenesisTime`, `MissingValidatorConfig`, `InvalidValidatorPubkeys`.
@@ -124,7 +124,7 @@ const ValidatorEntries = struct {
 
 /// Parses GENESIS_VALIDATORS as a list of structured entries.
 /// Each entry must be a map with `attestation_pubkey` and `proposal_pubkey` fields.
-/// This matches the cross-client genesis YAML convention defined by leanSpec.
+/// This matches the cross-client genesis YAML convention.
 fn parseValidatorEntriesFromYaml(
     allocator: Allocator,
     node: Yaml.Value,

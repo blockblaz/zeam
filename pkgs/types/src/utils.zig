@@ -245,7 +245,7 @@ pub fn sszCloneAndGetBytes(allocator: Allocator, comptime T: type, data: T, clon
 /// corrupted by ssz.serialize and must not be reused; call `deinit` on the source
 /// to release its heap allocations. Use this when the caller needs to mark the
 /// source consumed before any fallible deserialize or allocation step (see
-/// commitOneAggregateResult in forkchoice.zig).
+/// commitOneAggregateResult in the fork-choice layer).
 pub fn sszSerializeAndGetBytes(allocator: Allocator, comptime T: type, data: T) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(allocator);

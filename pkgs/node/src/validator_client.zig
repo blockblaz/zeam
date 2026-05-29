@@ -87,11 +87,11 @@ pub const ValidatorClient = struct {
 
         // if a new slot interval may be do a proposal
         switch (interval) {
-            // devnet5 (#14): block production is a proposer duty — the "am I proposer this slot?"
-            // decision lives here (chain.submitProposeOnInterval consults getSlotProposer). It is
-            // executed OFF the slot loop on a thread_pool worker, since the prod-scheme Type-2 merge
-            // is multi-second and would freeze gossip/tick handling if run inline. The worker
-            // produces, merges, and publishes itself, so this interval emits no synchronous output.
+            // Block production is a proposer duty — the "am I proposer this slot?" decision lives
+            // here (submitProposeOnInterval consults getSlotProposer). It runs off the slot loop on a
+            // thread_pool worker, since the prod-scheme Type-2 merge is multi-second and would freeze
+            // gossip/tick handling if run inline. The worker produces, merges, and publishes itself,
+            // so this interval emits no synchronous output.
             0 => {
                 self.chain.submitProposeOnInterval(node, time_intervals);
                 return null;
@@ -115,10 +115,10 @@ pub const ValidatorClient = struct {
         }
     }
 
-    // devnet5 (#14): block production moved off the slot loop to chain.submitProposeOnInterval /
-    // proposeImpl (a thread_pool worker). The old on-loop maybeDoProposal — which built the
-    // multi-second Type-2 merge inline and would freeze gossip/tick handling — was removed in
-    // favour of that single off-loop path.
+    // Block production moved off the slot loop to submitProposeOnInterval / proposeImpl (a
+    // thread_pool worker). The old on-loop maybeDoProposal — which built the multi-second Type-2
+    // merge inline and would freeze gossip/tick handling — was removed in favour of that single
+    // off-loop path.
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;

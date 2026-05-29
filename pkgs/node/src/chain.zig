@@ -23,10 +23,9 @@ const WaitGroup = thread_pool_pkg.WaitGroup;
 
 pub const fcFactory = @import("./forkchoice.zig");
 
-/// devnet5 (#16): cap on how many block attestations a single import may split back into Type-1s
-/// (`_deconstruct_block_into_store`). Each split is an expensive recursive-STARK prove, so even when
-/// in-sync we bound the per-block cost so re-aggregation never starves the propose merge. ethlambda
-/// uses the same per-block cap in its in-sync reaggregation path.
+/// Cap on how many block attestations a single import may split back into Type-1s when
+/// deconstructing a block into the store. Each split is an expensive recursive-STARK prove, so
+/// even when in-sync we bound the per-block cost so re-aggregation never starves the propose merge.
 const MAX_REAGGREGATIONS_PER_BLOCK: usize = 4;
 const constants = @import("./constants.zig");
 const tree_visualizer = @import("./tree_visualizer.zig");
@@ -73,18 +72,17 @@ pub const ChainOpts = struct {
     // Shared worker pool for CPU-bound work (signature verification).
     thread_pool: *ThreadPool,
     /// Surfaces the `--min-aggregation-inputs` CLI flag to the
-    /// per-`ForkChoice` aggregation threshold. See
-    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs` for the
-    /// default and `isTrivialAggregationInput` for the predicate semantics.
+    /// per-`ForkChoice` aggregation threshold. See `default_min_aggregation_inputs`
+    /// for the default and `isTrivialAggregationInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
     /// enforced lock-free by `submitAggregateOnInterval`. When the cap is
     /// reached the trigger is coalesced into `aggregate_reschedule_intervals`
-    /// and retried once when the in-flight worker finishes (see #907).
+    /// and retried once when the in-flight worker finishes.
     /// Kept low (default 4) so the queue drains quickly and the aggregator
-    /// stays focused on CURRENT slots rather than catching up old ones — per
-    /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
-    /// further-back slots are wasted work. See `BeamChain.aggregateImpl`.
+    /// stays focused on current slots rather than catching up old ones — the
+    /// slot filter is `{slot-1, slot}`, so aggregations for further-back slots
+    /// are wasted work. See `BeamChain.aggregateImpl`.
     aggregate_max_inflight: u32 = 4,
 };
 
@@ -107,7 +105,7 @@ pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
 
-    // devnet5: per-attestation Type-1 proofs (one per body AttestationData, parallel with the body
+    // Per-attestation Type-1 proofs (one per body AttestationData, parallel with the body
     // attestations). Merged with the proposer's Type-1 into the single Type-2 SignedBlock.proof
     // when the block is finalized for publishing.
     attestation_signatures: types.Type1ProofList,
@@ -121,26 +119,22 @@ pub const ProducedBlock = struct {
     }
 };
 
-/// Future-block queue entry. Used by both #788 (clock-lag
-/// future-block buffering) and slice (e) of #803 (centralised
-/// hash-root cache). Stores the producer's already-computed
-/// hash-tree root alongside the block so the gossip-path dedup
-/// loop, the `enqueuePendingBlock` cap-eviction sweep, and the
-/// drain (`processPendingBlocks`) all compare 32 bytes instead of
-/// re-hashing the full block body.
+/// Future-block queue entry. Used by clock-lag future-block buffering
+/// and the centralised hash-root cache. Stores the producer's
+/// already-computed hash-tree root alongside the block so the gossip-path
+/// dedup loop, the `enqueuePendingBlock` cap-eviction sweep, and the drain
+/// (`processPendingBlocks`) all compare 32 bytes instead of re-hashing the
+/// full block body.
 ///
-/// PR #841 review: `hashTreeRoot(BeamBlock, ...)` is a full SSZ
-/// tree walk — doing it 1024 times per duplicate-check is
-/// observable under a sustained clock-lag flood, which is the exact
-/// scenario the future-block queue exists to handle. Storing the
-/// 32-byte root here drops dedup from O(N·hash) to O(N·memcmp).
+/// `hashTreeRoot(BeamBlock, ...)` is a full SSZ tree walk — doing it 1024
+/// times per duplicate-check is observable under a sustained clock-lag
+/// flood, the exact scenario the future-block queue exists to handle.
+/// Storing the 32-byte root here drops dedup from O(N·hash) to O(N·memcmp).
 ///
-/// Mirrors leanSpec's `PendingBlock` shape
-/// (subspecs/sync/block_cache.py:55) for the load-bearing `root`
-/// field. Other PendingBlock fields (`received_from`, `received_at`,
-/// `backfill_depth`) are deliberately omitted in this PR — they hook
-/// into peer scoring + staleness detection that don't have consumers
-/// in zeam yet. Tracked as follow-up cleanup in #788's PR thread.
+/// Only the load-bearing `root` field is kept. Other pending-block fields
+/// (`received_from`, `received_at`, `backfill_depth`) are deliberately
+/// omitted — they hook into peer scoring + staleness detection that don't
+/// have consumers here yet.
 ///
 /// Heap-owning data is the `signed_block` SSZ slices; the entry must
 /// be `signed_block.deinit()`d when removed.
@@ -149,7 +143,7 @@ pub const PendingBlockEntry = struct {
     block_root: types.Root,
 };
 
-/// Cumulative stopwatch for `chain.onBlock` substeps (#863).
+/// Cumulative stopwatch for `chain.onBlock` substeps.
 ///
 /// `lap(label)` records the time elapsed since the previous `lap` (or
 /// since `init`) into the labeled `zeam_chain_onblock_step_duration_seconds`
@@ -188,13 +182,11 @@ pub const BeamChain = struct {
     allocator: Allocator,
     // from finalized onwards to recent
     /// Cached post-states keyed by block root. Migrated to
-    /// `*RcBeamState` in slice c-2b (#803): refcounted state
-    /// pointers let the chain worker (sole writer under c-2b) and
-    /// cross-thread readers (HTTP API, metrics, broadcaster)
-    /// share state without copying. Until commit 4 of this PR
-    /// drops the rwlock, `states_lock` continues to gate
-    /// concurrent map mutation — the rc handles only address
-    /// state-pointer lifetime, not map-shape mutation.
+    /// Refcounted state pointers let the chain worker (sole writer)
+    /// and cross-thread readers (HTTP API, metrics, broadcaster)
+    /// share state without copying. `states_lock` still gates
+    /// concurrent map mutation — the rc handles only state-pointer
+    /// lifetime, not map-shape mutation.
     states: std.AutoHashMap(types.Root, *RcBeamState),
     nodeId: u32,
     // This struct needs to contain the zeam_logger_config to be able to call `maybeRotate`
@@ -215,8 +207,8 @@ pub const BeamChain = struct {
     connected_peers: *ConnectedPeers,
     /// Wall-clock head lag in slots, updated each libxev tick by `BeamNode`
     /// from `Clock.wallSlotNow()`. Read by `getSyncStatus()` to detect
-    /// pre-finalization devnets that report `synced` while gossip ingress
-    /// has stalled (#926).
+    /// pre-finalization networks that report `synced` while gossip ingress
+    /// has stalled.
     wall_head_lag_slots: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
@@ -228,7 +220,7 @@ pub const BeamChain = struct {
     // Note: network subnet subscriptions are decided once at startup based
     // on the initial value. Flipping this at runtime affects gossip import
     // and aggregation duties for subnets the node is already subscribed to,
-    // matching the hot-standby model documented in leanEthereum/leanSpec#636.
+    // matching the hot-standby model.
     is_aggregator_enabled: std.atomic.Value(bool),
     /// Counter incremented every time `statesCommitKeepExisting` lands
     /// on the duplicate / kept-existing branch (i.e. the entry was
@@ -243,8 +235,7 @@ pub const BeamChain = struct {
     // Cached finalized state loaded from database (separate from states
     // map to avoid affecting pruning).
     //
-    // Slice c-2b commit 4 of #803: migrated from raw `*types.BeamState`
-    // to `*RcBeamState` (Option B from the PR #828 review thread) so the
+    // Migrated from raw `*types.BeamState` to `*RcBeamState` so the
     // cache-hit path in `getFinalizedState` can use the same
     // tryAcquire-then-drop-lock dance as `statesGet` when chain-worker
     // is enabled. Mutation is still gated by `events_lock`.
@@ -272,10 +263,9 @@ pub const BeamChain = struct {
     ///      cannot observe uninitialised FFI state. That single setup
     ///      initialises both prove and verify state so workers can call verify
     ///      without racing first-time initialization.
-    ///   3. `xmss.PublicKeyCache` is lock-free as of P1 of #863
-    ///      (per-slot atomic CAS); concurrent `getOrPut` calls are
-    ///      safe. The pre-PR-#884 serial-pre-phase constraint no
-    ///      longer applies.
+    ///   3. `xmss.PublicKeyCache` is lock-free (per-slot atomic CAS);
+    ///      concurrent `getOrPut` calls are safe. The old serial-pre-phase
+    ///      constraint no longer applies.
     ///
     /// New consumers of `thread_pool` should preserve all three invariants.
     thread_pool: *ThreadPool,
@@ -284,21 +274,20 @@ pub const BeamChain = struct {
     prune_cached_blocks_ctx: ?*anyopaque = null,
     prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
 
-    // -- imported-block backchannel (#863, #890) -------------------------
+    // -- imported-block backchannel -------------------------------------
     //
     // Worker → BeamNode hand-back fired from `chainWorkerOnBlockThunk`
     // after every successful import. Lets the network-aware code (cached-
     // descendant retry, missing-attestation-root fetch, batched parent
-    // flush) run without re-checking inside the chain — historically the
+    // flush) run without re-checking inside the chain — previously the
     // worker thunk silently dropped `missing_attestation_roots` because
     // it had no way to call back into `BeamNode.fetchBlockByRoots` (see
-    // the pre-existing comment on `chain.onGossip`'s `.block` arm and
-    // the warn in `chainWorkerProcessPendingBlocksThunk`). The callback
-    // is the formal channel for that hand-off.
+    // the comment on `chain.onGossip`'s `.block` arm and the warn in
+    // `chainWorkerProcessPendingBlocksThunk`). The callback is the formal
+    // channel for that hand-off.
     //
-    // **Threading audit (zclawz round 3 review on PR #890).** With
-    // chain-worker enabled the callback runs ON THE WORKER THREAD,
-    // not libxev. Every site the production callback
+    // Threading: with chain-worker enabled the callback runs on the worker
+    // thread, not libxev. Every site the production callback
     // (`BeamNode.handleChainImportedBlock`) reaches must be safe to
     // invoke from a non-libxev thread:
     //
@@ -317,9 +306,8 @@ pub const BeamChain = struct {
     //                                        → its own mutex
     //   * `network.backend.reqresp.sendRequest`
     //                                        → enqueues onto a
-    //     **Tokio `mpsc::Sender::try_send`** (`SwarmCommandChannel`,
-    //     see `rust/libp2p-glue/src/lib.rs::send_swarm_command`).
-    //     The Rust libp2p swarm runs on its OWN Tokio runtime — the
+    //     Tokio `mpsc::Sender::try_send` (`SwarmCommandChannel`).
+    //     The Rust libp2p swarm runs on its own Tokio runtime — the
     //     Zig caller never touches a libxev primitive on this path.
     //     `try_send` is `Send + Sync`-safe, so any thread can fire
     //     it; full / closed channels return error which is bucketed
@@ -339,14 +327,13 @@ pub const BeamChain = struct {
     //
     // The fn+ctx pair lives in a single optional so the worker
     // thunk's read is a single `if (.imported_block) |cb| ...`
-    // branch (zclawz round 3 review #M4). Pre-bundle this avoided a
-    // class of bugs where the setter wired one field but not the
-    // other — direct field mutation from tests would skip the
-    // public setter and silently drop the callback (the chain
-    // would free `missing_roots` instead of handing it back).
+    // branch. Bundling avoids a class of bugs where the setter wired
+    // one field but not the other — direct field mutation from tests
+    // would skip the public setter and silently drop the callback (the
+    // chain would free `missing_roots` instead of handing it back).
     imported_block: ?BlockCallback(ImportedBlockFn) = null,
 
-    // -- rejected-block backchannel (#890 zclawz review) -----------------
+    // -- rejected-block backchannel --------------------------------------
     //
     // Sister callback to `imported_block`: fires when
     // `chainWorkerOnBlockThunk`'s `onBlock` returns
@@ -379,8 +366,7 @@ pub const BeamChain = struct {
     // during `processPendingBlocks` (drain path) so the queue self-cleans.
     pending_blocks: std.ArrayList(PendingBlockEntry),
 
-    // Per-resource locks (slice a-2 of #803). See
-    // `docs/threading_refactor_slice_a.md` for the lock-hierarchy contract:
+    // Per-resource locks. Lock-hierarchy contract:
     //   tier 3: states_lock
     //   tier 4: pending_blocks_lock
     //   tier 5a: pubkey_cache_lock     (sibling — never co-held with 5b/5c)
@@ -388,24 +374,21 @@ pub const BeamChain = struct {
     //   tier 5c: events_lock           (sibling — never co-held with 5a/5b)
     //   tier 6: forkChoice (own RwLock, innermost)
     //
-    // As of slice a-3 the previous coarse `BeamNode.mutex` is gone; these
-    // per-resource locks are now the actual synchronisation between the
-    // libxev tick path and the libp2p worker on every chain entry point.
-    // (Slice (c) will reintroduce a finalization-scoped multi-resource
-    // lock when its first real user — the chain-worker `processFinalization
-    // Followup` move-off path — lands.)
+    // The previous coarse `BeamNode.mutex` is gone; these per-resource
+    // locks are now the actual synchronisation between the libxev tick
+    // path and the libp2p worker on every chain entry point.
     states_lock: zeam_utils.SyncRwLock = .{},
     pending_blocks_lock: zeam_utils.SyncMutex = .{},
     pubkey_cache_lock: zeam_utils.SyncMutex = .{},
     root_to_slot_lock: zeam_utils.SyncMutex = .{},
     events_lock: zeam_utils.SyncMutex = .{},
 
-    /// In-flight aggregate worker count (issue #907). `submitAggregateOnInterval`
+    /// In-flight aggregate worker count. `submitAggregateOnInterval`
     /// atomically checks against `aggregate_max_inflight` before spawning so the
     /// libxev interval tick never blocks. `aggregateImpl` decrements on exit.
     /// Aggregators keep this at 1; per-att_data FFI parallelism lives inside
     /// `aggregateUnlocked`. Values > 1 rely on commit-time duplicate suppression
-    /// in `forkchoice.aggregateUnlocked` (see PR #920 review).
+    /// in `forkchoice.aggregateUnlocked`.
     aggregate_inflight: std.atomic.Value(u32) = .init(0),
 
     /// Latest slot-driver interval coalesced while an aggregate worker was
@@ -414,7 +397,7 @@ pub const BeamChain = struct {
 
     /// Highest slot successfully published by the most recent aggregate worker.
     /// Used to skip redundant catch-up resubmits when coalesced triggers
-    /// map to a slot we already handled (#925 coalesce storm). Not advanced
+    /// map to a slot we already handled (coalesce storm). Not advanced
     /// on failure or empty runs so coalesce can retry.
     aggregate_last_completed_slot: std.atomic.Value(u64) = .init(0),
 
@@ -424,7 +407,7 @@ pub const BeamChain = struct {
     /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
     aggregate_max_inflight: u32,
 
-    /// devnet5 (#14): the block proof is a recursive-STARK Type-2 merge that takes seconds at the
+    /// The block proof is a recursive-STARK Type-2 merge that takes seconds at the
     /// prod scheme — far longer than an 800ms interval. Running it on the libxev slot loop would
     /// freeze gossip/tick handling, so `submitProposeOnInterval` offloads the whole propose
     /// (produceBlock + buildBlockProof + publishBlock) to a `thread_pool` worker, mirroring the
@@ -435,17 +418,17 @@ pub const BeamChain = struct {
     /// Joined at `deinit` so propose workers cannot outlive chain state.
     propose_wg: WaitGroup = .{},
 
-    /// devnet5: serialize the rayon-heavy recursive-STARK proves so each gets the FULL rayon thread
+    /// Serialize the rayon-heavy recursive-STARK proves so each gets the full rayon thread
     /// budget instead of fighting for it. Three paths now enter the prover concurrently — the
     /// propose worker (Type-2 merge in `buildBlockProof`), the aggregate worker
-    /// (`aggregateForSlots`), and block import (#16 `deconstructType2BlockProof`). Without this gate
+    /// (`aggregateForSlots`), and block import (`deconstructType2BlockProof`). Without this gate
     /// they over-subscribe rayon and each prove runs ~Nx slower, which inflates block latency and
     /// makes safe_target lag (breaking finalization). Acquired ONLY around the leaf FFI prove (no
     /// other zeam lock co-held) or, for aggregate, as the OUTERMOST lock before forkChoice.mutex —
     /// never `fcmutex -> prove_gate` — so there is no lock cycle.
     prove_gate: zeam_utils.SyncMutex = .{},
 
-    /// Optional chain-worker thread (slice c-2b commit 3 of #803).
+    /// Optional chain-worker thread.
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
     /// worker thread serialises the actual chain mutations.
@@ -461,15 +444,13 @@ pub const BeamChain = struct {
     /// stop/deinit/destroy ordering at the top of `BeamChain.deinit`.
     chain_worker: ?*chain_worker.ChainWorker = null,
 
-    /// leanSpec parity (`subspecs/sync/service.py::_pending_attestations`,
-    /// `_pending_aggregated_attestations`): gossip attestations whose
-    /// referenced source/target/head block is not yet imported, OR whose
-    /// slot is still in the future, are buffered here for replay after
-    /// the next successful `onBlock` import (`_replay_pending_attestations`
-    /// in the spec; mirrored by `replayPendingAttestations` below).
+    /// Gossip attestations whose referenced source/target/head block is
+    /// not yet imported, OR whose slot is still in the future, are buffered
+    /// here for replay after the next successful `onBlock` import (mirrored
+    /// by `replayPendingAttestations` below).
     ///
-    /// Capacity bounded by `constants.MAX_PENDING_ATTESTATIONS` (1024,
-    /// the spec's `MAX_PENDING_ATTESTATIONS`); FIFO eviction once full.
+    /// Capacity bounded by `constants.MAX_PENDING_ATTESTATIONS` (1024);
+    /// FIFO eviction once full.
     ///
     /// Concurrency: appends happen on the chain-worker thread (gossip
     /// dispatch lands in `chainWorkerOn*Thunk`) and on the calling
@@ -485,10 +466,9 @@ pub const BeamChain = struct {
 
     /// Bundles a `ctx` + `fn` pair into one optional struct so the
     /// worker thunk's "is the callback wired?" check is a single
-    /// branch (zclawz round 3 review on PR #890). The previous
-    /// shape (two independent `?` fields) had a footgun: a test or
-    /// future refactor that assigned one without the other would
-    /// silently drop callbacks because the thunk read both
+    /// branch. The previous shape (two independent `?` fields) had a
+    /// footgun: a test or future refactor that assigned one without the
+    /// other would silently drop callbacks because the thunk read both
     /// independently.
     pub fn BlockCallback(comptime FnT: type) type {
         return struct {
@@ -497,8 +477,8 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Callback fired after every successful chain-worker block import
-    /// (#890). `block_root` is the producer's-or-recomputed hash-tree
+    /// Callback fired after every successful chain-worker block import.
+    /// `block_root` is the producer's-or-recomputed hash-tree
     /// root of the block that was just imported; `missing_roots` is
     /// the slice of attestation head/source/target roots the chain
     /// could not resolve while applying the block. **Ownership of
@@ -609,16 +589,15 @@ pub const BeamChain = struct {
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
             // Sized to the genesis validator count. Lock-free per-slot
-            // cache (P1 of #863) — see `xmss.PublicKeyCache` doc for the
-            // CAS protocol and validator-set-growth caveats.
+            // cache — see `xmss.PublicKeyCache` doc for the CAS protocol
+            // and validator-set-growth caveats.
             .public_key_cache = try xmss.PublicKeyCache.init(allocator, @intCast(opts.config.genesis.numValidators())),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .thread_pool = opts.thread_pool,
-            // pending_blocks is the future-slot queue (issue #788). It's an
+            // pending_blocks is the future-slot queue. It's an
             // unmanaged ArrayList, so default-init to `.empty`; the lock
             // below guards mutation. Required field — without it the
-            // struct literal fails to compile under the merged main
-            // pending-blocks plumbing.
+            // struct literal fails to compile.
             .pending_blocks = .empty,
             // Per-resource locks default-initialised. RwLock and Mutex have
             // no special init; init() runs single-threaded so no acquire
@@ -632,16 +611,16 @@ pub const BeamChain = struct {
             // at its final heap location), so the worker's ctx pointer
             // remains stable for its entire lifetime.
             .chain_worker = null,
-            // Aggregate worker bookkeeping (issue #907). Counter + WaitGroup
-            // backstop the lock-free cap check + `deinit` join — see field docs.
+            // Aggregate worker bookkeeping. Counter + WaitGroup backstop
+            // the lock-free cap check + `deinit` join — see field docs.
             .aggregate_inflight = .init(0),
             .aggregate_reschedule_intervals = .init(0),
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
-            // leanSpec _pending_attestations / _pending_aggregated_attestations
-            // buffers — empty at init; FIFO-bounded by
-            // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
+            // Pending attestation / aggregated-attestation buffers — empty
+            // at init; FIFO-bounded by constants.MAX_PENDING_ATTESTATIONS in
+            // the enqueue helpers.
             .pending_attestations_mutex = .{},
             .pending_attestations = .empty,
             .pending_aggregated_attestations = .empty,
@@ -713,29 +692,26 @@ pub const BeamChain = struct {
     }
 
     // ------------------------------------------------------------------
-    // leanSpec pending-attestation buffer (subspecs/sync/service.py)
+    // Pending-attestation buffer
     // ------------------------------------------------------------------
     //
-    // Direct mirror of the spec's `_pending_attestations` and
-    // `_pending_aggregated_attestations` lists plus
-    // `_replay_pending_attestations`. The spec's contract:
+    // Buffers gossip attestations/aggregations that can't be applied yet
+    // and replays them after the next block import. Contract:
     //
-    //   * Validation failure (AssertionError / KeyError) on a gossip
-    //     attestation/aggregation → append to the pending list.
-    //   * Buffer is bounded by `MAX_PENDING_ATTESTATIONS` (1024 in
-    //     `subspecs/sync/config.py`); FIFO eviction when full.
-    //   * After every successful `on_gossip_block` import, the spec
-    //     calls `_replay_pending_attestations` which drains both
-    //     lists, retries each entry, and re-enqueues anything that
-    //     still fails (next replay attempt).
+    //   * Validation failure on a gossip attestation/aggregation →
+    //     append to the pending list.
+    //   * Buffer is bounded by `MAX_PENDING_ATTESTATIONS` (1024); FIFO
+    //     eviction when full.
+    //   * After every successful block import, drain both lists, retry
+    //     each entry, and re-enqueue anything that still fails (next
+    //     replay attempt).
     //
-    // Retryable validation errors (per leanSpec
-    // `forks/lstar/spec.py::validate_attestation`):
+    // Retryable validation errors:
     //
     //   * `error.UnknownHeadBlock` / `UnknownSourceBlock` /
-    //     `UnknownTargetBlock` — the spec's `assert ... in store.blocks`.
-    //   * `error.AttestationTooFarInFuture` — the spec's
-    //     `assert attestation_start_interval <= store.time + GOSSIP_DISPARITY_INTERVALS`.
+    //     `UnknownTargetBlock` — referenced block not yet in the store.
+    //   * `error.AttestationTooFarInFuture` — attestation start interval
+    //     beyond the gossip-disparity window.
     //
     // Permanent failures (signature mismatch, malformed checkpoint
     // ordering, slot mismatch) are dropped without buffering.
@@ -756,9 +732,8 @@ pub const BeamChain = struct {
         defer self.pending_attestations_mutex.unlock();
 
         if (self.pending_attestations.items.len >= constants.MAX_PENDING_ATTESTATIONS) {
-            // FIFO eviction: drop the oldest entry to make room. Spec
-            // semantics — `subspecs/sync/service.py::_pending_attestations[
-            // -MAX_PENDING_ATTESTATIONS:]` slice.
+            // FIFO eviction: drop the oldest entry to make room, keeping
+            // only the most recent MAX_PENDING_ATTESTATIONS entries.
             _ = self.pending_attestations.orderedRemove(0);
             zeam_metrics.metrics.lean_pending_attestations_evicted_total.incr(.{ .kind = "attestation" }) catch {};
         }
@@ -801,9 +776,8 @@ pub const BeamChain = struct {
         zeam_metrics.metrics.lean_pending_attestations_size.set(.{ .kind = "aggregation" }, self.pending_aggregated_attestations.items.len) catch {};
     }
 
-    /// Drain and retry both pending buffers. Mirrors leanSpec
-    /// `subspecs/sync/service.py::_replay_pending_attestations` which
-    /// the spec calls after every successful `on_gossip_block`.
+    /// Drain and retry both pending buffers. Called after every
+    /// successful block import.
     ///
     /// For each buffered entry: re-run the same validate / verify path
     /// the libxev-arrived gossip would. Outcomes:
@@ -812,12 +786,12 @@ pub const BeamChain = struct {
     ///     entry is consumed (storage is per-role: aggregators store
     ///     in fork-choice, non-aggregators just verify-and-drop).
     ///   * `buffered` — still missing block / still future-slot; the
-    ///     entry is re-appended to the back of the buffer (spec FIFO
-    ///     "kept in the buffer for the next replay attempt").
+    ///     entry is re-appended to the back of the buffer (FIFO,
+    ///     kept for the next replay attempt).
     ///   * `dropped` — permanent failure (signature mismatch, malformed
     ///     checkpoint ordering); the entry is discarded.
     ///
-    /// Threading contract (#863, #890): when the chain-worker is enabled
+    /// Threading contract: when the chain-worker is enabled
     /// this function MUST run on the worker thread. The `chain-worker`
     /// `on_block` thunk drives it inline after every successful import;
     /// libxev-side producers (`BeamNode.publishBlock`, the disabled-worker
@@ -844,7 +818,7 @@ pub const BeamChain = struct {
 
         const is_agg = self.is_aggregator_enabled.load(.acquire);
 
-        // #890: parallelize per-entry replay across the shared thread
+        // Parallelize per-entry replay across the shared thread
         // pool when one is configured. Each replay does
         // `validateAttestationData → verifySingleAttestation → (for
         // aggregators) forkChoice.onSignedAttestation` for raw atts,
@@ -855,8 +829,8 @@ pub const BeamChain = struct {
         // concurrent invocations serialize on those without
         // explicit coordination here. The big win is the XMSS verify
         // — `verifySingleAttestation` is CPU-bound and has no shared
-        // state with siblings (#863 stall data shows aggregator-heavy
-        // replay batches dominate by-far the longest libxev drain
+        // state with siblings (stall data shows aggregator-heavy
+        // replay batches dominate by far the longest libxev drain
         // windows).
         //
         // No pool ⇒ in-thread serial loop. The fallback path also
@@ -868,9 +842,9 @@ pub const BeamChain = struct {
         // allocate 1024 task wrappers up front. The pool's
         // worker count is what limits real parallelism anyway;
         // any more than ~thread_count outstanding tasks just
-        // queues. Pre-#890 measurements on aggregator-heavy
-        // devnet bursts showed 90%+ of replay calls have ≤ 64
-        // entries — keep the simple "spawn each" shape.
+        // queues. Measurements on aggregator-heavy bursts showed
+        // 90%+ of replay calls have ≤ 64 entries — keep the simple
+        // "spawn each" shape.
         var wg: WaitGroup = .{};
         for (atts.items) |gossip| {
             self.thread_pool.spawnWg(&wg, replayOneAttestationTask, .{ self, gossip, is_agg }) catch {
@@ -881,8 +855,7 @@ pub const BeamChain = struct {
             };
         }
         for (aggs.items) |*agg| {
-            // Pointer-stability invariant for the spawned task
-            // (zclawz reviews on PR #890):
+            // Pointer-stability invariant for the spawned task:
             //
             // The `*SignedAggregatedAttestation` we hand to
             // `replayOneAggregationTask` is a borrow into
@@ -932,8 +905,8 @@ pub const BeamChain = struct {
     /// every per-entry task verbatim. A concurrent admin toggle
     /// (`POST /lean/v0/admin/aggregator`) flips the role for the
     /// NEXT batch only — entries already in flight finish with the
-    /// snapshot value (zclawz review on PR #890). This is
-    /// intentional: the alternative (per-task fresh load) would
+    /// snapshot value. This is intentional: the alternative
+    /// (per-task fresh load) would
     /// race against forkchoice writes that depend on a coherent
     /// role for the duration of the replay.
     fn replayOneAttestationTask(
@@ -987,9 +960,8 @@ pub const BeamChain = struct {
         };
 
         // Validation passed on replay. Run signature verify + (for
-        // aggregators) fork-choice tracker update. leanSpec stores in
-        // `attestation_signatures` only for `is_aggregator`; non-
-        // aggregators "validate and drop".
+        // aggregators) fork-choice tracker update. Only aggregators store
+        // in `attestation_signatures`; non-aggregators validate and drop.
         self.runVerifiedGossipAttestation(gossip, is_aggregator_role) catch {
             zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "attestation", .outcome = "dropped" }) catch {};
             return;
@@ -1033,9 +1005,9 @@ pub const BeamChain = struct {
         zeam_metrics.metrics.lean_pending_attestations_replay_total.incr(.{ .kind = "aggregation", .outcome = "accepted" }) catch {};
     }
 
-    /// Run the post-validation gossip-attestation steps that match the
-    /// spec's `on_gossip_attestation` (signature verify + role-gated
-    /// store). `validateAttestationData` MUST have already run and
+    /// Run the post-validation gossip-attestation steps (signature
+    /// verify + role-gated store). `validateAttestationData` MUST have
+    /// already run and
     /// succeeded. Splitting this out lets both the libxev-dispatched
     /// thunk and `replayOneAttestation` share the same code path.
     fn runVerifiedGossipAttestation(
@@ -1045,8 +1017,7 @@ pub const BeamChain = struct {
     ) !void {
         const attestation = gossip.message.toAttestation();
 
-        // Signature verification — run for ALL nodes (spec:
-        // `forks/lstar/spec.py::on_gossip_attestation`, lines 1090-1131).
+        // Signature verification — run for all nodes.
         // Non-aggregators verify + drop; aggregators verify + store.
         var borrow = self.statesGet(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
         defer borrow.assertReleasedOrPanic();
@@ -1059,19 +1030,18 @@ pub const BeamChain = struct {
             &gossip.message.signature,
         );
 
-        // Role-gated storage — leanSpec: `if is_aggregator: ...`.
-        // zeam's analog of `attestation_signatures` is the per-validator
-        // attestation tracker maintained by `forkChoice.onSignedAttestation`,
-        // which in turn feeds head selection. Skipping it for non-
-        // aggregators matches the spec's "Non-aggregator nodes validate
-        // and drop — they never store gossip signatures" contract.
+        // Role-gated storage: only aggregators store. The analog of
+        // `attestation_signatures` is the per-validator attestation
+        // tracker maintained by `forkChoice.onSignedAttestation`, which
+        // in turn feeds head selection. Non-aggregators validate and
+        // drop — they never store gossip signatures.
         if (is_aggregator_role) {
             try self.forkChoice.onSignedAttestation(gossip.message);
         }
     }
 
     // ------------------------------------------------------------------
-    // chain_worker handler thunks (slice c-2b commit 3)
+    // chain_worker handler thunks
     // ------------------------------------------------------------------
     //
     // These thunks adapt the worker's type-erased vtable shape
@@ -1087,11 +1057,10 @@ pub const BeamChain = struct {
     //      `missing_roots` slice from `onBlock` /
     //      `processPendingBlocks`). In the chain-worker path, the
     //      missing-attestation-roots feedback loop into the gossip
-    //      layer's RPC fetch is intentionally dropped — a follow-up
-    //      commit can plumb a back-channel if it proves necessary
-    //      on devnet, but for c-2b's narrow gossip-block-and-
-    //      attestation migration the loss is the same as a dropped
-    //      gossip message.
+    //      layer's RPC fetch is intentionally dropped — a back-channel
+    //      can be plumbed if it proves necessary; for this narrow
+    //      gossip-block-and-attestation migration the loss is the same
+    //      as a dropped gossip message.
     //
     // The thunks live in `chain.zig` (not `chain_worker.zig`)
     // because they need access to `BeamChain` and its private
@@ -1107,14 +1076,12 @@ pub const BeamChain = struct {
         block_root: ?types.Root,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // Slice (e) of #803: forward the producer's already-computed
-        // block_root (when present) into `onBlock` via
-        // `CachedProcessedBlockInfo.blockRoot`. Saves the worker thread
-        // a redundant `hashTreeRoot(BeamBlock)` call — a non-trivial
-        // SSZ traversal on a wide block body. `null` falls back to the
-        // pre-existing in-`onBlock` recompute path; this keeps callers
-        // that legitimately have no precomputed root (the c-1 stub /
-        // any future producer) working unchanged.
+        // Forward the producer's already-computed block_root (when
+        // present) into `onBlock` via `CachedProcessedBlockInfo.blockRoot`.
+        // Saves the worker thread a redundant `hashTreeRoot(BeamBlock)`
+        // call — a non-trivial SSZ traversal on a wide block body. `null`
+        // falls back to the in-`onBlock` recompute path; this keeps callers
+        // that legitimately have no precomputed root working unchanged.
         const missing_roots = self.onBlock(signed_block, .{
             .pruneForkchoice = prune_forkchoice,
             .blockRoot = block_root,
@@ -1157,9 +1124,8 @@ pub const BeamChain = struct {
                     return;
                 }
                 // No callback wired (worker test rigs etc.) — fall
-                // through to the legacy "log and drop" path. That
-                // matches the pre-#890 chain-worker behaviour;
-                // production wires the callback in `BeamNode.init`.
+                // through to the "log and drop" path. Production wires
+                // the callback in `BeamNode.init`.
             }
             self.logger.err("chain-worker: onBlock failed slot={d}: {any}", .{
                 signed_block.block.slot,
@@ -1173,14 +1139,12 @@ pub const BeamChain = struct {
         // ignores the parameter (see the explicit `_ = signedBlock`
         // at its top), so the value is functionally unused here.
         self.onBlockFollowup(prune_forkchoice, &signed_block);
-        // leanSpec parity: `subspecs/sync/service.py::on_gossip_block`
-        // calls `_replay_pending_attestations` after every successful
-        // block import so attestations that referenced unknown blocks
-        // / future slots get a fresh validation attempt against the
-        // updated store.
+        // Replay pending attestations after every successful block
+        // import so attestations that referenced unknown blocks / future
+        // slots get a fresh validation attempt against the updated store.
         self.replayPendingAttestations();
 
-        // Invoke the imported-block backchannel (#890). When wired
+        // Invoke the imported-block backchannel. When wired
         // (BeamNode in production), the callback takes ownership of
         // `missing_roots` and runs `fetchBlockByRoots` +
         // `processCachedDescendants` from this worker thread. When
@@ -1216,17 +1180,13 @@ pub const BeamChain = struct {
         gossip: networks.AttestationGossip,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // leanSpec parity (`forks/lstar/spec.py::on_gossip_attestation`,
-        // `subspecs/sync/service.py::on_gossip_attestation`):
+        // Gossip-attestation handling:
         //
         //   1. Validate (block availability + topology + consistency +
-        //      future-slot bound). On AssertionError-equivalent →
-        //      buffer for replay (`_pending_attestations`). On
-        //      permanent failure → drop.
-        //   2. Verify the XMSS signature. Run for ALL roles (spec's
-        //      `assert self.sig_scheme.verify(...)`).
-        //   3. Store ONLY if `is_aggregator` (spec's `if is_aggregator:
-        //      new_committee_sigs.setdefault(...).add(...)`).
+        //      future-slot bound). On retryable failure → buffer for
+        //      replay. On permanent failure → drop.
+        //   2. Verify the XMSS signature. Run for all roles.
+        //   3. Store only if `is_aggregator`.
         const is_aggregator_role = self.is_aggregator_enabled.load(.acquire);
 
         self.validateAttestationData(gossip.message.message, false) catch |err| {
@@ -1236,8 +1196,7 @@ pub const BeamChain = struct {
                 error.UnknownTargetBlock,
                 error.MissingState,
                 => {
-                    // Spec says buffer for replay after the next
-                    // `on_gossip_block` import.
+                    // Buffer for replay after the next block import.
                     self.enqueuePendingAttestation(gossip, "unknown_block");
                     return;
                 },
@@ -1277,10 +1236,8 @@ pub const BeamChain = struct {
         agg: types.SignedAggregatedAttestation,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // leanSpec parity (`forks/lstar/spec.py::on_gossip_aggregated_attestation`,
-        // `subspecs/sync/service.py::on_gossip_aggregated_attestation`):
-        // validate + verify. On retryable error → buffer for replay
-        // after the next `on_gossip_block` (`_pending_aggregated_attestations`).
+        // Validate + verify. On retryable error → buffer for replay
+        // after the next block import.
         // The Message-owned `agg` is freed by chain_worker.dispatch
         // (defer m.deinit()) when this function returns; to retain
         // ownership in the buffer we MUST clone before re-handing to
@@ -1354,8 +1311,8 @@ pub const BeamChain = struct {
         const missing_roots = self.processPendingBlocks();
         defer self.allocator.free(missing_roots);
         if (missing_roots.len > 0) {
-            // Tripwire (zclawz review on PR #890): the thunk has no
-            // production producer today, so a non-zero counter
+            // Tripwire: the thunk has no production producer today,
+            // so a non-zero counter
             // value means somebody wired one without plumbing
             // missing-roots back to BeamNode and is stranding
             // sync. The warn is paired with the metric so the
@@ -1389,7 +1346,7 @@ pub const BeamChain = struct {
     }
 
     /// Worker-thread thunk for the `replay_pending_attestations`
-    /// queue message (#890). Producers post one of these messages
+    /// queue message. Producers post one of these messages
     /// after a libxev-side block import (publish path / disabled-
     /// worker fallback) so the unbounded `replayPendingAttestations`
     /// drain happens here instead of on the slot-driver thread.
@@ -1401,7 +1358,7 @@ pub const BeamChain = struct {
     }
 
     // ------------------------------------------------------------------
-    // submit* family (slice c-2b commit 3)
+    // submit* family
     // ------------------------------------------------------------------
     //
     // These wrappers route producer-side work through the
@@ -1409,10 +1366,9 @@ pub const BeamChain = struct {
     // exposes them regardless of whether the worker is running);
     // when the worker is disabled they return
     // `error.ChainWorkerDisabled` so the caller can fall back to
-    // the direct synchronous path. This keeps the off-mode
-    // semantics identical to slice (b) — the call site decides
-    // which path to take, the submit* wrappers never silently
-    // change behaviour.
+    // the direct synchronous path. The off-mode semantics stay
+    // simple — the call site decides which path to take, the
+    // submit* wrappers never silently change behaviour.
     //
     // Ownership contract on success: the caller transfers ownership
     // of any heap-bearing payload (currently `signed_block` and
@@ -1426,11 +1382,11 @@ pub const BeamChain = struct {
 
     /// Route a block import through the chain-worker queue.
     ///
-    /// Slice (e) of #803: `block_root` is the producer's already-
-    /// computed hash-tree root of `signed_block.block`. Pass `null`
-    /// only when the producer truly does not have one (and the
-    /// worker will recompute it inside `onBlock`). All current
-    /// production producers DO have a precomputed root — see
+    /// `block_root` is the producer's already-computed hash-tree
+    /// root of `signed_block.block`. Pass `null` only when the
+    /// producer truly does not have one (and the worker will
+    /// recompute it inside `onBlock`). All current production
+    /// producers do have a precomputed root — see
     /// `BeamNode.onGossip`, `processBlockByRoot|RangeChunk`,
     /// `publishBlock`, and `chain.onGossip` itself — so the
     /// `null` path is a fallback for tests / future variants.
@@ -1467,7 +1423,7 @@ pub const BeamChain = struct {
         try w.sendAggregatedAttestation(.{ .on_gossip_aggregated_attestation = agg });
     }
 
-    // `submitProcessPendingBlocks` removed (zclawz review on PR #890).
+    // `submitProcessPendingBlocks` removed.
     // No production caller existed: the libxev tick runs
     // `processPendingBlocks` inline so it can feed the returned
     // missing-roots into `BeamNode.fetchBlockByRoots`. The
@@ -1504,7 +1460,7 @@ pub const BeamChain = struct {
     pub const SubmitReplayError = chain_worker.AttestationQueue.TrySendError || error{ChainWorkerDisabled};
 
     /// Nudge the chain-worker to drain `pending_attestations` /
-    /// `pending_aggregated_attestations` (#890). Producers are libxev
+    /// `pending_aggregated_attestations`. Producers are libxev
     /// paths that imported a block synchronously (the disabled-worker
     /// fallback inside `BeamNode.processBlockByRoot|RangeChunk`,
     /// `processCachedDescendants`) and `BeamNode.publishBlock` (locally
@@ -1525,7 +1481,7 @@ pub const BeamChain = struct {
         self.prune_cached_blocks_fn = func;
     }
 
-    /// Register the imported-block backchannel (#890). The callback
+    /// Register the imported-block backchannel. The callback
     /// fires from `chainWorkerOnBlockThunk` after every successful
     /// import; takes ownership of the chain's `missing_roots` slice.
     /// See the `imported_block` field doc and the `ImportedBlockFn`
@@ -1540,7 +1496,7 @@ pub const BeamChain = struct {
         self.imported_block = .{ .ctx = ctx, .func = func };
     }
 
-    /// Register the rejected-block backchannel (#890 follow-up).
+    /// Register the rejected-block backchannel.
     /// Fires from `chainWorkerOnBlockThunk` only when `onBlock`
     /// returns `MissingPreState` or `PreFinalizedSlot` — see
     /// `RejectedBlockFn` and the `rejected_block` field doc. Same
@@ -1557,11 +1513,11 @@ pub const BeamChain = struct {
         // never called.)
         self.stopChainStateRefcountObserver();
 
-        // Issue #907: join any in-flight aggregate workers before
-        // tearing down chain state they reference.
+        // Join any in-flight aggregate workers before tearing down
+        // chain state they reference.
         self.thread_pool.waitAndWork(&self.aggregate_wg);
 
-        // devnet5 (#14): same for in-flight propose workers (produceBlock + Type-2 merge +
+        // Same for in-flight propose workers (produceBlock + Type-2 merge +
         // publishBlock) — they reference chain state and must not outlive it.
         self.thread_pool.waitAndWork(&self.propose_wg);
 
@@ -1582,9 +1538,9 @@ pub const BeamChain = struct {
 
         // Each entry holds an RcBeamState we own a reference on.
         // release() drops the count and frees the wrapper +
-        // interior state when refcount reaches 0. Under c-2b
-        // commit 2 nothing else takes acquires on map-resident
-        // states yet, so refcount is always 1 at deinit time.
+        // interior state when refcount reaches 0. Nothing else takes
+        // acquires on map-resident states, so refcount is always 1 at
+        // deinit time.
         var it = self.states.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.release();
@@ -1592,8 +1548,8 @@ pub const BeamChain = struct {
         self.states.deinit();
 
         // Clean up cached finalized state if present.
-        // Slice c-2b commit 4: cached_finalized_state is an
-        // RcBeamState now — release drives state.deinit + destroy when
+        // cached_finalized_state is an RcBeamState now — release drives
+        // state.deinit + destroy when
         // refcount reaches 0. Under chain_worker_enabled the cache may
         // have outstanding reader acquires; the rc keeps the underlying
         // allocation alive until the last reader releases. (At deinit
@@ -1615,8 +1571,8 @@ pub const BeamChain = struct {
         }
         self.pending_blocks.deinit(self.allocator);
 
-        // leanSpec _pending_attestations / _pending_aggregated_attestations
-        // buffers. Attestations are POD (no heap); aggregations were cloned
+        // Pending attestation / aggregated-attestation buffers.
+        // Attestations are POD (no heap); aggregations were cloned
         // on enqueue and need explicit `.deinit()` per entry to free the
         // proof participants BitList + signature bytes.
         self.pending_attestations_mutex.lock();
@@ -1655,9 +1611,9 @@ pub const BeamChain = struct {
     }
 
     // ------------------------------------------------------------------
-    // Lock helpers (slice a-2)
+    // Lock helpers
     //
-    // These thin wrappers keep callsites readable AND ensure every lock
+    // These thin wrappers keep callsites readable and ensure every lock
     // acquire is observed via `LockTimer` so we can attribute contention
     // by lock + site in `zeam_lock_{wait,hold}_seconds`. The legacy
     // `zeam_node_mutex_*` series is double-emitted by LockTimer for one
@@ -1670,23 +1626,22 @@ pub const BeamChain = struct {
     /// once before the borrow goes out of scope. Debug builds enforce
     /// one-release via `BorrowedState.released`.
     ///
-    /// Two paths, gated by chain-worker mode (slice c-2b commit 4 of #803):
+    /// Two paths, gated by chain-worker mode:
     ///
     ///   * `chain_worker != null` (chain-worker is the sole writer to
     ///     `BeamChain.states`): take the shared lock for the lookup,
     ///     `tryAcquire` the rc, drop the lock, and return a
     ///     `Backing.none` borrow whose lifetime is gated by the rc
     ///     refcount. Cross-thread readers (HTTP API, metrics scrape,
-    ///     event broadcaster) NO LONGER hold `states_lock.shared` for
+    ///     event broadcaster) no longer hold `states_lock.shared` for
     ///     the borrow lifetime, so a long-lived read does not block the
-    ///     chain worker's next exclusive-side mutation. This is the
-    ///     entire point of the c-2b migration.
+    ///     chain worker's next exclusive-side mutation.
     ///
     ///   * `chain_worker == null` (kill-switch / backward-compat under
-    ///     `--chain-worker=off`): keep the legacy lock-based borrow.
+    ///     `--chain-worker=off`): keep the lock-based borrow.
     ///     The shared lock is held for the borrow lifetime; map mutation
     ///     by the gossip/req-resp paths is gated by the exclusive side
-    ///     as before. Slice (b) semantics are preserved exactly.
+    ///     as before.
     pub fn statesGet(self: *Self, root: types.Root) ?BorrowedState {
         var t = LockTimer.start("states", "statesGet");
         self.states_lock.lockShared();
@@ -1711,18 +1666,18 @@ pub const BeamChain = struct {
                 }
                 // tryAcquire returned null: rc is in the freeing
                 // process (refcount→0 elsewhere). Today this should
-                // never happen because the only acquires today come
-                // from the worker thread itself, but the safe-by-
-                // default behavior is to report the entry as missing
-                // rather than dereference a dying allocation. The
-                // c-2b removal protocol ("remove-from-map then
-                // release") is what makes this branch theoretically
-                // reachable in the future without a UAF.
+                // never happen because the only acquires come from the
+                // worker thread itself, but the safe-by-default behavior
+                // is to report the entry as missing rather than
+                // dereference a dying allocation. The removal protocol
+                // ("remove-from-map then release") is what makes this
+                // branch theoretically reachable in the future without
+                // a UAF.
                 return null;
             }
-            // Legacy lock-based path: hand the shared lock off to the
-            // borrow.  Backward-compat with --chain-worker=off; PR
-            // #820 / #803 kill-switch.
+            // Lock-based path: hand the shared lock off to the
+            // borrow. Backward-compat with --chain-worker=off
+            // kill-switch.
             return BorrowedState{
                 .state = &rc.state,
                 .backing = .{ .states_shared_rwlock = &self.states_lock },
@@ -1775,9 +1730,9 @@ pub const BeamChain = struct {
     /// supplied `post_state` and we sszClone before wrapping) where
     /// the upstream errdefer is gated by an additional
     /// `post_state_owned` flag, not by an optional. A bool gate
-    /// matches both call sites; the optional gate did not. Pre-c-2b
-    /// the two sites used different mechanisms for identical work
-    /// (PR #828 review by @ch4r10t33r) — this helper unifies them.
+    /// matches both call sites; the optional gate did not. The two
+    /// sites previously used different mechanisms for identical work
+    /// — this helper unifies them.
     ///
     /// NOTE: the helper is for the OWNED case only. `onBlock`'s
     /// caller-supplied path still does its own `sszClone` +
@@ -1812,7 +1767,7 @@ pub const BeamChain = struct {
     /// Used by produceBlock / onBlock STF commit and similar
     /// single-key writes.
     ///
-    /// Under c-2b commit 2 the helper takes `*RcBeamState` directly
+    /// The helper takes `*RcBeamState` directly
     /// (callers wrap their `*BeamState` via `RcBeamState.create`
     /// before calling). Map ownership transfers in: on success the
     /// map holds the rc and will release it on `deinit`. On
@@ -1835,8 +1790,8 @@ pub const BeamChain = struct {
     /// alive across any subsequent deref of `borrow.state` (DB writes,
     /// forkchoice updates, etc.).
     ///
-    /// Why hold the exclusive lock across the borrow? See PR #820 / issue
-    /// #803: with `BeamNode.mutex` removed from the gossip / req-resp /
+    /// Why hold the exclusive lock across the borrow? With `BeamNode.mutex`
+    /// removed from the gossip / req-resp /
     /// interval paths, two threads can be inside `chain.onBlock`
     /// concurrently. Thread A's `onBlockFollowup -> processFinalizationAdvancement
     /// -> pruneStates` (also exclusive on `states_lock`) can `fetchRemove`
@@ -1864,23 +1819,21 @@ pub const BeamChain = struct {
         root: types.Root,
         rc: *RcBeamState,
     ) !struct { borrow: BorrowedState, kept_existing: bool } {
-        // INTENTIONAL: this helper holds the EXCLUSIVE side of
+        // Intentional: this helper holds the exclusive side of
         // `states_lock` across the returned borrow even when chain-
-        // worker mode is enabled. Slice c-2b commit 4 of #803 dropped
-        // the rwlock for `statesGet` / `getFinalizedState` cache-hit
-        // borrows, but the cross-call write barrier rationale from
-        // PR #820 / #803 still applies here: the borrow lifetime
-        // spans (DB write → forkChoice.confirmBlock); both must
-        // observe the in-map pointer atomically, so unlock/reacquire
+        // worker mode is enabled. We dropped the rwlock for
+        // `statesGet` / `getFinalizedState` cache-hit borrows, but the
+        // cross-call write barrier still applies here: the borrow
+        // lifetime spans (DB write → forkChoice.confirmBlock); both
+        // must observe the in-map pointer atomically, so unlock/reacquire
         // is exactly the UAF race we are closing. The chain-worker
-        // is the only writer to `states` under c-2b, but that does
-        // NOT make the cross-call barrier redundant — the worker
-        // executes its own helpers serially, and the barrier is
-        // about ordering against `pruneStates` (also exclusive),
-        // which can run from the same worker between this helper's
-        // borrow handoff and the caller's last deref. Switching to
-        // a Backing.none / tryAcquire shape here would re-open
-        // exactly the issue PR #820 fixed.
+        // is the only writer to `states`, but that does not make the
+        // cross-call barrier redundant — the worker executes its own
+        // helpers serially, and the barrier is about ordering against
+        // `pruneStates` (also exclusive), which can run from the same
+        // worker between this helper's borrow handoff and the caller's
+        // last deref. Switching to a Backing.none / tryAcquire shape
+        // here would re-open exactly that UAF race.
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
@@ -1889,7 +1842,7 @@ pub const BeamChain = struct {
         // released by its deinit. errdefer below covers the OOM path
         // on `getOrPut`. The LockTimer is moved into the borrow as
         // well so the hold-span observation closes at the deinit
-        // site, not here. PR #820.
+        // site, not here.
         //
         // Ownership: the helper takes responsibility for `rc` cleanup
         // on every error path (mirroring `statesPutExclusive`). The
@@ -1928,32 +1881,26 @@ pub const BeamChain = struct {
             // dropped so they don't double-release.
             //
             // Lock-hold note: when this release drops the refcount
-            // to 0 (the common case under c-2b commit 2 — the only
-            // acquires today come from the chain worker thread
-            // itself, which is the SAME thread executing this
-            // helper, so no concurrent acquire holds the rc alive),
-            // `release()` synchronously runs `state.deinit()` +
-            // `allocator.destroy(rc)` while holding
+            // to 0 (the common case — the only acquires come from the
+            // chain worker thread itself, the same thread executing
+            // this helper, so no concurrent acquire holds the rc
+            // alive), `release()` synchronously runs `state.deinit()`
+            // + `allocator.destroy(rc)` while holding
             // `states_lock.exclusive`. For production-sized states
             // BeamState.deinit walks every interior list/slice and
-            // is non-trivial work. Pre-c-2b the equivalent free was
-            // done by the CALLER outside the lock.
+            // is non-trivial work.
             //
             // The hold span is observable via
             // `zeam_lock_hold_seconds{lock="states", site=...}` —
             // the `site` argument differentiates `onBlock.commit`
-            // from `produceBlock.commit`, so a regression vs slice
-            // (b) baselines is visible per call site without any
-            // new instrumentation. Devnet should watch the
-            // `onBlock.commit` p99 across the slice (b)→(c-2b) cut.
+            // from `produceBlock.commit`, so a per-call-site regression
+            // is visible without any new instrumentation.
             //
-            // TODO(slice-c-2c): if the kept-existing free shows up
-            // as a hold-span regression on devnet, switch the
-            // helper to return the to-be-released rc alongside the
-            // borrow and have the caller release after dropping the
-            // lock (option (b) in the PR #828 review thread). Adds
-            // API surface but moves deinit work out of the critical
-            // section. Tracking-only until devnet has data; the
+            // If the kept-existing free shows up as a hold-span
+            // regression, switch the helper to return the
+            // to-be-released rc alongside the borrow and have the
+            // caller release after dropping the lock. Adds API surface
+            // but moves deinit work out of the critical section. The
             // single-writer assumption above means the cost is
             // entirely allocator work, not contention with other
             // chain mutators.
@@ -1978,7 +1925,7 @@ pub const BeamChain = struct {
 
     /// Take the exclusive side of `states_lock` and remove the entry.
     /// Returns the removed `*RcBeamState` (or null) so the caller can
-    /// release it. Under c-2b the caller MUST call `.release()` on
+    /// release it. The caller MUST call `.release()` on
     /// the returned rc to drop the map's reference; if other readers
     /// hold acquires the underlying state stays alive until the last
     /// release.
@@ -1996,13 +1943,12 @@ pub const BeamChain = struct {
 
     /// Sample `rc.count()` for every entry in `BeamChain.states` and
     /// emit one observation per entry into the
-    /// `lean_chain_state_refcount_distribution` histogram. Slice c-2b
-    /// commit 5 of #803.
+    /// `lean_chain_state_refcount_distribution` histogram.
     ///
     /// Pattern: take `states_lock.shared` for the iteration only, drop
     /// the lock before observing values (no allocations or fallible
     /// ops happen inside the critical section). The lock hold span is
-    /// O(N) in the number of map entries; under c-2b this stays small
+    /// O(N) in the number of map entries; this stays small
     /// (≤ the un-pruned post-finalized state set, typically O(1) to O(10)).
     ///
     /// Infallible: any iteration failure path would silently drop the
@@ -2023,8 +1969,8 @@ pub const BeamChain = struct {
         //
         // The buffered-snapshot path is the safer shape: it minimizes
         // the lock hold span. The on-stack buffer is sized for the
-        // expected upper bound on devnet (un-pruned post-finalized
-        // states + cached anchor) plus headroom.
+        // expected upper bound (un-pruned post-finalized states +
+        // cached anchor) plus headroom.
         var buf: [128]u32 = undefined;
         var n: usize = 0;
         var overflow = false;
@@ -2056,7 +2002,7 @@ pub const BeamChain = struct {
                 @floatFromInt(c),
             );
         }
-        // Log the overflow case once per scrape so devnet operators
+        // Log the overflow case once per scrape so operators
         // notice maps growing past the buffer; not fatal.
         if (overflow) {
             self.logger.debug(
@@ -2105,29 +2051,29 @@ pub const BeamChain = struct {
 
     /// Append a block to `pending_blocks` for later replay.
     ///
-    /// Issue #788: under mutex contention the forkchoice clock can lag
+    /// Under mutex contention the forkchoice clock can lag
     /// wall-time by tens of slots; gossip blocks for those slots arrive at
     /// the wall-clock time and would otherwise be rejected as `FutureSlot`,
     /// causing the forkchoice head to fall back to `latest_finalized` (no
     /// descendants exist in protoArray). Buffering them here lets
     /// `processPendingBlocks` replay them once the clock catches up.
     ///
-    /// **Complexity** (PR #841 review #5/#6): all sub-passes are O(N) in
-    /// the queue length, no O(N²) anywhere.
+    /// Complexity: all sub-passes are O(N) in the queue length, no O(N²)
+    /// anywhere.
     ///   * Pre-finalized eviction is a single in-place compaction pass
     ///     using a write-pointer (preserves receive order; no per-removal
     ///     `orderedRemove` shift).
     ///   * Dedup is `memcmp` against the cached root in each
-    ///     `PendingBlockEntry`, not a re-hash of the full block body. The
-    ///     review explicitly called out the prior O(N·hash) loop as a
-    ///     blocking issue under sustained gossip floods.
+    ///     `PendingBlockEntry`, not a re-hash of the full block body — a
+    ///     re-hash loop is an O(N·hash) hotspot under sustained gossip
+    ///     floods.
     ///   * Cap-eviction uses `orderedRemove(0)` for the FIFO drop and is
     ///     O(N) for the single shift.
     ///
-    /// **Append OOM safety** (PR #841 review #7): we reserve space *before*
-    /// the cap-eviction. If the reservation itself OOMs we return early
-    /// without evicting anything — the prior shape would free the oldest
-    /// entry, then OOM on the append, losing two blocks per OOM event.
+    /// Append OOM safety: we reserve space *before* the cap-eviction. If
+    /// the reservation itself OOMs we return early without evicting
+    /// anything — the prior shape would free the oldest entry, then OOM on
+    /// the append, losing two blocks per OOM event.
     /// `ensureUnusedCapacity(1)` is a no-op in steady state because the
     /// ArrayList's underlying buffer was already sized to the cap on a
     /// previous append.
@@ -2170,7 +2116,7 @@ pub const BeamChain = struct {
         defer t.released();
         defer self.pending_blocks_lock.unlock();
 
-        // Pre-finalized in-place compaction (PR #841 review #6 — prior
+        // Pre-finalized in-place compaction (a prior
         // `orderedRemove(i)` per dropped entry was O(N²) under flood).
         // Walk forward, copy keepers down to a write pointer, deinit
         // dropped entries as we pass over them. Receive order is preserved
@@ -2194,8 +2140,8 @@ pub const BeamChain = struct {
             self.pending_blocks.shrinkRetainingCapacity(write);
         }
 
-        // Dedup by cached root — PR #841 review #5: was an O(N) re-hash
-        // per check, now an O(N) memcmp.
+        // Dedup by cached root — was an O(N) re-hash per check, now an
+        // O(N) memcmp.
         for (self.pending_blocks.items) |existing| {
             if (std.mem.eql(u8, &existing.block_root, &block_root)) {
                 self.logger.debug(
@@ -2209,7 +2155,7 @@ pub const BeamChain = struct {
             }
         }
 
-        // PR #841 review #7: reserve append capacity BEFORE evicting so an
+        // Reserve append capacity BEFORE evicting so an
         // allocator failure in the reservation step does not lose the
         // oldest entry too. In steady state this is a no-op (the ArrayList
         // was already grown to MAX_PENDING_BLOCKS on a prior append). If
@@ -2254,14 +2200,14 @@ pub const BeamChain = struct {
     /// Returns a slice of all missing attestation roots encountered while
     /// processing queued blocks; the caller owns and must free the slice.
     ///
-    /// One-at-a-time iteration (slice a-2): each loop iteration reacquires
+    /// One-at-a-time iteration: each loop iteration reacquires
     /// `pending_blocks_lock`, rescans from index 0 for the first ready
     /// block, removes it, releases the lock, then replays via `onBlock`.
     /// This trades O(n²) worst case for safety — indices are never assumed
     /// stable across an unlock, so the gossip thread is free to append to
     /// the queue between iterations. The `lean_pending_blocks_drain_iters`
-    /// histogram measures how often this matters in practice; current
-    /// devnet workloads keep n small.
+    /// histogram measures how often this matters in practice; typical
+    /// workloads keep n small.
     pub fn processPendingBlocks(self: *Self) []types.Root {
         var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
         var iter_count: usize = 0;
@@ -2281,20 +2227,19 @@ pub const BeamChain = struct {
             const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
             const finalized_slot = self.forkChoice.getLatestFinalized().slot;
             const current_slot = self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
-            // PR #841 review #8: drain-side eviction of "too-far-future"
-            // entries whose slot the forkchoice clock has not yet caught
-            // up to and is unlikely to ever (an adversary can flood with
-            // blocks at `current_slot + 250` that are within the
-            // queueable window at enqueue time but stay un-replayable
-            // until the clock advances by 250 slots). Saturating add
-            // avoids u64 wrap-around on adversarial input — see PR #841
-            // review #8.
+            // Drain-side eviction of "too-far-future" entries whose slot
+            // the forkchoice clock has not yet caught up to and is
+            // unlikely to ever (an adversary can flood with blocks at
+            // `current_slot + 250` that are within the queueable window
+            // at enqueue time but stay un-replayable until the clock
+            // advances by 250 slots). Saturating add avoids u64
+            // wrap-around on adversarial input.
             const too_far_future_slot: types.Slot = current_slot +| constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE;
 
             // Pop the first ready entry under the lock; release before any
             // heavy work so gossip-thread appends can proceed.
             //
-            // The scan is an in-place compaction (PR #841 review #6: prior
+            // The scan is an in-place compaction (a prior
             // `orderedRemove(i)` per dropped entry was O(N²) under flood).
             // Walk forward, copy keepers down to a write pointer; when we
             // see the first "ready" block (slot * intervals <= fc_time)
@@ -2344,9 +2289,9 @@ pub const BeamChain = struct {
                 defer queued_entry.signed_block.deinit();
 
                 const queued_slot = queued_entry.signed_block.block.slot;
-                // PR #841 review #5 + slice (e) of #803: use the cached
-                // root from the queue entry instead of re-hashing the
-                // block. The root was stamped at gossip ingress — SSZ is
+                // Use the cached root from the queue entry instead of
+                // re-hashing the block. The root was stamped at gossip
+                // ingress — SSZ is
                 // collision-resistant, so this is identical to what the
                 // pre-cache path computed at this point.
                 const block_root: types.Root = queued_entry.block_root;
@@ -2513,9 +2458,9 @@ pub const BeamChain = struct {
         // called post ticking the chain to the correct time, but once validator is separated
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
-        // Align with leanSpec: accept new aggregated payloads before proposing.
-        // This ensures the proposer builds on the latest proposal head derived
-        // from known aggregated payloads.
+        // Accept new aggregated payloads before proposing so the proposer
+        // builds on the latest proposal head derived from known aggregated
+        // payloads.
         const proposal_head = try self.forkChoice.getProposalHead(opts.slot);
         const parent_root = proposal_head.root;
 
@@ -2538,7 +2483,7 @@ pub const BeamChain = struct {
         }
 
         const post_state = try self.allocator.create(types.BeamState);
-        // c-2b: switched from `?*BeamState` (nulled on consume) to a
+        // Switched from `?*BeamState` (nulled on consume) to a
         // bool gate to match `onBlock`'s post_state_settled shape.
         // `wrapOwnedStateIntoRc` flips this on consume; the upstream
         // errdefer below covers every early-return path before the
@@ -2645,13 +2590,13 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
-        // c-2b: move the heap-allocated post_state into a freshly-
+        // Move the heap-allocated post_state into a freshly-
         // `create`d RcBeamState via the shared helper that
         // centralises the value-copy + destroy + create dance.
         // Helper sets `post_state_consumed = true` BEFORE its
         // (fallible) create call, so the upstream errdefer does
         // not deref freed memory on OOM and does not double-free
-        // on success. PR #828 review by @ch4r10t33r.
+        // on success.
         const post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_consumed);
         // statesPutExclusive takes ownership of the rc on success;
         // releases on its own OOM path.
@@ -2689,7 +2634,7 @@ pub const BeamChain = struct {
         };
     }
 
-    /// devnet5 / leanSpec #717: merge a produced block's per-attestation Type-1 proofs with the
+    /// Merge a produced block's per-attestation Type-1 proofs with the
     /// proposer's signature over the block root into the single Type-2 `SignedBlock.proof`.
     ///
     /// This is the expensive recursive-STARK merge. It is invoked off the slot-driver loop (the
@@ -2854,10 +2799,10 @@ pub const BeamChain = struct {
 
     /// Process an incoming gossip message.
     ///
-    /// Slice (e) of #803: `precomputed_block_root` is the producer's
-    /// already-computed `hashTreeRoot(BeamBlock, signed_block.block)`.
+    /// `precomputed_block_root` is the producer's already-computed
+    /// `hashTreeRoot(BeamBlock, signed_block.block)`.
     /// Pass `null` only when the producer truly does not have one
-    /// — every current production gossip producer DOES (see
+    /// — every current production gossip producer does (see
     /// `BeamNode.onGossip` which computes it before taking any
     /// per-resource lock so it can be reused across the lock-free
     /// pre-check fan-out and this call). The block branch threads the
@@ -2897,7 +2842,7 @@ pub const BeamChain = struct {
 
                 if (!hasBlock) {
                     // Validate the block. `validateBlock` distinguishes
-                    // three future-slot cases (issue #788):
+                    // three future-slot cases:
                     //   * within `MAX_FUTURE_SLOT_TOLERANCE` — fall through
                     //     to the existing per-interval pending-queue check
                     //     and either queue or process now.
@@ -2966,8 +2911,8 @@ pub const BeamChain = struct {
                         }
                     }
 
-                    // Slice c-2b commit 3 of #803: route through the
-                    // chain-worker queue when enabled. We clone
+                    // Route through the chain-worker queue when
+                    // enabled. We clone
                     // `signed_block` here — the gossip layer owns the
                     // borrowed copy for the duration of this callback,
                     // but the worker takes ownership and runs
@@ -2997,10 +2942,10 @@ pub const BeamChain = struct {
                         var cloned_consumed = false;
                         // `defer` (not `errdefer`): QueueFull / QueueClosed return
                         // `.{}` from the catch arm — a normal return — so `errdefer`
-                        // would not run and the clone would leak (zclawz review, #886).
+                        // would not run and the clone would leak.
                         defer if (!cloned_consumed) cloned.deinit();
-                        // Slice (e): forward the block_root we already computed
-                        // above so the worker thread doesn't re-hash the block.
+                        // Forward the block_root we already computed above so
+                        // the worker thread doesn't re-hash the block.
                         self.submitBlock(cloned, true, block_root) catch |err| switch (err) {
                             error.QueueFull => {
                                 self.logger.warn(
@@ -3068,14 +3013,12 @@ pub const BeamChain = struct {
                     sender_node_name,
                 });
 
-                // leanSpec sync-state gating
-                // (`subspecs/sync/service.py::on_gossip_attestation`):
-                // gossip is processed in `SYNCING` and `SYNCED`; only
-                // dropped in `IDLE` (no peers / forkchoice not yet
-                // initialised). The behind_peers state maps to spec
-                // `SYNCING` — accept attestations and let the buffer
-                // catch unknown-block / future-slot ones for replay
-                // after the next gossip block lands.
+                // Sync-state gating: gossip is processed when synced or
+                // syncing; only dropped when idle (no peers / forkchoice
+                // not yet initialised). When behind peers we accept
+                // attestations and let the buffer catch unknown-block /
+                // future-slot ones for replay after the next gossip
+                // block lands.
                 switch (self.getSyncStatus()) {
                     .synced, .behind_peers => {},
                     .no_peers, .fc_initing => {
@@ -3084,26 +3027,24 @@ pub const BeamChain = struct {
                     },
                 }
 
-                // leanSpec parity for non-aggregators: spec runs
-                // validate + signature verify even when not storing
-                // (`forks/lstar/spec.py::on_gossip_attestation` gates
-                // ONLY the `attestation_signatures` write on
-                // `is_aggregator`). Dispatching through the chain-
-                // worker for both roles keeps the libxev thread out
-                // of the heavy XMSS verify; the worker thunk skips
-                // the fork-choice tracker update for non-aggregators.
+                // For non-aggregators we still run validate + signature
+                // verify even when not storing — only the
+                // `attestation_signatures` write is gated on
+                // `is_aggregator`. Dispatching through the chain-worker
+                // for both roles keeps the libxev thread out of the
+                // heavy XMSS verify; the worker thunk skips the
+                // fork-choice tracker update for non-aggregators.
                 if (self.chain_worker != null) {
                     // Pure dispatch on the libxev thread —
                     // `validateAttestationData` (proto-array reads
                     // under `forkChoice.mutex`) and the XMSS verify
                     // both run on the worker thread. The worker thunk
-                    // runs them for ALL roles (leanSpec parity); only
-                    // the fork-choice tracker update is gated on
-                    // `is_aggregator_enabled`.
+                    // runs them for all roles; only the fork-choice
+                    // tracker update is gated on `is_aggregator_enabled`.
                     //
                     // Retryable validation failures (unknown block /
-                    // future slot) land in the spec's pending buffer
-                    // for replay after the next `onBlock` import; see
+                    // future slot) land in the pending buffer for replay
+                    // after the next `onBlock` import; see
                     // `enqueuePendingAttestation` and
                     // `replayPendingAttestations`. `BlocksByRoot`
                     // fetch storms are absorbed by that buffer
@@ -3178,11 +3119,10 @@ pub const BeamChain = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // leanSpec sync-state gating (same as `.attestation`
-                // arm): accept gossip in `SYNCING` and `SYNCED`; drop
-                // only in `IDLE` (no peers / fc not initialised).
-                // Retryable validation failures land in the pending
-                // buffer for replay.
+                // Sync-state gating (same as `.attestation` arm): accept
+                // gossip when synced or syncing; drop only when idle (no
+                // peers / fc not initialised). Retryable validation
+                // failures land in the pending buffer for replay.
                 switch (self.getSyncStatus()) {
                     .synced, .behind_peers => {},
                     .no_peers, .fc_initing => {
@@ -3192,9 +3132,9 @@ pub const BeamChain = struct {
                 }
 
                 if (self.chain_worker != null) {
-                    // Issue #863 P5: same as the attestation arm — pure
-                    // dispatch on the libxev thread; the worker thunk
-                    // runs `onGossipAggregatedAttestation` (which itself
+                    // Same as the attestation arm — pure dispatch on the
+                    // libxev thread; the worker thunk runs
+                    // `onGossipAggregatedAttestation` (which itself
                     // calls `validateAttestationData` then the heavy
                     // XMSS aggregate-verify).
                     //
@@ -3206,15 +3146,15 @@ pub const BeamChain = struct {
                     // we need an independent allocation. On submit
                     // failure or queue-full/closed, `defer` frees the clone if the
                     // worker did not take ownership (`errdefer` would miss the
-                    // catch-arm `return .{}` paths — zclawz review, #886).
+                    // catch-arm `return .{}` paths).
                     var cloned: types.SignedAggregatedAttestation = undefined;
                     try types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned);
                     var cloned_consumed = false;
                     defer if (!cloned_consumed) cloned.deinit();
                     self.submitGossipAggregatedAttestation(cloned) catch |err| switch (err) {
                         error.QueueFull => {
-                            // leanSpec buffers retryable gossip; mirror that on
-                            // worker backpressure instead of dropping (#863).
+                            // Buffer retryable gossip on worker
+                            // backpressure instead of dropping.
                             self.enqueuePendingAggregation(cloned, "queue_full");
                             cloned_consumed = true;
                             zeam_metrics.metrics.lean_pending_attestations_buffered_total.incr(.{ .kind = "aggregation", .reason = "queue_full" }) catch {};
@@ -3241,9 +3181,9 @@ pub const BeamChain = struct {
 
                 // Worker-disabled path (tests / single-threaded mode):
                 // run validate + verify + store inline. On retryable
-                // failure, clone-and-buffer for replay so spec's
-                // `_pending_aggregated_attestations` semantics hold
-                // even without the chain-worker.
+                // failure, clone-and-buffer for replay so the
+                // pending-aggregation semantics hold even without the
+                // chain-worker.
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
                     switch (err) {
                         error.UnknownHeadBlock,
@@ -3281,13 +3221,13 @@ pub const BeamChain = struct {
         }
     }
 
-    // import block assuming it is gossip validated or synced
-    // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
-    // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
+    // Import a block assuming it is gossip-validated or synced.
+    // Functionality is split between this and our forkchoice's onBlock to
+    // parallelize "apply transition" with other verifications.
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
         const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
-        // Per-substep stopwatch (#863). Records into
+        // Per-substep stopwatch. Records into
         // `zeam_chain_onblock_step_duration_seconds{step="…"}` so the
         // multi-second tail can be attributed without invasive logging.
         var step_watch = OnblockStepWatch.init();
@@ -3302,10 +3242,10 @@ pub const BeamChain = struct {
         };
         if (blockInfo.blockRoot != null) {
             zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onBlock" }) catch {};
-            // PR #842 review #2: see the rationale in
-            // `forkchoice.onBlock`. Same trust-but-verify pattern at
-            // the chain-level public API boundary; debug + ReleaseSafe
-            // only, free in `ReleaseFast` / `ReleaseSmall`.
+            // See the rationale in `forkchoice.onBlock`. Same
+            // trust-but-verify pattern at the chain-level public API
+            // boundary; debug + ReleaseSafe only, free in `ReleaseFast`
+            // / `ReleaseSmall`.
             if (std.debug.runtime_safety) verify: {
                 var verify_root: [32]u8 = undefined;
                 zeam_utils.hashTreeRoot(types.BeamBlock, block, &verify_root, self.allocator) catch |err| {
@@ -3351,15 +3291,13 @@ pub const BeamChain = struct {
             // rejected without mutating post state). Uses the shared thread pool when available to
             // parallelize per-attestation verification across CPU workers.
             //
-            // The XMSS pubkey cache is documented NOT thread-safe; today the
-            // The XMSS pubkey cache is lock-free as of P1 of #863
-            // (`xmss.PublicKeyCache` uses per-slot atomic CAS). No
-            // `pubkey_cache_lock` acquisition needed here — readers
-            // and the STF's own population path race on the slot's
-            // atomic and the loser frees its handle. The previous
-            // mutex around this block was the dominant contributor
-            // to the ~78ms mean lock hold reported in #863.
-            // devnet5: a block carries ONE merged Type-2 proof, so verification is a single
+            // The XMSS pubkey cache is lock-free (`xmss.PublicKeyCache`
+            // uses per-slot atomic CAS). No `pubkey_cache_lock`
+            // acquisition needed here — readers and the STF's own
+            // population path race on the slot's atomic and the loser
+            // frees its handle. An earlier mutex around this block was
+            // the dominant contributor to a ~78ms mean lock hold.
+            // A block carries one merged Type-2 proof, so verification is a single
             // container.verify (no per-attestation parallel batch). thread_pool no longer needed here.
             try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
 
@@ -3464,7 +3402,7 @@ pub const BeamChain = struct {
 
             const aggregated_attestations = block.body.attestations.constSlice();
 
-            // devnet5: the block carries a single merged Type-2 proof (already verified above), not
+            // The block carries a single merged Type-2 proof (already verified above), not
             // per-attestation signature groups. Each attestation's participants come straight from
             // its own aggregation_bits, so there is no per-group count or participant cross-check.
 
@@ -3544,13 +3482,11 @@ pub const BeamChain = struct {
                 }
             }
 
-            // devnet5 (#16): re-aggregation (leanSpec `_deconstruct_block_into_store`). Split the
-            // block's single Type-2 proof back into a Type-1 per selected body attestation and store
-            // them in latest_new so a later aggregator/proposer can fold the block's coverage into
-            // its own aggregate. Selection is gated to keep the (expensive recursive-STARK) split
-            // off the critical path:
-            //   * in-sync only — a syncing node is replaying history, not contributing aggregates
-            //     (ethlambda gates its reaggregation path the same way);
+            // Re-aggregation: split the block's single Type-2 proof back into a Type-1 per selected
+            // body attestation and store them in latest_new so a later aggregator/proposer can fold
+            // the block's coverage into its own aggregate. Selection is gated to keep the (expensive
+            // recursive-STARK) split off the critical path:
+            //   * in-sync only — a syncing node is replaying history, not contributing aggregates;
             //   * skip target.slot <= latest_justified.slot — already-decided coverage adds nothing;
             //   * skip attestations the local pools already fully cover — re-deriving a Type-1 we
             //     already hold is wasted prove work;
@@ -3635,8 +3571,8 @@ pub const BeamChain = struct {
         // (DB write + forkchoice confirm) via the returned BorrowedState.
         // This blocks `pruneStates` (also exclusive on `states_lock`) from
         // racing in via another thread's `onBlockFollowup` and freeing the
-        // entry under us. See PR #820 / issue #803.
-        // c-2b: wrap post_state in an RcBeamState before commit.
+        // entry under us.
+        // Wrap post_state in an RcBeamState before commit.
         // Two paths depending on ownership:
         //   * post_state_owned (we allocated it locally above):
         //     route through `wrapOwnedStateIntoRc` — it does the
@@ -3650,10 +3586,9 @@ pub const BeamChain = struct {
         //     and is flipped after the commit succeeds because the
         //     gate's errdefer is gated on `post_state_owned` too).
         //
-        // PR #828 review by @ch4r10t33r: pre-c-2b the owned path
-        // used a different gate mechanism than `produceBlock`
-        // (post_state_settled bool vs ?*BeamState nulling); the
-        // helper unifies them.
+        // The owned path previously used a different gate mechanism
+        // than `produceBlock` (post_state_settled bool vs ?*BeamState
+        // nulling); the helper unifies them.
         var post_state_rc: *RcBeamState = undefined;
         if (post_state_owned) {
             // Helper flips `post_state_settled = true` BEFORE the
@@ -3873,10 +3808,9 @@ pub const BeamChain = struct {
         });
 
         // We keep the canonical chain from finalized to head, so we can safely prune all non-canonical states
-        // Actually remove and deallocate the pruned states (under
-        // c-2b: release the rc — the underlying state may stay
-        // alive if other readers hold acquires; freed when last
-        // release runs).
+        // Actually remove and deallocate the pruned states. Release the
+        // rc — the underlying state may stay alive if other readers hold
+        // acquires; freed when the last release runs.
         for (roots) |root| {
             if (self.states.fetchRemove(root)) |entry| {
                 entry.value.release();
@@ -4020,8 +3954,8 @@ pub const BeamChain = struct {
         // reachable across one finalization boundary. Pruning on
         // `latestFinalized.slot` drops exactly the roots in
         // (previousFinalized.slot, latestFinalized.slot] that such states can
-        // reference, which wedged zeam_0 on devnet-4 via a cross-fork reorg
-        // (see issue #771 and the complementary STF hotfix in #772).
+        // reference, which previously wedged a node via a cross-fork reorg
+        // (paired with an STF hotfix).
         {
             var t_rts = LockTimer.start("root_to_slot", "processFinalizationAdvancement.prune");
             locking.assertNoTier5SiblingHeld("processFinalizationAdvancement.prune");
@@ -4064,12 +3998,12 @@ pub const BeamChain = struct {
         const current_slot = self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
         // latest_finalized is a multi-field Checkpoint written under
         // forkChoice.mutex (exclusive). Take the shared lock via the
-        // accessor to avoid a torn (slot, root) pair. PR #820 / #803.
+        // accessor to avoid a torn (slot, root) pair.
         const finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
         // 1. Future slot check.
         //
-        // Issue #788: under heavy mutex contention (#786) the forkchoice's
+        // Under heavy mutex contention the forkchoice's
         // local clock (`timeSlots`) can lag wall-time by tens of slots.
         // Gossip blocks for those slots arrive at wall-time and would
         // otherwise be rejected as `FutureSlot`, causing the head to fall
@@ -4097,7 +4031,7 @@ pub const BeamChain = struct {
         // upper bound, not a routing decision.
         const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
         const max_future_queue: types.Slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE;
-        // PR #841 review #8: `current_slot + max_future_*` can overflow
+        // `current_slot + max_future_*` can overflow
         // `types.Slot` (u64) on adversarial input. Practically safe — slots
         // stay well below 2^32 for centuries — but Zig 0.16 release-mode
         // arithmetic doesn't trap, so a wrap-around could silently flip the
@@ -4167,9 +4101,8 @@ pub const BeamChain = struct {
         // pre-finalization ancestors. This is the gossip-level DoS defense that
         // prevents malicious peers from flooding the fork choice store with
         // blocks whose parent chain cannot reach the finalized checkpoint.
-        // forkchoice.onBlock is intentionally permissive here (matching
-        // leanSpec store.on_block semantics), so the check must live at this
-        // attack surface.
+        // forkchoice.onBlock is intentionally permissive here, so the
+        // check must live at this attack surface.
         if (!self.forkChoice.isFinalizedDescendant(block.parent_root)) {
             self.logger.debug("block validation failed: parent 0x{x} does not descend from finalized root", .{
                 &block.parent_root,
@@ -4187,11 +4120,11 @@ pub const BeamChain = struct {
     ///
     /// Block-included attestations skip the time check; they are trusted under
     /// the block's own validation. `is_from_block` is retained as a log marker.
-    /// Issue #863 P3: cheap O(1) future-slot bound check for gossip
-    /// attestations — extracted so the libxev main thread can fast-drop
-    /// future-slot attestations BEFORE dispatching to the chain-worker
-    /// (rec 5: keep the libxev hot path doing only constant-time
-    /// per-message work). The check is identical to the one inside
+    /// Cheap O(1) future-slot bound check for gossip attestations —
+    /// extracted so the libxev main thread can fast-drop future-slot
+    /// attestations before dispatching to the chain-worker, keeping the
+    /// libxev hot path doing only constant-time per-message work. The
+    /// check is identical to the one inside
     /// `validateAttestationData`'s pre-lookup section and is repeated
     /// there so the worker-thread path remains correct under future
     /// callers that bypass the libxev fast-drop.
@@ -4206,17 +4139,16 @@ pub const BeamChain = struct {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
 
-        // Issue #863 P3 part 1: future-slot drop is hoisted to BEFORE the
-        // proto-node lookups. Pre-fix order ran the lookups first, so an
-        // attestation for `current_slot + 100` referencing future blocks
-        // bottomed out at `UnknownHeadBlock` and the caller dutifully
-        // enqueued a `BlocksByRoot` for that future head — which always
-        // 404'd because the block didn't exist anywhere. Multiplied by
-        // 4× subnet fan-out on aggregators this was a fetch-storm
-        // amplifier and a primary contributor to the slot-driver
-        // starvation in #863. Rejecting the attestation here means we
-        // never derive a missing root for it and the fetch is simply
-        // never enqueued.
+        // Future-slot drop is hoisted to before the proto-node lookups.
+        // The old order ran the lookups first, so an attestation for
+        // `current_slot + 100` referencing future blocks bottomed out at
+        // `UnknownHeadBlock` and the caller dutifully enqueued a
+        // `BlocksByRoot` for that future head — which always 404'd
+        // because the block didn't exist anywhere. Multiplied by 4×
+        // subnet fan-out on aggregators this was a fetch-storm amplifier
+        // and a primary contributor to slot-driver starvation. Rejecting
+        // the attestation here means we never derive a missing root for
+        // it and the fetch is simply never enqueued.
         //
         // Bound is intervals-based (`GOSSIP_DISPARITY_INTERVALS`, =1) so
         // we still accept the very first interval of the next slot —
@@ -4265,7 +4197,7 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceSlotExceedsTarget;
         }
 
-        //    This corresponds to leanSpec's: assert attestation.source.slot <= attestation.target.slot
+        //    Invariant: attestation.source.slot <= attestation.target.slot
         if (data.source.slot > data.target.slot) {
             self.logger.debug("attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
                 data.source.slot,
@@ -4274,7 +4206,7 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceCheckpointExceedsTarget;
         }
 
-        //    This corresponds to leanSpec's: assert data.head.slot >= data.target.slot
+        //    Invariant: data.head.slot >= data.target.slot
         if (data.head.slot < data.target.slot) {
             self.logger.debug("attestation validation failed: head slot {d} < target slot {d}", .{
                 data.head.slot,
@@ -4292,7 +4224,7 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceCheckpointSlotMismatch;
         }
 
-        //    This corresponds to leanSpec's: assert target_block.slot == attestation.target.slot
+        //    Invariant: target_block.slot == attestation.target.slot
         if (target_block.slot != data.target.slot) {
             self.logger.debug("attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
                 target_block.slot,
@@ -4301,7 +4233,7 @@ pub const BeamChain = struct {
             return AttestationValidationError.TargetCheckpointSlotMismatch;
         }
 
-        //    This corresponds to leanSpec's: assert head_block.slot == attestation.head.slot
+        //    Invariant: head_block.slot == attestation.head.slot
         if (head_block.slot != data.head.slot) {
             self.logger.debug("attestation validation failed: head block slot {d} != head checkpoint slot {d}", .{
                 head_block.slot,
@@ -4311,8 +4243,7 @@ pub const BeamChain = struct {
         }
 
         // (Future-slot bound check is hoisted above the proto-node
-        // lookups — see the issue-#863 P3 comment at the top of this
-        // function.)
+        // lookups — see the comment at the top of this function.)
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
             data.source.slot,
@@ -4407,9 +4338,8 @@ pub const BeamChain = struct {
             defer borrow.deinit();
             const validators = borrow.state.validators.constSlice();
 
-            // pubkey_cache is lock-free as of P1 of #863 — no
-            // mutex acquisition needed. See `xmss.PublicKeyCache`
-            // for the per-slot CAS protocol.
+            // pubkey_cache is lock-free — no mutex acquisition needed.
+            // See `xmss.PublicKeyCache` for the per-slot CAS protocol.
 
             for (validator_indices) |validator_index| {
                 if (validator_index >= validators.len) {
@@ -4459,7 +4389,7 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Submit aggregate work to the dedicated ThreadPool worker (issue #873).
+    /// Submit aggregate work to the dedicated ThreadPool worker.
     /// Returns within microseconds; the worker calls `publishProducedAggregations`
     /// itself. If the previous aggregate is still in-flight, the trigger is
     /// coalesced and a catch-up run is scheduled when the worker finishes.
@@ -4516,7 +4446,7 @@ pub const BeamChain = struct {
 
         // Non-blocking enqueue onto the shared ThreadPool. Validators are cloned
         // inside the worker after the slot clock is re-read so a slow or
-        // coalesced trigger does not snapshot stale head state (#925).
+        // coalesced trigger does not snapshot stale head state.
         self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, slot }) catch {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
@@ -4550,7 +4480,7 @@ pub const BeamChain = struct {
 
         // Re-read the slot clock at worker entry. A slow worker otherwise
         // aggregates a stale {slot-1, slot} window from enqueue time while
-        // the chain has moved on — wasted FFI that drives coalesce storms (#907).
+        // the chain has moved on — wasted FFI that drives coalesce storms.
         const clock_slot = chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
         const work = Self.resolveAggregateWorkerSlot(trigger_slot, clock_slot);
         const slot = work.slot;
@@ -4580,7 +4510,7 @@ pub const BeamChain = struct {
 
         // On-time workers use {slot-1, slot}. When the trigger lagged the
         // clock by 2+ slots, slot-1 att_data is past the merge window — skip
-        // it and prove only the current slot (PR #900 / #925 catch-up storm).
+        // it and prove only the current slot (catch-up storm).
         var slot_window_buf: [2]types.Slot = undefined;
         var slot_window_len: usize = 0;
         if (!work.is_clock_catch_up and slot > 0) {
@@ -4614,7 +4544,7 @@ pub const BeamChain = struct {
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
-    /// devnet5 (#14): trigger off-loop block production for `time_intervals` if this node is the
+    /// Trigger off-loop block production for `time_intervals` if this node is the
     /// proposer for the slot. Called from the libxev interval tick at interval-in-slot 0; returns
     /// within microseconds. The whole propose (produceBlock + Type-2 merge + publishBlock) runs on
     /// a `thread_pool` worker so the multi-second prod-scheme merge never freezes the slot loop.
@@ -4746,13 +4676,13 @@ pub const BeamChain = struct {
     /// field, then falls back to a database load. Returns null if the state
     /// is not available in any location.
     ///
-    /// Slice (a-2) migration: this used to return a raw `*const BeamState`
-    /// borrowed from the in-memory map under `BeamNode.mutex`. After (a-2)
-    /// it returns a `BorrowedState` whose backing lock depends on which
-    /// path produced the result:
+    /// This used to return a raw `*const BeamState` borrowed from the
+    /// in-memory map under `BeamNode.mutex`. It now returns a
+    /// `BorrowedState` whose backing lock depends on which path produced
+    /// the result:
     ///   * In-memory map hit  → backed by `states_lock` (shared) when
     ///     `--chain-worker=off`; `Backing.none` (rc-only lifetime)
-    ///     when `--chain-worker=on` (slice c-2b commit 4 of #803).
+    ///     when `--chain-worker=on`.
     ///   * Cache hit / DB load → backed by `events_lock` (mutex) when
     ///     `--chain-worker=off`, since `cached_finalized_state` is
     ///     mutated under `events_lock` (the DB-load path also writes
@@ -4762,14 +4692,10 @@ pub const BeamChain = struct {
     ///     returning, mirroring the lock-free path in `statesGet`.
     /// Callers MUST release the borrow exactly once via `deinit()` or
     /// `cloneAndRelease(allocator)`.
-    ///
-    /// PR description (a-2) enumerates every caller migrated under this
-    /// API change — grepping `states.get` will not find them.
     pub fn getFinalizedState(self: *Self) ?BorrowedState {
         // latest_finalized is a multi-field Checkpoint written under
         // forkChoice.mutex (exclusive); use the shared-locked accessor
         // so we don't pair `slot` with a different update's `root`.
-        // PR #820 / #803.
         const finalized_checkpoint = self.forkChoice.getLatestFinalized();
 
         // First try the in-memory states map under `states_lock.shared`.
@@ -4919,7 +4845,7 @@ pub const BeamChain = struct {
     /// Get the latest justified checkpoint.
     /// Returns the checkpoint with slot and root of the most recent
     /// justified checkpoint, snapshotted under forkChoice.mutex.lockShared
-    /// so callers see a coherent (slot, root) pair. PR #820 / #803.
+    /// so callers see a coherent (slot, root) pair.
     pub fn getJustifiedCheckpoint(self: *Self) types.Checkpoint {
         return self.forkChoice.getLatestJustified();
     }
@@ -4955,7 +4881,6 @@ pub const BeamChain = struct {
         // forkChoice.head and fcStore.latest_finalized are multi-field
         // structs written under forkChoice.mutex.lock(). Snapshot via the
         // shared-locked accessors so callers see coherent values.
-        // PR #820 / #803.
         const our_head_slot = self.forkChoice.getHead().slot;
         const our_finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
@@ -4978,8 +4903,8 @@ pub const BeamChain = struct {
             }
         }
 
-        // `behind_peers` maps to leanSpec **SYNCING** ("deep sync"). It must
-        // ONLY fire on a finalization gap; a 1-slot head delta is normal
+        // `behind_peers` is the "deep sync" state. It must
+        // only fire on a finalization gap; a 1-slot head delta is normal
         // gossip latency, not deep sync, and `behind_peers` consumers
         // (`validator_client.maybeDoProposal` / `mayBeDoAttestation`) skip
         // proposer/attestation duties — gating those on transient head
@@ -5001,16 +4926,16 @@ pub const BeamChain = struct {
             return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
-        // Check 3: pre-finalization devnets — wall-clock head lag means we are
-        // not at chain tip even though finalization gaps are zero (#926).
+        // Check 3: pre-finalization networks — wall-clock head lag means we are
+        // not at chain tip even though finalization gaps are zero.
         //
         // BUT only if a peer is actually ahead of our head — i.e. there is someone to sync FROM.
         // In a uniformly-slow network (e.g. the prod XMSS scheme, where each block's Type-2 merge
         // can exceed an interval), every node's head lags the wall clock equally while all agree on
         // the tip. Tripping behind_peers there disables propose+aggregate on ALL nodes with no peer
-        // to catch up from — a pre-finalization deadlock that prevents the FIRST finalization from
-        // ever happening. If no peer reports a higher head, we ARE the tip: stay synced and keep
-        // producing/aggregating so the chain can progress and finalize. (#717 devnet5.)
+        // to catch up from — a pre-finalization deadlock that prevents the first finalization from
+        // ever happening. If no peer reports a higher head, we are the tip: stay synced and keep
+        // producing/aggregating so the chain can progress and finalize.
         const wall_lag = self.wall_head_lag_slots.load(.monotonic);
         if (max_peer_head_slot > our_head_slot and blocks_by_range_sync.isWallHeadLagSyncing(
             our_finalized_slot,
@@ -5070,9 +4995,9 @@ pub const BlockValidationError = error{
     FutureSlot,
     /// Block slot is in the future but within the `pending_blocks`
     /// queueing window. The caller should clone + queue the block for
-    /// later replay rather than treating it as an error. See #788 for
-    /// the rationale (forkchoice clock can lag wall-time under mutex
-    /// contention; we should not drop otherwise-valid gossip).
+    /// later replay rather than treating it as an error. Rationale: the
+    /// forkchoice clock can lag wall-time under mutex contention; we
+    /// should not drop otherwise-valid gossip.
     FutureSlotQueueable,
     /// Block slot is before the finalized slot
     PreFinalizedSlot,
@@ -5359,7 +5284,6 @@ test "buildTreeVisualization integration test" {
 }
 
 // Attestation Validation Tests
-// These tests align with leanSpec's test_attestation_processing.py
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
@@ -5774,14 +5698,14 @@ test "attestation validation - gossip future-slot bound" {
 }
 
 // ----------------------------------------------------------------------
-// Issue #788 — future-slot block queueing tests
+// Future-slot block queueing tests
 //
 // Cover the FutureSlot/FutureSlotQueueable distinction added by
 // `validateBlock` and the `enqueuePendingBlock` helper that backs the
 // gossip path. The actual `onGossip` integration is exercised by the
 // chain-worker / node tests; here we focus on the boundary conditions
 // of the new logic so a regression that re-introduces the
-// drop-on-future-slot pathway (#788) lights up immediately.
+// drop-on-future-slot pathway lights up immediately.
 // ----------------------------------------------------------------------
 
 const FutureSlotTestFixture = struct {
@@ -5877,8 +5801,8 @@ test "validateBlock #788: FutureSlot hard-reject for block beyond queue toleranc
     defer fx.deinit(std.testing.allocator);
 
     // Anything beyond MAX_FUTURE_SLOT_QUEUE_TOLERANCE is rejected as
-    // FutureSlot — the hard reject that pre-#788 behaviour applied to
-    // every future-slot block, now narrowed to the truly-bogus range.
+    // FutureSlot — the hard reject once applied to every future-slot
+    // block, now narrowed to the truly-bogus range.
     var block = fx.mock_chain.blocks[1].block;
     block.slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE + 10;
 
@@ -5896,7 +5820,7 @@ test "validateBlock #788: queue-tolerance boundary is inclusive" {
     // slot that should still be FutureSlotQueueable, not FutureSlot.
     // One slot beyond that flips to FutureSlot. Lock both sides of the
     // boundary so a future contributor cannot accidentally drop it by
-    // one and silently re-introduce the #788 reset symptom.
+    // one and silently re-introduce the head-reset symptom.
     var block_at_boundary = fx.mock_chain.blocks[1].block;
     block_at_boundary.slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE;
     try std.testing.expectError(
@@ -6058,7 +5982,7 @@ test "processPendingBlocks #788: evicts pre-finalized entries during scan" {
     try std.testing.expectEqual(@as(usize, 0), fx.beam_chain.pending_blocks.items.len);
 }
 
-// PR #841 review #10: drain-side eviction of "too-far-future" entries.
+// Drain-side eviction of "too-far-future" entries.
 // An adversary that floods with blocks at `current_slot + 200` (within
 // MAX_FUTURE_SLOT_QUEUE_TOLERANCE = 256 so accepted into queue) leaves
 // them sitting in the queue forever — they never become processable
@@ -6097,7 +6021,7 @@ test "processPendingBlocks #788: evicts too-far-future entries during scan" {
     try std.testing.expectEqual(@as(usize, 0), fx.beam_chain.pending_blocks.items.len);
 }
 
-// PR #841 review #9: append_oom path coverage. The capacity
+// append_oom path coverage. The capacity
 // reservation in `enqueuePendingBlock` MUST fail before the
 // cap-eviction so an allocator failure does not lose two blocks per
 // OOM event (one evicted, one rejected). Use a FailingAllocator
@@ -6169,7 +6093,7 @@ test "enqueuePendingBlock #788: append_oom path returns false without evicting" 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
-// PR #841 review #4/#5: dedup compares cached roots, not re-hashed
+// Dedup compares cached roots, not re-hashed
 // blocks. The cap-1024 worst case used to do 1024 SSZ tree-hashes per
 // duplicate-check; now it does 1024 32-byte memcmp's. Lock the
 // behaviour in code so a future contributor cannot accidentally drop
@@ -6205,11 +6129,10 @@ test "enqueuePendingBlock #788: dedup uses cached root, not re-hash" {
     try std.testing.expectEqual(@as(usize, 1), fx.beam_chain.pending_blocks.items.len);
 }
 
-// PR #841 review #13: lock the metrics scrape contract for the
-// future-block queue so a struct rename or serializer regression
-// fails CI here, not silently in production. Mirrors the slice-(b)
-// LockTimer → /metrics audit pattern (`pkgs/node/src/locking.zig`)
-// and the slice-c-2b commit-5 refcount-distribution audit.
+// Lock the metrics scrape contract for the future-block queue so a
+// struct rename or serializer regression fails CI here, not silently
+// in production. Mirrors the LockTimer → /metrics audit pattern and
+// the refcount-distribution audit.
 //
 // We don't need to drive a real chain end-to-end — just exercise the
 // Counter/Gauge handles the chain code uses and assert each metric
@@ -6585,7 +6508,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
 }
 
 test "produceBlock - older-but-justified source is accepted" {
-    // leanSpec commit 00556d8: build_block must accept any attestation whose
+    // build_block must accept any attestation whose
     // source *slot* is in justified_slots, not just the most recent justified
     // checkpoint's root. This test places an attestation whose source is an
     // older justified slot (not the latest_justified checkpoint) and verifies
@@ -7091,9 +7014,9 @@ test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
 }
 
 // ---------------------------------------------------------------------
-// Concurrent stress tests for slice (a-3): exercise the UAF surface
-// directly at the unit level, so future regressions surface here without
-// needing the sim package. PR #820 / bug 14.
+// Concurrent stress tests: exercise the UAF surface directly at the
+// unit level, so future regressions surface here without needing the
+// sim package.
 //
 // All three tests use `std.testing.allocator` (thread-safe wrapper over
 // GeneralPurposeAllocator) for the BeamChain / cache. mock_chain inputs
@@ -7103,7 +7026,7 @@ test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
 test "BlockCache: 3-thread stress — insert / read / remove preserves invariants" {
     // Test A: three threads hammer a single BlockCache. One inserts blocks
     // (insertBlockPtr with ssz), one reads via cloneBlockAndSsz, one removes
-    // via removeFetchedBlock. The triple-atomic invariant from #803 says a
+    // via removeFetchedBlock. The triple-atomic invariant says a
     // reader must see {block-Some, ssz-Some} or {block-null, ssz-null} —
     // never the partial state. Removing must not double-free.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -7119,7 +7042,7 @@ test "BlockCache: 3-thread stress — insert / read / remove preserves invariant
     var bc = locking.BlockCache.init(std.testing.allocator);
     defer bc.deinit();
 
-    // N reduced from 1500 to 200 in PR #820 follow-up: the reader now
+    // N reduced from 1500 to 200: the reader now
     // uses `cloneBlockAndSsz`, which performs a full SSZ round-trip
     // (serialize + deserialize) per successful probe under the cache
     // mutex. That's the production-relevant API and the only safe
@@ -7416,7 +7339,7 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
 }
 
 test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)" {
-    // Regression for the post_state_rc leak Partha caught on PR #828:
+    // Regression for the post_state_rc leak:
     // statesCommitKeepExisting flips its rc-ownership-transfer at the
     // `getOrPut` step; if `getOrPut` itself OOMs, the helper is the
     // ONLY place that knows about the rc (the upstream caller in
@@ -7585,8 +7508,8 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
     // same time. Only one wins the forkChoice insert; the other observes
     // the existing fc block and skips that step but still does STF +
     // statesCommitKeepExisting. The kept_existing path is exactly what
-    // the slice (a-2) `cloneAndRelease` + slice (a-3) holds-exclusive-
-    // until-deref fix is protecting.
+    // the `cloneAndRelease` + holds-exclusive-until-deref fix is
+    // protecting.
     //
     // Per-iteration cost is dominated by two parallel STF runs +
     // signature verification; iter=30 keeps end-to-end runtime under a
@@ -7741,7 +7664,7 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
 }
 
 test "chain: concurrent re-import pressure — kept_existing path race + attestation spam" {
-    // Slice (b) cross-thread test scenario: two onBlock threads race
+    // Cross-thread test scenario: two onBlock threads race
     // the import of the SAME block sequence in opposite orders
     // (forward 1..N, reverse N..1) while an attestation thread spams
     // mixed-validity attestations. This is NOT a reorg test — we
@@ -7751,7 +7674,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
     // `states`; the loser then takes the kept_existing branch and
     // frees its redundantly-computed post-state. (A real reorg test
     // would need genMockChain to expose a fork-from-shared-parent
-    // helper; not in scope for slice (b).)
+    // helper; out of scope here.)
     //
     // The contract under test:
     //
@@ -7979,7 +7902,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
 }
 
 test "chain: finalization race — onBlockFollowup + statesGet from API-shaped reader" {
-    // Slice (b) cross-thread test scenario: while a writer thread imports
+    // Cross-thread test scenario: while a writer thread imports
     // blocks and advances finalization (via onBlockFollowup), an
     // HTTP-API-shaped reader thread loops over chain.statesGet +
     // cloneAndRelease for both finalized and non-finalized roots.
@@ -8204,7 +8127,7 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
 }
 
 test "chain-worker: end-to-end submitBlock advances state via the worker thread" {
-    // Slice c-2b commit 3 of #803 integration test.
+    // Chain-worker integration test.
     //
     // Boots a BeamChain with the chain-worker started, submits a real
     // block via `submitBlock` (the worker-routed producer wrapper),
@@ -8316,7 +8239,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     var cloned_consumed = false;
     defer if (!cloned_consumed) cloned.deinit();
 
-    // Slice (e) of #803: pass `null` for `block_root` so the
+    // Pass `null` for `block_root` so the
     // worker recomputes — this test deliberately exercises the
     // fallback path. End-to-end gossip path coverage runs through
     // the chain-worker stress harness in `stress.zig`.
@@ -8469,7 +8392,7 @@ const TestCallbackObserver = struct {
         // header lives on the stack and `.len` after free is
         // technically defined, reading freed-slice metadata trips
         // every reasonable static analyzer; explicit capture
-        // documents intent (zclawz round 3 review on PR #890).
+        // documents intent.
         const missing_len = missing_roots.len;
         self.allocator.free(missing_roots);
         self.mu.lock();
@@ -8510,7 +8433,7 @@ const TestCallbackObserver = struct {
 };
 
 test "chain-worker (#890): imported_block_fn fires once per successful submitBlock with the correct root" {
-    // PR #890 zclawz review: the `imported_block_fn` backchannel is
+    // The `imported_block_fn` backchannel is
     // the formal channel for the missing-attestation-roots fan-out
     // and the cached-descendant retry that previously had no
     // worker-side path. This is the happy-path test: submit a real
@@ -8619,7 +8542,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
 }
 
 test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU race)" {
-    // PR #890 zclawz review #2: the libxev producer
+    // The libxev producer
     // (`trySubmitImportToWorker`) checks `forkChoice.hasBlock(parent)`
     // before submitting; finalization can race and prune the parent
     // between the check and the worker's dispatch. Without the
@@ -8736,7 +8659,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
 }
 
 test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
-    // PR #890 zclawz round 3 review: the `pre_finalized` arm of
+    // The `pre_finalized` arm of
     // `RejectedBlockReason` is a separate code path
     // (`pruneCachedBlocks` instead of `cacheBlockAndFetchParent`)
     // and was previously uncovered by tests. Provoke it by bumping
@@ -8852,7 +8775,7 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
 }
 
 test "chain.statesGet under chain_worker enabled returns Backing.none + acquired_rc (slice c-2b commit 4)" {
-    // Slice c-2b commit 4 of #803: when chain_worker != null, statesGet
+    // When chain_worker != null, statesGet
     // takes the lock-free path — it tryAcquires the rc under the shared
     // lock, drops the lock, and returns a Backing.none borrow. This
     // test verifies the contract: the borrow is Backing.none, has a
@@ -8951,8 +8874,8 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
 }
 
 test "chain.statesGet under chain_worker enabled does not block exclusive writers (slice c-2b commit 4)" {
-    // The whole point of slice c-2b commit 4: a long-lived reader borrow
-    // must NOT block an exclusive-side mutation by the chain worker
+    // The whole point of the lock-free read path: a long-lived reader
+    // borrow must NOT block an exclusive-side mutation by the chain worker
     // path. We hold a Backing.none borrow open across the lifetime of
     // a writer thread that takes the exclusive lock and inserts an
     // unrelated entry; under the old shared-held-for-borrow behavior
@@ -9034,9 +8957,9 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
     try std.testing.expect(borrow.backing == .none);
 
     // Writer: take the exclusive lock + insert an unrelated entry.
-    // Under the OLD shared-held-for-borrow behavior this would block
-    // until the reader released; under c-2b commit 4 the reader's
-    // borrow does NOT hold the lock, so the writer completes
+    // Under the old shared-held-for-borrow behavior this would block
+    // until the reader released; with the lock-free read path the
+    // reader's borrow does NOT hold the lock, so the writer completes
     // immediately.
     const WriterCtx = struct {
         chain: *BeamChain,

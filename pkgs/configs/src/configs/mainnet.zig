@@ -6,8 +6,8 @@ pub const mainnet = types.ChainSpec{
     .name = "mainnet",
     .fork_digest = "00000000",
     .attestation_committee_count = 1,
-    // leanSpec chain/config.py: MAX_ATTESTATIONS_DATA = 8 (== params.MAX_ATTESTATIONS_DATA,
-    // the verifySignatures hard cap). Must not exceed it or the builder would assemble
-    // blocks the verify path rejects.
+    // MAX_ATTESTATIONS_DATA = 8 (== params.MAX_ATTESTATIONS_DATA, the
+    // verifySignatures hard cap). Must not exceed it or the builder would
+    // assemble blocks the verify path rejects.
     .max_attestations_data = 8,
 };

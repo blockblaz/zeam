@@ -213,8 +213,8 @@ pub const NodeTestContext = struct {
         allocator: Allocator,
         block: *types.SignedBlock,
     ) !void {
-        // devnet5: build one Type-1 proof per body attestation, then merge them with the
-        // proposer's Type-1 into the single Type-2 block proof — the same path production uses.
+        // Build one Type-1 proof per body attestation, then merge them with the proposer's
+        // Type-1 into the single Type-2 block proof — the same path production uses.
         // Validators are reconstructed from the test genesis spec to feed buildType2BlockProof.
         var validators = try types.Validators.init(allocator);
         defer validators.deinit();

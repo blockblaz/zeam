@@ -114,8 +114,8 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
 
     const lean_env = expect_mod.expectStringField(FixtureError, case_obj, &.{"leanEnv"}, ctx, "leanEnv") catch "prod";
 
-    // devnet5 (#717) verify_signatures fixtures are all leanEnv=test and carry a single Type-2
-    // `signedBlock.proof` (replacing devnet4's `signedBlock.signature`). Verifying them needs a
+    // The current verify_signatures fixtures are all leanEnv=test and carry a single Type-2
+    // `signedBlock.proof` (replacing the older `signedBlock.signature`). Verifying them needs a
     // test-scheme leanMultisig FFI to split + verify the Type-2 proof — which zeam does not have
     // (the leanMultisig glue is hardcoded to the production scheme). Until that FFI exists and the
     // runner is ported to the Type-2 proof-verify path, skip leanEnv=test fixtures rather than
@@ -197,8 +197,8 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
     //
     // leanMultisig's Rust glue is hardcoded to the production scheme; test-scheme
     // bytes will not deserialize through it. For invalid-fixture cases that path
-    // returning false is the expected outcome anyway (the spec asserts the
-    // implementation rejects). For valid-fixture cases with body attestations,
+    // returning false is the expected outcome anyway (the fixture expects a
+    // reject). For valid-fixture cases with body attestations,
     // we'd need a parallel test-scheme leanMultisig FFI; none of the current
     // valid fixtures carry body attestations so that gap doesn't bite yet.
     const att_failed = verifyBodyAttestations(allocator, ctx, &state, &block, signed_block_obj) catch |err| switch (err) {
@@ -254,7 +254,7 @@ fn verifyBodyAttestations(
     // they exercise the verifier's input-validation path, not a corrupt
     // fixture. Surface them as "verification rejected" (return true) so the
     // expectException check at the call site can match. Matches the HTTP
-    // test driver's behavior in pkgs/cli/src/test_driver.zig.
+    // test driver's behavior.
     const att_sigs_data = att_sigs_obj.get("data") orelse {
         std.debug.print(
             "fixture {s} case {s}: attestationSignatures missing data\n",

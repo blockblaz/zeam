@@ -6,8 +6,7 @@ use rec_aggregation::{
 use std::panic::AssertUnwindSafe;
 use std::slice;
 
-// Mirror hashsig-glue's struct layout with #[repr(C)]
-// These must match hashsig-glue/src/lib.rs exactly
+// Mirror hashsig-glue's struct layout with #[repr(C)]; these must match it exactly.
 #[repr(C)]
 pub struct PublicKey {
     pub inner: XmssPublicKey,
@@ -477,7 +476,7 @@ pub unsafe extern "C" fn xmss_verify_type_2(
 ///
 /// `num_threads = 0` means "use rayon's default" (one thread per logical CPU). Typical caller:
 /// set to `cpu_count - 3` to reserve cores for libxev, the chain worker, and the rust-libp2p
-/// network thread (issue #873).
+/// network thread.
 ///
 /// Returns 0 on success or if the pool was already initialized, -1 never (errors are treated as ok).
 #[no_mangle]

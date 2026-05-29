@@ -93,8 +93,8 @@ fn warnIfOtherBackendPopulated(
 }
 
 /// Runtime-selectable database handle. Both variants implement the
-/// same method surface (matching the RocksDB-shaped API used by
-/// `pkgs/node`); the `switch` arms below forward every call to the
+/// same method surface (matching the RocksDB-shaped API used by the
+/// node); the `switch` arms below forward every call to the
 /// active backend.
 ///
 /// The tagged-union shape (rather than a vtable) is deliberate: every

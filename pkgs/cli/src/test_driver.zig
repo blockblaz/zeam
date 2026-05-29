@@ -1,4 +1,4 @@
-/// Fork-choice test driver for hive lean-spec-tests.
+/// Fork-choice test driver for the hive consensus test fixtures.
 ///
 /// Implements:
 ///   POST /lean/v0/test_driver/fork_choice/init
@@ -7,8 +7,8 @@
 ///   POST /lean/v0/test_driver/state_transition/run
 ///   POST /lean/v0/test_driver/verify_signatures/run
 ///
-/// Logic mirrors pkgs/spectest/src/runner/fork_choice_runner.zig but adapted
-/// for persistent per-request state and HTTP responses.
+/// Logic mirrors the fork-choice runner but adapted for persistent
+/// per-request state and HTTP responses.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
@@ -725,7 +725,7 @@ fn processTickStep(
     driver: *ForkChoiceDriverState,
     step_obj: std.json.ObjectMap,
 ) !void {
-    // Tick step supports two alternative forms (mirrors leanSpec ForkChoiceStep::Tick):
+    // Tick step supports two alternative forms:
     //   "time": unix timestamp  — convert to intervals via genesis_time
     //   "interval": direct interval count
     const anchor_genesis_time = driver.fork_choice.anchorState.config.genesis_time;
@@ -785,10 +785,10 @@ fn processAttestationStep(
     if (validator_id >= validators_slice.len) return error.UnknownValidator;
     try validateAttestationDataForGossip(driver, att_data);
 
-    // XMSS signature verification. The hive lean-spec-tests fixtures embed a
-    // SignedAttestation per gossip step (see leanSpec/.../gossip_attestation_spec.py:
-    // valid_signature=False produces an all-zero structurally-valid signature
-    // that must fail XMSS verification). Hive fixtures use leanEnv=prod, so we
+    // XMSS signature verification. The hive fixtures embed a
+    // SignedAttestation per gossip step: a valid_signature=False entry produces
+    // an all-zero structurally-valid signature that must fail XMSS
+    // verification. Hive fixtures use leanEnv=prod, so we
     // dispatch to xmss.verifySsz (the test-scheme path is exercised by the
     // local spectest runner instead).
     const sig_value = att_obj.get("signature") orelse return error.SignatureVerificationFailed;
@@ -914,7 +914,6 @@ pub fn stepForkChoiceDriver(
         };
     } else if (std.mem.eql(u8, step_type, "attestation")) {
         // Single-validator gossip attestation: {"validatorId": N, "data": {...}}
-        // Mirrors ForkChoiceStep::Attestation in leanSpec.
         processAttestationStep(driver, step_obj) catch |err| {
             if (isProtocolError(err) or err == error.OutOfMemory) return err;
             accepted = false;
@@ -1058,7 +1057,7 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
 
     var transition_error: ?[]const u8 = null;
 
-    // Slots-only monotonicity fixtures (leanSpec PR #643: test_process_slots_*)
+    // Slots-only monotonicity fixtures (test_process_slots_*)
     // ship `pre` + `expectException` with no blocks. The test asserts that
     // `process_slots(state, state.slot)` (or any `target <= state.slot`) is
     // rejected. zeam's `state.process_slots` returns `InvalidPreState` on
@@ -1113,7 +1112,7 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
 
 /// POST /lean/v0/test_driver/verify_signatures/run
 /// Verifies block signatures against an anchor state.
-/// Implements XMSS proposer + attestation signature verification for hive lean-spec-tests.
+/// Implements XMSS proposer + attestation signature verification for the hive test fixtures.
 pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

@@ -22,7 +22,6 @@ pub const LOG_INV_RATE_PROD: usize = 2;
 
 /// A single-message multi-signature proof: many validators over one message+slot.
 /// `participants` is the validator bitfield; `proof` is the compact no-pubkeys wire form.
-/// Replaces devnet4's `AggregatedSignatureProof`.
 pub const TypeOneMultiSignature = struct {
     participants: attestation.AggregationBits,
     proof: ByteList512KiB,
@@ -149,9 +148,9 @@ pub const TypeOneMultiSignature = struct {
     }
 };
 
-/// Compatibility alias: devnet5 renamed the per-attestation aggregate proof
+/// Compatibility alias: the per-attestation aggregate proof was renamed
 /// `AggregatedSignatureProof` → `TypeOneMultiSignature` (same shape: participants + proof bytes,
-/// same `aggregate()` signature). Aliased so main's #916 per-att_data aggregation code keeps
+/// same `aggregate()` signature). Aliased so the per-att_data aggregation code keeps
 /// compiling against the new type without a wholesale rename. Field rename `proof_data`→`proof`
 /// and container `ByteListMiB`→`ByteList512KiB` are reconciled at the call sites.
 pub const AggregatedSignatureProof = TypeOneMultiSignature;

@@ -350,7 +350,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         );
 
         // The per-attestation Type-1s are now folded into proof_bytes and are no longer owned by
-        // the block (devnet5 SignedBlock has no per-attestation list). Free them here.
+        // the block (SignedBlock has no per-attestation list). Free them here.
         for (agg_signatures.slice()) |*sig| sig.deinit();
         agg_signatures.deinit();
         agg_sig_cleanup = false;

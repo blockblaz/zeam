@@ -79,26 +79,23 @@ pub const NodeCommand = struct {
     @"shadow-xmss-merge-rate": ?f64 = null,
     @"db-backend": database.Backend = .rocksdb,
     @"chain-spec": ?[]const u8 = null,
-    /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `true` post
-    /// devnet-4 burn-in (#788 follow-up + slice (d)/(e) PR): the
-    /// worker path is the supported prod path; the synchronous path
-    /// stays in place as a kill-switch via `--chain-worker false`.
+    /// Route producer-side gossip handlers through the chain-worker queue.
+    /// Default `true`: the worker path is the supported prod path; the
+    /// synchronous path stays in place as a kill-switch via `--chain-worker false`.
     @"chain-worker": bool = true,
     /// Override the rayon worker count used by the multisig (XMSS) aggregate
     /// prover. `null` (the default, surfaced as omitted on the CLI) keeps the
     /// existing post-system-thread split that gives roughly half of the
     /// remaining cores to the Zig pool and half to rayon — fine for non-
     /// aggregator nodes. Aggregators on CPU-rich hosts can pass a value here
-    /// to give the prover more parallelism without rebuilding (#899).
+    /// to give the prover more parallelism without rebuilding.
     @"rayon-threads": ?u32 = null,
     /// Minimum (children + gossip-sig) inputs required before the aggregator
     /// invokes the recursive STARK prover for an `AttestationData`. Default
-    /// `2` (post-#908) skips the no-children + single-gossip-sig case where
-    /// the prover would produce a 1-validator aggregate of zero consensus
-    /// value. `1` reverts to pre-#908 behavior (always aggregate ≥1 sig).
-    /// Higher values trade slot latency for fewer sub-threshold aggregates
-    /// on chatty subnets. See issue #907 finding 4.
+    /// `2` skips the no-children + single-gossip-sig case where the prover
+    /// would produce a 1-validator aggregate of zero consensus value. `1`
+    /// always aggregates at least one sig. Higher values trade slot latency
+    /// for fewer sub-threshold aggregates on chatty subnets.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
 
     pub const __shorts__ = .{
@@ -445,8 +442,8 @@ fn mainInner(init: std.process.Init) !void {
                 .ignore_unknown_fields = true,
                 .allocate = .alloc_if_needed,
             };
-            // See pkgs/cli/src/node.zig (and #831): `parseFromSlice` returns
-            // string fields aliased into the `Parsed` arena. `ChainSpec.deinit`
+            // `parseFromSlice` returns string fields aliased into the
+            // `Parsed` arena. `ChainSpec.deinit`
             // later calls `allocator.free` on `name` / `fork_digest`, so move
             // both fields onto the top-level allocator before the arena dies.
             const parsed = try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options);
@@ -763,8 +760,7 @@ fn mainInner(init: std.process.Init) !void {
                     // Start BeamNode first so it registers selective gossip
                     // topic handlers; EthLibp2p.run() then derives the
                     // gossipsub subscribe set from those handlers (instead of
-                    // joining every attestation subnet). See
-                    // pkgs/network/src/ethlibp2p.zig run() for the rationale.
+                    // joining every attestation subnet).
                     try self.beam_node.run();
 
                     if (self.network) |net| {
