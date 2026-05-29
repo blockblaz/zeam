@@ -66,6 +66,31 @@ const NodeOpts = struct {
     aggregate_max_inflight: u32 = 4,
 };
 
+/// blocks_by_root retry backoff (interop storm fix). A requested block root that no peer can
+/// currently serve — e.g. a freshly-proposed block whose owner has not finished its off-loop
+/// Type-2 merge and therefore has not yet published/persisted it — previously triggered an
+/// immediate, unbounded re-fetch on every "unserved" response (`retryUnservedBlockRoots`),
+/// producing a ~700 req/s blocks_by_root storm. The storm starved the prover (worsening the very
+/// merge it was waiting on) and only resolved when the block finally arrived via gossip.
+///
+/// Fix: keep `BLOCKS_BY_ROOT_IMMEDIATE_RETRIES` immediate re-routes to a different peer (the
+/// legitimate "wrong peer" case that keeps a parent-chain walk progressing), then fall back to
+/// exponential backoff (BASE → MAX) driven by `drainUnservedRetries` on the interval tick. No hard
+/// give-up: a late joiner may only reach an old block via blocks_by_root, so a root stays scheduled
+/// at the MAX cadence until ingested (then dropped lazily in the drain).
+const BLOCKS_BY_ROOT_IMMEDIATE_RETRIES: u32 = 1;
+const BLOCKS_BY_ROOT_RETRY_BASE_MS: u64 = 250;
+const BLOCKS_BY_ROOT_RETRY_MAX_MS: u64 = 4000;
+
+const UnservedBlockRetry = struct {
+    depth: u32,
+    /// Total unserved responses seen for this root (drives the backoff schedule).
+    attempts: u32,
+    /// Monotonic ns at which the next backed-off retry is due. 0 = no backed-off retry pending
+    /// (the most recent attempt was dispatched immediately and we await its response).
+    next_retry_ns: i128,
+};
+
 pub const BeamNode = struct {
     allocator: Allocator,
     clock: *clockFactory.Clock,
@@ -103,6 +128,13 @@ pub const BeamNode = struct {
     /// Maps block_root → blocks_by_range request_id for post-import accounting.
     range_async_chunk_imports: std.AutoHashMap(types.Root, u64),
     range_async_chunk_imports_lock: zeam_utils.SyncMutex = .{},
+
+    /// blocks_by_root retry backoff state (interop storm fix). Maps an unserved block root to its
+    /// backoff schedule; drained on the interval tick by `drainUnservedRetries`. Guarded by its own
+    /// lock — both the libp2p bridge (req-resp response → `retryUnservedBlockRoots`) and the libxev
+    /// tick (`drainUnservedRetries`) touch it.
+    unserved_block_retries: std.AutoHashMap(types.Root, UnservedBlockRetry),
+    unserved_block_retries_lock: zeam_utils.SyncMutex = .{},
 
     /// Test-only failure injection for `onInterval` catch-and-continue paths.
     test_inject_validator_error_at_intervals: []const usize = &.{},
@@ -213,6 +245,7 @@ pub const BeamNode = struct {
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
             .batch_pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
             .range_async_chunk_imports = std.AutoHashMap(types.Root, u64).init(allocator),
+            .unserved_block_retries = std.AutoHashMap(types.Root, UnservedBlockRetry).init(allocator),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -247,6 +280,7 @@ pub const BeamNode = struct {
         self.allocator.destroy(self.chain);
         self.batch_pending_parent_roots.deinit();
         self.range_async_chunk_imports.deinit();
+        self.unserved_block_retries.deinit();
         self.network.deinit();
     }
 
@@ -2642,6 +2676,10 @@ pub const BeamNode = struct {
                 self.sweepTimedOutRequests();
 
                 self.processReadyCachedBlocks(slot);
+
+                // Re-dispatch backed-off blocks_by_root roots whose cooldown elapsed (interop
+                // storm fix); drops any that have since been ingested.
+                self.drainUnservedRetries();
             }
 
             // Application-layer failures are logged and counted, not returned.
@@ -2983,12 +3021,89 @@ pub const BeamNode = struct {
         // and keep the walk on the peer that served this response.
         self.flushPendingParentFetches(peer_id);
 
-        // Re-schedule each unserved root; fetchBlockByRoots will
-        // dedup against forkchoice/cache/pending and pick a new peer.
+        // Re-schedule each unserved root. `scheduleUnservedRetry` allows a small number of
+        // immediate re-routes to a different peer (keeps a parent-chain walk progressing past a
+        // peer that EOS'd without serving), then switches to exponential backoff driven by
+        // `drainUnservedRetries` on the interval tick. This prevents the tight ~700 req/s
+        // blocks_by_root storm that occurs when NO peer can serve the root (e.g. a freshly-proposed
+        // block still mid off-loop Type-2 merge), which otherwise starves the prover and worsens
+        // the very delay it is waiting on. fetchBlockByRoots still dedups against
+        // forkchoice/cache/pending and picks a new peer.
         for (roots_to_retry.items) |item| {
+            if (self.scheduleUnservedRetry(item.root, item.depth)) {
+                const single = [_]types.Root{item.root};
+                self.fetchBlockByRoots(&single, item.depth) catch |err| {
+                    self.logger.warn("retryUnservedBlockRoots: failed to re-fetch root after unserved EOS/failure: {any}", .{err});
+                };
+            }
+        }
+    }
+
+    /// Record an unserved block root and decide whether to re-fetch it immediately. Returns true
+    /// for the first `BLOCKS_BY_ROOT_IMMEDIATE_RETRIES` unserved responses (so a parent-chain walk
+    /// can re-route to another peer without delay); afterwards arms an exponentially backed-off
+    /// retry (dispatched later by `drainUnservedRetries`) and returns false. See the
+    /// `BLOCKS_BY_ROOT_*` constants for the rationale.
+    fn scheduleUnservedRetry(self: *Self, root: types.Root, depth: u32) bool {
+        self.unserved_block_retries_lock.lock();
+        defer self.unserved_block_retries_lock.unlock();
+
+        const gop = self.unserved_block_retries.getOrPut(root) catch {
+            // OOM tracking the retry: degrade to the old immediate-retry behavior rather than
+            // dropping the root (correctness over storm-avoidance in the rare OOM case).
+            return true;
+        };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .depth = depth, .attempts = 1, .next_retry_ns = 0 };
+            return true;
+        }
+        gop.value_ptr.attempts += 1;
+        gop.value_ptr.depth = depth;
+        if (gop.value_ptr.attempts <= BLOCKS_BY_ROOT_IMMEDIATE_RETRIES) {
+            gop.value_ptr.next_retry_ns = 0;
+            return true;
+        }
+        // Exponential backoff: BASE << (attempts - immediate - 1), capped at MAX.
+        const shift: u6 = @intCast(@min(gop.value_ptr.attempts - BLOCKS_BY_ROOT_IMMEDIATE_RETRIES - 1, 16));
+        const backoff_ms = @min(BLOCKS_BY_ROOT_RETRY_BASE_MS << shift, BLOCKS_BY_ROOT_RETRY_MAX_MS);
+        gop.value_ptr.next_retry_ns = zeam_utils.monotonicTimestampNs() + @as(i128, @intCast(backoff_ms)) * std.time.ns_per_ms;
+        return false;
+    }
+
+    /// Interval-tick driver for backed-off blocks_by_root retries. Drops roots already ingested
+    /// (lazy cleanup) and re-dispatches roots whose backoff has elapsed, re-arming each at the MAX
+    /// cadence until its `unserved` response recomputes the schedule via `scheduleUnservedRetry`.
+    fn drainUnservedRetries(self: *Self) void {
+        const now = zeam_utils.monotonicTimestampNs();
+        var due: std.ArrayListUnmanaged(struct { root: types.Root, depth: u32 }) = .empty;
+        defer due.deinit(self.allocator);
+        var to_remove: std.ArrayListUnmanaged(types.Root) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        {
+            self.unserved_block_retries_lock.lock();
+            defer self.unserved_block_retries_lock.unlock();
+            var it = self.unserved_block_retries.iterator();
+            while (it.next()) |entry| {
+                const root = entry.key_ptr.*;
+                if (self.chain.forkChoice.hasBlock(root)) {
+                    to_remove.append(self.allocator, root) catch {};
+                    continue;
+                }
+                if (entry.value_ptr.next_retry_ns != 0 and now >= entry.value_ptr.next_retry_ns) {
+                    due.append(self.allocator, .{ .root = root, .depth = entry.value_ptr.depth }) catch {};
+                    // Re-arm at MAX cadence; the (re)dispatch's unserved response recomputes the
+                    // backoff via scheduleUnservedRetry. Prevents double-dispatch before it returns.
+                    entry.value_ptr.next_retry_ns = now + @as(i128, @intCast(BLOCKS_BY_ROOT_RETRY_MAX_MS)) * std.time.ns_per_ms;
+                }
+            }
+            for (to_remove.items) |root| _ = self.unserved_block_retries.remove(root);
+        }
+
+        for (due.items) |item| {
             const single = [_]types.Root{item.root};
             self.fetchBlockByRoots(&single, item.depth) catch |err| {
-                self.logger.warn("retryUnservedBlockRoots: failed to re-fetch root after unserved EOS/failure: {any}", .{err});
+                self.logger.warn("drainUnservedRetries: failed to re-fetch backed-off root: {any}", .{err});
             };
         }
     }
