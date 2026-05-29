@@ -1,6 +1,7 @@
 // figure out a way to dynamically load these constants based on env
 const std = @import("std");
 const mainnetPreset = @import("./presets/mainnet.zig");
+const build_options = @import("build_options");
 pub const Preset = enum {
     mainnet,
     minimal,
@@ -11,7 +12,10 @@ const presets = .{ .mainnet = mainnetPreset.preset };
 pub const activePreset = Preset.mainnet;
 const activePresetValues = @field(presets, @tagName(activePreset));
 
-pub const SECONDS_PER_SLOT = activePresetValues.SECONDS_PER_SLOT;
+// Preset default, optionally overridden at build time by `-Dseconds-per-slot` (test/sim only — lets
+// the simtest widen the slot so the real prover fits; prod omits the flag and uses the preset).
+// `build_options.seconds_per_slot_override` is comptime-known, so dependent timing math stays comptime.
+pub const SECONDS_PER_SLOT = build_options.seconds_per_slot_override orelse activePresetValues.SECONDS_PER_SLOT;
 
 // SSZ capacity constants
 pub const HISTORICAL_ROOTS_LIMIT = activePresetValues.HISTORICAL_ROOTS_LIMIT;
@@ -31,5 +35,9 @@ pub const MAX_ATTESTATIONS_DATA: usize = 8;
 pub const AGGREGATION_DEADLINE_MS: u64 = 750;
 
 test "test preset loading" {
-    try std.testing.expect(SECONDS_PER_SLOT == mainnetPreset.preset.SECONDS_PER_SLOT);
+    // Only assert the preset value when no -Dseconds-per-slot override is in effect (the override
+    // is test/sim-only and intentionally diverges from the preset).
+    if (build_options.seconds_per_slot_override == null) {
+        try std.testing.expect(SECONDS_PER_SLOT == mainnetPreset.preset.SECONDS_PER_SLOT);
+    }
 }
