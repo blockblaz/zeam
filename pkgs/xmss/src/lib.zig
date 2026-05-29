@@ -12,6 +12,7 @@ pub const verifyAggregatedPayload = aggregate.verifyAggregatedPayload;
 pub const verifyAggregatedPayloadBatch = aggregate.verifyAggregatedPayloadBatch;
 pub const AggregatedPayloadVerifyBatch = aggregate.AggregatedPayloadVerifyBatch;
 pub const aggregate_module = aggregate;
+pub const shadow_cost = aggregate.shadow_cost;
 
 const hashsig = @import("hashsig.zig");
 pub const KeyPair = hashsig.KeyPair;

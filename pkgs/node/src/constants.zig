@@ -123,6 +123,29 @@ pub const SYNC_STATUS_REFRESH_INTERVAL_SLOTS: u64 = 8;
 // recovery probe is just under 12 slots (~48s) after the node stops advancing.
 pub const SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS: u64 = 4;
 
+// Maximum peer status RPCs issued per libxev tick during periodic refresh.
+// Batching avoids blasting every connected peer at interval 0, which was
+// observed to time out en masse on devnet (#926) and leave catch-up stuck.
+pub const SYNC_STATUS_REFRESH_PEERS_PER_TICK: usize = 8;
+
+// When no gossip has been received for this many wall-clock slots, treat
+// ingress as stalled and initiate RPC catch-up from the best known peer
+// head without waiting for a status response (#926).
+pub const GOSSIP_STALL_THRESHOLD_SLOTS: u64 = 2;
+
+// Re-send gossipsub mesh subscriptions on this cadence when mesh membership
+// is low or gossip ingress has stalled (#926).
+pub const GOSSIP_MESH_HEAL_INTERVAL_SLOTS: u64 = 32;
+
+// Total gossipsub mesh peers below this triggers a mesh resubscribe attempt.
+pub const GOSSIP_MESH_MIN_PEERS: u64 = 4;
+
+/// Wall-clock silence duration that indicates gossip ingress has stalled (#926).
+pub fn gossipStallThresholdMs() u64 {
+    return GOSSIP_STALL_THRESHOLD_SLOTS *
+        @as(u64, @intCast(params.SECONDS_PER_SLOT * std.time.ms_per_s));
+}
+
 // Threshold (in slots) above which we prefer a `blocks_by_range` bulk sync over the
 // recursive head-by-root walk. When the peer's head is more than this many slots
 // ahead of ours, we issue a single ranged request to catch up efficiently rather

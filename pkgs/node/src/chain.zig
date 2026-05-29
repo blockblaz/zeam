@@ -30,6 +30,7 @@ const LockTimer = locking.LockTimer;
 const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -204,6 +205,11 @@ pub const BeamChain = struct {
     /// `iterateLocked()` for sync-status decisions. Mutation is the
     /// network's responsibility — the chain only consumes.
     connected_peers: *ConnectedPeers,
+    /// Wall-clock head lag in slots, updated each libxev tick by `BeamNode`
+    /// from `Clock.wallSlotNow()`. Read by `getSyncStatus()` to detect
+    /// pre-finalization devnets that report `synced` while gossip ingress
+    /// has stalled (#926).
+    wall_head_lag_slots: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
     // Aggregator role flag, toggleable at runtime via `setAggregator`.
@@ -2794,9 +2800,139 @@ pub const BeamChain = struct {
         sender_peer_id: []const u8,
         precomputed_block_root: ?types.Root,
     ) !GossipProcessingResult {
+        // Issue #942: record total time chain.onGossip spends on the libxev thread
+        // per gossip type. Compare against zeam_xev_clock_until_done_drain_seconds
+        // and `zeam_libxev_callback_duration_seconds{site=onGossip.block.dispatch}`
+        // to attribute slow drains to attestation/aggregation dispatch vs. block work.
+        const gossip_dispatch_start_ns = zeam_utils.monotonicTimestampNs();
+        const gossip_site: []const u8 = switch (data.*) {
+            .block => "onGossip.block",
+            .attestation => "onGossip.attestation",
+            .aggregation => "onGossip.aggregation",
+        };
+        defer {
+            const elapsed_s = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - gossip_dispatch_start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+            zeam_metrics.observeLibxevCallback(gossip_site, elapsed_s);
+        }
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.block;
+
+                // Issue #942: when the chain-worker is enabled and the caller
+                // did not precompute the block root (common gossip path with parent
+                // already in fork-choice), skip both the libxev-side hashTreeRoot
+                // AND the hasBlock dedup here. The chain-worker thunk runs the
+                // dedup via protoArray.onBlock (early-out at forkchoice.zig:97-101)
+                // after computing the root off-thread, avoiding the heavy SSZ hash
+                // on the libxev event-loop thread.
+                //
+                // Rare paths that need block_root on libxev (future-slot enqueue,
+                // worker-disabled inline processing) compute it lazily below.
+                //
+                // Trade-offs vs. the old eager-hash approach:
+                //   * A re-arriving gossip block whose root is already in protoArray
+                //     will run STF on the worker before protoArray deduplicates it
+                //     (wasted CPU on worker, but libxev unblocked). Rare in healthy
+                //     gossipsub mesh (message_id dedup at the Rust layer fires first).
+                //   * The `processed_block_root` returned to BeamNode for
+                //     `processCachedDescendants` is null on the worker-dispatch fast
+                //     path; the imported-block backchannel (handleChainImportedBlock)
+                //     already fires processCachedDescendants with the resolved root.
+                if (self.chain_worker != null and precomputed_block_root == null) {
+                    // Fast-dispatch path: no libxev-side hash or dedup.
+                    // Validate only the parts that don't require block_root.
+                    // FutureSlot hard-drop can be checked via validateBlock; we
+                    // compute block_root lazily only on the FutureSlotQueueable path.
+                    const dispatch_start_ns = zeam_utils.monotonicTimestampNs();
+                    self.validateBlock(block, true) catch |err| switch (err) {
+                        error.FutureSlotQueueable => {
+                            // Need block_root for the pending queue key — compute lazily.
+                            var lazy_root: types.Root = undefined;
+                            try zeam_utils.hashTreeRoot(types.BeamBlock, block, &lazy_root, self.allocator);
+                            var cloned: types.SignedBlock = undefined;
+                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                            const queued = self.enqueuePendingBlock(cloned, lazy_root);
+                            if (queued) {
+                                self.logger.info(
+                                    "queued future-slot gossip block slot={d} blockroot=0x{x}: current_slot={d}",
+                                    .{
+                                        block.slot,
+                                        &lazy_root,
+                                        self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic),
+                                    },
+                                );
+                            }
+                            return .{};
+                        },
+                        error.FutureSlot => {
+                            zeam_metrics.metrics.lean_blocks_future_slot_dropped_total.incr();
+                            return err;
+                        },
+                        else => return err,
+                    };
+
+                    // Slot-clock future check — needs block_root for the pending queue.
+                    if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
+                        var lazy_root: types.Root = undefined;
+                        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &lazy_root, self.allocator);
+                        self.logger.debug(
+                            "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
+                            .{ block.slot, &lazy_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
+                        );
+                        var cloned: types.SignedBlock = undefined;
+                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                        if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
+                            const queued = self.enqueuePendingBlock(cloned, lazy_root);
+                            if (queued) {
+                                self.logger.info(
+                                    "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
+                                    .{ block.slot, &lazy_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
+                                );
+                            }
+                            return .{};
+                        } else {
+                            self.logger.debug(
+                                "chain already ticked while cloning block for queuing, skipping queuing and directly processing slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
+                                .{ block.slot, &lazy_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
+                            );
+                            cloned.deinit();
+                        }
+                    }
+
+                    // Worker dispatch: SSZ clone + queue push on libxev — no hash.
+                    var cloned: types.SignedBlock = undefined;
+                    try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                    var cloned_consumed = false;
+                    defer if (!cloned_consumed) cloned.deinit();
+                    // Pass null block_root: worker thunk computes it off-thread.
+                    self.submitBlock(cloned, true, null) catch |err| switch (err) {
+                        error.QueueFull => {
+                            self.logger.warn(
+                                "chain-worker: block queue full, dropping slot={d}",
+                                .{block.slot},
+                            );
+                            return .{};
+                        },
+                        error.QueueClosed => {
+                            self.logger.warn(
+                                "chain-worker: block queue closed, dropping slot={d}",
+                                .{block.slot},
+                            );
+                            return .{};
+                        },
+                        error.ChainWorkerDisabled => unreachable,
+                    };
+                    cloned_consumed = true;
+                    // Record dispatch time. `processed_block_root` is null here;
+                    // handleChainImportedBlock fires processCachedDescendants.
+                    const dispatch_elapsed_s = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - dispatch_start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                    zeam_metrics.observeLibxevCallback("onGossip.block.dispatch", dispatch_elapsed_s);
+                    return .{};
+                }
+
+                // Slow path: either chain_worker is null (worker-disabled, tests /
+                // single-threaded mode) OR the caller already precomputed the root
+                // (orphan-cache path passed a real root from node.onGossip).
                 const block_root: [32]u8 = if (precomputed_block_root) |r| r else r: {
                     var cblock_root: [32]u8 = undefined;
                     try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
@@ -4759,23 +4895,45 @@ pub const BeamChain = struct {
 
         // Check 1: our head is behind peer finalization — we don't even have finalized blocks
         if (our_head_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
         if (our_finalized_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
+        }
+
+        // Check 3: pre-finalization devnets — wall-clock head lag means we are
+        // not at chain tip even though finalization gaps are zero (#926).
+        const wall_lag = self.wall_head_lag_slots.load(.monotonic);
+        if (blocks_by_range_sync.isWallHeadLagSyncing(
+            our_finalized_slot,
+            max_peer_finalized_slot,
+            wall_lag,
+            constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+        )) {
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         return .synced;
+    }
+
+    fn behindPeersStatus(
+        self: *Self,
+        head_slot: types.Slot,
+        finalized_slot: types.Slot,
+        max_peer_finalized_slot: types.Slot,
+    ) SyncStatus {
+        _ = self;
+        return .{ .behind_peers = .{
+            .head_slot = head_slot,
+            .finalized_slot = finalized_slot,
+            .max_peer_finalized_slot = max_peer_finalized_slot,
+        } };
+    }
+
+    pub fn setWallHeadLagSlots(self: *Self, lag_slots: u64) void {
+        self.wall_head_lag_slots.store(lag_slots, .monotonic);
     }
 };
 

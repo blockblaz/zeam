@@ -96,6 +96,21 @@ const Metrics = struct {
     /// `cargo run --release -- recursion --n 2`; zeam worker histograms include
     /// snapshot, prep, child-proof deserialize, and serialize on top of this.
     zeam_xmss_rec_aggregate_prove_seconds: XmssRecAggregateProveHistogram,
+    /// Same wall time as `zeam_xmss_rec_aggregate_prove_seconds`, labeled by
+    /// coarse `num_raw` / `num_children` input-size buckets so the build
+    /// histogram tail can be classified as steady-state full-committee proves
+    /// vs partial-input reproves (see #940 investigation plan item 1).
+    /// Buckets are deliberately low-cardinality — see `numRawBucket` /
+    /// `numChildrenBucket` below for the exact mapping.
+    zeam_xmss_rec_aggregate_prove_by_input_seconds: XmssRecAggregateProveByInputHistogram,
+    /// Per-phase breakdown inside `xmss_aggregate` reported back from the
+    /// Rust FFI via out-pointers. The three phases ("marshal", "stark",
+    /// "post") sum to a value very close to one observation on
+    /// `zeam_xmss_rec_aggregate_prove_seconds` (delta is the FFI call/return
+    /// overhead, sub-microsecond). This lets us tell whether zeam's per-call
+    /// cost lives in argument deserialization or in the leanMultisig STARK
+    /// itself — the two have very different fixes. See #940.
+    zeam_xmss_rec_aggregate_phase_seconds: XmssRecAggregatePhaseHistogram,
     lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
@@ -159,6 +174,16 @@ const Metrics = struct {
     lean_gossip_block_size_bytes: GossipBlockSizeBytesHistogram,
     lean_gossip_attestation_size_bytes: GossipAttestationSizeBytesHistogram,
     lean_gossip_aggregation_size_bytes: GossipAggregationSizeBytesHistogram,
+    /// Issue #942: count gossip-ingress decode rejections, labeled by
+    /// `topic_kind` (block | attestation | aggregation) and `reason`
+    /// (snappy_empty | snappy_varint | snappy_oversized | snappy_truncated |
+    /// snappy_decode | ssz_decode). Without this counter, the only operator-
+    /// visible signal that zeam has stopped accepting gossip is `lean_head_slot`
+    /// drifting behind wall-clock — by which point the node is already off
+    /// consensus. With it, the failure mode is dashboard-visible the moment
+    /// decode starts failing, and the `reason` label attributes upstream
+    /// vs. our-side framing mismatches vs. SSZ-body issues separately.
+    zeam_gossip_decode_failures_total: ZeamGossipDecodeFailuresCounter,
     // Attestation production time histogram
     lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
     // compactAttestations metrics
@@ -183,6 +208,12 @@ const Metrics = struct {
     zeam_xev_clock_until_done_slow_ge_500ms_total: ZeamXevClockUntilDoneSlowGe500msCounter,
     /// Count of clock-loop `run(.until_done)` drains taking ≥1s wall time.
     zeam_xev_clock_until_done_slow_ge_1s_total: ZeamXevClockUntilDoneSlowGe1sCounter,
+    /// Wall time spent inside individual libxev callbacks, labeled by callsite.
+    /// Used to attribute slow `zeam_xev_clock_until_done_drain_seconds` to a
+    /// specific synchronous chunk of work executed on the libxev thread (#942).
+    /// Each callsite name is a fixed low-cardinality string; see
+    /// `observeLibxevCallback` for the canonical site list.
+    zeam_libxev_callback_duration_seconds: LibxevCallbackDurationHistogram,
     // Fork-choice tick interval duration: actual elapsed time between forkchoice tickIntervalUnlocked calls
     zeam_fork_choice_tick_interval_duration_seconds: ForkChoiceTickIntervalDurationHistogram,
     /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
@@ -441,6 +472,13 @@ const Metrics = struct {
     const PQSigBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigBuildingPhaseHistogram = metrics_lib.HistogramVec(f32, struct { phase: []const u8 }, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 });
     const XmssRecAggregateProveHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0 });
+    const XmssRecAggregateProveByInputLabel = struct { num_raw: []const u8, num_children: []const u8 };
+    const XmssRecAggregateProveByInputHistogram = metrics_lib.HistogramVec(f32, XmssRecAggregateProveByInputLabel, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0 });
+    // Buckets span sub-millisecond (post phase = pointer wrap, typically ns)
+    // through multi-second STARK proves. Phase label values are
+    // "marshal" | "stark" | "post" — see XmssRecAggregatePhaseLabel below.
+    const XmssRecAggregatePhaseLabel = struct { phase: []const u8 };
+    const XmssRecAggregatePhaseHistogram = metrics_lib.HistogramVec(f32, XmssRecAggregatePhaseLabel, &[_]f32{ 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0 });
     const PQSigAggregatedVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
     const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
@@ -493,6 +531,7 @@ const Metrics = struct {
     const LeanNodeSyncStatusGauge = metrics_lib.GaugeVec(u64, struct { status: []const u8 });
     // Gossip message size histogram types
     const GossipBlockSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000 });
+    const ZeamGossipDecodeFailuresCounter = metrics_lib.CounterVec(u64, struct { topic_kind: []const u8, reason: []const u8 });
     const GossipAttestationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 512, 1_024, 2_048, 4_096, 8_192, 16_384 });
     const GossipAggregationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1_024, 4_096, 16_384, 65_536, 131_072, 262_144, 524_288, 1_048_576 });
     // Attestation production time histogram type
@@ -506,6 +545,16 @@ const Metrics = struct {
     });
     const ZeamXevClockUntilDoneSlowGe500msCounter = metrics_lib.Counter(u64);
     const ZeamXevClockUntilDoneSlowGe1sCounter = metrics_lib.Counter(u64);
+    /// Per-callsite libxev callback duration (issue #942). Buckets span
+    /// 100us through 5s to capture both fast dispatches (queue submits,
+    /// metric increments) and pathological CPU-bound callbacks
+    /// (hashTreeRoot of a multi-MB block, SSZ clones of a STARK proof).
+    const LibxevCallbackSiteLabel = struct { site: []const u8 };
+    const LibxevCallbackDurationHistogram = metrics_lib.HistogramVec(
+        f32,
+        LibxevCallbackSiteLabel,
+        &[_]f32{ 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5 },
+    );
     const ForkChoiceTickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
     /// Aggregation tick (interval-in-slot 2): spans sub-ms through multi-second stalls.
     const AggregationIntervalTickHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
@@ -935,6 +984,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Per att_data wall time for AggregatedSignatureProof.aggregate (bitfield merge + xmss.aggregateSignatures, including leanMultisig STARK). For bare rec_xmss_aggregate prove time comparable to lean-bench, use zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
         .zeam_pq_sig_aggregated_signatures_building_phase_seconds = try Metrics.PQSigBuildingPhaseHistogram.init(allocator, io, "zeam_pq_sig_aggregated_signatures_building_phase_seconds", .{ .help = "Phase-level time for aggregate production, labeled by phase (snapshot|att_data_prep|xmss_prove|compute_ffi|commit). See #899 / #907." }, .{}),
         .zeam_xmss_rec_aggregate_prove_seconds = Metrics.XmssRecAggregateProveHistogram.init("zeam_xmss_rec_aggregate_prove_seconds", .{ .help = "Wall time inside xmss_aggregate (leanMultisig rec_xmss_aggregate STARK prove + FFI key clones, one att_data). Compare to leanBench aggregate.flat_*_r2; worker/phase metrics add snapshot, prep, child-proof deserialize, and serialize." }, .{}),
+        .zeam_xmss_rec_aggregate_prove_by_input_seconds = try Metrics.XmssRecAggregateProveByInputHistogram.init(allocator, io, "zeam_xmss_rec_aggregate_prove_by_input_seconds", .{ .help = "Same observation as zeam_xmss_rec_aggregate_prove_seconds, additionally labeled by num_raw (count of raw gossip XMSS signatures) and num_children (count of recursive child STARK proofs) input-size buckets (#940). Buckets: num_raw in {0,1,2,3,4,5,6,7,8,9-15,16-31,32+}; num_children in {0,1,2,3-4,5-7,8+}. Used to classify the aggregate build histogram tail (steady-state full-committee prove vs partial-input reprove)." }, .{}),
+        .zeam_xmss_rec_aggregate_phase_seconds = try Metrics.XmssRecAggregatePhaseHistogram.init(allocator, io, "zeam_xmss_rec_aggregate_phase_seconds", .{ .help = "Per-phase wall time inside xmss_aggregate FFI (#940), reported back from Rust via out-pointers. phase=\"marshal\" covers argument deserialization (raw XMSS PK/sig clones + child PK collection + child proof deserialize). phase=\"stark\" is the leanMultisig rec_xmss_aggregate STARK call — expected to scale linearly with num_raw per lean-bench (~3.6 ms/sig at log_inv_rate=2 on Hetzner 16-core). phase=\"post\" is Box::into_raw of the returned aggregate (pointer wrap, typically nanoseconds). The three phases sum to ~zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
         .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature" }, .{}),
         .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures" }, .{}),
         .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures" }, .{}),
@@ -979,6 +1030,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Bytes size of a gossip block message" }, .{}),
         .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Bytes size of a gossip attestation message" }, .{}),
         .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Bytes size of a gossip aggregated attestation message" }, .{}),
+        .zeam_gossip_decode_failures_total = try Metrics.ZeamGossipDecodeFailuresCounter.init(allocator, io, "zeam_gossip_decode_failures_total", .{ .help = "Gossip-ingress decode rejections, labeled by topic_kind (block|attestation|aggregation) and reason (snappy_empty|snappy_varint|snappy_oversized|snappy_truncated|snappy_decode|ssz_decode). Operator-visible signal that zeam has stopped accepting gossip BEFORE lean_head_slot drifts off wall-clock. See issue #942." }, .{}),
         .lean_attestations_production_time_seconds = Metrics.AttestationProductionTimeHistogram.init("lean_attestations_production_time_seconds", .{ .help = "Time taken to produce attestation" }, .{}),
         // compactAttestations metrics
         .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
@@ -993,6 +1045,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
+        .zeam_libxev_callback_duration_seconds = try Metrics.LibxevCallbackDurationHistogram.init(allocator, io, "zeam_libxev_callback_duration_seconds", .{ .help = "Wall-clock time spent inside individual libxev callbacks, labeled by site (issue #942). Tracks synchronous CPU work blocking the libxev thread between drain passes. Compare against zeam_xev_clock_until_done_drain_seconds and the slow_ge_*ms counters to attribute slow drains to a specific callsite. Sites include onGossip.block.hash_tree_root, onGossip.block.ssz_clone, onGossip.aggregation.ssz_clone, onGossip.attestation.dispatch, onInterval.tick, chain.onGossip.dispatch." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
         .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
@@ -1223,6 +1276,18 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
     try metrics_lib.write(&metrics, writer);
 }
 
+/// Record wall-clock time spent inside one libxev callback (issue #942).
+/// `site` must be a fixed compile-time string from the canonical list
+/// documented on `zeam_libxev_callback_duration_seconds` — runtime-built
+/// strings would inflate the Prometheus series cardinality.
+pub fn observeLibxevCallback(site: []const u8, elapsed_seconds: f32) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_libxev_callback_duration_seconds.observe(
+        .{ .site = site },
+        elapsed_seconds,
+    ) catch {};
+}
+
 /// Record a sub-phase of aggregate attestation production (see
 /// `zeam_pq_sig_aggregated_signatures_building_phase_seconds`).
 pub fn observeAggregateAttestationBuildPhase(phase: []const u8, elapsed_seconds: f32) void {
@@ -1233,11 +1298,87 @@ pub fn observeAggregateAttestationBuildPhase(phase: []const u8, elapsed_seconds:
     ) catch {};
 }
 
-/// Record leanMultisig `rec_xmss_aggregate` wall time for one att_data (xmss_aggregate FFI).
-pub fn observeXmssRecAggregateProve(elapsed_seconds: f32) void {
+/// Record leanMultisig `rec_xmss_aggregate` wall time for one att_data
+/// (xmss_aggregate FFI). `num_raw` is the count of raw gossip XMSS signatures
+/// fed to this prove; `num_children` is the count of recursive child STARK
+/// proofs included. Both flow into the labeled
+/// `zeam_xmss_rec_aggregate_prove_by_input_seconds` companion via
+/// low-cardinality bucket strings (see #940).
+pub fn observeXmssRecAggregateProve(elapsed_seconds: f32, num_raw: usize, num_children: usize) void {
     if (!g_initialized or isZKVM()) return;
     metrics.zeam_xmss_rec_aggregate_prove_seconds.observe(elapsed_seconds);
     observeAggregateAttestationBuildPhase("xmss_prove", elapsed_seconds);
+    metrics.zeam_xmss_rec_aggregate_prove_by_input_seconds.observe(
+        .{ .num_raw = numRawBucket(num_raw), .num_children = numChildrenBucket(num_children) },
+        elapsed_seconds,
+    ) catch {};
+}
+
+/// Coarse low-cardinality bucket for the `num_raw` label on
+/// `zeam_xmss_rec_aggregate_prove_by_input_seconds`. Current ansible-devnet
+/// committees are 8-validator so values 0..8 stay distinct; larger committees
+/// roll into wider buckets to bound Prometheus series cardinality.
+fn numRawBucket(n: usize) []const u8 {
+    return switch (n) {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9, 10, 11, 12, 13, 14, 15 => "9-15",
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 => "16-31",
+        else => "32+",
+    };
+}
+
+/// Record one phase of `xmss_aggregate`'s internal timing breakdown
+/// (`zeam_xmss_rec_aggregate_phase_seconds`). `phase` must be one of the
+/// constants documented on the metric (currently "marshal", "stark", "post");
+/// callers are the xmss aggregation module on a successful prove only.
+/// `elapsed_ns` is the value the Rust FFI wrote into its out-pointer.
+pub fn observeXmssRecAggregatePhase(phase: []const u8, elapsed_ns: u64) void {
+    if (!g_initialized or isZKVM()) return;
+    const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    metrics.zeam_xmss_rec_aggregate_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_s,
+    ) catch {};
+}
+
+/// Issue #942: record one gossip-ingress decode rejection. `topic_kind` must
+/// be one of "block" | "attestation" | "aggregation"; `reason` is one of
+/// "snappy_empty" | "snappy_varint" | "snappy_oversized" | "snappy_truncated"
+/// | "snappy_decode" | "ssz_decode" — see the metric help text on
+/// `zeam_gossip_decode_failures_total` for the full enumeration.
+///
+/// Safe to call from FFI / network callback contexts: no allocation, label
+/// keys are interned by the registry. Silently no-ops before
+/// `metrics.init()` so test runs that haven't started the registry don't
+/// crash. Cardinality bound: 3 topic_kinds × 6 reasons = 18 series.
+pub fn incrGossipDecodeFailure(topic_kind: []const u8, reason: []const u8) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_gossip_decode_failures_total.incr(
+        .{ .topic_kind = topic_kind, .reason = reason },
+    ) catch {};
+}
+
+/// Coarse low-cardinality bucket for the `num_children` label on
+/// `zeam_xmss_rec_aggregate_prove_by_input_seconds`. `num_children=0` is the
+/// only value seen on flat aggregation today (#940); other buckets exist for
+/// the recursive path.
+fn numChildrenBucket(n: usize) []const u8 {
+    return switch (n) {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3, 4 => "3-4",
+        5, 6, 7 => "5-7",
+        else => "8+",
+    };
 }
 
 // ---------------------------------------------------------------------
@@ -1517,4 +1658,26 @@ test "issues #863/#867: xev until_done drain metrics appear in /metrics output" 
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_drain_seconds") != null);
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_500ms_total") != null);
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_1s_total") != null);
+}
+
+// Issue #942: per-callsite libxev callback duration histogram is the
+// primary attribution signal for slow xev drains. Verify both the
+// metric name and a representative `site` label show up in the
+// Prometheus scrape body.
+test "issue #942: libxev callback duration histogram appears in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    observeLibxevCallback("onGossip.block.hash_tree_root", 0.042);
+    observeLibxevCallback("onInterval.tick", 0.003);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_libxev_callback_duration_seconds") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"onGossip.block.hash_tree_root\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"onInterval.tick\"") != null);
 }

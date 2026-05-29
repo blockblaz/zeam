@@ -2219,6 +2219,28 @@ pub const ForkChoice = struct {
 
         const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
+
+        // Drop any existing stored aggregate whose participants are fully
+        // contained in the new one (#940 deferred-aggregation path). With
+        // the live-raws change below, successive aggregator ticks re-prove
+        // flat over a growing raw set, so the new aggregate normally
+        // dominates every prior aggregate for this att_data. Without this
+        // pass the payload list would accumulate one strictly-dominated
+        // entry per tick until finalization pruned them.
+        {
+            var idx: usize = 0;
+            while (idx < gop.value_ptr.items.len) {
+                if (types.participantsContainsAll(stored_proof.participants, gop.value_ptr.items[idx].proof.participants)) {
+                    var dropped = gop.value_ptr.swapRemove(idx);
+                    dropped.proof.deinit();
+                    if (dropped.source_payload_participants) |*bits| bits.deinit();
+                    if (dropped.source_gossip_participants) |*bits| bits.deinit();
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+
         try gop.value_ptr.append(self.allocator, .{
             .slot = att_data.slot,
             .proof = stored_proof,
@@ -2229,22 +2251,57 @@ pub const ForkChoice = struct {
         source_payload_bits_owned = false;
         source_gossip_bits_owned = false;
 
+        // Drop the snapshot's per-att_data inner map (snapshot ownership only).
+        //
+        // The previous implementation also deleted the snapshot's vids from the
+        // LIVE `attestation_signatures` map, freeing memory but forcing every
+        // subsequent aggregator tick to recursively merge the just-committed
+        // aggregate (now sitting in `latest_new_aggregated_payloads`) with any
+        // newly-arrived raws. That merge fires `rec_xmss_aggregate` with
+        // children, which costs ~4.5 s on the devnet aggregator vs ~0.5 s for
+        // an equivalent flat re-prove (#940 phase metric: 99.97% of cost is
+        // the STARK kernel, recursive proves dominate the p95 tail).
+        //
+        // Keeping raws live lets `prepareAggregateAttData` flat-re-prove over
+        // the larger raw set on later ticks; the `anyStoredProofCoversAll`
+        // pre-check there short-circuits when nothing new has arrived, so we
+        // do not re-aggregate redundantly. Memory is still bounded — the
+        // finalization-driven prune at `pruneStaleSignatures` removes
+        // signatures whose `target.slot <= finalized_slot`, same as before.
         if (snap.signatures.fetchRemove(att_data)) |snap_inner_kv| {
             var snap_inner = snap_inner_kv.value;
-            defer snap_inner.deinit();
-            if (self.attestation_signatures.getPtr(att_data)) |live_inner| {
-                var snap_vid_it = snap_inner.iterator();
-                while (snap_vid_it.next()) |vid_entry| {
-                    _ = live_inner.remove(vid_entry.key_ptr.*);
-                }
-                if (live_inner.count() == 0) {
-                    self.attestation_signatures.removeAndDeinit(att_data);
-                }
-            }
+            snap_inner.deinit();
         }
 
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
         zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
+
+        // #942 observability: emit a one-line summary per committed aggregate
+        // so operators can see *what* the aggregator just published from
+        // structured logs alone (counterpart to the gossip-decode-failure
+        // preview added on the ingress side). Fields chosen to be cheap and
+        // diagnostic: validator count in the aggregate (`attestations`),
+        // attestation slot (`slot`), and the first 8 hex chars of the head /
+        // target / source roots so the same aggregate can be cross-referenced
+        // against block-import logs without dumping full 32-byte roots on
+        // every line. Logged at info — one line per committed aggregate
+        // matches the existing `agg start slot=...` line above and stays
+        // well under typical log-volume budgets at devnet committee sizes.
+        const head_short = att_data.head.root[0..4];
+        const target_short = att_data.target.root[0..4];
+        const source_short = att_data.source.root[0..4];
+        self.logger.info(
+            "aggregated {d} attestations slot={d} head=0x{x}.. target_slot={d} target=0x{x}.. source_slot={d} source=0x{x}..",
+            .{
+                participant_count,
+                att_data.slot,
+                head_short,
+                att_data.target.slot,
+                target_short,
+                att_data.source.slot,
+                source_short,
+            },
+        );
 
         var publish_proof: types.AggregatedSignatureProof = undefined;
         try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &publish_proof, self.allocator);
@@ -2989,7 +3046,13 @@ test "aggregate prunes attestation signatures" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), aggregations.len);
-    try std.testing.expectEqual(@as(usize, 0), fork_choice.attestation_signatures.count());
+    // After #940 deferred-aggregation: raws stay live so that the next
+    // aggregator tick can flat-re-prove over a growing set instead of paying
+    // ~4.5 s for a recursive merge of the just-committed aggregate with new
+    // gossip arrivals. The two raw sigs we inserted for this att_data are
+    // still present after the commit; only `snap.signatures` (the worker's
+    // private snapshot of the same map) was drained.
+    try std.testing.expectEqual(@as(usize, 1), fork_choice.attestation_signatures.count());
     try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(attestation_data) != null);
 }
 
@@ -3969,7 +4032,7 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const test_thread_pool = try initTestThreadPool();
+    const test_thread_pool = try setupTestPrimitives();
     defer test_thread_pool.deinit();
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,

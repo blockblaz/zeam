@@ -67,6 +67,67 @@ pub fn shouldRefreshPeerStatus(
     return .{ .refresh = refresh, .wall_head_lag_slots = wall_head_lag_slots };
 }
 
+/// True when pre-finalization sync should report `behind_peers` based on
+/// wall-clock head lag alone (early devnets with `finalized_slot = 0`).
+pub fn isWallHeadLagSyncing(
+    our_finalized_slot: types.Slot,
+    max_peer_finalized_slot: types.Slot,
+    wall_head_lag_slots: u64,
+    threshold_slots: u64,
+) bool {
+    if (our_finalized_slot != 0 or max_peer_finalized_slot != 0) return false;
+    return wall_head_lag_slots >= threshold_slots;
+}
+
+/// Rotate a peer batch for rate-limited status refresh.
+pub fn peerBatchWindow(total_peers: usize, cursor: usize, batch_size: usize) struct {
+    start: usize,
+    count: usize,
+    next_cursor: usize,
+} {
+    if (total_peers == 0 or batch_size == 0) {
+        return .{ .start = 0, .count = 0, .next_cursor = 0 };
+    }
+    const start = cursor % total_peers;
+    const count = @min(batch_size, total_peers);
+    return .{
+        .start = start,
+        .count = count,
+        .next_cursor = (start + count) % total_peers,
+    };
+}
+
+/// Whether to start RPC catch-up from cached peer status without waiting for
+/// a fresh status response (gossip ingress stall + wall-clock head lag).
+pub fn shouldInitiateProactiveCatchUp(
+    wall_head_lag_slots: u64,
+    wall_head_lag_threshold_slots: u64,
+    gossip_silent_ms: u64,
+    gossip_stall_threshold_ms: u64,
+) bool {
+    if (wall_head_lag_slots < wall_head_lag_threshold_slots) return false;
+    if (gossip_stall_threshold_ms == 0) return true;
+    return gossip_silent_ms >= gossip_stall_threshold_ms;
+}
+
+/// Whether gossipsub mesh subscriptions should be re-sent.
+pub fn shouldHealGossipMesh(
+    mesh_peers: u64,
+    min_mesh_peers: u64,
+    gossip_silent_ms: u64,
+    gossip_stall_threshold_ms: u64,
+) bool {
+    if (mesh_peers < min_mesh_peers) return true;
+    if (gossip_stall_threshold_ms == 0) return false;
+    return gossip_silent_ms >= gossip_stall_threshold_ms;
+}
+
+/// Milliseconds since `last_gossip_rx_ms` (0 when no gossip received yet).
+pub fn gossipSilentMs(now_ms: u64, last_gossip_rx_ms: u64) u64 {
+    if (last_gossip_rx_ms == 0) return 0;
+    return now_ms -| last_gossip_rx_ms;
+}
+
 /// Whether a peer status should trigger proactive catch-up (issue #893 / PR #894).
 /// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` only selects range vs by-root inside `initiateCatchUpFromPeerStatus`.
 pub fn shouldCatchUpFromPeerStatus(
@@ -341,6 +402,44 @@ test "syncEndDecision fork abort" {
         .has_alternate_peer = true,
     };
     try std.testing.expectEqual(SyncEndAction.abort_fallback, syncEndDecision(input));
+}
+
+test "isWallHeadLagSyncing only applies before finalization" {
+    try std.testing.expect(isWallHeadLagSyncing(0, 0, 4, 4));
+    try std.testing.expect(!isWallHeadLagSyncing(0, 0, 3, 4));
+    try std.testing.expect(!isWallHeadLagSyncing(1, 0, 10, 4));
+    try std.testing.expect(!isWallHeadLagSyncing(0, 1, 10, 4));
+}
+
+test "peerBatchWindow rotates through peers" {
+    const w0 = peerBatchWindow(10, 0, 8);
+    try std.testing.expectEqual(@as(usize, 0), w0.start);
+    try std.testing.expectEqual(@as(usize, 8), w0.count);
+    try std.testing.expectEqual(@as(usize, 8), w0.next_cursor);
+
+    const w1 = peerBatchWindow(10, 8, 8);
+    try std.testing.expectEqual(@as(usize, 8), w1.start);
+    try std.testing.expectEqual(@as(usize, 8), w1.count);
+    try std.testing.expectEqual(@as(usize, 6), w1.next_cursor);
+}
+
+test "shouldInitiateProactiveCatchUp requires wall lag and gossip stall" {
+    const threshold_ms: u64 = 8000;
+    try std.testing.expect(shouldInitiateProactiveCatchUp(4, 4, threshold_ms, threshold_ms));
+    try std.testing.expect(!shouldInitiateProactiveCatchUp(3, 4, threshold_ms, threshold_ms));
+    try std.testing.expect(!shouldInitiateProactiveCatchUp(4, 4, threshold_ms - 1, threshold_ms));
+}
+
+test "shouldHealGossipMesh on low mesh or gossip stall" {
+    const threshold_ms: u64 = 8000;
+    try std.testing.expect(shouldHealGossipMesh(3, 4, 0, threshold_ms));
+    try std.testing.expect(shouldHealGossipMesh(10, 4, threshold_ms, threshold_ms));
+    try std.testing.expect(!shouldHealGossipMesh(10, 4, 0, threshold_ms));
+}
+
+test "gossipSilentMs handles never-received and elapsed silence" {
+    try std.testing.expectEqual(@as(u64, 0), gossipSilentMs(10_000, 0));
+    try std.testing.expectEqual(@as(u64, 3_000), gossipSilentMs(10_000, 7_000));
 }
 
 test "classifyChunkImport: queue_full drops, never falls back to inline (#894 regression guard)" {

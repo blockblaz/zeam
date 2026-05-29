@@ -3,6 +3,7 @@ const hashsig = @import("hashsig.zig");
 const ssz = @import("ssz");
 const zeam_metrics = @import("@zeam/metrics");
 const zeam_utils = @import("@zeam/utils");
+pub const shadow_cost = @import("shadow_cost.zig");
 
 pub const AggregationError = error{ SerializationFailed, DeserializationFailed, PublicKeysSignatureLengthMismatch, AggregationFailed, InvalidAggregateSignature };
 
@@ -38,6 +39,11 @@ extern fn xmss_aggregate(
     message_hash_ptr: [*]const u8,
     slot: u32,
     log_inv_rate: usize,
+    // Phase timing out-params (#940). See multisig-glue/src/lib.rs for the
+    // exact phase definitions. Nullable.
+    out_marshal_ns: ?*u64,
+    out_stark_ns: ?*u64,
+    out_post_ns: ?*u64,
 ) callconv(.c) ?*AggregatedXMSS;
 
 extern fn xmss_verify_aggregated(
@@ -153,6 +159,14 @@ pub fn aggregateSignatures(
         child_proof_lens[i] = proof_slice.len;
     }
 
+    // Phase-timing buckets filled by the Rust FFI (#940). Zero-initialized so
+    // an early-return inside xmss_aggregate that skips the writes still leaves
+    // a defined state; the success path below overwrites all three before we
+    // observe them.
+    var ffi_marshal_ns: u64 = 0;
+    var ffi_stark_ns: u64 = 0;
+    var ffi_post_ns: u64 = 0;
+
     const prove_start_ns = zeam_utils.monotonicTimestampNs();
     const agg_sig = xmss_aggregate(
         public_keys.ptr,
@@ -166,8 +180,14 @@ pub fn aggregateSignatures(
         message_hash,
         epoch,
         log_inv_rate,
+        &ffi_marshal_ns,
+        &ffi_stark_ns,
+        &ffi_post_ns,
     ) orelse return AggregationError.AggregationFailed;
-    recordXmssProveDuration(prove_start_ns);
+    recordXmssProveDuration(prove_start_ns, public_keys.len, num_children);
+    zeam_metrics.observeXmssRecAggregatePhase("marshal", ffi_marshal_ns);
+    zeam_metrics.observeXmssRecAggregatePhase("stark", ffi_stark_ns);
+    zeam_metrics.observeXmssRecAggregatePhase("post", ffi_post_ns);
 
     // Serialize the aggregate signature to bytes
     var buffer: [MAX_AGGREGATE_SIGNATURE_SIZE]u8 = undefined;
@@ -184,13 +204,18 @@ pub fn aggregateSignatures(
     for (buffer[0..bytes_written]) |byte| {
         try multisig_aggregated_signature.append(byte);
     }
+
+    // Shadow sim-cost: model aggregation CPU time on the virtual clock (no-op unless a
+    // rate is configured). Sleeps on the calling (aggregation worker) thread.
+    const shadow_delay_ns = shadow_cost.aggregateDelayNs(public_keys.len);
+    if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
 
-fn recordXmssProveDuration(start_ns: i128) void {
+fn recordXmssProveDuration(start_ns: i128, num_raw: usize, num_children: usize) void {
     const end_ns = zeam_utils.monotonicTimestampNs();
     const elapsed_ns: i128 = if (end_ns >= start_ns) end_ns - start_ns else 0;
     const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-    zeam_metrics.observeXmssRecAggregateProve(elapsed_s);
+    zeam_metrics.observeXmssRecAggregateProve(elapsed_s, num_raw, num_children);
 }
 
 /// Precondition: `setupXmssAggregation` must have been called once in this process.
@@ -209,6 +234,10 @@ pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, m
     );
 
     if (!result) return AggregationError.InvalidAggregateSignature;
+
+    // Shadow sim-cost: model verification CPU time on the virtual clock.
+    const shadow_delay_ns = shadow_cost.verifyDelayNs(public_keys.len);
+    if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
 
 pub const AggregatedPayloadVerifyBatch = struct {

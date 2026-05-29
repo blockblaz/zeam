@@ -119,6 +119,23 @@ pub const BeamNode = struct {
     /// that preserves that invariant.
     sync_refresh_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Rotating cursor for rate-limited `refreshSyncFromPeers` batches (#926).
+    sync_refresh_peer_cursor: usize = 0,
+
+    /// Monotonic millis of the last inbound gossip delivery (#926).
+    last_gossip_rx_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Monotonic millis of the last inbound gossip BLOCK delivery (#942).
+    /// Distinct from `last_gossip_rx_ms` because attestations on the
+    /// `/leanconsensus/.../attestation_*/ssz_snappy` topics arrive at
+    /// ~5/s on a busy mesh and keep `last_gossip_rx_ms` fresh even when
+    /// every block is being dropped by `snappy.error.Corrupt`.
+    /// `maybeInitiateProactiveCatchUp` was gating on the union-of-all-
+    /// topics counter, so attestations were silently masking a total
+    /// block-ingress stall and the catch-up RPC never fired. Tracked
+    /// separately so the block-silence signal can drive its own decision.
+    last_gossip_block_rx_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     const Self = @This();
 
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
@@ -314,39 +331,44 @@ pub const BeamNode = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        const now_ms: u64 = @intCast(zeam_utils.unixTimestampMillis());
+        self.last_gossip_rx_ms.store(now_ms, .monotonic);
+        // #942: track block-topic gossip separately. Attestations on the
+        // `/attestation_X/ssz_snappy` topics are small (~2.6 KB), decode
+        // reliably even on a fleet where every large message corrupts
+        // (~5/s arrival), and would otherwise keep `last_gossip_rx_ms`
+        // fresh and suppress `shouldInitiateProactiveCatchUp` indefinitely
+        // even though no block has reached the application layer in many
+        // slots. The block-specific timestamp lets the proactive catch-up
+        // gate detect that condition and trigger `blocks_by_root` /
+        // `blocks_by_range` RPC fallback the same way grandine recovers.
+        switch (data.*) {
+            .block => self.last_gossip_block_rx_ms.store(now_ms, .monotonic),
+            else => {},
+        }
 
         // Lifetime invariant for `data`:
         //   The gossip subsystem (see `pkgs/network/src/ethlibp2p.zig`) owns the
         //   `GossipMessage` for the entire duration of this callback. It is the
         //   standard libp2p callback contract: the buffer is not recycled, freed
-        //   or mutated until `onGossip` returns. We rely on this twice — once
-        //   for the pre-lock `hashTreeRoot` read of `data.block.block` and again
-        //   inside the locked section for the same field. If a future refactor
-        //   ever changes that contract (e.g. arena-pooled message buffers), the
-        //   pre-lock read becomes a use-after-free and this comment must be the
-        //   place to revisit. Do NOT cache or stash `data` past this scope.
+        //   or mutated until `onGossip` returns. Do NOT cache or stash `data`
+        //   past this scope.
         //
-        // Pre-lock work (issue #786): hashTreeRoot over a BeamBlock is pure CPU
-        // work that does not touch any shared state, but it can be expensive on
-        // large blocks (up to MAX_ATTESTATIONS_DATA aggregated XMSS proofs ⇒
-        // hundreds of KB to MBs of tree-hashing). Computing it before locking
-        // shrinks the critical section and lets `onInterval` make progress on
-        // the libxev thread in parallel. The computed root is reused in every
-        // downstream branch (success path + error paths) so we never recompute
-        // under the lock.
+        // `precomputed_block_root` is computed lazily — only when the block's
+        // parent is NOT already in fork-choice (the orphan-cache path, where the
+        // root is needed as a cache key synchronously on the libxev thread).
         //
-        // `precomputed_block_root` stays `undefined` for non-block gossip
-        // messages and is read only inside the `.block` arm of the switch
-        // below (and its error sub-branches). Any future code path that reads
-        // it outside that arm will hit Zig's `undefined` poison in debug
-        // builds — intentional defensive behavior.
-        var precomputed_block_root: types.Root = undefined;
-        if (data.* == .block) {
-            zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
-                self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
-                return;
-            };
-        }
+        // For the common case (parent present, block dispatched to chain-worker),
+        // we skip hashTreeRoot on libxev entirely (#942): the chain-worker thunk
+        // computes the root off-thread inside `onBlock`. The libxev-side hasBlock
+        // dedup is also skipped in this path; `protoArray.onBlock` performs the
+        // same dedup on the worker thread (early-out at line 97-101 of
+        // forkchoice.zig). The trade-off is that re-arriving gossip blocks whose
+        // root is already in protoArray will run STF on the worker before the
+        // protoArray no-op dedup fires; this is rare and accepted (#942 follow-up
+        // data from `zeam_libxev_callback_duration_seconds` will confirm).
+        //
+        // `precomputed_block_root` is null for all non-block gossip types.
 
         // Slice (a-3): the outer BeamNode.mutex is gone. Each chain entry
         // point inside the switch arms takes its own per-resource locks
@@ -354,6 +376,8 @@ pub const BeamNode = struct {
         // root_to_slot_lock, events_lock, forkChoice}); network state
         // mutations go through `Network`'s LockedMap / BlockCache /
         // ConnectedPeers helpers. See docs/threading_refactor_slice_a.md.
+
+        var precomputed_block_root: ?types.Root = null;
 
         switch (data.*) {
             .block => |signed_block| {
@@ -371,12 +395,24 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // Reuse the root we computed before taking the lock.
-                const block_root = precomputed_block_root;
-
-                _ = self.network.removePendingBlockRoot(block_root);
-
                 if (!hasParentBlock) {
+                    // Orphan path: compute block_root on libxev — needed as cache
+                    // key for `cacheBlockAndFetchParent` and `removePendingBlockRoot`.
+                    // This is a rare path (parent not yet imported), so the hash cost
+                    // here is acceptable.
+                    const hash_start_ns = zeam_utils.monotonicTimestampNs();
+                    var orphan_block_root: types.Root = undefined;
+                    zeam_utils.hashTreeRoot(types.BeamBlock, block, &orphan_block_root, self.allocator) catch |err| {
+                        self.logger.warn("failed to compute block root for orphan gossip block slot={d}: {any}", .{ block.slot, err });
+                        return;
+                    };
+                    const hash_elapsed_s = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - hash_start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                    zeam_metrics.observeLibxevCallback("onGossip.block.hash_tree_root", hash_elapsed_s);
+                    precomputed_block_root = orphan_block_root;
+                    const block_root = orphan_block_root;
+
+                    _ = self.network.removePendingBlockRoot(block_root);
+
                     // Cache this block for later processing when parent arrives
                     if (self.cacheBlockAndFetchParent(block_root, signed_block, 0)) |_| {
                         self.logger.debug(
@@ -410,6 +446,8 @@ pub const BeamNode = struct {
                     // Return early - don't pass to chain until parent arrives
                     return;
                 }
+                // hasParentBlock==true: fall through with precomputed_block_root=null.
+                // chain.onGossip and the chain-worker compute the root off libxev.
             },
             .attestation => |signed_attestation| {
                 const slot = signed_attestation.message.message.slot;
@@ -435,25 +473,36 @@ pub const BeamNode = struct {
             },
         }
 
-        // Slice (e) of #803: thread `precomputed_block_root` through
-        // chain.onGossip so the chain layer doesn't recompute the
-        // hash-tree root we already have. For non-block gossip
-        // (attestation/aggregation) we pass `null`; the chain layer
-        // ignores it on those branches.
-        const root_for_chain: ?types.Root = if (data.* == .block) precomputed_block_root else null;
+        // Issue #942: for the common gossip-block path (parent present),
+        // `precomputed_block_root` is null — chain.onGossip defers the hash to
+        // the chain-worker. For the orphan path and non-block gossip it is either
+        // the root computed above or null respectively; chain.onGossip ignores it
+        // on attestation/aggregation branches.
+        const root_for_chain: ?types.Root = precomputed_block_root;
         const result = self.chain.onGossip(data, sender_peer_id, root_for_chain) catch |err| {
             switch (err) {
                 // Block rejected because it's before finalized - drop it and prune any cached
                 // descendants we might still be holding onto.
                 error.PreFinalizedSlot => {
                     if (data.* == .block) {
-                        // Reuse the root we computed before taking the lock (issue #786).
-                        const block_root = precomputed_block_root;
-                        self.logger.info(
-                            "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
-                            .{&block_root},
-                        );
-                        _ = self.network.pruneCachedBlocks(block_root, null);
+                        // For the orphan path precomputed_block_root is non-null; for
+                        // the common (parent-present) path it is null — chain.onGossip
+                        // computed the root on libxev via its own lazy path. Skip
+                        // pruneCachedBlocks in the null case; any cached descendants
+                        // will age out naturally (block was pre-finalized so they are
+                        // all stale anyway — no liveness impact).
+                        if (precomputed_block_root) |block_root| {
+                            self.logger.info(
+                                "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
+                                .{&block_root},
+                            );
+                            _ = self.network.pruneCachedBlocks(block_root, null);
+                        } else {
+                            self.logger.info(
+                                "gossip block slot={d} rejected as pre-finalized (root not computed on libxev)",
+                                .{data.block.block.slot},
+                            );
+                        }
                     }
                     return;
                 },
@@ -1126,6 +1175,44 @@ pub const BeamNode = struct {
         return parent_root;
     }
 
+    /// Cache an RPC chunk whose parent is not yet in fork choice and queue a
+    /// batched parent fetch. Shared by the chain-worker fast path and the
+    /// MissingPreState fallback so RPC handlers never duplicate cache logic.
+    fn cacheMissingParentRpcChunk(
+        self: *Self,
+        block_root: types.Root,
+        signed_block: *const types.SignedBlock,
+        peer_id: []const u8,
+        pending_depth: u32,
+    ) void {
+        if (pending_depth >= constants.MAX_BLOCK_FETCH_DEPTH) {
+            self.logger.warn(
+                "Reached max block fetch depth ({d}) for block 0x{x}, discarding",
+                .{ constants.MAX_BLOCK_FETCH_DEPTH, &block_root },
+            );
+            return;
+        }
+
+        const fetch_depth = pending_depth + 1;
+        if (self.cacheBlockAndFetchParent(block_root, signed_block.*, fetch_depth)) |parent_root| {
+            self.logger.debug(
+                "Cached block 0x{x} at depth {d}, fetching parent 0x{x}",
+                .{ &block_root, pending_depth, &parent_root },
+            );
+        } else |cache_err| {
+            if (cache_err == CacheBlockError.PreFinalized) {
+                self.logger.info(
+                    "block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
+                    .{ &block_root, signed_block.block.slot },
+                );
+                _ = self.network.pruneCachedBlocks(block_root, null);
+            } else {
+                self.logger.warn("failed to cache block 0x{x}: {any}", .{ &block_root, cache_err });
+            }
+        }
+        self.flushPendingParentFetches(peer_id);
+    }
+
     fn cacheFutureBlock(
         self: *Self,
         block_root: types.Root,
@@ -1231,50 +1318,18 @@ pub const BeamNode = struct {
                     },
                     .fallback_inline => {},
                 }
+            } else {
+                // Parent not yet imported — cache and fetch instead of inline
+                // `onBlock` on libxev (#894 / #926).
+                self.cacheMissingParentRpcChunk(block_root, signed_block, block_ctx.peer_id, current_depth);
+                return;
             }
 
             // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 // Check if the error is due to missing parent
                 if (err == chainFactory.BlockProcessingError.MissingPreState) {
-                    // Check if we've hit the max depth
-                    if (current_depth >= constants.MAX_BLOCK_FETCH_DEPTH) {
-                        self.logger.warn(
-                            "Reached max block fetch depth ({d}) for block 0x{x}, discarding",
-                            .{ constants.MAX_BLOCK_FETCH_DEPTH, &block_root },
-                        );
-                        return;
-                    }
-
-                    // Cache this block and fetch parent
-                    if (self.cacheBlockAndFetchParent(block_root, signed_block.*, current_depth + 1)) |parent_root| {
-                        self.logger.debug(
-                            "Cached block 0x{x} at depth {d}, fetching parent 0x{x}",
-                            .{
-                                &block_root,
-                                current_depth,
-                                &parent_root,
-                            },
-                        );
-                    } else |cache_err| {
-                        if (cache_err == CacheBlockError.PreFinalized) {
-                            // Block is pre-finalized - prune any cached descendants waiting for this parent
-                            self.logger.info(
-                                "block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
-                                .{
-                                    &block_root,
-                                    signed_block.block.slot,
-                                },
-                            );
-                            _ = self.network.pruneCachedBlocks(block_root, null);
-                        } else {
-                            self.logger.warn("failed to cache block 0x{x}: {any}", .{
-                                &block_root,
-                                cache_err,
-                            });
-                        }
-                    }
-                    self.flushPendingParentFetches(block_ctx.peer_id);
+                    self.cacheMissingParentRpcChunk(block_root, signed_block, block_ctx.peer_id, current_depth);
                     return;
                 }
 
@@ -1717,25 +1772,14 @@ pub const BeamNode = struct {
                 },
                 .fallback_inline => {},
             }
+        } else {
+            self.cacheMissingParentRpcChunk(block_root, signed_block, peer_id, 0);
+            return;
         }
 
         const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
             if (err == chainFactory.BlockProcessingError.MissingPreState) {
-                // Cache and try to fetch parent. Range responses arrive ordered by slot,
-                // but the first chunk in a batch may still need its parent fetched.
-                if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
-                    self.logger.debug(
-                        "blocks_by_range: cached block 0x{x}, fetching parent 0x{x}",
-                        .{ &block_root, &parent_root },
-                    );
-                } else |cache_err| {
-                    if (cache_err == CacheBlockError.PreFinalized) {
-                        _ = self.network.pruneCachedBlocks(block_root, null);
-                    } else {
-                        self.logger.warn("blocks_by_range: failed to cache block 0x{x}: {any}", .{ &block_root, cache_err });
-                    }
-                }
-                self.flushPendingParentFetches(peer_id);
+                self.cacheMissingParentRpcChunk(block_root, signed_block, peer_id, 0);
                 return;
             }
             if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
@@ -2517,6 +2561,10 @@ pub const BeamNode = struct {
             const client_type = clientTypeFromName(node_name.name);
             zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 0) catch {};
         }
+
+        if (reason == .timeout or reason == .error_) {
+            self.maybeHealGossipMesh(self.updateWallHeadLagSnapshot());
+        }
     }
 
     pub fn onPeerConnectionFailed(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, result: networks.ConnectionResult) !void {
@@ -2582,11 +2630,21 @@ pub const BeamNode = struct {
 
         var current_interval: isize = start_interval;
         while (current_interval <= itime_intervals) : (current_interval += 1) {
+            // Issue #942: measure how long each interval tick keeps the libxev thread busy.
+            const interval_tick_start_ns = zeam_utils.monotonicTimestampNs();
+            defer {
+                const elapsed_s = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - interval_tick_start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                zeam_metrics.observeLibxevCallback("onInterval.tick", elapsed_s);
+            }
             const interval: usize = @intCast(current_interval);
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
             // Commit per interval before sub-steps so later errors cannot replay it.
             self.last_interval = current_interval;
+
+            // Feed wall-clock head lag into `getSyncStatus()` before the chain
+            // tick updates sync metrics (#926).
+            const wall_head_lag_slots = self.updateWallHeadLagSnapshot();
 
             {
                 // No outer mutex: each sub-system owns its locks.
@@ -2681,35 +2739,7 @@ pub const BeamNode = struct {
                 self.refreshSyncFromPeers();
             }
 
-            // Periodically re-send status to connected peers when sync may need
-            // recovery. Finalization-only sync state can report `synced` on early
-            // devnets while finalized_slot stays at zero; if gossip ingress stalls,
-            // the head then falls behind wall-clock slots but no new status response
-            // arrives to trigger RPC catch-up. Keep the pure policy in
-            // `blocks_by_range_sync.zig`; this tick path only supplies snapshots
-            // and performs the RPC side effect.
-            const sync_status = self.chain.getSyncStatus();
-            const our_head_slot = self.chain.forkChoice.getHead().slot;
-            const wall_slot = self.clock.wallSlotNow();
-            const refresh_decision = blocks_by_range_sync.shouldRefreshPeerStatus(
-                sync_status,
-                interval_in_slot,
-                slot,
-                our_head_slot,
-                wall_slot,
-                constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS,
-                constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
-            );
-            if (refresh_decision.refresh) {
-                switch (sync_status) {
-                    .synced => self.logger.info(
-                        "head is {d} wall-clock slots behind while synced; refreshing peer status for catch-up",
-                        .{refresh_decision.wall_head_lag_slots},
-                    ),
-                    else => {},
-                }
-                self.refreshSyncFromPeers();
-            }
+            self.runSyncRecoveryOnInterval(slot, interval_in_slot, wall_head_lag_slots);
 
             if (interval_in_slot == 2) {
                 const agg_timer = zeam_metrics.zeam_node_aggregation_interval_tick_seconds.start();
@@ -2746,7 +2776,162 @@ pub const BeamNode = struct {
         self.scheduleSyncRefresh();
     }
 
-    /// Re-send our status to every connected peer.
+    fn updateWallHeadLagSnapshot(self: *Self) u64 {
+        const our_head_slot = self.chain.forkChoice.getHead().slot;
+        const wall_slot = self.clock.wallSlotNow();
+        const wall_head_lag_slots = blocks_by_range_sync.cappedSyncGapSlots(wall_slot, our_head_slot, wall_slot);
+        self.chain.setWallHeadLagSlots(wall_head_lag_slots);
+        return wall_head_lag_slots;
+    }
+
+    fn gossipIngressSnapshot(self: *Self) struct { silent_ms: u64, block_silent_ms: u64, mesh_peers: u64 } {
+        const now_ms: u64 = @intCast(zeam_utils.unixTimestampMillis());
+        const last_block_ms = self.last_gossip_block_rx_ms.load(.monotonic);
+        // #942: "block silent" semantics. Returns `maxInt(u64)` when we
+        // have never delivered a block to the application — that signals
+        // "infinitely silent on the block topic" to the proactive catch-up
+        // gate, which is exactly what we want when block ingress has not
+        // started yet (devnet just past genesis with all blocks failing
+        // snappy decode, etc.). Once any block ever decodes cleanly via
+        // `onGossip`, this collapses to the normal `now_ms - last_block_ms`
+        // measurement.
+        const block_silent_ms: u64 = if (last_block_ms == 0)
+            std.math.maxInt(u64)
+        else
+            now_ms -| last_block_ms;
+        return .{
+            .silent_ms = blocks_by_range_sync.gossipSilentMs(
+                now_ms,
+                self.last_gossip_rx_ms.load(.monotonic),
+            ),
+            .block_silent_ms = block_silent_ms,
+            .mesh_peers = self.network.gossipMeshPeerCount(),
+        };
+    }
+
+    fn runSyncRecoveryOnInterval(self: *Self, slot: types.Slot, interval_in_slot: usize, wall_head_lag_slots: u64) void {
+        const sync_status = self.chain.getSyncStatus();
+        const our_head_slot = self.chain.forkChoice.getHead().slot;
+        const wall_slot = self.clock.wallSlotNow();
+        const refresh_decision = blocks_by_range_sync.shouldRefreshPeerStatus(
+            sync_status,
+            interval_in_slot,
+            slot,
+            our_head_slot,
+            wall_slot,
+            constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS,
+            constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+        );
+        if (refresh_decision.refresh) {
+            switch (sync_status) {
+                .synced => self.logger.info(
+                    "head is {d} wall-clock slots behind while synced; refreshing peer status for catch-up",
+                    .{refresh_decision.wall_head_lag_slots},
+                ),
+                else => {},
+            }
+            self.refreshSyncFromPeers();
+        }
+
+        // Proactive catch-up runs every slot rather than at the status-refresh
+        // cadence: when gossip ingress has stalled, waiting up to 8 slots for
+        // the next refresh window defeats the point of acting on cached peer
+        // status. Overlap is filtered inside `initiateBlocksByRangeCatchUp`.
+        if (interval_in_slot == 0) {
+            self.maybeInitiateProactiveCatchUp(wall_head_lag_slots);
+        }
+
+        if (interval_in_slot == 0 and slot % constants.GOSSIP_MESH_HEAL_INTERVAL_SLOTS == 0) {
+            self.maybeHealGossipMesh(wall_head_lag_slots);
+        }
+    }
+
+    /// Snapshot the best (highest head_slot) peer status while holding the
+    /// connected-peers read lock, duplicating peer_id so the caller can
+    /// safely release the lock before issuing RPCs.
+    ///
+    /// Caller owns `result.peer_id` and must free it via `self.allocator`.
+    ///
+    /// Borrowing `entry.key_ptr.*` past `guard.deinit()` would race with
+    /// `onPeerDisconnected` (rust-bridge thread) freeing the hash-map key,
+    /// causing a use-after-free in the downstream RPC dispatch.
+    fn findBestCatchUpPeerStatus(self: *Self) ?CatchUpPeerStatus {
+        var best: ?CatchUpPeerStatus = null;
+        var best_peer_id_buf: []u8 = &[_]u8{};
+        var guard = self.network.connected_peers.iterateLocked();
+        defer guard.deinit();
+        while (guard.iter.next()) |entry| {
+            const peer_info = entry.value_ptr;
+            const status = peer_info.latest_status orelse continue;
+            if (best != null and status.head_slot <= best.?.head_slot) continue;
+
+            const owned = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+            if (best_peer_id_buf.len != 0) self.allocator.free(best_peer_id_buf);
+            best_peer_id_buf = owned;
+            best = .{
+                .peer_id = owned,
+                .head_slot = status.head_slot,
+                .head_root = status.head_root,
+                .finalized_slot = status.finalized_slot,
+            };
+        }
+        return best;
+    }
+
+    fn maybeInitiateProactiveCatchUp(self: *Self, wall_head_lag_slots: u64) void {
+        const ingress = self.gossipIngressSnapshot();
+        // #942: gate on BLOCK-topic silence, not union-of-all-topics
+        // silence. Attestations decode reliably even on a fleet where
+        // every block is being rejected by snappy.error.Corrupt; if we
+        // gated on union-silence the attestation stream would suppress
+        // the catch-up RPC indefinitely while no block ever reaches the
+        // app. With `block_silent_ms` the gate fires the moment we have
+        // a wall-lag and no block has come through gossip for the stall
+        // threshold (8 s on a 4 s slot devnet).
+        if (!blocks_by_range_sync.shouldInitiateProactiveCatchUp(
+            wall_head_lag_slots,
+            constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+            ingress.block_silent_ms,
+            constants.gossipStallThresholdMs(),
+        )) return;
+
+        const our_head_slot = self.chain.forkChoice.getHead().slot;
+        const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+        const catch_up_status = self.findBestCatchUpPeerStatus() orelse return;
+        defer self.allocator.free(catch_up_status.peer_id);
+        if (!self.shouldCatchUpFromPeerStatus(catch_up_status, our_head_slot, our_finalized_slot)) return;
+
+        self.logger.info(
+            "proactive catch-up: block-gossip silent for {d}ms (any-gossip silent for {d}ms), wall lag {d} slots, peer {s}{f} head={d}",
+            .{
+                ingress.block_silent_ms,
+                ingress.silent_ms,
+                wall_head_lag_slots,
+                catch_up_status.peer_id,
+                self.node_registry.getNodeNameFromPeerId(catch_up_status.peer_id),
+                catch_up_status.head_slot,
+            },
+        );
+        self.initiateCatchUpFromPeerStatus(catch_up_status, our_head_slot);
+    }
+
+    fn maybeHealGossipMesh(self: *Self, wall_head_lag_slots: u64) void {
+        const ingress = self.gossipIngressSnapshot();
+        if (!blocks_by_range_sync.shouldHealGossipMesh(
+            ingress.mesh_peers,
+            constants.GOSSIP_MESH_MIN_PEERS,
+            ingress.silent_ms,
+            constants.gossipStallThresholdMs(),
+        )) return;
+
+        self.logger.info(
+            "gossip mesh heal: mesh_peers={d} gossip_silent_ms={d} wall_lag={d}",
+            .{ ingress.mesh_peers, ingress.silent_ms, wall_head_lag_slots },
+        );
+        self.network.refreshGossipMesh();
+    }
+
+    /// Re-send our status to a rotating batch of connected peers.
     ///
     /// Called periodically when the node is not yet synced so that peers
     /// already connected before the sync mechanism became aware of them
@@ -2775,7 +2960,19 @@ pub const BeamNode = struct {
 
         const status = self.chain.getStatus();
         const handler = self.getReqRespResponseHandler();
-        for (peer_ids.items) |peer_id| {
+        const total = peer_ids.items.len;
+        const batch = blocks_by_range_sync.peerBatchWindow(
+            total,
+            self.sync_refresh_peer_cursor,
+            constants.SYNC_STATUS_REFRESH_PEERS_PER_TICK,
+        );
+        self.sync_refresh_peer_cursor = batch.next_cursor;
+
+        var sent: usize = 0;
+        var i: usize = 0;
+        while (i < batch.count) : (i += 1) {
+            const idx = (batch.start + i) % total;
+            const peer_id = peer_ids.items[idx];
             _ = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
                 self.logger.warn("failed to refresh status to peer {s}{f}: {any}", .{
                     peer_id,
@@ -2783,6 +2980,13 @@ pub const BeamNode = struct {
                     err,
                 });
             };
+            sent += 1;
+        }
+        if (sent < total) {
+            self.logger.debug(
+                "status refresh batch: sent {d}/{d} peers (cursor={d})",
+                .{ sent, total, self.sync_refresh_peer_cursor },
+            );
         }
     }
 
