@@ -4260,7 +4260,7 @@ test "Network: ConnectedPeers integration with selectPeer (slice a-3)" {
     try std.testing.expect(node.network.hasPeer("peer-aaa"));
 
     // selectPeer returns an owned copy.
-    if (try node.network.selectPeer()) |picked| {
+    if (try node.network.selectPeer(null)) |picked| {
         defer allocator.free(picked);
         try std.testing.expect(node.network.hasPeer(picked));
     } else return error.NoPick;

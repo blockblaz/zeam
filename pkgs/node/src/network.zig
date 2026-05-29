@@ -429,16 +429,16 @@ pub const Network = struct {
 
     /// Returns an owned copy of a randomly selected peer's id, or null when
     /// no peers are connected. Caller frees with `self.allocator.free`.
-    pub fn selectPeer(self: *Self) !?[]u8 {
-        return self.connected_peers.selectPeerCopy(self.allocator);
+    pub fn selectPeer(self: *Self, min_slot: ?u64) !?[]u8 {
+        return self.connected_peers.selectPeerCopy(self.allocator, min_slot);
     }
 
-    pub fn selectPeerExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
-        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, false);
+    pub fn selectPeerExcluding(self: *Self, exclude: ?[]const u8, min_slot: ?u64) !?[]u8 {
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, false, min_slot);
     }
 
     pub fn selectPeerForRangeSyncExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
-        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, true);
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, true, null);
     }
 
     pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
@@ -1094,8 +1094,8 @@ pub const Network = struct {
         // returns the backend error and the existing retry paths handle it.
         const peer = if (preferred_peer) |peer_id| blk: {
             if (self.hasPeer(peer_id)) break :blk try self.allocator.dupe(u8, peer_id);
-            break :blk (try self.selectPeer()) orelse return error.NoPeersAvailable;
-        } else (try self.selectPeer()) orelse return error.NoPeersAvailable;
+            break :blk (try self.selectPeer(null)) orelse return error.NoPeersAvailable;
+        } else (try self.selectPeer(null)) orelse return error.NoPeersAvailable;
         var peer_owned = true;
         errdefer if (peer_owned) self.allocator.free(peer);
 

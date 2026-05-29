@@ -969,8 +969,8 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// Pick a random peer id under the shared lock. Returns a
         /// freshly-allocated copy of the peer id so the caller can use
         /// it after the lock is released. Caller frees with `allocator`.
-        pub fn selectPeerCopy(self: *Self, allocator: Allocator) !?[]u8 {
-            return self.selectPeerExcluding(allocator, null, false);
+        pub fn selectPeerCopy(self: *Self, allocator: Allocator, min_slot: ?u64) !?[]u8 {
+            return self.selectPeerExcluding(allocator, null, false, min_slot);
         }
 
         pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
@@ -992,12 +992,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// Pick a random connected peer, optionally excluding one id (for RPC retry).
         /// When `range_capable_only`, skips peers that reported `blocks_by_range` unavailable.
         /// Returns null when every connected peer is excluded (e.g. single-peer devnet).
-        pub fn selectPeerExcluding(
-            self: *Self,
-            allocator: Allocator,
-            exclude: ?[]const u8,
-            range_capable_only: bool,
-        ) !?[]u8 {
+        pub fn selectPeerExcluding(self: *Self, allocator: Allocator, exclude: ?[]const u8, range_capable_only: bool, min_slot: ?u64) !?[]u8 {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
@@ -1007,16 +1002,26 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             var candidates: std.ArrayList([]const u8) = .empty;
             defer candidates.deinit(allocator);
 
-            var it = self.map.iterator();
-            while (it.next()) |entry| {
-                if (exclude) |ex| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
+            var effective_min_slot: ?u64 = min_slot;
+            while (true) {
+                var it = self.map.iterator();
+                while (it.next()) |entry| {
+                    if (exclude) |ex| {
+                        if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
+                    }
+                    if (effective_min_slot) |ms| {
+                        const peer_head_slot = if (entry.value_ptr.latest_status) |status| status.head_slot else 0;
+                        if (ms > peer_head_slot) continue;
+                    }
+                    if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
+                        if (entry.value_ptr.blocks_by_range_unavailable) continue;
+                    }
+                    try candidates.append(allocator, entry.value_ptr.peer_id);
                 }
-                if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
-                    if (entry.value_ptr.blocks_by_range_unavailable) continue;
-                }
-                try candidates.append(allocator, entry.value_ptr.peer_id);
+                if (candidates.items.len > 0 or effective_min_slot == null) break;
+                effective_min_slot = null;
             }
+
             if (candidates.items.len == 0) return null;
 
             const io = std.Io.Threaded.global_single_threaded.io();
@@ -1952,7 +1957,7 @@ test "ConnectedPeers: connect / disconnect / count atomic" {
     }
 
     // selectPeerCopy returns an owned slice from the present set.
-    const picked = (try cp.selectPeerCopy(testing.allocator)) orelse return error.NoPick;
+    const picked = (try cp.selectPeerCopy(testing.allocator, null)) orelse return error.NoPick;
     defer testing.allocator.free(picked);
     try testing.expect(cp.contains(picked));
 }
