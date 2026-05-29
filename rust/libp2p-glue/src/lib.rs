@@ -288,6 +288,87 @@ const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 8192;
 /// monopolize the executor.
 const MAX_SWARM_COMMANDS_PER_TICK: usize = 256;
 
+/// Capacity of the inbound-gossip hand-off channel (issue #942).
+///
+/// Each slot owns one inbound gossip payload (the compressed bytes moved out
+/// of `gossipsub::Message`). The libp2p event loop `try_send`s onto this
+/// channel; a single dedicated worker thread drains it and performs the heavy
+/// synchronous snappy-decompress + SSZ-deserialize + chain dispatch via
+/// `handleMsgFromRustBridge`. The point is to keep that hundreds-of-ms-per-block
+/// work OFF the `new_current_thread` tokio runtime that also drives quinn's
+/// QUIC I/O — that starvation corrupted the QUIC receive path and stalled
+/// gossip (the cross-message byte-bleed pinned in `issue_942_layer.md`, and the
+/// earlier 148 broken QUIC handshakes / 8 Status-RPC timeouts).
+///
+/// Bounded so a burst of large blocks cannot grow memory without limit. On a
+/// full channel the message is dropped (counted in `INBOUND_GOSSIP_DROPPED_TOTAL`)
+/// — gossip is best-effort and a missed block is recovered via the
+/// blocks_by_root / blocks_by_range RPC sync fallback. 256 slots × the common
+/// ~286 KB block ≈ 73 MB worst case; drops only occur during a decode backlog,
+/// which is exactly when shedding load (instead of stalling the transport) is
+/// the right behaviour.
+const INBOUND_GOSSIP_CHANNEL_CAPACITY: usize = 256;
+
+/// Count of inbound gossip messages dropped because the decode worker's queue
+/// was full (issue #942). Process-wide; surfaced in logs at the drop site.
+static INBOUND_GOSSIP_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// One inbound gossip message handed from the libp2p event loop to the decode
+/// worker thread. Owns every buffer the FFI call reads so the raw pointers
+/// passed into Zig stay valid while the call runs off the event-loop thread.
+struct InboundGossip {
+    network_id: u32,
+    zig_handler: u64,
+    topic: CString,
+    sender_peer_id: CString,
+    data: Vec<u8>,
+}
+
+/// Drain loop for the dedicated inbound-gossip decode worker thread (issue
+/// #942). Blocks on `recv()`; exits once the event loop drops the sender and
+/// the channel is drained. Runs `handleMsgFromRustBridge` — i.e. the full
+/// snappy decompress + SSZ deserialize + `chain.onGossip` dispatch — here, off
+/// the tokio/quinn event-loop thread. A single worker preserves the serial
+/// `onGossip` ordering the chain layer assumed when this ran inline.
+fn run_inbound_gossip_worker(rx: std::sync::mpsc::Receiver<InboundGossip>) {
+    while let Ok(msg) = rx.recv() {
+        // #942 forensic: hash the bytes about to cross the FFI boundary into
+        // Zig. Moved off the event loop into this worker so the O(len) sha256
+        // no longer competes with quinn for event-loop time. Pairs with the
+        // Zig-side `sha256_inbound` and the producer's `sha256_compressed` for
+        // cross-fleet correlation; remove once the in-transit corruption is
+        // confirmed fixed.
+        let mut ingress_hasher = sha2::Sha256::new();
+        ingress_hasher.update(msg.data.as_slice());
+        let ingress_digest = ingress_hasher.finalize();
+        logger::rustLogger.info(
+            msg.network_id,
+            &format!(
+                "[#942 rx] topic={} len={} sha256_libp2p_ingress={} peer={}",
+                msg.topic.to_string_lossy(),
+                msg.data.len(),
+                hex::encode(ingress_digest),
+                msg.sender_peer_id.to_string_lossy(),
+            ),
+        );
+
+        // SAFETY: `msg` owns `topic`, `sender_peer_id` and `data` for the whole
+        // duration of this call, so all three pointers are valid until
+        // `handleMsgFromRustBridge` returns. The Zig handler copies/consumes
+        // what it needs before returning (it must not stash the buffers — see
+        // the lifetime invariant comment in `node.onGossip`).
+        unsafe {
+            handleMsgFromRustBridge(
+                msg.zig_handler,
+                msg.topic.as_ptr(),
+                msg.data.as_ptr(),
+                msg.data.len(),
+                msg.sender_peer_id.as_ptr(),
+            );
+        }
+    }
+}
+
 /// Reason tags for `SWARM_COMMAND_DROPPED_TOTAL` and the matching FFI getter
 /// `get_swarm_command_dropped_total`. Mirrored on the Zig side as a plain
 /// `u32` enum so the Prometheus counter can be labeled by reason without
@@ -1427,6 +1508,18 @@ impl Network {
         let mut mesh_peers_tick = tokio::time::interval(Duration::from_secs(1));
         mesh_peers_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // #942: hand inbound gossip off to a dedicated decode worker thread so
+        // the synchronous snappy-decompress + SSZ-deserialize + chain dispatch
+        // does not block this tokio thread, which also drives quinn's QUIC I/O.
+        // A single worker keeps `onGossip` serialized exactly as it was when the
+        // call ran inline below.
+        let (gossip_tx, gossip_rx) =
+            std::sync::mpsc::sync_channel::<InboundGossip>(INBOUND_GOSSIP_CHANNEL_CAPACITY);
+        let gossip_worker = std::thread::Builder::new()
+            .name(format!("zeam-gossip-decode-{}", self.network_id))
+            .spawn(move || run_inbound_gossip_worker(gossip_rx))
+            .expect("failed to spawn inbound gossip decode worker thread");
+
         'eventloop: loop {
             tokio::select! {
             biased;
@@ -1797,21 +1890,31 @@ impl Network {
                             }
 
                             if let gossipsub::Event::Message { message, .. } = gossipsub_event {
-                                let topic_str = message.topic.as_str().to_string();
-                                let topic = match CString::new(topic_str.as_str()) {
+                                // #942: do NOT decode here. The full
+                                // snappy-decompress + SSZ-deserialize + chain
+                                // dispatch (`handleMsgFromRustBridge`) used to
+                                // run inline on this thread, which also drives
+                                // quinn's QUIC I/O. On a 286 KB–9 MB block that
+                                // blocked the event loop for hundreds of ms,
+                                // starving the QUIC receive path — the root
+                                // cause of the inbound snappy corruption (the
+                                // cross-message byte-bleed in issue_942_layer.md)
+                                // and the earlier 148 broken QUIC handshakes / 8
+                                // Status-RPC timeouts. We now only build the
+                                // hand-off record (cheap) and pass ownership of
+                                // the payload to the decode worker thread; the
+                                // ingress sha256 forensic log moved there too.
+                                let topic_str = message.topic.as_str();
+                                let topic = match CString::new(topic_str) {
                                     Ok(cstr) => cstr,
                                     Err(_) => {
                                         logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic_str));
                                         continue;
                                     }
                                 };
-                                let topic = topic.as_ptr();
-
-                                let message_ptr = message.data.as_ptr();
-                                let message_len = message.data.len();
 
                                 let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
-                                let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
+                                let sender_peer_id = match CString::new(sender_peer_id_string.as_str()) {
                                     Ok(cstring) => cstring,
                                     Err(_) => {
                                         logger::rustLogger.error(
@@ -1822,82 +1925,37 @@ impl Network {
                                     }
                                 };
 
-                                // #942 phase 4: the Rust-side `Decoder::new().decompress_vec`
-                                // and accompanying `[gossip ingress decode FAIL]` log + dump
-                                // (added in `840d7058` / `f3c40406`) are GONE on purpose.
-                                //
-                                // Cause: on the 2026-05-29 devnet a 3.7 MB broken-snappy block
-                                // landed at 11:26:07 and the synchronous decompress here
-                                // (running on top of the equivalent decompress that
-                                // gossipsub's `message_id_fn` already does) blocked the
-                                // libp2p event loop for hundreds of milliseconds. The
-                                // resulting starvation knocked 8 in-flight Status RPCs
-                                // into simultaneous timeout at 11:26:56, broke 148 QUIC
-                                // handshakes with `HandshakeTimedOut`, and tipped zeam_8
-                                // into "Max reconnection attempts (5) reached, giving up"
-                                // for several peers. After that the node was sending
-                                // Status requests into the void: the chain stalled at
-                                // head=98 not because catch-up wasn't trying but because
-                                // the transport itself had been jammed by 2× per-message
-                                // decompress on the event loop.
-                                //
-                                // What we lose by removing this:
-                                //   * `[gossip ingress decode FAIL]` per-failure log →
-                                //     covered by the Zig-side `Error in snappyz decoding
-                                //     the message for topic=... first32=...` log
-                                //     (`pkgs/network/src/ethlibp2p.zig`).
-                                //   * `failed_gossip_*.bin` Rust dumps → covered by the
-                                //     pre-existing Zig-side `failed_snappyz_decode_*.bin`
-                                //     dumps written via `writeFailedBytes`. The Rust dumps
-                                //     captured `message.data` before the FFI handoff and
-                                //     were used in the cross-receiver test on 2026-05-29
-                                //     to prove the bytes are byte-identical at the wire
-                                //     side; that hypothesis is now confirmed and the
-                                //     duplicate dump path is no longer needed.
-                                //   * `rust_snap=ok` vs Zig decode reconciliation → only
-                                //     useful if there's an FFI slice bug. The
-                                //     cross-receiver test already showed the bytes that
-                                //     reach Zig match what Rust sees, so the FFI is
-                                //     faithful and this reconciliation has no signal left.
-
-                                // #942 follow-up (2026-05-29): publish-side `[#942 publish]`
-                                // logs in Zig now emit `sha256_compressed` for every outbound
-                                // gossip message. We pair that with a Rust-side ingress
-                                // hash here, immediately before the FFI handoff into Zig,
-                                // so cross-fleet attribution becomes a single grep without
-                                // needing the rate-gated `failed_snappyz_decode_*.bin`
-                                // dumps. A devnet capture this morning showed an inbound
-                                // 284553-byte block whose Zig-side sha256 differed from
-                                // ethlambda's publish-side sha256 despite matching length
-                                // — proving the bytes are mutated in transit. This log
-                                // pins WHERE in the stack that mutation lands: if
-                                // `sha256_libp2p_ingress` already differs from the
-                                // producer's `sha256_compressed`, corruption is upstream
-                                // of our shim (inside rust-libp2p / gossipsub). If it
-                                // matches the producer but Zig-side differs, the FFI
-                                // slice handoff is corrupting bytes.
-                                //
-                                // Cost: sha256 of message.data is O(len) hashing with no
-                                // allocation. Measured ~1 ms per 300 KB block on x86_64
-                                // — vs the ~hundreds-of-ms full snappy decompress that
-                                // was removed in `840d7058`. Acceptable event-loop cost
-                                // for the bug hunt; remove once the in-transit corruption
-                                // is fixed.
-                                let mut ingress_hasher = sha2::Sha256::new();
-                                ingress_hasher.update(message.data.as_slice());
-                                let ingress_digest = ingress_hasher.finalize();
-                                logger::rustLogger.info(self.network_id, &format!(
-                                    "[#942 rx] topic={} len={} sha256_libp2p_ingress={} peer={}",
-                                    topic_str,
-                                    message_len,
-                                    hex::encode(ingress_digest),
-                                    sender_peer_id_string,
-                                ));
-
-                                unsafe {
-                                    handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
+                                let work = InboundGossip {
+                                    network_id: self.network_id,
+                                    zig_handler: self.zig_handler,
+                                    topic,
+                                    sender_peer_id,
+                                    // Move the owned payload off the event loop;
+                                    // the worker holds it for the FFI call.
+                                    data: message.data,
                                 };
-                                logger::rustLogger.debug(self.network_id, "zig callback completed");
+
+                                match gossip_tx.try_send(work) {
+                                    Ok(()) => {}
+                                    Err(std::sync::mpsc::TrySendError::Full(dropped)) => {
+                                        let total = INBOUND_GOSSIP_DROPPED_TOTAL
+                                            .fetch_add(1, Ordering::Relaxed)
+                                            + 1;
+                                        logger::rustLogger.warn(self.network_id, &format!(
+                                            "[#942] inbound gossip decode queue full (cap={}); dropped topic={} len={} (dropped_total={}). Missed block recoverable via blocks_by_root/range RPC sync.",
+                                            INBOUND_GOSSIP_CHANNEL_CAPACITY,
+                                            dropped.topic.to_string_lossy(),
+                                            dropped.data.len(),
+                                            total,
+                                        ));
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                        logger::rustLogger.error(
+                                            self.network_id,
+                                            "[#942] inbound gossip decode worker gone; dropping message",
+                                        );
+                                    }
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Reqresp(ReqRespMessage {
@@ -2229,6 +2287,20 @@ impl Network {
             }
 
             }
+        }
+
+        // #942: stop the inbound gossip decode worker. Dropping the sender makes
+        // the worker's blocking `recv()` return `Err` once the channel drains,
+        // so it finishes any queued messages and exits. Joining here — on the
+        // rust-bridge thread, before this function returns and Zig joins it —
+        // guarantees no in-flight `handleMsgFromRustBridge` call is still running
+        // when Zig tears down the EthLibp2p handler after `stop_network`.
+        drop(gossip_tx);
+        if let Err(panic) = gossip_worker.join() {
+            logger::rustLogger.error(
+                self.network_id,
+                &format!("inbound gossip decode worker thread panicked: {:?}", panic),
+            );
         }
 
         // Clean up per-network state so any later `stop_network`/`start_network`
