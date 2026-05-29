@@ -2350,7 +2350,24 @@ impl Behaviour {
 }
 
 fn new_swarm(local_keypair: Keypair, network_id: u32) -> libp2p::swarm::Swarm<Behaviour> {
-    let transport = build_transport(local_keypair.clone(), true).unwrap();
+    // #942 transport bisection: the inbound snappy corruption is provably
+    // introduced on zeam's receive path after AEAD decryption (ingress hash
+    // differs from the producer's publish hash, and both QUIC and TCP+noise
+    // are integrity-protected, ruling out the wire). To split the search
+    // between the QUIC stack (quinn/libp2p-quic) and the TCP stack
+    // (yamux/gossipsub codec), set ZEAM_DISABLE_QUIC=1 to run TCP+yamux+noise
+    // only. If `error.Corrupt` vanishes, the bug is in the QUIC reassembly;
+    // if it persists, it is in yamux or the gossipsub length-delimited codec.
+    // Default (unset) keeps QUIC enabled, i.e. current behaviour.
+    let quic_support = !matches!(
+        std::env::var("ZEAM_DISABLE_QUIC").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
+    logger::rustLogger.info(
+        network_id,
+        &format!("[#942 transport] quic_support={quic_support} (set ZEAM_DISABLE_QUIC=1 to force TCP+yamux+noise only)"),
+    );
+    let transport = build_transport(local_keypair.clone(), quic_support).unwrap();
     logger::rustLogger.debug(network_id, "build the transport");
 
     // No gossipsub topics joined here. Mesh subscriptions are driven from
