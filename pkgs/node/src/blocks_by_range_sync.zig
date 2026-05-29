@@ -328,9 +328,15 @@ test "shouldCatchUpFromPeerStatus triggers on head gap before finalization" {
 }
 
 test "shouldCatchUpFromPeerStatus small gaps use by-root not threshold gate" {
-    const gap = cappedSyncGapSlots(50, 0, 100);
+    // The threshold gate distinguishes "small gap → by-root parent walk" from
+    // "large gap → bulk by-range fetch" — exercise a gap small enough to stay
+    // on the by-root path under the post-#942-follow-up threshold (4). The
+    // earlier shape of this test used gap=50 against the historic threshold
+    // of 64; the present numbers preserve the intent (gap below threshold,
+    // still triggers catch-up) with the post-fix threshold value.
+    const gap = cappedSyncGapSlots(3, 0, 10);
     try std.testing.expect(gap < constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD);
-    try std.testing.expect(shouldCatchUpFromPeerStatus(50, 0, 0, 0, 100));
+    try std.testing.expect(shouldCatchUpFromPeerStatus(3, 0, 0, 0, 10));
 }
 
 test "syncEndDecision retry requires alternate peer" {
