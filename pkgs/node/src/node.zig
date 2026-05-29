@@ -125,6 +125,17 @@ pub const BeamNode = struct {
     /// Monotonic millis of the last inbound gossip delivery (#926).
     last_gossip_rx_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// Monotonic millis of the last inbound gossip BLOCK delivery (#942).
+    /// Distinct from `last_gossip_rx_ms` because attestations on the
+    /// `/leanconsensus/.../attestation_*/ssz_snappy` topics arrive at
+    /// ~5/s on a busy mesh and keep `last_gossip_rx_ms` fresh even when
+    /// every block is being dropped by `snappy.error.Corrupt`.
+    /// `maybeInitiateProactiveCatchUp` was gating on the union-of-all-
+    /// topics counter, so attestations were silently masking a total
+    /// block-ingress stall and the catch-up RPC never fired. Tracked
+    /// separately so the block-silence signal can drive its own decision.
+    last_gossip_block_rx_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     const Self = @This();
 
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
@@ -320,7 +331,21 @@ pub const BeamNode = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.last_gossip_rx_ms.store(@intCast(zeam_utils.unixTimestampMillis()), .monotonic);
+        const now_ms: u64 = @intCast(zeam_utils.unixTimestampMillis());
+        self.last_gossip_rx_ms.store(now_ms, .monotonic);
+        // #942: track block-topic gossip separately. Attestations on the
+        // `/attestation_X/ssz_snappy` topics are small (~2.6 KB), decode
+        // reliably even on a fleet where every large message corrupts
+        // (~5/s arrival), and would otherwise keep `last_gossip_rx_ms`
+        // fresh and suppress `shouldInitiateProactiveCatchUp` indefinitely
+        // even though no block has reached the application layer in many
+        // slots. The block-specific timestamp lets the proactive catch-up
+        // gate detect that condition and trigger `blocks_by_root` /
+        // `blocks_by_range` RPC fallback the same way grandine recovers.
+        switch (data.*) {
+            .block => self.last_gossip_block_rx_ms.store(now_ms, .monotonic),
+            else => {},
+        }
 
         // Lifetime invariant for `data`:
         //   The gossip subsystem (see `pkgs/network/src/ethlibp2p.zig`) owns the
@@ -2759,13 +2784,27 @@ pub const BeamNode = struct {
         return wall_head_lag_slots;
     }
 
-    fn gossipIngressSnapshot(self: *Self) struct { silent_ms: u64, mesh_peers: u64 } {
+    fn gossipIngressSnapshot(self: *Self) struct { silent_ms: u64, block_silent_ms: u64, mesh_peers: u64 } {
         const now_ms: u64 = @intCast(zeam_utils.unixTimestampMillis());
+        const last_block_ms = self.last_gossip_block_rx_ms.load(.monotonic);
+        // #942: "block silent" semantics. Returns `maxInt(u64)` when we
+        // have never delivered a block to the application — that signals
+        // "infinitely silent on the block topic" to the proactive catch-up
+        // gate, which is exactly what we want when block ingress has not
+        // started yet (devnet just past genesis with all blocks failing
+        // snappy decode, etc.). Once any block ever decodes cleanly via
+        // `onGossip`, this collapses to the normal `now_ms - last_block_ms`
+        // measurement.
+        const block_silent_ms: u64 = if (last_block_ms == 0)
+            std.math.maxInt(u64)
+        else
+            now_ms -| last_block_ms;
         return .{
             .silent_ms = blocks_by_range_sync.gossipSilentMs(
                 now_ms,
                 self.last_gossip_rx_ms.load(.monotonic),
             ),
+            .block_silent_ms = block_silent_ms,
             .mesh_peers = self.network.gossipMeshPeerCount(),
         };
     }
@@ -2841,10 +2880,18 @@ pub const BeamNode = struct {
 
     fn maybeInitiateProactiveCatchUp(self: *Self, wall_head_lag_slots: u64) void {
         const ingress = self.gossipIngressSnapshot();
+        // #942: gate on BLOCK-topic silence, not union-of-all-topics
+        // silence. Attestations decode reliably even on a fleet where
+        // every block is being rejected by snappy.error.Corrupt; if we
+        // gated on union-silence the attestation stream would suppress
+        // the catch-up RPC indefinitely while no block ever reaches the
+        // app. With `block_silent_ms` the gate fires the moment we have
+        // a wall-lag and no block has come through gossip for the stall
+        // threshold (8 s on a 4 s slot devnet).
         if (!blocks_by_range_sync.shouldInitiateProactiveCatchUp(
             wall_head_lag_slots,
             constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
-            ingress.silent_ms,
+            ingress.block_silent_ms,
             constants.gossipStallThresholdMs(),
         )) return;
 
@@ -2855,8 +2902,9 @@ pub const BeamNode = struct {
         if (!self.shouldCatchUpFromPeerStatus(catch_up_status, our_head_slot, our_finalized_slot)) return;
 
         self.logger.info(
-            "proactive catch-up: gossip silent for {d}ms, wall lag {d} slots, peer {s}{f} head={d}",
+            "proactive catch-up: block-gossip silent for {d}ms (any-gossip silent for {d}ms), wall lag {d} slots, peer {s}{f} head={d}",
             .{
+                ingress.block_silent_ms,
                 ingress.silent_ms,
                 wall_head_lag_slots,
                 catch_up_status.peer_id,
