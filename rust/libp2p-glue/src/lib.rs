@@ -2350,38 +2350,43 @@ impl From<MessageDomain> for [u8; 4] {
 
 impl Behaviour {
     fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
-        // #942: hash raw gossip bytes only. The previous implementation ran
-        // `snap::raw::Decoder::decompress_vec(&message.data)` on every inbound
-        // gossip message to content-address by uncompressed bytes (so two
-        // different snappy encodings of the same SSZ block would share a
-        // message-id and dedupe correctly). On the live devnet that
-        // synchronous decompress on 1–3 MB broken-snappy payloads (with the
-        // decoder walking hundreds of KB of valid tags before failing on a
-        // bad copy offset) blocked the gossipsub event loop long enough that
-        // libxev ticks on the Zig side spiked into the 0.5–1 s bucket en
-        // masse (~2700 slow ticks on a 30 min run), libp2p's flow control
-        // observed the slowness and silently demoted zeam's mesh share, and
-        // zeam stopped receiving ANY gossip — including small / well-formed
-        // messages on unrelated topics — for 20+ minutes.
+        // #942 follow-up: restore spec-conformant content-addressed
+        // `message_id` (Ethereum gossipsub convention:
+        //   `SHA256(domain_tag || topic_len || topic || decompressed_bytes)`).
         //
-        // Raw-bytes hashing fixes the hot path: no decompress on ingress,
-        // no per-message CPU spike, no `Decoder` allocation. Cost: two
-        // peers publishing the same SSZ block with DIFFERENT snappy encoders
-        // get DIFFERENT message-ids and we'd forward both. In practice mesh
-        // forwarding propagates the original publisher's bytes verbatim, so
-        // duplicates almost always hit the existing identical-bytes path
-        // (`duplicate_cache_time` in `ConfigBuilder` catches those).
+        // The raw-bytes form that was here previously caused zeam to assign
+        // distinct message-ids to byte-different but content-identical
+        // copies of the same logical message. On the 2026-05-28/29 devnet
+        // we observed 8 distinct corrupted-snappy encodings of the same
+        // slot=1 block (`data_len=285473`, same `sha256_first32` prefix)
+        // arriving at zeam_8 in 70 s, all from forwarder peers' mcaches
+        // (gean_1, zeam_13, _14, _15). Under raw-bytes hashing zeam
+        // computed 8 distinct ids, attempted to decode all 8, failed all 8.
+        // Under content-addressed hashing, the first clean copy wins; all
+        // subsequent copies with the same decompressed content dedupe to
+        // the same id and are dropped by gossipsub before the application
+        // layer ever sees them.
         //
-        // The `MessageDomain` enum and the `Decoder` import become dead
-        // code with this change but are intentionally left in place — the
-        // long-term direction is to add a fast pre-check (e.g. only verify
-        // the snappy header varint and topic-specific size bounds) before
-        // delivery, which will re-use this scaffolding. Removing them in
-        // a follow-up.
+        // Cost: synchronous decompress on the gossipsub event loop. The
+        // earlier abandonment of this scheme was motivated by event-loop
+        // stalls of 0.5–1 s on broken-snappy payloads — the deferred-
+        // hashTreeRoot work that landed earlier on this branch has already
+        // cut `zeam_xev_clock_until_done_slow_ge_500ms_total` from ~7,600
+        // to ~490 in the parallel measurement, so the synchronous decompress
+        // here is no longer the dominant cost on the libxev tick budget.
+        // If that regresses post-deploy, the right next step is to put
+        // a small LRU cache in front of this function keyed on the raw
+        // bytes' SHA256 so identical-bytes re-forwards never re-decompress.
         let mut hasher = sha2::Sha256::new();
+        let (data_for_hash, domain): (Vec<u8>, [u8; 4]) =
+            match Decoder::new().decompress_vec(&message.data) {
+                Ok(decoded) => (decoded, MessageDomain::ValidSnappy.into()),
+                Err(_) => (message.data.clone(), MessageDomain::InvalidSnappy.into()),
+            };
+        hasher.update(domain);
         hasher.update(message.topic.as_str().len().to_le_bytes());
         hasher.update(message.topic.as_str().as_bytes());
-        hasher.update(&message.data);
+        hasher.update(&data_for_hash);
         let digest = hasher.finalize();
         gossipsub::MessageId::from(&digest[..20])
     }
