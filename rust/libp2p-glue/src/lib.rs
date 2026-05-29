@@ -339,96 +339,14 @@ fn record_mesh_peers(network_id: u32, count: u64) {
     }
 }
 
-/// #942 diagnostic: hard-capped counter for the per-failure gossip-byte
-/// dumps written by `dump_failed_gossip_payload`. The cap exists so a
-/// runaway corruption event can't fill the operator's disk with a few
-/// megabytes per failed receipt — once the limit is hit, the function
-/// becomes a no-op (the failure is still logged via the existing
-/// `[gossip ingress]` line, just not dumped).
-const MAX_FAILED_GOSSIP_DUMPS: u64 = 50;
-static FAILED_GOSSIP_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// #942 diagnostic: persist the full `message.data` bytes of a gossip
-/// message that `snap::raw::Decoder` rejected. Filename is structured
-/// `failed_gossip_<topic>_<data_len>_<sha256_first32>_<seq>.bin` with
-/// a sibling `.meta.txt` so the operator can group different receipts
-/// of the same logical message (same `data_len` and same prefix hash)
-/// and `cmp -l` them byte-by-byte to locate exactly where the corruption
-/// enters. Without this, we only see varying `dst_pos` values in the log
-/// — we never get the raw bytes that produced each one.
-///
-/// Best-effort: failures to write are silently swallowed because this is
-/// a diagnostic path and must not impact the live gossip pipeline.
-fn dump_failed_gossip_payload(
-    network_id: u32,
-    topic_kind: &str,
-    propagation_peer: &str,
-    data: &[u8],
-) {
-    let seq = FAILED_GOSSIP_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if seq >= MAX_FAILED_GOSSIP_DUMPS {
-        return;
-    }
-
-    let mut hasher = sha2::Sha256::new();
-    let prefix_len = std::cmp::min(data.len(), 32);
-    hasher.update(&data[..prefix_len]);
-    let prefix_hash_bytes = hasher.finalize();
-    let prefix_hash = hex::encode(&prefix_hash_bytes[..8]); // 16 hex chars
-
-    let dir = std::path::Path::new("/data/deserialization_dumps");
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        logger::rustLogger.warn(
-            network_id,
-            &format!("[#942 dump] could not create dump dir: {}", e),
-        );
-        return;
-    }
-
-    let bin_name = format!(
-        "failed_gossip_{}_{}_{}_seq{:03}.bin",
-        topic_kind,
-        data.len(),
-        prefix_hash,
-        seq,
-    );
-    let meta_name = format!(
-        "failed_gossip_{}_{}_{}_seq{:03}.meta.txt",
-        topic_kind,
-        data.len(),
-        prefix_hash,
-        seq,
-    );
-    let bin_path = dir.join(&bin_name);
-    let meta_path = dir.join(&meta_name);
-
-    if let Err(e) = std::fs::write(&bin_path, data) {
-        logger::rustLogger.warn(
-            network_id,
-            &format!("[#942 dump] write {} failed: {}", bin_name, e),
-        );
-        return;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let meta = format!(
-        "wall_time_unix={}\ntopic_kind={}\ndata_len={}\nprefix_sha256_64bit={}\npropagation_peer={}\nseq={}\n",
-        now, topic_kind, data.len(), prefix_hash, propagation_peer, seq,
-    );
-    let _ = std::fs::write(&meta_path, meta);
-    logger::rustLogger.info(
-        network_id,
-        &format!(
-            "[#942 dump] wrote {} ({} bytes, seq {}/{})",
-            bin_name,
-            data.len(),
-            seq + 1,
-            MAX_FAILED_GOSSIP_DUMPS
-        ),
-    );
-}
+// `dump_failed_gossip_payload` / `MAX_FAILED_GOSSIP_DUMPS` / `FAILED_GOSSIP_DUMP_COUNTER`
+// were removed in #942 phase 4. See the long-form rationale at the call site
+// (the `Behaviour::poll`-side comment in the gossipsub `Event::Message` arm):
+// the Rust-side per-failure dump duplicated the Zig-side
+// `failed_snappyz_decode_*.bin` dumps written by `writeFailedBytes`, and the
+// `Decoder::new().decompress_vec` it gated on was the second synchronous
+// decompress per gossip message — together they jammed the libp2p event
+// loop on broken-snappy bombs on the 2026-05-29 devnet.
 
 /// FFI getter: cumulative count of dropped swarm commands for the given
 /// reason tag (see `SwarmCommandDropReason`). Returns 0 for unknown tags so
@@ -1878,7 +1796,7 @@ impl Network {
                                 record_mesh_peers(self.network_id, mesh_count);
                             }
 
-                            if let gossipsub::Event::Message { propagation_source, message_id, message, .. } = gossipsub_event {
+                            if let gossipsub::Event::Message { message, .. } = gossipsub_event {
                                 let topic_str = message.topic.as_str().to_string();
                                 let topic = match CString::new(topic_str.as_str()) {
                                     Ok(cstr) => cstr,
@@ -1904,74 +1822,43 @@ impl Network {
                                     }
                                 };
 
-                                // #942: failure-path diagnostic. Snap-decode every inbound
-                                // gossip message at the Rust side so we can (a) detect when
-                                // the receive-buffer bytes differ from what gossipsub's
-                                // `message_id_fn` saw (FFI / slice bug → would manifest
-                                // here as Rust decompress failure while Zig succeeds, or
-                                // vice versa), and (b) on failure, dump the raw bytes via
-                                // `dump_failed_gossip_payload` for offline `cmp -l` of
-                                // multi-receipt corruption. The decode IS wasted CPU on the
-                                // common-case happy path (message_id_fn already decompressed
-                                // these bytes to compute the id, so we are doing the same
-                                // work twice for diagnostic value) — kept until #942's
-                                // upstream-encoder bug is fixed, since each devnet cycle is
-                                // expensive enough that having the dumps already on disk is
-                                // worth the per-message cost. Remove the call once the
-                                // upstream broken-encoding source is identified.
-                                let rust_decode_result = Decoder::new().decompress_vec(&message.data);
-                                if let Err(e) = &rust_decode_result {
-                                    // Failure path only: build the hex preview, log the line,
-                                    // and dump the raw bytes for offline analysis. The
-                                    // happy path emits zero log lines and allocates zero
-                                    // strings beyond the snap decode itself.
-                                    //
-                                    // Earlier revisions of this branch emitted a
-                                    // `[gossip ingress]` info line on EVERY message
-                                    // including ~900 attestations/min on a healthy mesh
-                                    // — ~16 MB/hour of log volume that swamps `docker
-                                    // logs` and `promtail` for no operator benefit. The
-                                    // metrics counter `zeam_gossip_decode_failures_total`
-                                    // covers the aggregate signal; this per-failure log
-                                    // keeps the byte-level forensic signal for the
-                                    // diagnosis that's still in flight.
-                                    let preview_len = std::cmp::min(message_len, 32);
-                                    let mut preview_hex = String::with_capacity(preview_len * 3);
-                                    {
-                                        use std::fmt::Write as _;
-                                        for (i, b) in message.data[..preview_len].iter().enumerate() {
-                                            if i != 0 {
-                                                preview_hex.push(' ');
-                                            }
-                                            let _ = write!(&mut preview_hex, "{:02x}", b);
-                                        }
-                                    }
-                                    let propagation_peer = propagation_source.to_string();
-                                    logger::rustLogger.info(
-                                        self.network_id,
-                                        &format!(
-                                            "[gossip ingress decode FAIL] topic={} sender={} propagation_peer={} msg_id={} data_len={} rust_snap=err({:?}) first{}={}",
-                                            topic_str,
-                                            sender_peer_id_string,
-                                            propagation_peer,
-                                            message_id,
-                                            message_len,
-                                            e,
-                                            preview_len,
-                                            preview_hex,
-                                        ),
-                                    );
-                                    let topic_kind_short = match topic_str.split('/').nth(3) {
-                                        Some(k) => k.split('_').next().unwrap_or("unk"),
-                                        None => "unk",
-                                    };
-                                    dump_failed_gossip_payload(
-                                        self.network_id,
-                                        topic_kind_short,
-                                        &propagation_peer,
-                                        &message.data,
-                                    );
-                                }
+                                // #942 phase 4: the Rust-side `Decoder::new().decompress_vec`
+                                // and accompanying `[gossip ingress decode FAIL]` log + dump
+                                // (added in `840d7058` / `f3c40406`) are GONE on purpose.
+                                //
+                                // Cause: on the 2026-05-29 devnet a 3.7 MB broken-snappy block
+                                // landed at 11:26:07 and the synchronous decompress here
+                                // (running on top of the equivalent decompress that
+                                // gossipsub's `message_id_fn` already does) blocked the
+                                // libp2p event loop for hundreds of milliseconds. The
+                                // resulting starvation knocked 8 in-flight Status RPCs
+                                // into simultaneous timeout at 11:26:56, broke 148 QUIC
+                                // handshakes with `HandshakeTimedOut`, and tipped zeam_8
+                                // into "Max reconnection attempts (5) reached, giving up"
+                                // for several peers. After that the node was sending
+                                // Status requests into the void: the chain stalled at
+                                // head=98 not because catch-up wasn't trying but because
+                                // the transport itself had been jammed by 2× per-message
+                                // decompress on the event loop.
+                                //
+                                // What we lose by removing this:
+                                //   * `[gossip ingress decode FAIL]` per-failure log →
+                                //     covered by the Zig-side `Error in snappyz decoding
+                                //     the message for topic=... first32=...` log
+                                //     (`pkgs/network/src/ethlibp2p.zig`).
+                                //   * `failed_gossip_*.bin` Rust dumps → covered by the
+                                //     pre-existing Zig-side `failed_snappyz_decode_*.bin`
+                                //     dumps written via `writeFailedBytes`. The Rust dumps
+                                //     captured `message.data` before the FFI handoff and
+                                //     were used in the cross-receiver test on 2026-05-29
+                                //     to prove the bytes are byte-identical at the wire
+                                //     side; that hypothesis is now confirmed and the
+                                //     duplicate dump path is no longer needed.
+                                //   * `rust_snap=ok` vs Zig decode reconciliation → only
+                                //     useful if there's an FFI slice bug. The
+                                //     cross-receiver test already showed the bytes that
+                                //     reach Zig match what Rust sees, so the FFI is
+                                //     faithful and this reconciliation has no signal left.
 
                                 unsafe {
                                     handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
