@@ -12,13 +12,11 @@ pub fn computeDelayNs(rate: ?f64, n: usize) u64 {
     return @intFromFloat(ns);
 }
 
-// Resolved shadow sim-cost rates (per-second; unit varies per rate — see each). null = feature off (no sleep).
-// Set once at node startup by `init`; reads are lock-free because `init` runs before
-// any aggregation worker thread is spawned and the values are read-only thereafter.
+// Sim-cost rates, set once at startup; null means off. Read lock-free: init runs before
+// any worker thread, and the values are read-only after.
 var agg_rate: ?f64 = null;
 var verify_rate: ?f64 = null;
-// merge_rate's unit is components/second (n = Type-1 components merged into one Type-2),
-// not signatures/second — see mergeDelayNs.
+// merge rate is components per second, not signatures per second.
 var merge_rate: ?f64 = null;
 
 const ENV_AGG = "ZEAM_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE";
@@ -50,7 +48,7 @@ pub fn verifyDelayNs(n: usize) u64 {
     return computeDelayNs(verify_rate, n);
 }
 
-/// Nanoseconds to sleep to model merging `n` Type-1 components into one Type-2 proof.
+/// Nanoseconds to sleep to model merging `n` components into one proof.
 pub fn mergeDelayNs(n: usize) u64 {
     return computeDelayNs(merge_rate, n);
 }
@@ -110,8 +108,7 @@ test "computeDelayNs: proportional to n / rate (qlean default rate)" {
 }
 
 test "mergeDelayNs: reads merge_rate set by init; proportional to n / rate" {
-    // The CLI arg (non-null) wins over the env per init's precedence, so this is
-    // deterministic regardless of any ZEAM_SHADOW_XMSS_MERGE_RATE in the environment.
+    // A non-null CLI arg wins over the env var, so this stays deterministic.
     init(null, null, 22.704);
     // 100 components / 22.704 per-sec = 4.40451... s ~= 4_404_510_000 ns
     const ns = mergeDelayNs(100);

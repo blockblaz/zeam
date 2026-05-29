@@ -256,8 +256,7 @@ pub fn aggregateType1(
     recordXmssProveDuration(prove_start_ns, raw_pks.len, num_children);
     try appendAll(out, buf[0..written]);
 
-    // #944 shadow sim-cost: model aggregation CPU time on the virtual clock (no-op unless a rate
-    // is configured). Sleeps on the calling (aggregation worker) thread.
+    // Model aggregation cost on the virtual clock (no-op unless a rate is set). Runs on the worker.
     const shadow_delay_ns = shadow_cost.aggregateDelayNs(raw_pks.len);
     if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
@@ -287,9 +286,7 @@ pub fn verifyType1(
     const ok = xmss_verify_type_1(pks.ptr, pks.len, message_hash, slot, wire.ptr, wire.len);
     if (!ok) return AggregationError.Type1VerifyFailed;
 
-    // #944 shadow sim-cost: model verification CPU time on the virtual clock (no-op unless a rate
-    // is configured). devnet5 replaced verifyAggregatedPayload with verifyType1, so the verify-cost
-    // injection moves here.
+    // Model verification cost on the virtual clock (no-op unless a rate is set). Runs on the worker.
     const shadow_delay_ns = shadow_cost.verifyDelayNs(pks.len);
     if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
@@ -367,10 +364,8 @@ pub fn mergeType1ToType2(
     if (rc != 0) return AggregationError.Type2MergeFailed;
     try appendAll(out, buf[0..written]);
 
-    // #944 shadow sim-cost: model the Type-2 merge (proposal block-building) CPU time on the
-    // virtual clock (no-op unless --shadow-xmss-merge-rate / ZEAM_SHADOW_XMSS_MERGE_RATE is set).
-    // Placed after the mock early-return (above) so the mock and merge-rate never both add delay.
-    // Sleeps on the calling proposal worker thread, mirroring aggregateType1/verifyType1.
+    // Model the merge cost on the virtual clock, like the aggregate/verify paths above (no-op
+    // unless a rate is set). After the mock return above, so the two never both add delay.
     const shadow_delay_ns = shadow_cost.mergeDelayNs(num_parts);
     if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
