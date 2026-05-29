@@ -1009,9 +1009,11 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
                     if (exclude) |ex| {
                         if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
                     }
-                    if (effective_min_slot) |ms| {
-                        const peer_head_slot = if (entry.value_ptr.latest_status) |status| status.head_slot else 0;
-                        if (ms > peer_head_slot) continue;
+                    if (comptime @hasField(PeerInfo, "latest_status")) {
+                        if (effective_min_slot) |ms| {
+                            const peer_head_slot = if (entry.value_ptr.latest_status) |status| status.head_slot else 0;
+                            if (ms > peer_head_slot) continue;
+                        }
                     }
                     if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
                         if (entry.value_ptr.blocks_by_range_unavailable) continue;
@@ -1919,10 +1921,11 @@ test "LockedMap: concurrent put/get/remove smoke" {
 }
 
 test "ConnectedPeers: connect / disconnect / count atomic" {
+    const FakeStatus = struct { head_slot: u64 };
     const FakePeerInfo = struct {
         peer_id: []const u8,
         connected_at: i64,
-        latest_status: ?u32 = null,
+        latest_status: ?FakeStatus = null,
     };
     const CP = ConnectedPeersImpl(FakePeerInfo);
     var cp = CP.init(testing.allocator);
@@ -1944,8 +1947,8 @@ test "ConnectedPeers: connect / disconnect / count atomic" {
     try testing.expect(!cp.disconnect("peer-b"));
 
     // setLatestStatus on present + missing.
-    try testing.expect(cp.setLatestStatus("peer-a", @as(u32, 42)));
-    try testing.expect(!cp.setLatestStatus("peer-z", @as(u32, 0)));
+    try testing.expect(cp.setLatestStatus("peer-a", FakeStatus{ .head_slot = 42 }));
+    try testing.expect(!cp.setLatestStatus("peer-z", FakeStatus{ .head_slot = 0 }));
 
     // Iteration sees the remaining two entries under the shared lock.
     {
@@ -1963,10 +1966,11 @@ test "ConnectedPeers: connect / disconnect / count atomic" {
 }
 
 test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
+    const FakeStatus = struct { head_slot: u64 };
     const FakePeerInfo = struct {
         peer_id: []const u8,
         connected_at: i64,
-        latest_status: ?u32 = null,
+        latest_status: ?FakeStatus = null,
     };
     const CP = ConnectedPeersImpl(FakePeerInfo);
     var cp = CP.init(testing.allocator);
