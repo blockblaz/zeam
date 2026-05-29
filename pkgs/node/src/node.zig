@@ -122,6 +122,14 @@ pub const BeamNode = struct {
     /// Rotating cursor for rate-limited `refreshSyncFromPeers` batches (#926).
     sync_refresh_peer_cursor: usize = 0,
 
+    /// Slot of the most recent force-fanout peer-status refresh fired by the
+    /// stuck-mesh-cluster detector (#942 follow-up). Used to rate-limit the
+    /// detector to one fanout per `SYNC_STATUS_STUCK_CLUSTER_REFRESH_COOLDOWN_SLOTS`
+    /// so a continuous stuck condition doesn't burst-refresh every interval
+    /// and re-create the en-masse RPC-timeout cascade from #926 that motivated
+    /// the original status-refresh batching.
+    last_stuck_cluster_refresh_slot: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     /// Monotonic millis of the last inbound gossip delivery (#926).
     last_gossip_rx_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -2839,6 +2847,11 @@ pub const BeamNode = struct {
         // status. Overlap is filtered inside `initiateBlocksByRangeCatchUp`.
         if (interval_in_slot == 0) {
             self.maybeInitiateProactiveCatchUp(wall_head_lag_slots);
+            // #942 follow-up: same slot-boundary cadence as proactive catch-up.
+            // The detector itself is rate-limited internally so wiring it here
+            // doesn't fire every interval; we just need a clock tick to evaluate
+            // the predicate against fresh wall_slot / best-peer-head values.
+            self.maybeForceFullPeerStatusRefresh(slot);
         }
 
         if (interval_in_slot == 0 and slot % constants.GOSSIP_MESH_HEAL_INTERVAL_SLOTS == 0) {
@@ -2938,6 +2951,18 @@ pub const BeamNode = struct {
     /// (e.g., after a restart or while stuck in fc_initing) get another
     /// chance to report their head and trigger block fetching.
     fn refreshSyncFromPeers(self: *Self) void {
+        self.refreshSyncFromPeersImpl(.batched);
+    }
+
+    /// Refresh selector for `refreshSyncFromPeersImpl`. `.batched` walks the
+    /// rotating peer-cursor window of `SYNC_STATUS_REFRESH_PEERS_PER_TICK`
+    /// (existing #926 behaviour). `.full_fanout` sends status to every
+    /// connected peer in one tick — only used by the stuck-mesh-cluster
+    /// detector and rate-limited at the caller side by
+    /// `SYNC_STATUS_STUCK_CLUSTER_REFRESH_COOLDOWN_SLOTS`.
+    const RefreshKind = enum { batched, full_fanout };
+
+    fn refreshSyncFromPeersImpl(self: *Self, kind: RefreshKind) void {
         // Snapshot the connected peer ids under the shared lock so we can
         // call `sendStatusToPeer` (which takes its own locks) without
         // holding the connected_peers lock across nested locks.
@@ -2961,17 +2986,24 @@ pub const BeamNode = struct {
         const status = self.chain.getStatus();
         const handler = self.getReqRespResponseHandler();
         const total = peer_ids.items.len;
-        const batch = blocks_by_range_sync.peerBatchWindow(
-            total,
-            self.sync_refresh_peer_cursor,
-            constants.SYNC_STATUS_REFRESH_PEERS_PER_TICK,
-        );
-        self.sync_refresh_peer_cursor = batch.next_cursor;
+
+        const window_start: usize, const window_count: usize = switch (kind) {
+            .batched => blk: {
+                const batch = blocks_by_range_sync.peerBatchWindow(
+                    total,
+                    self.sync_refresh_peer_cursor,
+                    constants.SYNC_STATUS_REFRESH_PEERS_PER_TICK,
+                );
+                self.sync_refresh_peer_cursor = batch.next_cursor;
+                break :blk .{ batch.start, batch.count };
+            },
+            .full_fanout => .{ 0, total },
+        };
 
         var sent: usize = 0;
         var i: usize = 0;
-        while (i < batch.count) : (i += 1) {
-            const idx = (batch.start + i) % total;
+        while (i < window_count) : (i += 1) {
+            const idx = (window_start + i) % total;
             const peer_id = peer_ids.items[idx];
             _ = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
                 self.logger.warn("failed to refresh status to peer {s}{f}: {any}", .{
@@ -2982,12 +3014,59 @@ pub const BeamNode = struct {
             };
             sent += 1;
         }
-        if (sent < total) {
-            self.logger.debug(
-                "status refresh batch: sent {d}/{d} peers (cursor={d})",
-                .{ sent, total, self.sync_refresh_peer_cursor },
-            );
+        switch (kind) {
+            .batched => if (sent < total) {
+                self.logger.debug(
+                    "status refresh batch: sent {d}/{d} peers (cursor={d})",
+                    .{ sent, total, self.sync_refresh_peer_cursor },
+                );
+            },
+            .full_fanout => self.logger.info(
+                "status refresh full fanout: sent {d}/{d} peers (stuck-mesh-cluster detector #942)",
+                .{ sent, total },
+            ),
         }
+    }
+
+    /// #942 follow-up: detect the "stuck mesh cluster" condition (all visible
+    /// peers report a head_slot far below wall-clock) and trigger a one-shot
+    /// full-fanout status refresh to try to discover any peer that has actually
+    /// moved. Rate-limited via `last_stuck_cluster_refresh_slot` so a
+    /// continuously-true condition fires at most once per
+    /// `SYNC_STATUS_STUCK_CLUSTER_REFRESH_COOLDOWN_SLOTS` slot window.
+    ///
+    /// This complements the existing batched refresh: the batch eventually
+    /// rotates through every peer over ~`peers / 8` slots, but on a stuck
+    /// devnet that's tens of seconds wasted hammering the same stale-head
+    /// targets. The full fanout closes that window when the data we have says
+    /// "no visible peer is on the chain tip" — exactly the signal observed
+    /// on the 2026-05-29 devnet where zeam_8's best cached peer head was 45
+    /// while wall-clock was at 298.
+    fn maybeForceFullPeerStatusRefresh(self: *Self, slot: types.Slot) void {
+        const best = self.findBestCatchUpPeerStatus() orelse return;
+        defer self.allocator.free(best.peer_id);
+        const wall_slot = self.clock.wallSlotNow();
+        const last_force = self.last_stuck_cluster_refresh_slot.load(.monotonic);
+        if (!blocks_by_range_sync.shouldForceFullPeerStatusRefresh(
+            best.head_slot,
+            wall_slot,
+            slot,
+            last_force,
+            constants.SYNC_STATUS_STUCK_CLUSTER_PEER_LAG_THRESHOLD_SLOTS,
+            constants.SYNC_STATUS_STUCK_CLUSTER_REFRESH_COOLDOWN_SLOTS,
+        )) return;
+        self.logger.warn(
+            "stuck mesh cluster detected: best peer {s}{f} reports head={d}, wall={d}, our_head_lag={d}; forcing full-fanout status refresh",
+            .{
+                best.peer_id,
+                self.node_registry.getNodeNameFromPeerId(best.peer_id),
+                best.head_slot,
+                wall_slot,
+                wall_slot -| self.chain.forkChoice.getHead().slot,
+            },
+        );
+        self.last_stuck_cluster_refresh_slot.store(slot, .monotonic);
+        self.refreshSyncFromPeersImpl(.full_fanout);
     }
 
     /// Collect `blocks_by_root` roots that were NOT served by any chunk
