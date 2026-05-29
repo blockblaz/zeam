@@ -18,7 +18,9 @@ const clockFactory = @import("./clock.zig");
 /// Centralized so every test/driver in the workspace constructs the pool the
 /// same way (single-threaded global I/O, 4 worker threads). Callers own the
 /// returned pool and must call `deinit` on it.
-pub fn initTestThreadPool(allocator: Allocator) !*ThreadPool {
+pub fn setupTestPrimitives(allocator: Allocator) !*ThreadPool {
+    xmss.setRayonThreads(1);
+    try xmss.setupXmssAggregation();
     return ThreadPool.init(.{
         .allocator = allocator,
         .io = std.Io.Threaded.global_single_threaded.io(),
@@ -126,7 +128,7 @@ pub const NodeTestContext = struct {
         var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, &loop, logger_config);
         errdefer clock.deinit(allocator);
 
-        const thread_pool = try initTestThreadPool(allocator);
+        const thread_pool = try setupTestPrimitives(allocator);
         errdefer thread_pool.deinit();
 
         return NodeTestContext{

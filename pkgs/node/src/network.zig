@@ -57,6 +57,7 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
 
         fn onReqRespRequest(_: *anyopaque, _: *networks.ReqRespRequest, _: networks.ReqRespServerStream) anyerror!void {}
         fn subscribeReqResp(_: *anyopaque, _: networks.OnReqRespRequestCbHandler) anyerror!void {}
+        fn cancelInflightRequest(_: *anyopaque, _: u64) void {}
         fn subscribePeers(_: *anyopaque, _: networks.OnPeerEventCbHandler) anyerror!void {}
     };
 
@@ -75,6 +76,7 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
             .sendRequestFn = Ctx.sendRequest,
             .onReqRespRequestFn = Ctx.onReqRespRequest,
             .subscribeFn = Ctx.subscribeReqResp,
+            .cancelInflightRequestFn = Ctx.cancelInflightRequest,
         },
         .peers = .{ .ptr = &ctx, .subscribeFn = Ctx.subscribePeers },
     });
@@ -360,6 +362,14 @@ pub const Network = struct {
     /// leave the host" and surface it accordingly.
     pub fn publish(self: *Self, data: *const networks.GossipMessage) !bool {
         return self.backend.gossip.publish(data);
+    }
+
+    pub fn refreshGossipMesh(self: *Self) void {
+        self.backend.gossip.refreshMesh();
+    }
+
+    pub fn gossipMeshPeerCount(self: *Self) u64 {
+        return self.backend.gossip.meshPeerCount();
     }
 
     pub fn sendStatus(
@@ -1208,6 +1218,11 @@ pub const Network = struct {
     }
 
     pub fn finalizePendingRequest(self: *Self, request_id: u64) void {
+        // Drop the transport callback so a late rust-bridge response cannot
+        // invoke the handler after this request is finalized (timeout,
+        // disconnect bookkeeping, etc.).
+        self.backend.reqresp.cancelInflightRequest(request_id);
+
         if (self.pending_rpc_requests.fetchRemove(request_id)) |entry| {
             var rpc_entry = entry.value;
             switch (rpc_entry.request) {

@@ -201,7 +201,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_xmss.link_libc = true; // shadow_cost reads env via libc getenv
     zeam_xmss.addImport("ssz", ssz);
+    zeam_xmss.addImport("@zeam/metrics", zeam_metrics);
+    zeam_xmss.addImport("@zeam/utils", zeam_utils);
 
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
@@ -214,6 +217,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("@zeam/utils", zeam_utils);
     zeam_types.addImport("@zeam/metrics", zeam_metrics);
     zeam_types.addImport("@zeam/xmss", zeam_xmss);
+    zeam_types.addImport("@zeam/thread-pool", zeam_thread_pool);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -661,6 +665,23 @@ pub fn build(b: *Builder) !void {
     const run_node_test = b.addRunArtifact(node_tests);
     setTestRunLabelFromCompile(b, run_node_test, node_tests);
     test_step.dependOn(&run_node_test.step);
+
+    // Build shadow_cost as its own module for focused pure-function tests. This
+    // gives it independent globals from the copy imported through @zeam/xmss.
+    const zeam_shadow_cost = b.createModule(.{
+        .root_source_file = b.path("pkgs/xmss/src/shadow_cost.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_shadow_cost.link_libc = true; // shadow_cost reads env via libc getenv
+    const shadow_cost_tests = b.addTest(.{
+        .root_module = zeam_shadow_cost,
+    });
+    const run_shadow_cost_test = b.addRunArtifact(shadow_cost_tests);
+    setTestRunLabelFromCompile(b, run_shadow_cost_test, shadow_cost_tests);
+    test_step.dependOn(&run_shadow_cost_test.step);
+    const shadow_cost_test_step = b.step("test-shadow-cost", "Run shadow sim-cost unit tests");
+    shadow_cost_test_step.dependOn(&run_shadow_cost_test.step);
 
     const cli_tests = b.addTest(.{
         .root_module = cli_exe.root_module,

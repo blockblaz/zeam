@@ -85,9 +85,32 @@ const Metrics = struct {
     lean_pq_sig_aggregated_signatures_building_time_seconds: PQSigBuildingTimeHistogram,
     // Zeam-specific phase attribution for aggregate production (#899).
     // phase="snapshot" clones live signature/payload maps under signatures_mutex.
-    // phase="compute_ffi" builds recursive aggregate proofs from the snapshot.
+    // phase="att_data_prep" serial prepareAggregateAttData (hashTreeRoot, greedy
+    // payload pick, handle setup) inside computeAggregatedSignatures.
+    // phase="xmss_prove" leanMultisig rec_xmss_aggregate via xmss_aggregate FFI.
+    // phase="compute_ffi" full computeAggregatedSignatures (prep + parallel proves).
     // phase="commit" publishes results back into latest_new_aggregated_payloads.
     zeam_pq_sig_aggregated_signatures_building_phase_seconds: PQSigBuildingPhaseHistogram,
+    /// Wall time inside `xmss_aggregate` / leanMultisig `rec_xmss_aggregate` only
+    /// (one recursive STARK prove per att_data). Compare directly to lean-bench /
+    /// `cargo run --release -- recursion --n 2`; zeam worker histograms include
+    /// snapshot, prep, child-proof deserialize, and serialize on top of this.
+    zeam_xmss_rec_aggregate_prove_seconds: XmssRecAggregateProveHistogram,
+    /// Same wall time as `zeam_xmss_rec_aggregate_prove_seconds`, labeled by
+    /// coarse `num_raw` / `num_children` input-size buckets so the build
+    /// histogram tail can be classified as steady-state full-committee proves
+    /// vs partial-input reproves (see #940 investigation plan item 1).
+    /// Buckets are deliberately low-cardinality — see `numRawBucket` /
+    /// `numChildrenBucket` below for the exact mapping.
+    zeam_xmss_rec_aggregate_prove_by_input_seconds: XmssRecAggregateProveByInputHistogram,
+    /// Per-phase breakdown inside `xmss_aggregate` reported back from the
+    /// Rust FFI via out-pointers. The three phases ("marshal", "stark",
+    /// "post") sum to a value very close to one observation on
+    /// `zeam_xmss_rec_aggregate_prove_seconds` (delta is the FFI call/return
+    /// overhead, sub-microsecond). This lets us tell whether zeam's per-call
+    /// cost lives in argument deserialization or in the leanMultisig STARK
+    /// itself — the two have very different fixes. See #940.
+    zeam_xmss_rec_aggregate_phase_seconds: XmssRecAggregatePhaseHistogram,
     lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
@@ -181,8 +204,12 @@ const Metrics = struct {
     /// plus `publishProducedAggregations` when the aggregator produces gossip aggregates.
     zeam_node_aggregation_interval_tick_seconds: AggregationIntervalTickHistogram,
     /// Counter for skipped aggregate submissions, labeled by reason.
-    /// Reasons: "in_flight", "not_aggregator", "not_synced", "missing_state".
+    /// Reasons: "not_aggregator", "not_synced", "missing_state", "spawn_failed".
+    /// (In-flight triggers are coalesced via `zeam_aggregate_coalesced_total`.)
     zeam_aggregate_skip_total: AggregateSkipCounter,
+    /// Slot-driver aggregation triggers coalesced while a worker was in flight.
+    /// A single catch-up run is scheduled when the worker finishes.
+    zeam_aggregate_coalesced_total: AggregateCoalescedCounter,
     /// Histogram for the wall-clock duration of the aggregate FFI worker.
     zeam_aggregate_worker_duration_seconds: AggregateWorkerDurationHistogram,
     /// Counter for SignedAggregatedAttestation messages published by the local
@@ -428,6 +455,14 @@ const Metrics = struct {
     const PQSigAttestationsInAggregatedTotalCounter = metrics_lib.Counter(u64);
     const PQSigBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigBuildingPhaseHistogram = metrics_lib.HistogramVec(f32, struct { phase: []const u8 }, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 });
+    const XmssRecAggregateProveHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0 });
+    const XmssRecAggregateProveByInputLabel = struct { num_raw: []const u8, num_children: []const u8 };
+    const XmssRecAggregateProveByInputHistogram = metrics_lib.HistogramVec(f32, XmssRecAggregateProveByInputLabel, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0 });
+    // Buckets span sub-millisecond (post phase = pointer wrap, typically ns)
+    // through multi-second STARK proves. Phase label values are
+    // "marshal" | "stark" | "post" — see XmssRecAggregatePhaseLabel below.
+    const XmssRecAggregatePhaseLabel = struct { phase: []const u8 };
+    const XmssRecAggregatePhaseHistogram = metrics_lib.HistogramVec(f32, XmssRecAggregatePhaseLabel, &[_]f32{ 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0 });
     const PQSigAggregatedVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
     const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
@@ -535,6 +570,7 @@ const Metrics = struct {
     // Issue #837 — see `lean_node_interval_error_total` field doc.
     const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const AggregateCoalescedCounter = metrics_lib.Counter(u64);
     const AggregateWorkerDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
     const AggregatorPublishAggregationsCounter = metrics_lib.CounterVec(u64, struct { subnet: []const u8 });
     // Validator status gauge types
@@ -738,6 +774,12 @@ fn observeAggregateWorkerDuration(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn onXmssRecAggregateProveHistogram(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.XmssRecAggregateProveHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeAggregationIntervalTick(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.AggregationIntervalTickHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -862,6 +904,10 @@ pub var zeam_aggregate_worker_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeAggregateWorkerDuration,
 };
+pub var zeam_xmss_rec_aggregate_prove_seconds: Histogram = .{
+    .context = null,
+    .observe = &onXmssRecAggregateProveHistogram,
+};
 pub var lean_pending_blocks_drain_iters: Histogram = .{
     .context = null,
     .observe = &observePendingBlocksDrainIters,
@@ -908,8 +954,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
         // Aggregated attestation signature metrics
         .lean_pq_sig_aggregated_signatures_total = Metrics.PQSigAggregatedSignaturesTotalCounter.init("lean_pq_sig_aggregated_signatures_total", .{ .help = "Total number of aggregated signatures" }, .{}),
         .lean_pq_sig_attestations_in_aggregated_signatures_total = Metrics.PQSigAttestationsInAggregatedTotalCounter.init("lean_pq_sig_attestations_in_aggregated_signatures_total", .{ .help = "Total number of attestations included into aggregated signatures" }, .{}),
-        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Time taken to build an aggregated attestation signature" }, .{}),
-        .zeam_pq_sig_aggregated_signatures_building_phase_seconds = try Metrics.PQSigBuildingPhaseHistogram.init(allocator, io, "zeam_pq_sig_aggregated_signatures_building_phase_seconds", .{ .help = "Phase-level time taken to produce aggregate attestations, labeled by phase (snapshot|compute_ffi|commit). See #899." }, .{}),
+        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Per att_data wall time for AggregatedSignatureProof.aggregate (bitfield merge + xmss.aggregateSignatures, including leanMultisig STARK). For bare rec_xmss_aggregate prove time comparable to lean-bench, use zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
+        .zeam_pq_sig_aggregated_signatures_building_phase_seconds = try Metrics.PQSigBuildingPhaseHistogram.init(allocator, io, "zeam_pq_sig_aggregated_signatures_building_phase_seconds", .{ .help = "Phase-level time for aggregate production, labeled by phase (snapshot|att_data_prep|xmss_prove|compute_ffi|commit). See #899 / #907." }, .{}),
+        .zeam_xmss_rec_aggregate_prove_seconds = Metrics.XmssRecAggregateProveHistogram.init("zeam_xmss_rec_aggregate_prove_seconds", .{ .help = "Wall time inside xmss_aggregate (leanMultisig rec_xmss_aggregate STARK prove + FFI key clones, one att_data). Compare to leanBench aggregate.flat_*_r2; worker/phase metrics add snapshot, prep, child-proof deserialize, and serialize." }, .{}),
+        .zeam_xmss_rec_aggregate_prove_by_input_seconds = try Metrics.XmssRecAggregateProveByInputHistogram.init(allocator, io, "zeam_xmss_rec_aggregate_prove_by_input_seconds", .{ .help = "Same observation as zeam_xmss_rec_aggregate_prove_seconds, additionally labeled by num_raw (count of raw gossip XMSS signatures) and num_children (count of recursive child STARK proofs) input-size buckets (#940). Buckets: num_raw in {0,1,2,3,4,5,6,7,8,9-15,16-31,32+}; num_children in {0,1,2,3-4,5-7,8+}. Used to classify the aggregate build histogram tail (steady-state full-committee prove vs partial-input reprove)." }, .{}),
+        .zeam_xmss_rec_aggregate_phase_seconds = try Metrics.XmssRecAggregatePhaseHistogram.init(allocator, io, "zeam_xmss_rec_aggregate_phase_seconds", .{ .help = "Per-phase wall time inside xmss_aggregate FFI (#940), reported back from Rust via out-pointers. phase=\"marshal\" covers argument deserialization (raw XMSS PK/sig clones + child PK collection + child proof deserialize). phase=\"stark\" is the leanMultisig rec_xmss_aggregate STARK call — expected to scale linearly with num_raw per lean-bench (~3.6 ms/sig at log_inv_rate=2 on Hetzner 16-core). phase=\"post\" is Box::into_raw of the returned aggregate (pointer wrap, typically nanoseconds). The three phases sum to ~zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
         .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature" }, .{}),
         .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures" }, .{}),
         .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures" }, .{}),
@@ -970,8 +1019,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
-        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: in_flight, not_aggregator, not_synced, missing_state." }, .{}),
-        .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of the aggregate FFI worker (XMSS recursive aggregation)." }, .{}),
+        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
+        .zeam_aggregate_coalesced_total = Metrics.AggregateCoalescedCounter.init("zeam_aggregate_coalesced_total", .{ .help = "Aggregation slot triggers coalesced while a worker was in flight; one catch-up run is scheduled when the worker finishes." }, .{}),
+        .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of one aggregate worker run (snapshot through publishProducedAggregations), including all XMSS recursive STARK FFI inside computeAggregatedSignatures. Primary latency signal for aggregator slot budget (issue #907)." }, .{}),
         .zeam_aggregator_publish_aggregations_total = try Metrics.AggregatorPublishAggregationsCounter.init(allocator, io, "zeam_aggregator_publish_aggregations_total", .{ .help = "SignedAggregatedAttestation messages published by the local aggregator worker, labeled by attestation subnet. Distinct from lean_pq_sig_aggregated_signatures_total (block-proposal path only) so cross-client dashboards keep the standard metric's semantics intact." }, .{}),
         // BeamNode mutex contention metrics (issue #786)
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
@@ -1002,7 +1052,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_attestations_evicted_total = try Metrics.LeanPendingAttsEvictedCounter.init(allocator, io, "lean_pending_attestations_evicted_total", .{ .help = "Pending-attestation buffer FIFO evictions when MAX_PENDING_ATTESTATIONS (1024, leanSpec subspecs/sync/config.py) is reached. Labeled by kind={attestation,aggregation}." }, .{}),
         .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts (mirrors leanSpec _replay_pending_attestations). Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
         .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),
-        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
+        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, publishLocalProducedAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
     };
     metrics.zeam_blocks_by_root_inflight.set(0);
     metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};
@@ -1067,6 +1117,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
     zeam_node_aggregation_interval_tick_seconds.context = @ptrCast(&metrics.zeam_node_aggregation_interval_tick_seconds);
     zeam_aggregate_worker_duration_seconds.context = @ptrCast(&metrics.zeam_aggregate_worker_duration_seconds);
+    zeam_xmss_rec_aggregate_prove_seconds.context = @ptrCast(&metrics.zeam_xmss_rec_aggregate_prove_seconds);
     lean_pending_blocks_drain_iters.context = @ptrCast(&metrics.lean_pending_blocks_drain_iters);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
@@ -1194,6 +1245,82 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
     }
 
     try metrics_lib.write(&metrics, writer);
+}
+
+/// Record a sub-phase of aggregate attestation production (see
+/// `zeam_pq_sig_aggregated_signatures_building_phase_seconds`).
+pub fn observeAggregateAttestationBuildPhase(phase: []const u8, elapsed_seconds: f32) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_pq_sig_aggregated_signatures_building_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_seconds,
+    ) catch {};
+}
+
+/// Record leanMultisig `rec_xmss_aggregate` wall time for one att_data
+/// (xmss_aggregate FFI). `num_raw` is the count of raw gossip XMSS signatures
+/// fed to this prove; `num_children` is the count of recursive child STARK
+/// proofs included. Both flow into the labeled
+/// `zeam_xmss_rec_aggregate_prove_by_input_seconds` companion via
+/// low-cardinality bucket strings (see #940).
+pub fn observeXmssRecAggregateProve(elapsed_seconds: f32, num_raw: usize, num_children: usize) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_xmss_rec_aggregate_prove_seconds.observe(elapsed_seconds);
+    observeAggregateAttestationBuildPhase("xmss_prove", elapsed_seconds);
+    metrics.zeam_xmss_rec_aggregate_prove_by_input_seconds.observe(
+        .{ .num_raw = numRawBucket(num_raw), .num_children = numChildrenBucket(num_children) },
+        elapsed_seconds,
+    ) catch {};
+}
+
+/// Coarse low-cardinality bucket for the `num_raw` label on
+/// `zeam_xmss_rec_aggregate_prove_by_input_seconds`. Current ansible-devnet
+/// committees are 8-validator so values 0..8 stay distinct; larger committees
+/// roll into wider buckets to bound Prometheus series cardinality.
+fn numRawBucket(n: usize) []const u8 {
+    return switch (n) {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9, 10, 11, 12, 13, 14, 15 => "9-15",
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 => "16-31",
+        else => "32+",
+    };
+}
+
+/// Record one phase of `xmss_aggregate`'s internal timing breakdown
+/// (`zeam_xmss_rec_aggregate_phase_seconds`). `phase` must be one of the
+/// constants documented on the metric (currently "marshal", "stark", "post");
+/// callers are the xmss aggregation module on a successful prove only.
+/// `elapsed_ns` is the value the Rust FFI wrote into its out-pointer.
+pub fn observeXmssRecAggregatePhase(phase: []const u8, elapsed_ns: u64) void {
+    if (!g_initialized or isZKVM()) return;
+    const elapsed_s = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    metrics.zeam_xmss_rec_aggregate_phase_seconds.observe(
+        .{ .phase = phase },
+        elapsed_s,
+    ) catch {};
+}
+
+/// Coarse low-cardinality bucket for the `num_children` label on
+/// `zeam_xmss_rec_aggregate_prove_by_input_seconds`. `num_children=0` is the
+/// only value seen on flat aggregation today (#940); other buckets exist for
+/// the recursive path.
+fn numChildrenBucket(n: usize) []const u8 {
+    return switch (n) {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3, 4 => "3-4",
+        5, 6, 7 => "5-7",
+        else => "8+",
+    };
 }
 
 // ---------------------------------------------------------------------

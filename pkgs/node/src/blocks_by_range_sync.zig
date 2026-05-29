@@ -34,6 +34,100 @@ pub fn cappedSyncGapSlots(peer_head_slot: types.Slot, our_head_slot: types.Slot,
     return @min(peer_gap, wall_gap);
 }
 
+pub const PeerStatusRefreshDecision = struct {
+    refresh: bool,
+    wall_head_lag_slots: u64,
+};
+
+/// Pure periodic peer-status refresh policy.
+///
+/// Callers supply the current interval/slot cadence plus head snapshots; this helper
+/// owns the decision about whether a status refresh is useful. Wall-clock head lag is
+/// computed through `cappedSyncGapSlots` by treating `wall_slot` as the peer head,
+/// keeping all slot-gap arithmetic on one path.
+pub fn shouldRefreshPeerStatus(
+    sync_status: anytype,
+    interval_in_slot: usize,
+    slot: types.Slot,
+    our_head_slot: types.Slot,
+    wall_slot: types.Slot,
+    refresh_interval_slots: u64,
+    wall_head_lag_threshold_slots: u64,
+) PeerStatusRefreshDecision {
+    const wall_head_lag_slots = cappedSyncGapSlots(wall_slot, our_head_slot, wall_slot);
+    if (interval_in_slot != 0 or slot % refresh_interval_slots != 0) {
+        return .{ .refresh = false, .wall_head_lag_slots = wall_head_lag_slots };
+    }
+
+    const refresh = switch (sync_status) {
+        .fc_initing, .behind_peers => true,
+        .synced => wall_head_lag_slots >= wall_head_lag_threshold_slots,
+        .no_peers => false,
+    };
+    return .{ .refresh = refresh, .wall_head_lag_slots = wall_head_lag_slots };
+}
+
+/// True when pre-finalization sync should report `behind_peers` based on
+/// wall-clock head lag alone (early devnets with `finalized_slot = 0`).
+pub fn isWallHeadLagSyncing(
+    our_finalized_slot: types.Slot,
+    max_peer_finalized_slot: types.Slot,
+    wall_head_lag_slots: u64,
+    threshold_slots: u64,
+) bool {
+    if (our_finalized_slot != 0 or max_peer_finalized_slot != 0) return false;
+    return wall_head_lag_slots >= threshold_slots;
+}
+
+/// Rotate a peer batch for rate-limited status refresh.
+pub fn peerBatchWindow(total_peers: usize, cursor: usize, batch_size: usize) struct {
+    start: usize,
+    count: usize,
+    next_cursor: usize,
+} {
+    if (total_peers == 0 or batch_size == 0) {
+        return .{ .start = 0, .count = 0, .next_cursor = 0 };
+    }
+    const start = cursor % total_peers;
+    const count = @min(batch_size, total_peers);
+    return .{
+        .start = start,
+        .count = count,
+        .next_cursor = (start + count) % total_peers,
+    };
+}
+
+/// Whether to start RPC catch-up from cached peer status without waiting for
+/// a fresh status response (gossip ingress stall + wall-clock head lag).
+pub fn shouldInitiateProactiveCatchUp(
+    wall_head_lag_slots: u64,
+    wall_head_lag_threshold_slots: u64,
+    gossip_silent_ms: u64,
+    gossip_stall_threshold_ms: u64,
+) bool {
+    if (wall_head_lag_slots < wall_head_lag_threshold_slots) return false;
+    if (gossip_stall_threshold_ms == 0) return true;
+    return gossip_silent_ms >= gossip_stall_threshold_ms;
+}
+
+/// Whether gossipsub mesh subscriptions should be re-sent.
+pub fn shouldHealGossipMesh(
+    mesh_peers: u64,
+    min_mesh_peers: u64,
+    gossip_silent_ms: u64,
+    gossip_stall_threshold_ms: u64,
+) bool {
+    if (mesh_peers < min_mesh_peers) return true;
+    if (gossip_stall_threshold_ms == 0) return false;
+    return gossip_silent_ms >= gossip_stall_threshold_ms;
+}
+
+/// Milliseconds since `last_gossip_rx_ms` (0 when no gossip received yet).
+pub fn gossipSilentMs(now_ms: u64, last_gossip_rx_ms: u64) u64 {
+    if (last_gossip_rx_ms == 0) return 0;
+    return now_ms -| last_gossip_rx_ms;
+}
+
 /// Whether a peer status should trigger proactive catch-up (issue #893 / PR #894).
 /// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` only selects range vs by-root inside `initiateCatchUpFromPeerStatus`.
 pub fn shouldCatchUpFromPeerStatus(
@@ -175,6 +269,54 @@ test "cappedSyncGapSlots limits range catch-up to wall-clock head" {
     try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(200, 150, 100));
 }
 
+test "shouldRefreshPeerStatus handles cadence sync state and wall lag" {
+    const TestSyncStatus = union(enum) {
+        synced,
+        no_peers,
+        fc_initing,
+        behind_peers,
+    };
+
+    // Wall-lag arithmetic is shared with cappedSyncGapSlots by treating wall_slot as
+    // the remote head: no lag at/past wall, positive lag only when wall is ahead.
+    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(100, 100, 100));
+    try std.testing.expectEqual(@as(u64, 0), cappedSyncGapSlots(99, 100, 99));
+    try std.testing.expectEqual(@as(u64, 4), cappedSyncGapSlots(104, 100, 104));
+
+    const cases = [_]struct {
+        status: TestSyncStatus,
+        interval_in_slot: usize,
+        slot: types.Slot,
+        our_head_slot: types.Slot,
+        wall_slot: types.Slot,
+        threshold_slots: u64,
+        want_refresh: bool,
+        want_lag: u64,
+    }{
+        .{ .status = .synced, .interval_in_slot = 1, .slot = 104, .our_head_slot = 100, .wall_slot = 104, .threshold_slots = 4, .want_refresh = false, .want_lag = 4 },
+        .{ .status = .synced, .interval_in_slot = 0, .slot = 103, .our_head_slot = 100, .wall_slot = 104, .threshold_slots = 4, .want_refresh = false, .want_lag = 4 },
+        .{ .status = .synced, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 103, .threshold_slots = 4, .want_refresh = false, .want_lag = 3 },
+        .{ .status = .synced, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 104, .threshold_slots = 4, .want_refresh = true, .want_lag = 4 },
+        .{ .status = .fc_initing, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
+        .{ .status = .behind_peers, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
+        .{ .status = .no_peers, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 200, .threshold_slots = 4, .want_refresh = false, .want_lag = 100 },
+    };
+
+    for (cases) |case| {
+        const decision = shouldRefreshPeerStatus(
+            case.status,
+            case.interval_in_slot,
+            case.slot,
+            case.our_head_slot,
+            case.wall_slot,
+            constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS,
+            case.threshold_slots,
+        );
+        try std.testing.expectEqual(case.want_refresh, decision.refresh);
+        try std.testing.expectEqual(case.want_lag, decision.wall_head_lag_slots);
+    }
+}
+
 test "shouldCatchUpFromPeerStatus triggers on head gap before finalization" {
     // Early devnet: both finalized at 0, peer head ahead — must catch up via blocks_by_root.
     try std.testing.expect(shouldCatchUpFromPeerStatus(31, 0, 0, 0, 40));
@@ -260,6 +402,44 @@ test "syncEndDecision fork abort" {
         .has_alternate_peer = true,
     };
     try std.testing.expectEqual(SyncEndAction.abort_fallback, syncEndDecision(input));
+}
+
+test "isWallHeadLagSyncing only applies before finalization" {
+    try std.testing.expect(isWallHeadLagSyncing(0, 0, 4, 4));
+    try std.testing.expect(!isWallHeadLagSyncing(0, 0, 3, 4));
+    try std.testing.expect(!isWallHeadLagSyncing(1, 0, 10, 4));
+    try std.testing.expect(!isWallHeadLagSyncing(0, 1, 10, 4));
+}
+
+test "peerBatchWindow rotates through peers" {
+    const w0 = peerBatchWindow(10, 0, 8);
+    try std.testing.expectEqual(@as(usize, 0), w0.start);
+    try std.testing.expectEqual(@as(usize, 8), w0.count);
+    try std.testing.expectEqual(@as(usize, 8), w0.next_cursor);
+
+    const w1 = peerBatchWindow(10, 8, 8);
+    try std.testing.expectEqual(@as(usize, 8), w1.start);
+    try std.testing.expectEqual(@as(usize, 8), w1.count);
+    try std.testing.expectEqual(@as(usize, 6), w1.next_cursor);
+}
+
+test "shouldInitiateProactiveCatchUp requires wall lag and gossip stall" {
+    const threshold_ms: u64 = 8000;
+    try std.testing.expect(shouldInitiateProactiveCatchUp(4, 4, threshold_ms, threshold_ms));
+    try std.testing.expect(!shouldInitiateProactiveCatchUp(3, 4, threshold_ms, threshold_ms));
+    try std.testing.expect(!shouldInitiateProactiveCatchUp(4, 4, threshold_ms - 1, threshold_ms));
+}
+
+test "shouldHealGossipMesh on low mesh or gossip stall" {
+    const threshold_ms: u64 = 8000;
+    try std.testing.expect(shouldHealGossipMesh(3, 4, 0, threshold_ms));
+    try std.testing.expect(shouldHealGossipMesh(10, 4, threshold_ms, threshold_ms));
+    try std.testing.expect(!shouldHealGossipMesh(10, 4, 0, threshold_ms));
+}
+
+test "gossipSilentMs handles never-received and elapsed silence" {
+    try std.testing.expectEqual(@as(u64, 0), gossipSilentMs(10_000, 0));
+    try std.testing.expectEqual(@as(u64, 3_000), gossipSilentMs(10_000, 7_000));
 }
 
 test "classifyChunkImport: queue_full drops, never falls back to inline (#894 regression guard)" {

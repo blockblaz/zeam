@@ -36,6 +36,10 @@ pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
 pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
 pub const compactAttestations = block.compactAttestations;
 pub const default_min_aggregation_inputs = block.default_min_aggregation_inputs;
+pub const SingleAggregatedSignature = block.SingleAggregatedSignature;
+pub const computeSingleAggregatedSignature = block.computeSingleAggregatedSignature;
+pub const attestationDataLessThan = block.attestationDataLessThan;
+pub const participantsContainsAll = block.participantsContainsAll;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;
@@ -75,6 +79,7 @@ pub const GenesisSpec = utils.GenesisSpec;
 pub const ChainSpec = utils.ChainSpec;
 pub const sszClone = utils.sszClone;
 pub const sszCloneAndGetBytes = utils.sszCloneAndGetBytes;
+pub const sszSerializeAndGetBytes = utils.sszSerializeAndGetBytes;
 pub const IsJustifiableSlot = utils.IsJustifiableSlot;
 pub const RootToSlotCache = utils.RootToSlotCache;
 

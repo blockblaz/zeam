@@ -466,7 +466,7 @@ pub fn initForkChoiceDriver(
     zeam_utils.hashTreeRoot(types.BeamBlock, anchor_block, &anchor_block_root, driver_allocator) catch
         return error.HashFailed;
 
-    var test_thread_pool = try node.testing.initTestThreadPool(driver_allocator);
+    var test_thread_pool = try @import("@zeam/node").testing.setupTestPrimitives(driver_allocator);
     errdefer test_thread_pool.deinit();
 
     // Init fork choice (uses anchor_state_ptr for anchorState)

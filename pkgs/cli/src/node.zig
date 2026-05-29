@@ -178,6 +178,70 @@ pub const Node = struct {
 
     const Self = @This();
 
+    /// Thread roles configured at startup. Counts are logged once init
+    /// completes so operators can verify `--rayon-threads` / aggregator
+    /// auto-tune and compare against `cpu_count`.
+    const StartupThreadBudget = struct {
+        cpu_count: usize,
+        zig_worker_pool: usize,
+        rayon: usize,
+        aggregate_max_inflight: u32,
+        chain_worker: usize,
+        metrics_server: usize,
+        api_server: usize,
+        rayon_source: []const u8,
+
+        fn estimatedTotal(self: @This()) usize {
+            // main (xev slot-driver) + Io.Threaded + libp2p + zig pool + rayon
+            // + chain-worker + metrics + api + slot watchdog (run()).
+            return 1 + 1 + 1 + self.zig_worker_pool + self.rayon + self.chain_worker +
+                self.metrics_server + self.api_server + 1;
+        }
+    };
+
+    fn logStartupThreadBudget(self: *Self, budget: StartupThreadBudget) void {
+        self.logger.info(
+            "startup thread budget: cpu_count={d} estimated_os_threads≈{d}",
+            .{ budget.cpu_count, budget.estimatedTotal() },
+        );
+        self.logger.info(
+            "  main/xev slot-driver: 1 (this thread runs xev.Loop via clock.run)",
+            .{},
+        );
+        self.logger.info(
+            "  std.Io.Threaded:      1 (blocking I/O for Zig pool + disk)",
+            .{},
+        );
+        self.logger.info(
+            "  libp2p rust bridge:   1 (spawned in network.run)",
+            .{},
+        );
+        self.logger.info(
+            "  zig worker pool:      {d} (aggregate_max_inflight={d})",
+            .{ budget.zig_worker_pool, budget.aggregate_max_inflight },
+        );
+        self.logger.info(
+            "  rayon (XMSS prover):  {d}{s}",
+            .{ budget.rayon, budget.rayon_source },
+        );
+        self.logger.info(
+            "  chain-worker:         {d}{s}",
+            .{ budget.chain_worker, if (budget.chain_worker == 0) " (disabled)" else "" },
+        );
+        self.logger.info(
+            "  metrics HTTP server:  {d}",
+            .{budget.metrics_server},
+        );
+        self.logger.info(
+            "  api HTTP server:      {d}",
+            .{budget.api_server},
+        );
+        self.logger.info(
+            "  slot-driver watchdog: 1 (spawned at run() start)",
+            .{},
+        );
+    }
+
     /// Closes the current database, wipes the on-disk rocksdb directory, and
     /// reopens a fresh database at the same path.
     ///
@@ -420,14 +484,16 @@ pub const Node = struct {
         const cpu_count = std.Thread.getCpuCount() catch 2;
         const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
         const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
-        const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
-        const worker_count = @min(zig_worker_budget, @as(usize, ThreadPool.max_thread_count));
-        self.thread_pool = try ThreadPool.init(.{
-            .allocator = allocator,
-            .io = std.Io.Threaded.global_single_threaded.io(),
-            .thread_count = @intCast(worker_count),
-        });
-        errdefer self.thread_pool.deinit();
+
+        // Aggregators: XMSS recursive prove (rayon) is the per-slot bottleneck. Keep a
+        // small Zig pool for capped in-flight aggregate workers (#907).
+        const worker_count = if (options.is_aggregator) blk: {
+            const aggregator_zig_workers = @max(@as(usize, 2), desired_workers / 4);
+            break :blk @min(@as(usize, ThreadPool.max_thread_count), aggregator_zig_workers);
+        } else blk: {
+            const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
+            break :blk @min(zig_worker_budget, @as(usize, ThreadPool.max_thread_count));
+        };
 
         // Coordinate the Zig worker pool and the rayon pool used by the XMSS
         // aggregate prover from the same post-system-thread budget so they do
@@ -443,21 +509,36 @@ pub const Node = struct {
         // aggregator that bottleneck is the produce path instead, so giving
         // rayon more cores measurably shortens the per-pass build time.
         //
-        // Must be called before setupProver/setupVerifier since rayon’s global
+        // Must be called before setupXmssAggregation since rayon’s global
         // pool is initialized lazily on first use.
-        const rayon_threads = if (options.rayon_threads) |override|
-            @max(@as(usize, 1), @as(usize, override))
+        const rayon_threads = if (options.rayon_threads) |override| blk: {
+            const requested = @max(@as(usize, 1), @as(usize, override));
+            // Cap explicit overrides to the post-system budget so devnet hosts
+            // with `--rayon-threads 12` on 8 vCPUs do not oversubscribe XMSS
+            // prove and inflate worker p50 (#925).
+            const effective = @min(requested, desired_workers);
+            if (effective < requested) {
+                self.logger.warn(
+                    "--rayon-threads {d} exceeds post-system budget {d}; using {d} rayon threads",
+                    .{ requested, desired_workers, effective },
+                );
+            }
+            break :blk effective;
+        } else if (options.is_aggregator)
+            desired_workers
         else
             @max(@as(usize, 1), desired_workers -| worker_count);
-        self.logger.info(
-            "thread pools: cpu_count={d} zig_workers={d} rayon_threads={d}{s}",
-            .{
-                cpu_count,
-                worker_count,
-                rayon_threads,
-                if (options.rayon_threads != null) " (rayon override via --rayon-threads)" else "",
-            },
-        );
+        // One outer aggregate worker at a time on aggregators. Each att_data
+        // prove runs sequentially inside that worker (ethlambda-style) so
+        // Rayon gets the full CPU budget per job instead of ThreadPool ×
+        // Rayon oversubscription (#925).
+        const aggregate_max_inflight: u32 = if (options.is_aggregator) 1 else 4;
+        const rayon_source: []const u8 = if (options.rayon_threads != null)
+            " (--rayon-threads override)"
+        else if (options.is_aggregator)
+            " (aggregator auto-tune: full post-system budget)"
+        else
+            " (non-aggregator auto-split)";
         // Operator-typo guard for --rayon-threads (review feedback on #903).
         // Rayon tolerates over-subscription, but values like `--rayon-threads 160`
         // on a 4-vCPU box silently degrade throughput. Warn (don't reject) so the
@@ -473,6 +554,16 @@ pub const Node = struct {
             }
         }
         xmss.setRayonThreads(rayon_threads);
+
+        // Single XMSS aggregation setup for both prover and verifier paths
+        try xmss.setupXmssAggregation();
+
+        self.thread_pool = try ThreadPool.init(.{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .thread_count = @intCast(worker_count),
+        });
+        errdefer self.thread_pool.deinit();
 
         // Log the aggregator threshold on startup so operators can see
         // exactly how `--min-aggregation-inputs` was resolved (default vs
@@ -490,16 +581,6 @@ pub const Node = struct {
             },
         );
 
-        // Pre-warm the XMSS verifier on the main thread before any worker can
-        // call `verifyAggregatedPayload`. The Rust-side verifier setup is
-        // documented as idempotent but is not hardened against first-time-init
-        // races between concurrent callers; doing it once here removes that
-        // race regardless of the Rust implementation.
-        xmss.setupVerifier() catch |err| {
-            // Do not call `thread_pool.deinit()` here — `errdefer` below already tears it down.
-            return err;
-        };
-
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -516,6 +597,7 @@ pub const Node = struct {
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
             .min_aggregation_inputs = options.min_aggregation_inputs,
+            .aggregate_max_inflight = aggregate_max_inflight,
         });
         errdefer self.beam_node.deinit();
 
@@ -562,6 +644,17 @@ pub const Node = struct {
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
         }
+
+        self.logStartupThreadBudget(.{
+            .cpu_count = cpu_count,
+            .zig_worker_pool = worker_count,
+            .rayon = rayon_threads,
+            .aggregate_max_inflight = aggregate_max_inflight,
+            .chain_worker = if (options.chain_worker_enabled) 1 else 0,
+            .metrics_server = if (options.metrics_enable) 1 else 0,
+            .api_server = if (options.metrics_enable) 1 else 0,
+            .rayon_source = rayon_source,
+        });
 
         self.logger = options.logger_config.logger(.node);
     }

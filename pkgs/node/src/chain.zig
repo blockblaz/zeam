@@ -30,6 +30,7 @@ const LockTimer = locking.LockTimer;
 const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -70,6 +71,15 @@ pub const ChainOpts = struct {
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs` for the
     /// default and `isTrivialAggregationInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
+    /// enforced lock-free by `submitAggregateOnInterval`. When the cap is
+    /// reached the trigger is coalesced into `aggregate_reschedule_intervals`
+    /// and retried once when the in-flight worker finishes (see #907).
+    /// Kept low (default 4) so the queue drains quickly and the aggregator
+    /// stays focused on CURRENT slots rather than catching up old ones — per
+    /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
+    /// further-back slots are wasted work. See `BeamChain.aggregateImpl`.
+    aggregate_max_inflight: u32 = 4,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -197,6 +207,11 @@ pub const BeamChain = struct {
     /// `iterateLocked()` for sync-status decisions. Mutation is the
     /// network's responsibility — the chain only consumes.
     connected_peers: *ConnectedPeers,
+    /// Wall-clock head lag in slots, updated each libxev tick by `BeamNode`
+    /// from `Clock.wallSlotNow()`. Read by `getSyncStatus()` to detect
+    /// pre-finalization devnets that report `synced` while gossip ingress
+    /// has stalled (#926).
+    wall_head_lag_slots: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
     // Aggregator role flag, toggleable at runtime via `setAggregator`.
@@ -245,10 +260,12 @@ pub const BeamChain = struct {
     ///      or any custom non-thread-safe allocator would race. If a future
     ///      change swaps the allocator, audit every consumer of `thread_pool`
     ///      (`stf.verifySignaturesParallel`, `types.compactAttestations`).
-    ///   2. The XMSS verifier must be set up before the pool's first verify.
-    ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
-    ///      pool construction; without that pre-warm, concurrent first-time
-    ///      verifies could race the Rust-side initialization.
+    ///   2. The XMSS prover/verifier bytecode must be set up before the pool's
+    ///      first verify. The CLI calls `xmss.setupXmssAggregation()` on the
+    ///      main thread *before* constructing the thread pool, so workers
+    ///      cannot observe uninitialised FFI state. That single setup
+    ///      initialises both prove and verify state so workers can call verify
+    ///      without racing first-time initialization.
     ///   3. `xmss.PublicKeyCache` is lock-free as of P1 of #863
     ///      (per-slot atomic CAS); concurrent `getOrPut` calls are
     ///      safe. The pre-PR-#884 serial-pre-phase constraint no
@@ -377,13 +394,29 @@ pub const BeamChain = struct {
     root_to_slot_lock: zeam_utils.SyncMutex = .{},
     events_lock: zeam_utils.SyncMutex = .{},
 
-    /// Dedicated Io.Threaded for the aggregate FFI worker (issue #873).
-    /// `concurrent_limit = .limited(1)` enforces at most one in-flight
-    /// aggregate task; a second submit returns `error.ConcurrencyUnavailable`.
-    aggregate_io: *std.Io.Threaded,
+    /// In-flight aggregate worker count (issue #907). `submitAggregateOnInterval`
+    /// atomically checks against `aggregate_max_inflight` before spawning so the
+    /// libxev interval tick never blocks. `aggregateImpl` decrements on exit.
+    /// Aggregators keep this at 1; per-att_data FFI parallelism lives inside
+    /// `aggregateUnlocked`. Values > 1 rely on commit-time duplicate suppression
+    /// in `forkchoice.aggregateUnlocked` (see PR #920 review).
+    aggregate_inflight: std.atomic.Value(u32) = .init(0),
 
-    /// Long-lived group hosting submitted aggregate tasks.
-    aggregate_group: std.Io.Group = .init,
+    /// Latest slot-driver interval coalesced while an aggregate worker was
+    /// in flight. `aggregateImpl` clears this on exit and re-submits once.
+    aggregate_reschedule_intervals: std.atomic.Value(u64) = .init(0),
+
+    /// Highest slot successfully published by the most recent aggregate worker.
+    /// Used to skip redundant catch-up resubmits when coalesced triggers
+    /// map to a slot we already handled (#925 coalesce storm). Not advanced
+    /// on failure or empty runs so coalesce can retry.
+    aggregate_last_completed_slot: std.atomic.Value(u64) = .init(0),
+
+    /// Joined at `deinit` so aggregate workers cannot outlive chain state.
+    aggregate_wg: WaitGroup = .{},
+
+    /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
+    aggregate_max_inflight: u32,
 
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
@@ -530,16 +563,6 @@ pub const BeamChain = struct {
         errdefer anchor_rc.release();
         try states.put(fork_choice.head.blockRoot, anchor_rc);
 
-        // Issue #873: dedicated Io.Threaded for aggregate FFI worker.
-        // concurrent_limit = .limited(1) ensures at most one in-flight aggregate task.
-        const agg_io = try allocator.create(std.Io.Threaded);
-        errdefer allocator.destroy(agg_io);
-        agg_io.* = std.Io.Threaded.init(allocator, .{
-            .async_limit = .nothing,
-            .concurrent_limit = .limited(1),
-        });
-        errdefer agg_io.deinit();
-
         var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
@@ -582,9 +605,13 @@ pub const BeamChain = struct {
             // at its final heap location), so the worker's ctx pointer
             // remains stable for its entire lifetime.
             .chain_worker = null,
-            // aggregate_io: dedicated Io.Threaded for aggregate FFI worker (issue #873).
-            .aggregate_io = agg_io,
-            .aggregate_group = .init,
+            // Aggregate worker bookkeeping (issue #907). Counter + WaitGroup
+            // backstop the lock-free cap check + `deinit` join — see field docs.
+            .aggregate_inflight = .init(0),
+            .aggregate_reschedule_intervals = .init(0),
+            .aggregate_last_completed_slot = .init(0),
+            .aggregate_wg = .{},
+            .aggregate_max_inflight = opts.aggregate_max_inflight,
             // leanSpec _pending_attestations / _pending_aggregated_attestations
             // buffers — empty at init; FIFO-bounded by
             // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
@@ -1503,9 +1530,9 @@ pub const BeamChain = struct {
         // never called.)
         self.stopChainStateRefcountObserver();
 
-        // Issue #873: wait for any in-flight aggregate worker before
-        // tearing down chain state it references.
-        self.aggregate_group.cancel(self.aggregate_io.io());
+        // Issue #907: join any in-flight aggregate workers before
+        // tearing down chain state they reference.
+        self.thread_pool.waitAndWork(&self.aggregate_wg);
 
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
@@ -1518,11 +1545,6 @@ pub const BeamChain = struct {
             self.allocator.destroy(w);
             self.chain_worker = null;
         }
-
-        // Issue #873: tear down aggregate worker pool after chain_worker
-        // is stopped and aggregate_group is cancelled.
-        self.aggregate_io.deinit();
-        self.allocator.destroy(self.aggregate_io);
 
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
@@ -4215,20 +4237,17 @@ pub const BeamChain = struct {
         return self.forkChoice.onSignedAttestation(signedAttestation.message);
     }
 
-    pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        try self.validateAttestationData(signedAggregation.data, false);
-
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
-        defer validator_indices.deinit(self.allocator);
-
-        try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
-
-        // Update attestation trackers for gossip attestations so fork choice sees these votes
-        for (validator_indices.items) |vi| {
+    /// Update fork-choice attestation trackers for an aggregated proof.
+    pub fn applyAggregatedAttestationTrackers(
+        self: *Self,
+        data: types.AttestationData,
+        validator_indices: []const usize,
+    ) void {
+        for (validator_indices) |vi| {
             const validator_id: types.ValidatorIndex = @intCast(vi);
             const attestation = types.Attestation{
                 .validator_id = validator_id,
-                .data = signedAggregation.data,
+                .data = data,
             };
             self.forkChoice.onAttestation(attestation, false) catch |err| {
                 self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
@@ -4236,7 +4255,26 @@ pub const BeamChain = struct {
                 });
             };
         }
+    }
 
+    /// Per-subnet publish counter for locally committed aggregates.
+    pub fn recordAggregatorPublishMetric(self: *Self, signed: *const types.SignedAggregatedAttestation) void {
+        const committee_count = self.config.spec.attestation_committee_count;
+        if (committee_count == 0) return;
+        const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse return;
+        var label_buf: [16]u8 = undefined;
+        const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch return;
+        zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
+    }
+
+    pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
+        try self.validateAttestationData(signedAggregation.data, false);
+
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
+        defer validator_indices.deinit(self.allocator);
+
+        try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
+        self.applyAggregatedAttestationTrackers(signedAggregation.data, validator_indices.items);
         try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
     }
 
@@ -4285,10 +4323,37 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Submit aggregate work to the dedicated Io.Threaded worker (issue #873).
+    /// Monotonic max for coalesced slot-driver intervals (libxev + pool threads).
+    fn storeMaxAggregateRescheduleInterval(self: *Self, candidate: u64) void {
+        var current = self.aggregate_reschedule_intervals.load(.monotonic);
+        while (candidate > current) {
+            const exchanged = self.aggregate_reschedule_intervals.cmpxchgWeak(
+                current,
+                candidate,
+                .release,
+                .monotonic,
+            ) orelse return;
+            current = exchanged;
+        }
+    }
+
+    const AggregateWorkerSlot = struct {
+        slot: usize,
+        is_clock_catch_up: bool,
+    };
+
+    fn resolveAggregateWorkerSlot(trigger_slot: usize, clock_slot: usize) AggregateWorkerSlot {
+        const is_clock_catch_up = trigger_slot + 1 < clock_slot;
+        return .{
+            .slot = if (is_clock_catch_up) clock_slot else trigger_slot,
+            .is_clock_catch_up = is_clock_catch_up,
+        };
+    }
+
+    /// Submit aggregate work to the dedicated ThreadPool worker (issue #873).
     /// Returns within microseconds; the worker calls `publishProducedAggregations`
-    /// itself. If the previous aggregate is still in-flight, the submit is
-    /// skipped and the skip metric is incremented.
+    /// itself. If the previous aggregate is still in-flight, the trigger is
+    /// coalesced and a catch-up run is scheduled when the worker finishes.
     pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
@@ -4321,84 +4386,116 @@ pub const BeamChain = struct {
             },
         }
 
-        // Snapshot state on the caller's thread (fast path).
-        const head_root = self.forkChoice.getHead().blockRoot;
-        var borrow = self.statesGet(head_root) orelse {
-            self.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "missing_state" }) catch {};
+        // Non-blocking cap check on the libxev thread. Done BEFORE the
+        // expensive validators clone in the worker so a saturated worker
+        // pool doesn't burn SSZ work we'd immediately throw away.
+        // `fetchAdd`-then-compare is a soft ceiling — transient overshoot
+        // is bounded by concurrent caller count and self-corrects on the
+        // next interval.
+        const prev = self.aggregate_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= self.aggregate_max_inflight) {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
+            const current_interval = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+            const pending_interval = @max(time_intervals, current_interval);
+            self.storeMaxAggregateRescheduleInterval(pending_interval);
+            self.logger.info("coalescing aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
+            zeam_metrics.metrics.zeam_aggregate_coalesced_total.incr();
             return;
-        };
-        defer borrow.assertReleasedOrPanic();
-        const snapshot = borrow.cloneAndRelease(self.allocator) catch |err| {
-            self.logger.warn("failed to clone state for aggregation at slot={d}: {any}", .{ slot, err });
-            return;
-        };
+        }
+        // Past this point we own one `aggregate_inflight` slot — every
+        // early-return below must release it.
 
-        // Submit to the dedicated aggregate worker. concurrent_limit=1
-        // ensures at most one in-flight task.
-        self.aggregate_group.concurrent(self.aggregate_io.io(), aggregateImpl, .{ self, node, snapshot, slot }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                self.logger.info("skipping aggregation for slot={d}: previous aggregate still in-flight", .{slot});
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "in_flight" }) catch {};
-                // Free the snapshot we just cloned — the worker won't run.
-                snapshot.deinit();
-                self.allocator.destroy(snapshot);
-                return;
-            },
+        // Non-blocking enqueue onto the shared ThreadPool. Validators are cloned
+        // inside the worker after the slot clock is re-read so a slow or
+        // coalesced trigger does not snapshot stale head state (#925).
+        self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, slot }) catch {
+            _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
+            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
+            return;
         };
     }
 
-    /// Worker body for the aggregate FFI (runs on `aggregate_io` thread).
-    /// Owns `snapshot` and frees it on exit.
-    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, snapshot: *types.BeamState, slot: usize) void {
+    fn publishOneAggregate(ctx: *anyopaque, signed: types.SignedAggregatedAttestation) void {
+        const node: *@import("./node.zig").BeamNode = @ptrCast(@alignCast(ctx));
+        node.publishCommittedAggregation(signed);
+    }
+
+    /// Worker body for the aggregate FFI (runs on a shared `ThreadPool` worker).
+    fn aggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, trigger_slot: usize) void {
+        defer {
+            const pending = chain.aggregate_reschedule_intervals.swap(0, .acq_rel);
+            if (pending != 0) {
+                const now = chain.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+                const reschedule_interval = @max(pending, now);
+                const pending_slot = @divFloor(reschedule_interval, constants.INTERVALS_PER_SLOT);
+                const last_done = chain.aggregate_last_completed_slot.load(.monotonic);
+                if (pending_slot > last_done) {
+                    chain.submitAggregateOnInterval(node, @intCast(reschedule_interval));
+                }
+            }
+        }
+        defer _ = chain.aggregate_inflight.fetchSub(1, .acq_rel);
         const worker_timer = zeam_metrics.zeam_aggregate_worker_duration_seconds.start();
         defer _ = worker_timer.observe();
 
-        defer {
-            snapshot.deinit();
-            chain.allocator.destroy(snapshot);
+        // Re-read the slot clock at worker entry. A slow worker otherwise
+        // aggregates a stale {slot-1, slot} window from enqueue time while
+        // the chain has moved on — wasted FFI that drives coalesce storms (#907).
+        const clock_slot = chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        const work = Self.resolveAggregateWorkerSlot(trigger_slot, clock_slot);
+        const slot = work.slot;
+        if (slot != trigger_slot) {
+            chain.logger.info(
+                "aggregate worker slot catch-up: trigger={d} clock={d} using={d}",
+                .{ trigger_slot, clock_slot, slot },
+            );
         }
+
+        const head_root = chain.forkChoice.getHead().blockRoot;
+        var borrow = chain.statesGet(head_root) orelse {
+            chain.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
+            return;
+        };
+        defer borrow.deinit();
+
+        var validators_owned: types.Validators = undefined;
+        types.sszClone(chain.allocator, types.Validators, borrow.state.validators, &validators_owned) catch |err| {
+            chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
+            return;
+        };
+        defer validators_owned.deinit();
 
         // Log subnet-wise coverage of current new payloads before starting aggregation.
         chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
 
+        // On-time workers use {slot-1, slot}. When the trigger lagged the
+        // clock by 2+ slots, slot-1 att_data is past the merge window — skip
+        // it and prove only the current slot (PR #900 / #925 catch-up storm).
         var slot_window_buf: [2]types.Slot = undefined;
         var slot_window_len: usize = 0;
-        if (slot > 0) {
+        if (!work.is_clock_catch_up and slot > 0) {
             slot_window_buf[slot_window_len] = @intCast(slot - 1);
             slot_window_len += 1;
         }
         slot_window_buf[slot_window_len] = @intCast(slot);
         slot_window_len += 1;
 
-        const aggregations = chain.forkChoice.aggregateForSlots(snapshot, slot_window_buf[0..slot_window_len]) catch |err| {
+        const aggregations = chain.forkChoice.aggregateForSlots(
+            &validators_owned,
+            slot_window_buf[0..slot_window_len],
+            node,
+            publishOneAggregate,
+        ) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return;
         };
         defer chain.allocator.free(aggregations);
 
-        if (aggregations.len == 0) return;
-
-        // Per-subnet publish counter. Operators rely on this to tell whether the
-        // local aggregator is producing for its duty subnet at all; the standard
-        // `lean_pq_sig_aggregated_signatures_total` increments only on the
-        // block-proposal path (see chain.zig produceBlock) and stays near zero on
-        // a healthy aggregator that is not also a recent proposer, which makes it
-        // a poor signal for the aggregator role. Derive the subnet from the
-        // first set participant in each proof: all participants of a single
-        // SignedAggregatedAttestation come from the same committee subnet (cf.
-        // `computeSubnetId` = validator_index % attestation_committee_count).
-        const committee_count = chain.config.spec.attestation_committee_count;
-        if (committee_count > 0) {
-            for (aggregations) |signed| {
-                const subnet_id = firstParticipantSubnet(signed.proof.participants, committee_count) orelse continue;
-                var label_buf: [16]u8 = undefined;
-                const subnet_label = std.fmt.bufPrint(&label_buf, "{d}", .{subnet_id}) catch continue;
-                zeam_metrics.metrics.zeam_aggregator_publish_aggregations_total.incr(.{ .subnet = subnet_label }) catch {};
-            }
+        if (aggregations.len > 0) {
+            node.publishProducedAggregations(aggregations);
         }
-
-        node.publishProducedAggregations(aggregations);
+        chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
     /// Find the subnet of the first set participant in `participants`.
@@ -4676,23 +4773,45 @@ pub const BeamChain = struct {
 
         // Check 1: our head is behind peer finalization — we don't even have finalized blocks
         if (our_head_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
         if (our_finalized_slot < max_peer_finalized_slot) {
-            return .{ .behind_peers = .{
-                .head_slot = our_head_slot,
-                .finalized_slot = our_finalized_slot,
-                .max_peer_finalized_slot = max_peer_finalized_slot,
-            } };
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
+        }
+
+        // Check 3: pre-finalization devnets — wall-clock head lag means we are
+        // not at chain tip even though finalization gaps are zero (#926).
+        const wall_lag = self.wall_head_lag_slots.load(.monotonic);
+        if (blocks_by_range_sync.isWallHeadLagSyncing(
+            our_finalized_slot,
+            max_peer_finalized_slot,
+            wall_lag,
+            constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
+        )) {
+            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         return .synced;
+    }
+
+    fn behindPeersStatus(
+        self: *Self,
+        head_slot: types.Slot,
+        finalized_slot: types.Slot,
+        max_peer_finalized_slot: types.Slot,
+    ) SyncStatus {
+        _ = self;
+        return .{ .behind_peers = .{
+            .head_slot = head_slot,
+            .finalized_slot = finalized_slot,
+            .max_peer_finalized_slot = max_peer_finalized_slot,
+        } };
+    }
+
+    pub fn setWallHeadLagSlots(self: *Self, lag_slots: u64) void {
+        self.wall_head_lag_slots.store(lag_slots, .monotonic);
     }
 };
 
@@ -4739,8 +4858,8 @@ pub const BlockValidationError = error{
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
-fn initTestThreadPool() !*ThreadPool {
-    return @import("./testing.zig").initTestThreadPool(std.testing.allocator);
+fn setupTestPrimitives() !*ThreadPool {
+    return @import("./testing.zig").setupTestPrimitives(std.testing.allocator);
 }
 
 test "process and add mock blocks into a node's chain" {
@@ -4785,7 +4904,7 @@ test "process and add mock blocks into a node's chain" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
@@ -4877,7 +4996,7 @@ test "printSlot output demonstration" {
     defer test_registry.deinit();
 
     // Initialize the beam chain
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, blk: {
@@ -4960,7 +5079,7 @@ test "buildTreeVisualization integration test" {
     defer test_registry.deinit();
 
     // Initialize the beam chain
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, blk: {
@@ -5057,7 +5176,7 @@ test "attestation validation - comprehensive" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
@@ -5354,7 +5473,7 @@ test "attestation validation - gossip future-slot bound" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
@@ -5483,7 +5602,7 @@ const FutureSlotTestFixture = struct {
         fx.test_registry = try fx.allocator.create(NodeNameRegistry);
         fx.test_registry.* = NodeNameRegistry.init(fx.allocator);
 
-        fx.thread_pool = try initTestThreadPool();
+        fx.thread_pool = try setupTestPrimitives();
 
         fx.beam_chain = try fx.allocator.create(BeamChain);
         fx.beam_chain.* = try BeamChain.init(fx.allocator, ChainOpts{
@@ -5968,7 +6087,7 @@ test "attestation processing - valid block attestation" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
@@ -6073,7 +6192,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
@@ -6213,7 +6332,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
     const test_registry = try allocator.create(NodeNameRegistry);
     test_registry.* = NodeNameRegistry.init(allocator);
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
 
     const beam_chain = try allocator.create(BeamChain);
     beam_chain.* = try BeamChain.init(allocator, ChainOpts{
@@ -6946,7 +7065,7 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -7142,7 +7261,7 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -7309,7 +7428,7 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
         test_registry.* = NodeNameRegistry.init(std.testing.allocator);
         defer test_registry.deinit();
 
-        const thread_pool = try initTestThreadPool();
+        const thread_pool = try setupTestPrimitives();
         defer thread_pool.deinit();
 
         var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -7469,7 +7588,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
         test_registry.* = NodeNameRegistry.init(std.testing.allocator);
         defer test_registry.deinit();
 
-        const thread_pool = try initTestThreadPool();
+        const thread_pool = try setupTestPrimitives();
         defer thread_pool.deinit();
 
         var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -7704,7 +7823,7 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -7930,7 +8049,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -8054,7 +8173,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     registry_2.* = NodeNameRegistry.init(std.testing.allocator);
     defer registry_2.deinit();
 
-    const thread_pool_2 = try initTestThreadPool();
+    const thread_pool_2 = try setupTestPrimitives();
     defer thread_pool_2.deinit();
 
     var beam_chain_off = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -8216,7 +8335,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -8333,7 +8452,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -8444,7 +8563,7 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -8556,7 +8675,7 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
@@ -8659,7 +8778,7 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
     test_registry.* = NodeNameRegistry.init(std.testing.allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try initTestThreadPool();
+    const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{

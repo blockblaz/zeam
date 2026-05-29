@@ -68,6 +68,10 @@ pub const GossipSub = struct {
     publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!bool,
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
+    /// Re-send gossipsub mesh subscriptions (optional; no-op when null).
+    refreshMeshFn: ?*const fn (ptr: *anyopaque) void = null,
+    /// Current gossipsub mesh peer count (optional; zero when null).
+    meshPeerCountFn: ?*const fn (ptr: *anyopaque) u64 = null,
 
     pub fn format(self: GossipSub, writer: anytype) !void {
         _ = self;
@@ -76,6 +80,15 @@ pub const GossipSub = struct {
 
     pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);
+    }
+
+    pub fn refreshMesh(self: GossipSub) void {
+        if (self.refreshMeshFn) |refresh| refresh(self.ptr);
+    }
+
+    pub fn meshPeerCount(self: GossipSub) u64 {
+        if (self.meshPeerCountFn) |count_fn| return count_fn(self.ptr);
+        return 0;
     }
 
     /// Publish a gossip message. Returns `true` if the message was successfully
@@ -94,6 +107,10 @@ pub const ReqResp = struct {
     sendRequestFn: *const fn (ptr: *anyopaque, peer_id: []const u8, req: *const ReqRespRequest, callback: ?OnReqRespResponseCbHandler) anyerror!u64,
     onReqRespRequestFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest, stream: ReqRespServerStream) anyerror!void,
     subscribeFn: *const fn (ptr: *anyopaque, handler: OnReqRespRequestCbHandler) anyerror!void,
+    /// Drop a registered response callback without notifying the handler.
+    /// Used when the node layer finalizes a pending RPC (timeout, completed
+    /// bookkeeping) so a late bridge response cannot invoke a stale callback.
+    cancelInflightRequestFn: *const fn (ptr: *anyopaque, request_id: u64) void,
 
     pub fn subscribe(self: ReqResp, handler: OnReqRespRequestCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, handler);
@@ -101,6 +118,10 @@ pub const ReqResp = struct {
 
     pub fn sendRequest(self: ReqResp, peer_id: []const u8, req: *const ReqRespRequest, callback: ?OnReqRespResponseCbHandler) anyerror!u64 {
         return self.sendRequestFn(self.ptr, peer_id, req, callback);
+    }
+
+    pub fn cancelInflightRequest(self: ReqResp, request_id: u64) void {
+        self.cancelInflightRequestFn(self.ptr, request_id);
     }
 };
 
@@ -715,7 +736,8 @@ pub const ReqRespRequestCallback = struct {
     }
 
     pub fn deinit(self: *ReqRespRequestCallback) void {
-        // peer_id is owned by the callback, free it
+        // peer_id is owned by the callback; handler.ptr references the node and
+        // is not freed here (see BeamNode.getReqRespResponseHandler).
         self.allocator.free(self.peer_id);
     }
 
