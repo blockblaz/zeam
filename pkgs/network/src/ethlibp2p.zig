@@ -18,6 +18,13 @@ const snappyz = @import("snappyz");
 const snappyframesz = @import("snappyframesz");
 const node_registry = @import("./node_registry.zig");
 const NodeNameRegistry = node_registry.NodeNameRegistry;
+// #942 follow-up: publish-side forensic logging includes the build git SHA so
+// receivers across the fleet can correlate broken-byte receipts back to the
+// exact producer binary.
+const build_options = @import("build_options");
+
+// Gossipsub spec message-id domain (matches Rust libp2p-glue / leanSpec).
+const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = .{ 0x01, 0x00, 0x00, 0x00 };
 
 const ServerStreamError = error{
     StreamAlreadyFinished,
@@ -1630,8 +1637,101 @@ pub const EthLibp2p = struct {
 
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
+
+        // #942 publish-side forensic log. If a peer reports
+        // `snappy.error.Corrupt` on bytes whose sha256 matches the
+        // `sha256_compressed` field below, the producer of those bytes is the
+        // node that emitted this line (identified by `git_sha`). Conversely,
+        // if no producer log matches the broken hash, the corruption
+        // originated downstream (forwarder re-encode or wire-level damage).
+        self.emitPublishForensicLog(data, topic_str, message, compressed_message);
+
         self.logger.debug("network-{d}:: publishing to rust bridge data={f} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
         return publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
+    }
+
+    /// Emit a single structured log line capturing the pre-snappy and
+    /// post-snappy hashes of an outbound gossip message plus the spec
+    /// message-id. Intended for cross-fleet log correlation under #942.
+    /// Failures here are swallowed: instrumentation must not block publish.
+    fn emitPublishForensicLog(
+        self: *Self,
+        data: *const interface.GossipMessage,
+        topic_str: [:0]u8,
+        ssz_bytes: []const u8,
+        compressed: []const u8,
+    ) void {
+        // Pre/post-snappy content hashes.
+        var ssz_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(ssz_bytes, &ssz_hash, .{});
+        var compressed_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(compressed, &compressed_hash, .{});
+
+        // Spec gossipsub message_id:
+        //   SHA256(MESSAGE_DOMAIN_VALID_SNAPPY || u64_le(topic_len) || topic || ssz_bytes)[:20]
+        // Mirrors the formula in `rust/libp2p-glue/src/lib.rs` so a producer's
+        // message_id matches what any receiver computes from the same payload.
+        var msg_id_20: [20]u8 = undefined;
+        {
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(&MESSAGE_DOMAIN_VALID_SNAPPY);
+            var topic_len_le: [8]u8 = undefined;
+            const topic_slice: []const u8 = topic_str[0..topic_str.len];
+            std.mem.writeInt(u64, &topic_len_le, @as(u64, topic_slice.len), .little);
+            hasher.update(&topic_len_le);
+            hasher.update(topic_slice);
+            hasher.update(ssz_bytes);
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            @memcpy(&msg_id_20, digest[0..20]);
+        }
+
+        // Self-decode roundtrip: a `false` here means the local snappyz
+        // encoder produced a payload its own decoder rejects — strong signal
+        // that the producer (this binary) is the source of broken-snappy.
+        const self_decoded = snappyz.decodeWithMax(self.allocator, compressed, MAX_GOSSIP_BLOCK_SIZE) catch null;
+        defer if (self_decoded) |d| self.allocator.free(d);
+        const self_decode_ok: bool = if (self_decoded) |d| std.mem.eql(u8, d, ssz_bytes) else false;
+
+        // Per-kind fields. Block root is only meaningful for the block kind;
+        // attestation/aggregation leave it zeroed.
+        var slot: u64 = 0;
+        var proposer: u64 = 0;
+        var block_root: [32]u8 = std.mem.zeroes([32]u8);
+        const kind_label: []const u8 = switch (data.*) {
+            .block => |sb| blk: {
+                slot = sb.block.slot;
+                proposer = sb.block.proposer_index;
+                zeam_utils.hashTreeRoot(types.BeamBlock, sb.block, &block_root, self.allocator) catch {};
+                break :blk "block";
+            },
+            .aggregation => |agg| blk: {
+                slot = agg.data.slot;
+                break :blk "aggregation";
+            },
+            .attestation => |att| blk: {
+                slot = att.message.message.slot;
+                break :blk "attestation";
+            },
+        };
+
+        self.logger.info(
+            "[#942 publish] net={d} kind={s} topic={s} slot={d} proposer={d} block_root={x} sha256_ssz={x} sha256_compressed={x} compressed_len={d} self_decode_ok={any} msg_id={x} git_sha={s} snappy_lib=zig-snappy-0.0.5",
+            .{
+                self.params.networkId,
+                kind_label,
+                topic_str,
+                slot,
+                proposer,
+                &block_root,
+                &ssz_hash,
+                &compressed_hash,
+                compressed.len,
+                self_decode_ok,
+                &msg_id_20,
+                build_options.version,
+            },
+        );
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
