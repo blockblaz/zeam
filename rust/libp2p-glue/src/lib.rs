@@ -762,7 +762,27 @@ unsafe fn create_and_run_network_inner(
 
     release_params();
 
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    // #942: run the libp2p/quinn stack on a multi-threaded tokio runtime.
+    //
+    // Previously this was `new_current_thread()`, which drove BOTH the swarm
+    // future (which calls the spec-mandated synchronous snappy decompress
+    // inside `message_id_fn`) AND quinn's UDP endpoint-driver task on a single
+    // thread. A 3.3MB block decompressing for hundreds of ms therefore starved
+    // quinn's receive path mid-reassembly -> the cross-copy byte-bleed
+    // corruption that only zeam exhibited. The healthy rust-libp2p clients
+    // (grandine/ream) run multi-threaded executors, so quinn keeps draining the
+    // socket on another worker while the swarm thread decompresses.
+    //
+    // Safe now that inbound gossip dispatch is on a dedicated worker thread
+    // (run_inbound_gossip_worker) which preserves serial onGossip ordering
+    // regardless of tokio flavor. 2 workers suffice: one runs the block_on'd
+    // event loop, the other keeps the quinn endpoint driver live. Kept low to
+    // avoid oversubscribing the box's rayon/chain-worker/libxev threads.
+    let rt = Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
 
     rt.block_on(async move {
         let mut p2p_net = Network::new(network_id, zig_handler);
