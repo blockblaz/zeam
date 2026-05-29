@@ -161,6 +161,11 @@ pub fn build(b: *Builder) !void {
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
     // Absolute path to test-keys for pre-generated validator keys
     build_options.addOption([]const u8, "test_keys_path", b.pathFromRoot("test-keys/hash-sig-keys"));
+    // Test/sim-only override for SECONDS_PER_SLOT (default: preset value). Widens the slot so the
+    // real XMSS Type-2 merge fits within a slot on weak CI CPU (e.g. `zig build simtest
+    // -Dseconds-per-slot=12`); prod builds omit it and use the preset's 4s. See pkgs/params/src/lib.zig.
+    const seconds_per_slot_override = b.option(u64, "seconds-per-slot", "Override SECONDS_PER_SLOT (test/sim only; default = preset 4s)");
+    build_options.addOption(?u64, "seconds_per_slot_override", seconds_per_slot_override);
     const build_options_module = build_options.createModule();
 
     // add zeam-utils
@@ -179,6 +184,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
+    zeam_params.addImport("build_options", build_options_module);
 
     // add zeam-metrics (core metrics definitions)
     const zeam_metrics = b.addModule("@zeam/metrics", .{
@@ -581,6 +587,9 @@ pub fn build(b: *Builder) !void {
     const integration_build_options_module = integration_build_options.createModule();
     cli_integration_tests.root_module.addImport("build_options", integration_build_options_module);
     cli_integration_tests.root_module.addImport("@zeam/utils", zeam_utils);
+    // @zeam/params so the harness can scale its chain-progress deadlines by SECONDS_PER_SLOT
+    // (a -Dseconds-per-slot override widens the slot, so the wall-clock waits must widen too).
+    cli_integration_tests.root_module.addImport("@zeam/params", zeam_params);
 
     // Add CLI constants module to integration tests
     const cli_constants = b.addModule("cli_constants", .{

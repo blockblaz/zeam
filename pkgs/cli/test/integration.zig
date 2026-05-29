@@ -2,6 +2,7 @@ const std = @import("std");
 const process = std.process;
 const net = std.Io.net;
 const zeam_utils = @import("@zeam/utils");
+const params = @import("@zeam/params");
 const build_options = @import("build_options");
 const constants = @import("cli_constants");
 const error_handler = @import("error_handler");
@@ -633,7 +634,9 @@ test "admin aggregator endpoint - GET returns seed, POST toggles at runtime" {
     // The API server comes up before the chain is wired in (503 until
     // `setChain` is called inside main.zig after validator key generation).
     // Poll until the chain is ready, then assert the baseline.
-    const chain_ready_deadline_ms: i64 = 60_000;
+    // Scales with slot time: a -Dseconds-per-slot override widens the slot, so first-block / chain
+    // readiness takes proportionally longer in wall-clock (60s at 4s slots, 180s at 12s).
+    const chain_ready_deadline_ms: i64 = 60_000 * @as(i64, @intCast(params.SECONDS_PER_SLOT)) / 4;
     const poll_start = zeam_utils.unixTimestampMillis();
     var get_before = try zeam_request.getAggregator();
     while (get_before.status != .ok) {
@@ -717,7 +720,9 @@ test "SSE events integration test - wait for justification and finalization" {
     //   - node3 emits its own new_finalization, or
     //   - global finalization advances beyond the first finalized slot, or
     //   - new_head events keep arriving after node3's delayed start (chain still progressing).
-    const timeout_ms: u64 = 480000; // 480 seconds timeout
+    // Scales with slot time (480s at the 4s preset, 1440s at -Dseconds-per-slot=12). The loop exits
+    // as soon as justification+finalization+node3-sync are observed, so this is just a headroom cap.
+    const timeout_ms: u64 = 480000 * params.SECONDS_PER_SLOT / 4;
     const start_ns = zeam_utils.monotonicTimestampNs();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
