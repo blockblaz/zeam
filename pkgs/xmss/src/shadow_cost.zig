@@ -12,14 +12,18 @@ pub fn computeDelayNs(rate: ?f64, n: usize) u64 {
     return @intFromFloat(ns);
 }
 
-// Resolved shadow sim-cost rates (signatures/second). null = feature off (no sleep).
+// Resolved shadow sim-cost rates (per-second; unit varies per rate — see each). null = feature off (no sleep).
 // Set once at node startup by `init`; reads are lock-free because `init` runs before
 // any aggregation worker thread is spawned and the values are read-only thereafter.
 var agg_rate: ?f64 = null;
 var verify_rate: ?f64 = null;
+// merge_rate's unit is components/second (n = Type-1 components merged into one Type-2),
+// not signatures/second — see mergeDelayNs.
+var merge_rate: ?f64 = null;
 
 const ENV_AGG = "ZEAM_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE";
 const ENV_VERIFY = "ZEAM_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE";
+const ENV_MERGE = "ZEAM_SHADOW_XMSS_MERGE_RATE";
 
 // Zig 0.16 removed `std.process.getEnvVarOwned`; use libc `getenv` for a simple
 // process-env read (no allocation, no free). Returns null when unset/unparseable.
@@ -30,9 +34,10 @@ fn readEnvRate(key: [*:0]const u8) ?f64 {
 
 /// Resolve the shadow sim-cost rates. Precedence: CLI flag (non-null) > env var > off.
 /// Call exactly once at node startup, before aggregation begins.
-pub fn init(cli_agg: ?f64, cli_verify: ?f64) void {
+pub fn init(cli_agg: ?f64, cli_verify: ?f64, cli_merge: ?f64) void {
     agg_rate = cli_agg orelse readEnvRate(ENV_AGG);
     verify_rate = cli_verify orelse readEnvRate(ENV_VERIFY);
+    merge_rate = cli_merge orelse readEnvRate(ENV_MERGE);
 }
 
 /// Nanoseconds to sleep to model aggregating `n` raw signatures.
@@ -43,6 +48,11 @@ pub fn aggregateDelayNs(n: usize) u64 {
 /// Nanoseconds to sleep to model verifying an aggregate over `n` public keys.
 pub fn verifyDelayNs(n: usize) u64 {
     return computeDelayNs(verify_rate, n);
+}
+
+/// Nanoseconds to sleep to model merging `n` Type-1 components into one Type-2 proof.
+pub fn mergeDelayNs(n: usize) u64 {
+    return computeDelayNs(merge_rate, n);
 }
 
 // --- Mock block proof (honest-sim integration tests) ------------------------------------------
@@ -97,4 +107,23 @@ test "computeDelayNs: proportional to n / rate (qlean default rate)" {
     const ns = computeDelayNs(22.704, 100);
     try std.testing.expect(ns > 4_400_000_000);
     try std.testing.expect(ns < 4_410_000_000);
+}
+
+test "mergeDelayNs: reads merge_rate set by init; proportional to n / rate" {
+    // The CLI arg (non-null) wins over the env per init's precedence, so this is
+    // deterministic regardless of any ZEAM_SHADOW_XMSS_MERGE_RATE in the environment.
+    init(null, null, 22.704);
+    // 100 components / 22.704 per-sec = 4.40451... s ~= 4_404_510_000 ns
+    const ns = mergeDelayNs(100);
+    try std.testing.expect(ns > 4_400_000_000);
+    try std.testing.expect(ns < 4_410_000_000);
+}
+
+test "mergeDelayNs: off when merge_rate <= 0; zero when n == 0" {
+    init(null, null, 0);
+    try std.testing.expectEqual(@as(u64, 0), mergeDelayNs(100));
+    init(null, null, -5.0);
+    try std.testing.expectEqual(@as(u64, 0), mergeDelayNs(100));
+    init(null, null, 22.704);
+    try std.testing.expectEqual(@as(u64, 0), mergeDelayNs(0));
 }

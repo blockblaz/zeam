@@ -76,6 +76,7 @@ pub const NodeCommand = struct {
     @"aggregate-subnet-ids": ?[]const u8 = null,
     @"shadow-xmss-aggregate-signatures-rate": ?f64 = null,
     @"shadow-xmss-verify-aggregated-signatures-rate": ?f64 = null,
+    @"shadow-xmss-merge-rate": ?f64 = null,
     @"db-backend": database.Backend = .rocksdb,
     @"chain-spec": ?[]const u8 = null,
     /// Slice c-2b commit 3 of #803: route producer-side gossip
@@ -123,6 +124,7 @@ pub const NodeCommand = struct {
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .@"shadow-xmss-aggregate-signatures-rate" = "Shadow sim only: signatures aggregated per second; injects sleep = n/rate into aggregation so CPU cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE",
         .@"shadow-xmss-verify-aggregated-signatures-rate" = "Shadow sim only: signatures verified per second inside an aggregate; injects sleep = n/rate into verification. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE",
+        .@"shadow-xmss-merge-rate" = "Shadow sim only: Type-1 components merged into a Type-2 per second; injects sleep = n/rate into the proposal Type-2 merge so block-building cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_MERGE_RATE",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
@@ -839,6 +841,7 @@ fn mainInner(init: std.process.Init) !void {
             xmss.shadow_cost.init(
                 leancmd.@"shadow-xmss-aggregate-signatures-rate",
                 leancmd.@"shadow-xmss-verify-aggregated-signatures-rate",
+                leancmd.@"shadow-xmss-merge-rate",
             );
             std.Io.Dir.cwd().createDirPath(init.io, leancmd.@"data-dir") catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "create data directory", .{ .path = leancmd.@"data-dir" });
