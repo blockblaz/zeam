@@ -160,6 +160,13 @@ fn appendAll(out: *ByteList512KiB, buf: []const u8) AggregationError!void {
     for (buf) |b| out.append(b) catch return AggregationError.ProofTooLarge;
 }
 
+// Mock-block-proof placeholders (see shadow_cost.mockBlockProofEnabled). When the feature is on,
+// the recursive-STARK FFI is skipped and these opaque markers stand in for the real proof bytes.
+// Consensus never inspects proof bytes (it runs on AggregationBits / AttestationData), and the
+// mock verify accepts any bytes, so the marker content only needs to be a valid (small) ByteList.
+const MOCK_TYPE1_PROOF = "ZEAM-MOCK-TYPE1-PROOF";
+const MOCK_TYPE2_PROOF = "ZEAM-MOCK-TYPE2-PROOF";
+
 /// Aggregate raw XMSS signatures and child Type-1 proofs into a single Type-1 proof.
 ///
 /// - `raw_pks`/`raw_sigs`: parallel raw public-key + signature handles (must be equal length).
@@ -179,6 +186,13 @@ pub fn aggregateType1(
 ) AggregationError!void {
     if (raw_pks.len != raw_sigs.len) return AggregationError.PublicKeysSignatureLengthMismatch;
     if (children_pks.len != children_proofs.len) return AggregationError.Type1AggregateFailed;
+
+    // Mock mode: skip the recursive-STARK prove, emit a placeholder Type-1. Instant (the proposal
+    // block-building budget is modeled by the merge delay, not here). See shadow_cost.
+    if (shadow_cost.mockBlockProofEnabled()) {
+        try appendAll(out, MOCK_TYPE1_PROOF);
+        return;
+    }
 
     try ensureProverReady();
 
@@ -263,6 +277,11 @@ pub fn verifyType1(
     slot: u32,
     proof: *const ByteList512KiB,
 ) AggregationError!void {
+    // Mock mode: placeholder Type-1s carry no real signature; accept so they enter the aggregate
+    // pool and contribute coverage (consensus runs on AttestationData, not proof bytes). Without
+    // this the placeholders are dropped here → coverage=none → no justification. All-zeam only.
+    if (shadow_cost.mockBlockProofEnabled()) return;
+
     try setupVerifier();
     const wire = proof.constSlice();
     const ok = xmss_verify_type_1(pks.ptr, pks.len, message_hash, slot, wire.ptr, wire.len);
@@ -290,6 +309,16 @@ pub fn mergeType1ToType2(
 ) AggregationError!void {
     if (parts.len != pks_per_part.len) return AggregationError.Type2MergeFailed;
     if (parts.len == 0) return AggregationError.Type2MergeFailed;
+
+    // Mock mode: this is the proposal block-building bottleneck. Skip the multi-second recursive
+    // STARK, emit a placeholder Type-2, and sleep the configured (default 400ms) budget so the
+    // proposal block-building time is a deterministic, under-slot value. See shadow_cost.
+    if (shadow_cost.mockBlockProofEnabled()) {
+        try appendAll(out, MOCK_TYPE2_PROOF);
+        const delay_ns = shadow_cost.mockBlockProofDelayNs();
+        if (delay_ns != 0) zeam_utils.sleepNs(delay_ns);
+        return;
+    }
 
     try ensureProverReady();
 
@@ -355,6 +384,13 @@ pub fn splitType2ByMessage(
     log_inv_rate: usize,
     out: *ByteList512KiB,
 ) AggregationError!void {
+    // Mock mode: emit a placeholder recovered Type-1 (deconstruction is gated/rare; recovered
+    // placeholders re-enter the pool and are re-merged/verified by the same mock). See shadow_cost.
+    if (shadow_cost.mockBlockProofEnabled()) {
+        try appendAll(out, MOCK_TYPE1_PROOF);
+        return;
+    }
+
     try ensureProverReady();
 
     const allocator = std.heap.c_allocator;
@@ -411,6 +447,11 @@ pub fn verifyType2(
 ) AggregationError!void {
     if (pks_per_message.len != messages.len) return AggregationError.Type2VerifyFailed;
     if (messages.len == 0) return AggregationError.Type2VerifyFailed;
+
+    // Mock mode: placeholder proofs carry no real signature; accept. Consensus correctness is
+    // unaffected (it runs on AttestationData, not proof bytes); the structural checks above
+    // (count, non-empty) still run. All-zeam only. See shadow_cost.
+    if (shadow_cost.mockBlockProofEnabled()) return;
 
     try setupVerifier();
 

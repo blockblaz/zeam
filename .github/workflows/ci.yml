@@ -407,6 +407,14 @@ jobs:
         exit 1
 
     - name: Run all sim tests
+      # simtest validates consensus / networking / finalization, not prover throughput. On CI's
+      # weak CPU the real multi-second XMSS Type-2 merge overruns the 4s slot, so blocks publish
+      # late and the chain can't bootstrap → timeout. Mock the proposal block-building time to a
+      # fixed sub-slot value (default 400ms) via ZEAM_MOCK_BLOCK_PROOF so simtest finalizes
+      # deterministically. Real proving is covered by the unit tests, build-all-provers, and
+      # spectest. All-zeam sim, so the placeholder proofs are self-consistent.
+      env:
+        ZEAM_MOCK_BLOCK_PROOF: "1"
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do

@@ -45,6 +45,43 @@ pub fn verifyDelayNs(n: usize) u64 {
     return computeDelayNs(verify_rate, n);
 }
 
+// --- Mock block proof (honest-sim integration tests) ------------------------------------------
+//
+// DISTINCT from the ZEAM_SHADOW_XMSS_*_RATE knobs above: those run the REAL prover and ADD a
+// modeled sleep to SIMULATE prod CPU cost (used by the shadow network simulator). This one does
+// the opposite — it REPLACES the XMSS recursive-STARK prove/verify FFI (Type-1 aggregate/verify,
+// Type-2 merge/verify/split) with fast placeholders + a fixed merge delay, so the validator
+// proposal block-building time is bounded well under the slot regardless of CPU.
+//
+// Purpose: let an ALL-HONEST-ZEAM integration test (simtest) exercise CONSENSUS (fork choice,
+// justification, finalization — all driven by AttestationData + AggregationBits, NEVER the proof
+// bytes) without the real multi-second merge blowing the slot budget on weak CI hardware. Real
+// proving is covered by the unit tests, build-all-provers, and spectest. ALL-honest-zeam ONLY:
+// the mock verify accepts ANY bytes (skips signature authentication), which is observably
+// equivalent to real proving only when every participant is honest — so it must NEVER be enabled
+// in mixed-client interop or production.
+
+const ENV_MOCK_BLOCK_PROOF = "ZEAM_MOCK_BLOCK_PROOF";
+const ENV_MOCK_BLOCK_PROOF_DELAY_MS = "ZEAM_MOCK_BLOCK_PROOF_DELAY_MS";
+const DEFAULT_MOCK_BLOCK_PROOF_DELAY_MS: u64 = 400;
+
+/// True when the mock-block-proof feature is enabled via env. Read lazily (no init dependency) so
+/// it works for any launch path (simtest spawns inherit the env; lean-quickstart exports it).
+pub fn mockBlockProofEnabled() bool {
+    const raw = std.c.getenv(ENV_MOCK_BLOCK_PROOF) orelse return false;
+    const v = std.mem.span(raw);
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+}
+
+/// Nanoseconds to sleep inside the mocked Type-2 merge to model a realistic but under-slot
+/// proposal block-building time. Default 400ms; override via ZEAM_MOCK_BLOCK_PROOF_DELAY_MS.
+pub fn mockBlockProofDelayNs() u64 {
+    const raw = std.c.getenv(ENV_MOCK_BLOCK_PROOF_DELAY_MS) orelse
+        return DEFAULT_MOCK_BLOCK_PROOF_DELAY_MS * std.time.ns_per_ms;
+    const ms = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch DEFAULT_MOCK_BLOCK_PROOF_DELAY_MS;
+    return ms * std.time.ns_per_ms;
+}
+
 test "computeDelayNs: off when rate missing or non-positive" {
     try std.testing.expectEqual(@as(u64, 0), computeDelayNs(null, 100));
     try std.testing.expectEqual(@as(u64, 0), computeDelayNs(0, 100));
