@@ -1344,6 +1344,16 @@ fn downloadAndStoreCheckpointBlock(
     };
     defer batch.deinit();
     batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, ssz_data.items);
+    // Also index the checkpoint block in the finalized slot index so that
+    // blocks_by_range can serve it.  Without this, `onReqRespRequest`'s
+    // finalized-range path (slot <= finalized_slot) finds no entry in
+    // DbFinalizedSlotsNamespace and the unfinalized-range walk is skipped
+    // (its guard is `end_slot_exclusive > finalized_slot + 1`, which is false
+    // when start_slot == finalized_slot == checkpoint_slot).  The result is an
+    // empty blocks_by_range response for the checkpoint slot even though the
+    // block is present in DbBlocksNamespace and is served correctly via
+    // blocks_by_root.
+    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, block.block.slot, expected_root);
     db.commit(&batch) catch |err| {
         logger.warn("checkpoint block fetch: DB commit failed: {}", .{err});
         return;
