@@ -2293,6 +2293,33 @@ pub const ForkChoice = struct {
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
         zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
 
+        // #942 observability: emit a one-line summary per committed aggregate
+        // so operators can see *what* the aggregator just published from
+        // structured logs alone (counterpart to the gossip-decode-failure
+        // preview added on the ingress side). Fields chosen to be cheap and
+        // diagnostic: validator count in the aggregate (`attestations`),
+        // attestation slot (`slot`), and the first 8 hex chars of the head /
+        // target / source roots so the same aggregate can be cross-referenced
+        // against block-import logs without dumping full 32-byte roots on
+        // every line. Logged at info — one line per committed aggregate
+        // matches the existing `agg start slot=...` line above and stays
+        // well under typical log-volume budgets at devnet committee sizes.
+        const head_short = att_data.head.root[0..4];
+        const target_short = att_data.target.root[0..4];
+        const source_short = att_data.source.root[0..4];
+        self.logger.info(
+            "aggregated {d} attestations slot={d} head=0x{x}.. target_slot={d} target=0x{x}.. source_slot={d} source=0x{x}..",
+            .{
+                participant_count,
+                att_data.slot,
+                head_short,
+                att_data.target.slot,
+                target_short,
+                att_data.source.slot,
+                source_short,
+            },
+        );
+
         var publish_proof: types.AggregatedSignatureProof = undefined;
         try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &publish_proof, self.allocator);
         return .{ .data = att_data, .proof = publish_proof };

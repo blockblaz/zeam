@@ -74,6 +74,8 @@ pub const NodeCommand = struct {
     @"is-aggregator": bool = false,
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
+    @"shadow-xmss-aggregate-signatures-rate": ?f64 = null,
+    @"shadow-xmss-verify-aggregated-signatures-rate": ?f64 = null,
     @"db-backend": database.Backend = .rocksdb,
     @"chain-spec": ?[]const u8 = null,
     /// Slice c-2b commit 3 of #803: route producer-side gossip
@@ -129,6 +131,8 @@ pub const NodeCommand = struct {
         .@"is-aggregator" = "Seed the node's aggregator role on startup. The role can be toggled at runtime via POST /lean/v0/admin/aggregator.",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
+        .@"shadow-xmss-aggregate-signatures-rate" = "Shadow sim only: signatures aggregated per second; injects sleep = n/rate into aggregation so CPU cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE",
+        .@"shadow-xmss-verify-aggregated-signatures-rate" = "Shadow sim only: signatures verified per second inside an aggregate; injects sleep = n/rate into verification. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
@@ -841,6 +845,12 @@ fn mainInner(init: std.process.Init) !void {
             },
         },
         .node => |leancmd| {
+            // Shadow sim-cost: resolve aggregation delay rates (CLI flag > env var > off)
+            // once, before any aggregation worker runs.
+            xmss.shadow_cost.init(
+                leancmd.@"shadow-xmss-aggregate-signatures-rate",
+                leancmd.@"shadow-xmss-verify-aggregated-signatures-rate",
+            );
             std.Io.Dir.cwd().createDirPath(init.io, leancmd.@"data-dir") catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "create data directory", .{ .path = leancmd.@"data-dir" });
                 return err;
