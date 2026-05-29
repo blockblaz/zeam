@@ -44,6 +44,9 @@ const SampleBitlist16 = ssz.utils.Bitlist(16);
 const SampleBytes32List8 = ssz.utils.List([32]u8, 8);
 const SampleUint32List16 = ssz.utils.List(u32, 16);
 const ByteListMiB = xmss.ByteListMiB;
+// devnet5 (leanSpec #717) renamed the proof-bytes list to ByteList512KiB; it is the
+// same Zig type as ByteListMiB (aliased in xmss), but spec fixtures key on the new name.
+const ByteList512KiB = xmss.ByteList512KiB;
 
 // Boundary fixture types (leanSpec test_merkleization_boundaries) — exercise
 // the bit-packed encoding at exactly chunk boundaries and at the byte/bit
@@ -182,6 +185,10 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "SampleBytes32List8", .zig_type = SampleBytes32List8, .has_deinit = true },
     .{ .name = "SampleUint32List16", .zig_type = SampleUint32List16, .has_deinit = true },
     .{ .name = "ByteListMiB", .zig_type = ByteListMiB, .has_deinit = true },
+    .{ .name = "ByteList512KiB", .zig_type = ByteList512KiB, .has_deinit = true },
+    // devnet5 (#717) XMSS aggregation containers — exercised by ssz test_xmss_containers fixtures.
+    .{ .name = "TypeOneMultiSignature", .zig_type = types.TypeOneMultiSignature, .has_deinit = true },
+    .{ .name = "TypeTwoMultiSignature", .zig_type = types.TypeTwoMultiSignature, .has_deinit = true },
     // Merkleization-boundary fixtures (leanSpec PR #646).
     .{ .name = "BoundaryBitvector1", .zig_type = BoundaryBitvector1, .has_deinit = false },
     .{ .name = "BoundaryBitvector7", .zig_type = BoundaryBitvector7, .has_deinit = false },
