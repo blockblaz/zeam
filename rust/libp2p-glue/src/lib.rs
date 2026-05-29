@@ -313,6 +313,30 @@ const INBOUND_GOSSIP_CHANNEL_CAPACITY: usize = 256;
 /// was full (issue #942). Process-wide; surfaced in logs at the drop site.
 static INBOUND_GOSSIP_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// #942 diagnosis: count of gossipsub `Message` events DELIVERED to the swarm
+/// event loop, split by topic kind ([0]=block, [1]=attestation/aggregation,
+/// [2]=other). This counts messages gossipsub handed up *before* our decode
+/// worker runs, so comparing the block vs attestation arrival rates across the
+/// stall tells us whether BLOCK gossip stops ARRIVING (a transport/mesh fault,
+/// e.g. QUIC recv-stream wedge or block-topic mesh collapse) or keeps arriving
+/// but fails downstream in decode. A periodic event-loop log prints the totals
+/// alongside the per-topic mesh size so a frozen block counter with a healthy
+/// mesh is immediately visible. Process-wide (one zeam node = one network).
+static GOSSIP_RECV_BY_KIND_TOTAL: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Classify a gossipsub topic string into a `GOSSIP_RECV_BY_KIND_TOTAL` index.
+/// Topics are Ethereum-style `/leanconsensus/<fork>/<kind>/ssz_snappy`.
+fn gossip_topic_kind_index(topic: &str) -> usize {
+    if topic.contains("/block") {
+        0
+    } else if topic.contains("agg") || topic.contains("attest") {
+        1
+    } else {
+        2
+    }
+}
+
 /// One inbound gossip message handed from the libp2p event loop to the decode
 /// worker thread. Owns every buffer the FFI call reads so the raw pointers
 /// passed into Zig stay valid while the call runs off the event-loop thread.
@@ -1540,6 +1564,11 @@ impl Network {
             .spawn(move || run_inbound_gossip_worker(gossip_rx))
             .expect("failed to spawn inbound gossip decode worker thread");
 
+        // #942 diagnosis: throttle the per-kind gossip-arrival summary to roughly
+        // every 10th mesh_peers tick (~10s) so the log shows the block/attestation
+        // delivery trend without flooding.
+        let mut diag_tick_count: u64 = 0;
+
         'eventloop: loop {
             tokio::select! {
             biased;
@@ -1925,6 +1954,12 @@ impl Network {
                                 // the payload to the decode worker thread; the
                                 // ingress sha256 forensic log moved there too.
                                 let topic_str = message.topic.as_str();
+                                // #942 diagnosis: count this DELIVERED message by
+                                // topic kind before any decode work, so the
+                                // periodic log can show whether block-topic
+                                // delivery has gone silent while the mesh is up.
+                                GOSSIP_RECV_BY_KIND_TOTAL[gossip_topic_kind_index(topic_str)]
+                                    .fetch_add(1, Ordering::Relaxed);
                                 let topic = match CString::new(topic_str) {
                                     Ok(cstr) => cstr,
                                     Err(_) => {
@@ -2304,6 +2339,36 @@ impl Network {
             _ = mesh_peers_tick.tick() => {
                 let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
                 record_mesh_peers(self.network_id, mesh_count);
+
+                // #942 diagnosis: every ~10s, log the per-topic-kind count of
+                // gossipsub Messages delivered so far plus the per-topic mesh
+                // size. If the block counter stops climbing while the block
+                // topic still has mesh peers, blocks have stopped ARRIVING
+                // (transport/mesh fault) rather than failing to decode.
+                diag_tick_count = diag_tick_count.wrapping_add(1);
+                if diag_tick_count % 10 == 0 {
+                    let block_recv = GOSSIP_RECV_BY_KIND_TOTAL[0].load(Ordering::Relaxed);
+                    let attn_recv = GOSSIP_RECV_BY_KIND_TOTAL[1].load(Ordering::Relaxed);
+                    let other_recv = GOSSIP_RECV_BY_KIND_TOTAL[2].load(Ordering::Relaxed);
+                    let gs = &swarm.behaviour().gossipsub;
+                    let mut topic_mesh = String::new();
+                    for topic in gs.topics() {
+                        let n = gs.mesh_peers(topic).count();
+                        let label = match gossip_topic_kind_index(&topic.to_string()) {
+                            0 => "block",
+                            1 => "attn",
+                            _ => "other",
+                        };
+                        topic_mesh.push_str(&format!(" {label}={n}"));
+                    }
+                    logger::rustLogger.info(
+                        self.network_id,
+                        &format!(
+                            "[#942 gossip-recv] delivered_total block={block_recv} attn={attn_recv} other={other_recv} | mesh_peers total={mesh_count}{topic_mesh} | inbound_decode_dropped={}",
+                            INBOUND_GOSSIP_DROPPED_TOTAL.load(Ordering::Relaxed),
+                        ),
+                    );
+                }
             }
 
             }
