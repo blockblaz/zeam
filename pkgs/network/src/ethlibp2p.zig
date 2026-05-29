@@ -424,8 +424,14 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
 /// disk with one debug file per message (PR #855 review #5). We only persist
 /// `1` of every `MALFORMED_DUMP_SAMPLE_RATE` rejections; the rest are logged
 /// inline. The counter is process-local and racy across threads, which is
-/// fine — the goal is *not* exact 1:1024 sampling, just bounded disk pressure.
-const MALFORMED_DUMP_SAMPLE_RATE: usize = 1024;
+/// fine — the goal is *not* exact 1:N sampling, just bounded disk pressure.
+///
+/// Lowered 1024 → 32 for the #942 in-transit-corruption investigation
+/// (2026-05-29 devnet). Worst-case observed failure rate was ~30 dumps/min
+/// on a single node, at <300 KB per dump → ~9 MB/min on disk, bounded by
+/// the rolling `deserialization_dumps/` cleanup in the ops playbook.
+/// Restore to 1024 once the libp2p-layer corruption is fixed (issue #942).
+const MALFORMED_DUMP_SAMPLE_RATE: usize = 32;
 var malformed_dump_counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
 /// Returns true iff the caller should persist this malformed message to disk.
@@ -601,11 +607,22 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         // #942: inline first-bytes preview + per-failure counter so a stalled
         // zeam fleet shows up on dashboards (`zeam_gossip_decode_failures_total`)
         // and the framing format on the wire is diagnosable from logs alone.
+        //
+        // #942 producer attribution: sha256(compressed) of the inbound bytes
+        // is the byte-exact fingerprint to look up against the publish-side
+        // `[#942 publish]` log line's `sha256_compressed`. Length alone has
+        // been observed to collide (devnet 2026-05-29 dump showed length
+        // 284553 match between ethlambda publish and zeam_8 inbound, but
+        // sha256 differed — proving in-transit byte mutation rather than
+        // codec interop bug). Adding the hash lets correlation become a
+        // single fleet-wide grep.
         const preview = byteHexPreview(message_bytes, GOSSIP_PREVIEW_MAX_BYTES);
         const preview_bytes = @min(message_bytes.len, GOSSIP_PREVIEW_MAX_BYTES);
+        var inbound_sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(message_bytes, &inbound_sha256, .{});
         zigHandler.logger.err(
-            "Error in snappyz decoding the message for topic={s} (len={d}) from peer={s}: {any}; first{d}={s}",
-            .{ topic_slice, message_bytes.len, sender_peer_id_slice, e, preview_bytes, preview.slice() },
+            "Error in snappyz decoding the message for topic={s} (len={d}) sha256_inbound={x} from peer={s}: {any}; first{d}={s}",
+            .{ topic_slice, message_bytes.len, &inbound_sha256, sender_peer_id_slice, e, preview_bytes, preview.slice() },
         );
         zeam_metrics.incrGossipDecodeFailure(topic_kind_label, "snappy_decode");
         if (shouldPersistMalformedDump()) {
@@ -2173,6 +2190,32 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
         MAX_GOSSIP_BLOCK_SIZE,
     );
     try std.testing.expectEqual(@as(usize, MAX_GOSSIP_BLOCK_SIZE), at_limit_ok.value);
+}
+
+test "issue_942 inbound corruption: real on-the-wire bytes captured from devnet must surface as error.Corrupt" {
+    // Captured 2026-05-29 from zeam_8 (root@77.42.121.211) during devnet run
+    // with PR #953 deployed. The byte stream arrived at zeam_8's gossipsub
+    // ingress with `compressed_len=284553` (matching ethlambda_8's slot-1
+    // block publish at 18:18:19.929 UTC, length 284553) but with a DIFFERENT
+    // sha256 than ethlambda's published `compressed_sha256=0c83964d…`.
+    //
+    // sha256(this file) = c8700b167c3550add606cdef67ab385d061165c141fd76718bc2a35ff13a496e
+    //
+    // Cross-checked locally: `rust-snap 1.1.1` (the exact same crate version
+    // ethlambda, ream, and grandine all use) also fails to decode these
+    // bytes with `Offset { offset: 2265232849, dst_pos: 98776 }`. That rules
+    // out a zig-snappy ↔ rust-snap interop bug and pins the corruption to
+    // somewhere between ethlambda's publish and zeam_8's receive — almost
+    // certainly inside the libp2p framing / muxer layer (echoes #39 +
+    // ruled out by #37 for mplex specifically).
+    //
+    // Locking the symptom in as a test means any future "fix" to snappyz
+    // that starts accepting these mangled bytes goes through a deliberate
+    // code review rather than silently masking the upstream transport bug.
+    const corrupt = @embedFile("testdata_issue_942_inbound_corrupt.bin");
+    try std.testing.expectEqual(@as(usize, 284553), corrupt.len);
+    const result = snappyz.decodeWithMax(std.testing.allocator, corrupt, MAX_GOSSIP_BLOCK_SIZE);
+    try std.testing.expectError(error.Corrupt, result);
 }
 
 test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic" {

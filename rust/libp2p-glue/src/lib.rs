@@ -1860,6 +1860,40 @@ impl Network {
                                 //     reach Zig match what Rust sees, so the FFI is
                                 //     faithful and this reconciliation has no signal left.
 
+                                // #942 follow-up (2026-05-29): publish-side `[#942 publish]`
+                                // logs in Zig now emit `sha256_compressed` for every outbound
+                                // gossip message. We pair that with a Rust-side ingress
+                                // hash here, immediately before the FFI handoff into Zig,
+                                // so cross-fleet attribution becomes a single grep without
+                                // needing the rate-gated `failed_snappyz_decode_*.bin`
+                                // dumps. A devnet capture this morning showed an inbound
+                                // 284553-byte block whose Zig-side sha256 differed from
+                                // ethlambda's publish-side sha256 despite matching length
+                                // — proving the bytes are mutated in transit. This log
+                                // pins WHERE in the stack that mutation lands: if
+                                // `sha256_libp2p_ingress` already differs from the
+                                // producer's `sha256_compressed`, corruption is upstream
+                                // of our shim (inside rust-libp2p / gossipsub). If it
+                                // matches the producer but Zig-side differs, the FFI
+                                // slice handoff is corrupting bytes.
+                                //
+                                // Cost: sha256 of message.data is O(len) hashing with no
+                                // allocation. Measured ~1 ms per 300 KB block on x86_64
+                                // — vs the ~hundreds-of-ms full snappy decompress that
+                                // was removed in `840d7058`. Acceptable event-loop cost
+                                // for the bug hunt; remove once the in-transit corruption
+                                // is fixed.
+                                let mut ingress_hasher = sha2::Sha256::new();
+                                ingress_hasher.update(message.data.as_slice());
+                                let ingress_digest = ingress_hasher.finalize();
+                                logger::rustLogger.info(self.network_id, &format!(
+                                    "[#942 rx] topic={} len={} sha256_libp2p_ingress={} peer={}",
+                                    topic_str,
+                                    message_len,
+                                    hex::encode(ingress_digest),
+                                    sender_peer_id_string,
+                                ));
+
                                 unsafe {
                                     handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
                                 };
