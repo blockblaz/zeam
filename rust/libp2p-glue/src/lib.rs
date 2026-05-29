@@ -1904,46 +1904,63 @@ impl Network {
                                     }
                                 };
 
-                                // #942 diagnostic: log the first 32 bytes of `message.data`
-                                // as gossipsub delivered it, IMMEDIATELY before the FFI handoff
-                                // to `handleMsgFromRustBridge`. The Zig side already logs
-                                // `first32=...` from inside the snappy-decode error path
-                                // (PR #945). If the two previews match exactly, the FFI is
-                                // faithful and any decode failure originates upstream of the
-                                // bridge (peer publish or gossipsub itself). If they differ,
-                                // there is a slice / pointer bug in the bridge handoff.
-                                //
-                                // Also report whether `snap::raw::Decoder` can decode the
-                                // payload at the Rust side (same crate ethlambda uses
-                                // successfully). A mismatch between Rust-side decode result
-                                // and Zig-side `snappyz.decodeWithMax` would indicate the
-                                // two decoders disagree on this byte sequence — strong
-                                // signal that the Zig snappy library has a bug specific to
-                                // this payload shape.
-                                let preview_len = std::cmp::min(message_len, 32);
-                                let preview_hex = {
-                                    use std::fmt::Write as _;
-                                    let mut s = String::with_capacity(preview_len * 3);
-                                    for (i, b) in message.data[..preview_len].iter().enumerate() {
-                                        if i != 0 {
-                                            s.push(' ');
-                                        }
-                                        let _ = write!(&mut s, "{:02x}", b);
-                                    }
-                                    s
-                                };
+                                // #942: failure-path diagnostic. Snap-decode every inbound
+                                // gossip message at the Rust side so we can (a) detect when
+                                // the receive-buffer bytes differ from what gossipsub's
+                                // `message_id_fn` saw (FFI / slice bug → would manifest
+                                // here as Rust decompress failure while Zig succeeds, or
+                                // vice versa), and (b) on failure, dump the raw bytes via
+                                // `dump_failed_gossip_payload` for offline `cmp -l` of
+                                // multi-receipt corruption. The decode IS wasted CPU on the
+                                // common-case happy path (message_id_fn already decompressed
+                                // these bytes to compute the id, so we are doing the same
+                                // work twice for diagnostic value) — kept until #942's
+                                // upstream-encoder bug is fixed, since each devnet cycle is
+                                // expensive enough that having the dumps already on disk is
+                                // worth the per-message cost. Remove the call once the
+                                // upstream broken-encoding source is identified.
                                 let rust_decode_result = Decoder::new().decompress_vec(&message.data);
-                                let rust_decode_status = match &rust_decode_result {
-                                    Ok(decoded) => format!("rust_snap=ok decoded_len={}", decoded.len()),
-                                    Err(e) => format!("rust_snap=err({:?})", e),
-                                };
-                                // #942 diagnostic: on a Rust-side decode failure, capture the
-                                // full message.data bytes (and a metadata sidecar) so we can
-                                // diff multiple receipts of the "same" logical message
-                                // (identified by topic + data_len + sha256 of first 32 bytes)
-                                // offline and see exactly where the byte stream diverges.
-                                // Capped at 50 dumps total to bound disk usage.
-                                if rust_decode_result.is_err() {
+                                if let Err(e) = &rust_decode_result {
+                                    // Failure path only: build the hex preview, log the line,
+                                    // and dump the raw bytes for offline analysis. The
+                                    // happy path emits zero log lines and allocates zero
+                                    // strings beyond the snap decode itself.
+                                    //
+                                    // Earlier revisions of this branch emitted a
+                                    // `[gossip ingress]` info line on EVERY message
+                                    // including ~900 attestations/min on a healthy mesh
+                                    // — ~16 MB/hour of log volume that swamps `docker
+                                    // logs` and `promtail` for no operator benefit. The
+                                    // metrics counter `zeam_gossip_decode_failures_total`
+                                    // covers the aggregate signal; this per-failure log
+                                    // keeps the byte-level forensic signal for the
+                                    // diagnosis that's still in flight.
+                                    let preview_len = std::cmp::min(message_len, 32);
+                                    let mut preview_hex = String::with_capacity(preview_len * 3);
+                                    {
+                                        use std::fmt::Write as _;
+                                        for (i, b) in message.data[..preview_len].iter().enumerate() {
+                                            if i != 0 {
+                                                preview_hex.push(' ');
+                                            }
+                                            let _ = write!(&mut preview_hex, "{:02x}", b);
+                                        }
+                                    }
+                                    let propagation_peer = propagation_source.to_string();
+                                    logger::rustLogger.info(
+                                        self.network_id,
+                                        &format!(
+                                            "[gossip ingress decode FAIL] topic={} sender={} propagation_peer={} msg_id={} data_len={} rust_snap=err({:?}) first{}={}",
+                                            topic_str,
+                                            sender_peer_id_string,
+                                            propagation_peer,
+                                            message_id,
+                                            message_len,
+                                            e,
+                                            preview_len,
+                                            preview_hex,
+                                        ),
+                                    );
                                     let topic_kind_short = match topic_str.split('/').nth(3) {
                                         Some(k) => k.split('_').next().unwrap_or("unk"),
                                         None => "unk",
@@ -1951,35 +1968,10 @@ impl Network {
                                     dump_failed_gossip_payload(
                                         self.network_id,
                                         topic_kind_short,
-                                        &propagation_source.to_string(),
+                                        &propagation_peer,
                                         &message.data,
                                     );
                                 }
-                                // #942 (follow-up): also log the gossipsub `propagation_source`
-                                // — the *connected* peer that just forwarded this message to
-                                // us. Unlike `message.source` (which is always None under
-                                // `ValidationMode::Anonymous`, line 2216), propagation_source
-                                // is always a real PeerId we can correlate against
-                                // `lean_connected_peers{client=...}` to identify the
-                                // forwarder's client family. With this in place, if every
-                                // failing-decode log has `propagation_source` resolving to a
-                                // zeam_* peer, we can attribute the bad-byte origin to a
-                                // zeam-only code path with high confidence.
-                                let propagation_peer = propagation_source.to_string();
-                                logger::rustLogger.info(
-                                    self.network_id,
-                                    &format!(
-                                        "[gossip ingress] topic={} sender={} propagation_peer={} msg_id={} data_len={} {} first{}={}",
-                                        topic_str,
-                                        sender_peer_id_string,
-                                        propagation_peer,
-                                        message_id,
-                                        message_len,
-                                        rust_decode_status,
-                                        preview_len,
-                                        preview_hex,
-                                    ),
-                                );
 
                                 unsafe {
                                     handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
