@@ -366,6 +366,13 @@ pub fn mergeType1ToType2(
     if (rc == -2) return AggregationError.ProofTooLarge;
     if (rc != 0) return AggregationError.Type2MergeFailed;
     try appendAll(out, buf[0..written]);
+
+    // #944 shadow sim-cost: model the Type-2 merge (proposal block-building) CPU time on the
+    // virtual clock (no-op unless --shadow-xmss-merge-rate / ZEAM_SHADOW_XMSS_MERGE_RATE is set).
+    // Placed after the mock early-return (above) so the mock and merge-rate never both add delay.
+    // Sleeps on the calling proposal worker thread, mirroring aggregateType1/verifyType1.
+    const shadow_delay_ns = shadow_cost.mergeDelayNs(num_parts);
+    if (shadow_delay_ns != 0) zeam_utils.sleepNs(shadow_delay_ns);
 }
 
 /// Recover the Type-1 component bound to `target_message_hash` out of a Type-2 proof.
