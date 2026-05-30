@@ -458,7 +458,7 @@ pub fn initForkChoiceDriver(
 
     const anchor_state_ptr = try driver_allocator.create(types.BeamState);
     errdefer driver_allocator.destroy(anchor_state_ptr);
-    try types.sszClone(driver_allocator, types.BeamState, anchor_state_temp, anchor_state_ptr);
+    anchor_state_ptr.* = try zeam_utils.clone(types.BeamState, &anchor_state_temp, driver_allocator);
     errdefer anchor_state_ptr.deinit();
 
     // Compute anchor block root for state_map
@@ -667,7 +667,7 @@ fn processBlockStep(
         new_state_ptr.deinit();
         driver.allocator.destroy(new_state_ptr);
     }
-    try types.sszClone(driver.allocator, types.BeamState, parent_state_ptr.*, new_state_ptr);
+    new_state_ptr.* = try zeam_utils.clone(types.BeamState, parent_state_ptr, driver.allocator);
 
     state_transition.apply_transition(driver.allocator, new_state_ptr, block, .{
         .logger = driver.fork_choice.logger,

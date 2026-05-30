@@ -1147,8 +1147,7 @@ fn downloadCheckpointState(
     logger.info("successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
 
     // Clone the state to move it out of the arena using the proper cloning function
-    var cloned_state: types.BeamState = undefined;
-    try types.sszClone(allocator, types.BeamState, checkpoint_state, &cloned_state);
+    const cloned_state = try zeam_utils.clone(types.BeamState, &checkpoint_state, allocator);
 
     return cloned_state;
 }

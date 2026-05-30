@@ -43,8 +43,7 @@ pub const ValidatorClientOutput = struct {
     }
 
     pub fn addAttestation(self: *Self, subnet_id: types.SubnetId, signed_attestation: types.SignedAttestation) !void {
-        var cloned_attestation: types.SignedAttestation = undefined;
-        try types.sszClone(self.allocator, types.SignedAttestation, signed_attestation, &cloned_attestation);
+        const cloned_attestation = try zeam_utils.clone(types.SignedAttestation, &signed_attestation, self.allocator);
         const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = cloned_attestation } };
         try self.gossip_messages.append(self.allocator, gossip_msg);
     }
