@@ -2815,7 +2815,7 @@ pub const BeamChain = struct {
         sender_peer_id: []const u8,
         precomputed_block_root: ?types.Root,
     ) !GossipProcessingResult {
-        // Issue #942: record total time chain.onGossip spends on the libxev thread
+        // Record total time chain.onGossip spends on the libxev thread
         // per gossip type. Compare against zeam_xev_clock_until_done_drain_seconds
         // and `zeam_libxev_callback_duration_seconds{site=onGossip.block.dispatch}`
         // to attribute slow drains to attestation/aggregation dispatch vs. block work.
@@ -2833,11 +2833,11 @@ pub const BeamChain = struct {
             .block => |signed_block| {
                 const block = signed_block.block;
 
-                // Issue #942: when the chain-worker is enabled and the caller
+                // When the chain-worker is enabled and the caller
                 // did not precompute the block root (common gossip path with parent
                 // already in fork-choice), skip both the libxev-side hashTreeRoot
-                // AND the hasBlock dedup here. The chain-worker thunk runs the
-                // dedup via protoArray.onBlock (early-out at forkchoice.zig:97-101)
+                // and the hasBlock dedup here. The chain-worker thunk runs the
+                // dedup via protoArray.onBlock (early-out on already-known root)
                 // after computing the root off-thread, avoiding the heavy SSZ hash
                 // on the libxev event-loop thread.
                 //

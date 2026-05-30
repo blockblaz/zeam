@@ -233,8 +233,8 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         var state_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-            // #942 follow-up: when the post-state root doesn't match the
-            // proposer's claim, log per-field hashTreeRoots of OUR computed
+            // When the post-state root doesn't match the
+            // proposer's claim, log per-field hashTreeRoots of our computed
             // post-state. Comparing these across nodes (or against a known
             // healthy node's post-state at the same slot) pins down exactly
             // which `BeamState` field is the divergent one. Without this,
@@ -250,14 +250,14 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
             logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger, "InvalidPostState", .err_level);
             return StateTransitionError.InvalidPostState;
         }
-        // #942 follow-up: matching baseline for the InvalidPostState
-        // forensics. On the 2026-05-29 devnet every zeam node hit
+        // Matching baseline for the InvalidPostState
+        // forensics. In one observed run every zeam node hit
         // `InvalidPostState` on slots 44, 49, 52, 57 (all ethlambda-
         // proposed blocks). The failure-side per-field log tells us what
-        // each field hashes to AT THE POINT OF FAILURE, but without an
+        // each field hashes to at the point of failure, but without an
         // adjacent "what does it look like when things were still working"
-        // baseline we can't see WHERE the trajectory first diverges from
-        // canonical. Logging per-field on SUCCESS for the same low-slot
+        // baseline we can't see where the trajectory first diverges from
+        // canonical. Logging per-field on success for the same low-slot
         // window gives us the per-slot ground truth from a peer that
         // hadn't failed yet (or, post-fix, lets us confirm zeam tracks
         // the canonical trajectory). Gated to `POSTSTATE_DIAG_SLOT_MAX`
@@ -275,22 +275,22 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
     }
 }
 
-/// #942 follow-up: window inside which per-field state-root diagnostics
+/// Window inside which per-field state-root diagnostics
 /// are emitted on every successful state transition (in addition to the
 /// always-on failure-side log). 80 slots covers the cluster of
-/// `InvalidPostState`-prone slots observed on the 2026-05-29 devnet
+/// `InvalidPostState`-prone slots observed in one run
 /// (44, 49, 52, 57 — all ethlambda-proposed) with margin, and is bounded
 /// enough that the extra log volume on a healthy node is ~80 lines per
 /// process lifetime, not per slot.
 const POSTSTATE_DIAG_SLOT_MAX: u64 = 80;
 
-/// #942 follow-up: log level selector for `logBeamStatePerFieldRoots`.
+/// Log level selector for `logBeamStatePerFieldRoots`.
 /// Failure-side calls log at `err` to surface alongside the underlying
 /// state-root mismatch; success-side calls log at `info` so they don't
 /// drown out real errors but stay visible in operator logs.
 const PerFieldLogLevel = enum { err_level, info_level };
 
-/// #942 follow-up: emit per-field hashTreeRoots of a post-state. Called
+/// Emit per-field hashTreeRoots of a post-state. Called
 /// from two sites in `apply_transition`:
 ///   * Failure side — when the computed post-state root doesn't match
 ///     the proposer's claim. `tag = "InvalidPostState"`, `level = .err_level`.

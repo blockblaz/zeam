@@ -156,7 +156,7 @@ pub const BeamNode = struct {
     /// Monotonic millis of the last inbound gossip delivery.
     last_gossip_rx_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Monotonic millis of the last inbound gossip BLOCK delivery (#942).
+    /// Monotonic millis of the last inbound gossip block delivery.
     /// Distinct from `last_gossip_rx_ms` because attestations on the
     /// `/leanconsensus/.../attestation_*/ssz_snappy` topics arrive at
     /// ~5/s on a busy mesh and keep `last_gossip_rx_ms` fresh even when
@@ -366,7 +366,7 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const now_ms: u64 = @intCast(zeam_utils.unixTimestampMillis());
         self.last_gossip_rx_ms.store(now_ms, .monotonic);
-        // #942: track block-topic gossip separately. Attestations on the
+        // Track block-topic gossip separately. Attestations on the
         // `/attestation_X/ssz_snappy` topics are small (~2.6 KB), decode
         // reliably even on a fleet where every large message corrupts
         // (~5/s arrival), and would otherwise keep `last_gossip_rx_ms`
@@ -392,13 +392,13 @@ pub const BeamNode = struct {
         // root is needed as a cache key synchronously on the libxev thread).
         //
         // For the common case (parent present, block dispatched to chain-worker),
-        // we skip hashTreeRoot on libxev entirely (#942): the chain-worker thunk
+        // we skip hashTreeRoot on libxev entirely: the chain-worker thunk
         // computes the root off-thread inside `onBlock`. The libxev-side hasBlock
         // dedup is also skipped in this path; `protoArray.onBlock` performs the
-        // same dedup on the worker thread (early-out at line 97-101 of
-        // forkchoice.zig). The trade-off is that re-arriving gossip blocks whose
+        // same dedup on the worker thread (early-out at the top of onBlock).
+        // The trade-off is that re-arriving gossip blocks whose
         // root is already in protoArray will run STF on the worker before the
-        // protoArray no-op dedup fires; this is rare and accepted (#942 follow-up
+        // protoArray no-op dedup fires; this is rare and accepted (follow-up
         // data from `zeam_libxev_callback_duration_seconds` will confirm).
         //
         // `precomputed_block_root` is null for all non-block gossip types.
@@ -2666,7 +2666,7 @@ pub const BeamNode = struct {
 
         var current_interval: isize = start_interval;
         while (current_interval <= itime_intervals) : (current_interval += 1) {
-            // Issue #942: measure how long each interval tick keeps the libxev thread busy.
+            // Measure how long each interval tick keeps the libxev thread busy.
             const interval_tick_start_ns = zeam_utils.monotonicTimestampNs();
             defer {
                 const elapsed_s = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - interval_tick_start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
@@ -2831,11 +2831,11 @@ pub const BeamNode = struct {
     fn gossipIngressSnapshot(self: *Self) struct { silent_ms: u64, block_silent_ms: u64, mesh_peers: u64 } {
         const now_ms: u64 = @intCast(zeam_utils.unixTimestampMillis());
         const last_block_ms = self.last_gossip_block_rx_ms.load(.monotonic);
-        // #942: "block silent" semantics. Returns `maxInt(u64)` when we
+        // "Block silent" semantics. Returns `maxInt(u64)` when we
         // have never delivered a block to the application — that signals
         // "infinitely silent on the block topic" to the proactive catch-up
         // gate, which is exactly what we want when block ingress has not
-        // started yet (devnet just past genesis with all blocks failing
+        // started yet (just past genesis with all blocks failing
         // snappy decode, etc.). Once any block ever decodes cleanly via
         // `onGossip`, this collapses to the normal `now_ms - last_block_ms`
         // measurement.
@@ -2924,14 +2924,14 @@ pub const BeamNode = struct {
 
     fn maybeInitiateProactiveCatchUp(self: *Self, wall_head_lag_slots: u64) void {
         const ingress = self.gossipIngressSnapshot();
-        // #942: gate on BLOCK-topic silence, not union-of-all-topics
+        // Gate on block-topic silence, not union-of-all-topics
         // silence. Attestations decode reliably even on a fleet where
         // every block is being rejected by snappy.error.Corrupt; if we
         // gated on union-silence the attestation stream would suppress
         // the catch-up RPC indefinitely while no block ever reaches the
         // app. With `block_silent_ms` the gate fires the moment we have
         // a wall-lag and no block has come through gossip for the stall
-        // threshold (8 s on a 4 s slot devnet).
+        // threshold (8 s on a 4 s slot).
         if (!blocks_by_range_sync.shouldInitiateProactiveCatchUp(
             wall_head_lag_slots,
             constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,

@@ -46,7 +46,7 @@ const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
 /// Maximum number of leading bytes inlined into gossip-decode-failure log
-/// lines for the #942 diagnostic preview. 32 bytes is enough to cover any
+/// lines for the diagnostic preview. 32 bytes is enough to cover any
 /// reasonable framing-magic prefix (snappy-frames magic is 10 bytes; common
 /// snappy-block varint headers are 1–3 bytes plus body tags) while keeping
 /// the log line readable and bounded.
@@ -65,7 +65,7 @@ const BytePreview = struct {
 };
 
 /// Build a `"aa bb cc ..."` hex preview of the first `max_bytes` of `data`
-/// for #942 gossip-decode-failure logs. Returns an empty slice when `data`
+/// for gossip-decode-failure logs. Returns an empty slice when `data`
 /// is empty. Pure / stack-only; safe to call from FFI gossip ingress
 /// without heap allocation.
 fn byteHexPreview(data: []const u8, max_bytes: usize) BytePreview {
@@ -522,7 +522,7 @@ fn rejectMalformedGossip(
         error.HeaderWithoutBody => "snappy_truncated",
     };
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
-    // #942: include the first 32 bytes hex inline so operators can diagnose
+    // Include the first 32 bytes hex inline so operators can diagnose
     // framing-format mismatches (e.g. snappy-frames magic `ff 06 00 00 73 4e
     // 61 50 70 59`) from logs without needing the sample-rate-gated dump file.
     const preview = byteHexPreview(message_bytes, 32);
@@ -530,7 +530,7 @@ fn rejectMalformedGossip(
         "Rejecting gossip message: {s} (topic={s}, len={d}, peer={s}{f}, first32={s})",
         .{ reason, topic_slice, message_bytes.len, sender_peer_id_slice, node_name, preview.slice() },
     );
-    // #942: dashboard-visible counter so a stuck zeam fleet shows up via
+    // Dashboard-visible counter so a stuck zeam fleet shows up via
     // metrics before head_slot drifts off wall-clock.
     zeam_metrics.incrGossipDecodeFailure(topic_kind, dump_label);
     if (shouldPersistMalformedDump()) {
@@ -590,7 +590,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 
     const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
-        // #942: inline first-bytes preview + per-failure counter so a stalled
+        // Inline first-bytes preview + per-failure counter so a stalled
         // zeam fleet shows up on dashboards (`zeam_gossip_decode_failures_total`)
         // and the framing format on the wire is diagnosable from logs alone.
         const preview = byteHexPreview(message_bytes, GOSSIP_PREVIEW_MAX_BYTES);
@@ -2089,7 +2089,7 @@ test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic
 }
 
 test "byteHexPreview: formats bytes with single-space separator" {
-    // #942 diagnostic: gossip-decode failure logs include the leading bytes
+    // Diagnostic: gossip-decode failure logs include the leading bytes
     // hex so operators can spot framing-format mismatches (snappy-frames
     // magic `ff 06 00 00 73 4e 61 50 70 59` vs snappy-block leading varint)
     // directly from the log line, without needing the sample-rate-gated
@@ -2122,9 +2122,9 @@ test "byteHexPreview: hard cap at GOSSIP_PREVIEW_MAX_BYTES even if caller asks m
 }
 
 test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
-    // Reproduce the #942 gossip-decode-failure pattern in a unit test.
+    // Reproduce the gossip-decode-failure pattern in a unit test.
     //
-    // Observation from the live devnet under PR #945 instrumentation:
+    // Observation from the live network under instrumentation:
     // - Both Zig `snappyz.decodeWithMax` AND Rust `snap::raw::Decoder` reject
     //   the same gossip payloads with `error.Corrupt` / `Offset { offset:
     //   62376420, dst_pos: 65866 }`.
@@ -2136,7 +2136,7 @@ test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
     //   the same payload classes fine. Working hypothesis: `snappyz.encode`
     //   produces non-standard snappy output for inputs that combine
     //   high-entropy content with the chunking boundary at
-    //   `maxBlockSize = 65536` (snappy.zig:17).
+    //   `maxBlockSize = 65536`.
     //
     // The existing snappyz "encode larger than maxBlockSize" test uses a
     // sequential `b.* = i & 0xff` pattern which is highly compressible and
@@ -2144,16 +2144,16 @@ test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
     // input has STARK-proof-like entropy (≈1.0 byte/byte) at sizes that
     // straddle the 64 KB chunk boundary multiple times.
     //
-    // If this test FAILS, we have local reproduction of #942 and can debug
-    // `encodeBlock` (snappy.zig:400) without devnet round-trips. If it
+    // If this test FAILS, we have local reproduction and can debug
+    // `encodeBlock` without network round-trips. If it
     // PASSES, the wire-side corruption originates elsewhere (peer encoder
     // outside zeam, or a gossipsub-layer mutation) and we need to capture
     // a real payload from the wire to drill further.
     const allocator = std.testing.allocator;
 
     // 280 KB: crosses the 65536-byte maxBlockSize boundary 4 times, in the
-    // size range of the failing devnet payloads (`data_len=287149` was a
-    // recurring victim in PR #945's live capture).
+    // size range of the failing payloads (`data_len=287149` was a
+    // recurring victim in the live capture).
     const input_size: usize = 280 * 1024;
     const input = try allocator.alloc(u8, input_size);
     defer allocator.free(input);
