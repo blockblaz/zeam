@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const json = std.json;
 const build_options = @import("build_options");
 const constants = @import("constants.zig");
@@ -284,15 +285,20 @@ pub fn main(init: std.process.Init) void {
 }
 
 fn mainInner(init: std.process.Init) !void {
+    // Debug builds use the DebugAllocator so development and tests keep leak
+    // and use-after-free detection. Release builds use libc's allocator: the
+    // DebugAllocator retains freed pages for its safety checks and never hands
+    // them back to the OS, so a long-running node ratchets RSS up to its peak.
+    // malloc/free is thread-safe, which the chain's worker pool requires.
     var gpa = std.heap.DebugAllocator(.{}).init;
-    const allocator = gpa.allocator();
-    defer {
+    const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    defer if (builtin.mode == .Debug) {
         const leaked = gpa.deinit();
         if (leaked == .leak) {
             std.log.err("Memory leak detected!", .{});
             std.process.exit(1);
         }
-    }
+    };
 
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
