@@ -2346,7 +2346,7 @@ impl Network {
                 // topic still has mesh peers, blocks have stopped ARRIVING
                 // (transport/mesh fault) rather than failing to decode.
                 diag_tick_count = diag_tick_count.wrapping_add(1);
-                if diag_tick_count % 10 == 0 {
+                if diag_tick_count.is_multiple_of(10) {
                     let block_recv = GOSSIP_RECV_BY_KIND_TOTAL[0].load(Ordering::Relaxed);
                     let attn_recv = GOSSIP_RECV_BY_KIND_TOTAL[1].load(Ordering::Relaxed);
                     let other_recv = GOSSIP_RECV_BY_KIND_TOTAL[2].load(Ordering::Relaxed);
