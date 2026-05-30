@@ -2612,7 +2612,9 @@ pub const BeamChain = struct {
         // 4. Add the block directly to forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
         //   them in the forkchoice
-        _ = try self.forkChoice.onBlock(block, post_state, .{
+        // Use the rc's live copy: wrapOwnedStateIntoRc moved the value out and
+        // freed the original post_state wrapper, so that pointer now dangles.
+        _ = try self.forkChoice.onBlock(block, &post_state_rc.state, .{
             .currentSlot = block.slot,
             .blockDelayMs = 0,
             .blockRoot = block_root,
