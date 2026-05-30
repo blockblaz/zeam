@@ -457,7 +457,9 @@ fn cacheChurnWorker(ctx: *StressCtx, thread_id: usize) void {
                 _ = ctx.cache_ops.fetchAdd(1, .monotonic);
                 continue;
             };
-            block.deinit();
+            // On success insertBlockPtr moved block's interior into the cache, so
+            // the cache owns it now — do not deinit here (that would free the
+            // cache's storage and dangle it for the reader path below).
         } else {
             // Try to remove a recently-inserted root.
             var root: types.Root = std.mem.zeroes(types.Root);

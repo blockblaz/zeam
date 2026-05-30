@@ -13,6 +13,12 @@
 // fragments less under the prover's large, bursty allocations, which is the
 // dominant source of node RSS. This is the only staticlib in the link set, so
 // the global allocator declared here governs the whole process's Rust side.
+//
+// The openvm/risc0 zkVM backends ship their own #[global_allocator]
+// (e.g. openvm_stark_backend), and only one is allowed per binary — so jemalloc
+// is installed only when neither zkVM prover is built. The multisig (devnet5)
+// and default builds, which carry the heavy prover, always get it.
+#[cfg(not(any(feature = "openvm", feature = "risc0")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
