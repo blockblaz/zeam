@@ -893,6 +893,140 @@ fn run_inbound_gossip_worker(rx: std::sync::mpsc::Receiver<InboundGossip>) {
     }
 }
 
+/// One reqresp FFI dispatch handed off from the swarm task to the dedicated
+/// reqresp worker. Owns every buffer the FFI call reads so the raw pointers
+/// passed to Zig stay valid for the duration of the call. Mirrors
+/// `InboundGossip` for the gossip side.
+///
+/// The 2026-05-30 a7779f91 / 883318f5 devnet probes showed that the swarm
+/// task could spend ~15 s inside one `SwarmEvent::Behaviour(Reqresp(_))`
+/// body — the Zig-side `handleRPCResponseFromRustBridge` synchronously runs
+/// snappy-framed decompress + SSZ deserialize + chain dispatch on the
+/// caller thread (ethlibp2p.zig::handleRPCResponseFromRustBridge:991-1037),
+/// and a single BlocksByRangeV1 response can stack many MB of work.
+/// Moving the call to a worker thread mirrors the existing fix #59 pattern
+/// for inbound gossip and lets quinn + gossipsub keep getting polled while
+/// the chain layer is busy.
+enum RpcWork {
+    Request {
+        zig_handler: u64,
+        channel_id: u64,
+        peer_id: CString,
+        protocol: CString,
+        payload: Vec<u8>,
+    },
+    Response {
+        zig_handler: u64,
+        request_id: u64,
+        peer_id: CString,
+        protocol: CString,
+        payload: Vec<u8>,
+    },
+    EndOfStream {
+        zig_handler: u64,
+        request_id: u64,
+        peer_id: CString,
+        protocol: CString,
+    },
+    Error {
+        zig_handler: u64,
+        request_id: u64,
+        protocol: CString,
+        code: u32,
+        message: CString,
+    },
+}
+
+/// Capacity for the inbound-reqresp dispatch channel. Sized to absorb a
+/// burst of `BlocksByRangeV1` chunks (the chain layer typically requests
+/// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` blocks per peer per sweep). Drops on
+/// overflow are logged + counted via `INBOUND_RPC_DROPPED_TOTAL` so a
+/// chronically saturated worker is visible without crashing the loop.
+const INBOUND_RPC_CHANNEL_CAPACITY: usize = 256;
+
+/// Cumulative count of reqresp FFI dispatches dropped because the worker's
+/// channel was full. Read by the diag emitter (and could be exported via
+/// FFI for metrics later).
+static INBOUND_RPC_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Drain loop for the dedicated reqresp worker thread. Blocks on `recv()`;
+/// exits once the event loop drops the sender and the channel is drained.
+/// Single worker so per-request ordering with the Zig chain layer matches
+/// the prior inline behavior.
+fn run_inbound_rpc_worker(rx: std::sync::mpsc::Receiver<RpcWork>) {
+    while let Ok(work) = rx.recv() {
+        match work {
+            RpcWork::Request {
+                zig_handler,
+                channel_id,
+                peer_id,
+                protocol,
+                payload,
+            } => {
+                // SAFETY: `peer_id`, `protocol`, and `payload` are owned by
+                // this `RpcWork` value, which stays alive until the FFI
+                // call returns. The Zig handler must copy any bytes it
+                // wants to retain (it does — see `handleRPCRequestFromRustBridge`
+                // in ethlibp2p.zig).
+                unsafe {
+                    handleRPCRequestFromRustBridge(
+                        zig_handler,
+                        channel_id,
+                        peer_id.as_ptr(),
+                        protocol.as_ptr(),
+                        payload.as_ptr(),
+                        payload.len(),
+                    );
+                }
+            }
+            RpcWork::Response {
+                zig_handler,
+                request_id,
+                peer_id,
+                protocol,
+                payload,
+            } => unsafe {
+                handleRPCResponseFromRustBridge(
+                    zig_handler,
+                    request_id,
+                    peer_id.as_ptr(),
+                    protocol.as_ptr(),
+                    payload.as_ptr(),
+                    payload.len(),
+                );
+            },
+            RpcWork::EndOfStream {
+                zig_handler,
+                request_id,
+                peer_id,
+                protocol,
+            } => unsafe {
+                handleRPCEndOfStreamFromRustBridge(
+                    zig_handler,
+                    request_id,
+                    peer_id.as_ptr(),
+                    protocol.as_ptr(),
+                );
+            },
+            RpcWork::Error {
+                zig_handler,
+                request_id,
+                protocol,
+                code,
+                message,
+            } => unsafe {
+                handleRPCErrorFromRustBridge(
+                    zig_handler,
+                    request_id,
+                    protocol.as_ptr(),
+                    code,
+                    message.as_ptr(),
+                );
+            },
+        }
+    }
+}
+
 /// Reason tags for `SWARM_COMMAND_DROPPED_TOTAL` and the matching FFI getter
 /// `get_swarm_command_dropped_total`. Mirrored on the Zig side as a plain
 /// `u32` enum so the Prometheus counter can be labeled by reason without
@@ -2177,6 +2311,18 @@ impl Network {
             .spawn(move || run_inbound_gossip_worker(gossip_rx))
             .expect("failed to spawn inbound gossip decode worker thread");
 
+        // #942 fix: reqresp FFI dispatch also off the event-loop thread.
+        // The 15 s arm-body spikes observed on the 883318f5 devnet were
+        // SwarmEvent::Behaviour(Reqresp(_)) bodies running synchronous
+        // snappy-framed-decompress + SSZ-deserialize + chain dispatch on
+        // the swarm task; mirrors the gossip worker pattern above.
+        let (rpc_tx, rpc_rx) =
+            std::sync::mpsc::sync_channel::<RpcWork>(INBOUND_RPC_CHANNEL_CAPACITY);
+        let rpc_worker = std::thread::Builder::new()
+            .name(format!("zeam-rpc-dispatch-{}", self.network_id))
+            .spawn(move || run_inbound_rpc_worker(rpc_rx))
+            .expect("failed to spawn inbound reqresp dispatch worker thread");
+
         // #942 diagnosis: throttle the per-kind gossip-arrival summary to roughly
         // every 10th mesh_peers tick (~10s) so the log shows the block/attestation
         // delivery trend without flooding.
@@ -2223,13 +2369,24 @@ impl Network {
                                 CString::new(protocol_id.as_str()),
                                 CString::new("request timed out"),
                             ) {
-                                unsafe {
-                                    handleRPCErrorFromRustBridge(
-                                        self.zig_handler,
-                                        request_id,
-                                        protocol_cstring.as_ptr(),
-                                        408,
-                                        message_cstring.as_ptr(),
+                                let work = RpcWork::Error {
+                                    zig_handler: self.zig_handler,
+                                    request_id,
+                                    protocol: protocol_cstring,
+                                    code: 408,
+                                    message: message_cstring,
+                                };
+                                if let Err(e) = rpc_tx.try_send(work) {
+                                    let total = INBOUND_RPC_DROPPED_TOTAL
+                                        .fetch_add(1, Ordering::Relaxed) + 1;
+                                    logger::rustLogger.warn(
+                                        self.network_id,
+                                        &format!(
+                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Timeout (total={}): {:?}",
+                                            INBOUND_RPC_CHANNEL_CAPACITY,
+                                            total,
+                                            e,
+                                        ),
                                     );
                                 }
                             }
@@ -2643,14 +2800,28 @@ impl Network {
                                     }
                                 };
 
-                                unsafe {
-                                    handleRPCRequestFromRustBridge(
-                                        self.zig_handler,
-                                        channel_id,
-                                        peer_id_cstring.as_ptr(),
-                                        protocol_cstring.as_ptr(),
-                                        payload.as_ptr(),
-                                        payload.len(),
+                                // Hand off to the reqresp worker thread; the
+                                // FFI call's synchronous snappy + SSZ +
+                                // chain work used to stall the swarm task
+                                // for many seconds (see RpcWork comment).
+                                let work = RpcWork::Request {
+                                    zig_handler: self.zig_handler,
+                                    channel_id,
+                                    peer_id: peer_id_cstring,
+                                    protocol: protocol_cstring,
+                                    payload,
+                                };
+                                if let Err(e) = rpc_tx.try_send(work) {
+                                    let total = INBOUND_RPC_DROPPED_TOTAL
+                                        .fetch_add(1, Ordering::Relaxed) + 1;
+                                    logger::rustLogger.warn(
+                                        self.network_id,
+                                        &format!(
+                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Request (total={}): {:?}",
+                                            INBOUND_RPC_CHANNEL_CAPACITY,
+                                            total,
+                                            e,
+                                        ),
                                     );
                                 }
                             }
@@ -2690,14 +2861,30 @@ impl Network {
                                     }
                                 };
 
-                                unsafe {
-                                    handleRPCResponseFromRustBridge(
-                                        self.zig_handler,
-                                        request_id,
-                                        peer_id_cstring.as_ptr(),
-                                        protocol_cstring.as_ptr(),
-                                        response_message.payload.as_ptr(),
-                                        response_message.payload.len(),
+                                // Hand off to the reqresp worker thread. The
+                                // synchronous Zig handler does snappy-framed
+                                // decompress + SSZ deserialize + chain
+                                // dispatch (handleRPCResponseFromRustBridge);
+                                // on the 883318f5 devnet this stalled the
+                                // swarm task for ~15 s per large response.
+                                let work = RpcWork::Response {
+                                    zig_handler: self.zig_handler,
+                                    request_id,
+                                    peer_id: peer_id_cstring,
+                                    protocol: protocol_cstring,
+                                    payload: response_message.payload,
+                                };
+                                if let Err(e) = rpc_tx.try_send(work) {
+                                    let total = INBOUND_RPC_DROPPED_TOTAL
+                                        .fetch_add(1, Ordering::Relaxed) + 1;
+                                    logger::rustLogger.warn(
+                                        self.network_id,
+                                        &format!(
+                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Response (total={}): {:?}",
+                                            INBOUND_RPC_CHANNEL_CAPACITY,
+                                            total,
+                                            e,
+                                        ),
                                     );
                                 }
                             }
@@ -2730,12 +2917,23 @@ impl Network {
                                         }
                                     };
 
-                                    unsafe {
-                                        handleRPCEndOfStreamFromRustBridge(
-                                            self.zig_handler,
-                                            request_id,
-                                            peer_id_cstring.as_ptr(),
-                                            protocol_cstring.as_ptr(),
+                                    let work = RpcWork::EndOfStream {
+                                        zig_handler: self.zig_handler,
+                                        request_id,
+                                        peer_id: peer_id_cstring,
+                                        protocol: protocol_cstring,
+                                    };
+                                    if let Err(e) = rpc_tx.try_send(work) {
+                                        let total = INBOUND_RPC_DROPPED_TOTAL
+                                            .fetch_add(1, Ordering::Relaxed) + 1;
+                                        logger::rustLogger.warn(
+                                            self.network_id,
+                                            &format!(
+                                                "[#942] inbound reqresp dispatch queue full (cap={}); dropped EndOfStream (total={}): {:?}",
+                                                INBOUND_RPC_CHANNEL_CAPACITY,
+                                                total,
+                                                e,
+                                            ),
                                         );
                                     }
                                 } else {
@@ -2771,13 +2969,24 @@ impl Network {
                                         CString::new(protocol_id.as_str()),
                                         CString::new(format!("{:?}", err)),
                                     ) {
-                                        unsafe {
-                                            handleRPCErrorFromRustBridge(
-                                                self.zig_handler,
-                                                request_id,
-                                                protocol_cstring.as_ptr(),
-                                                3,
-                                                message_cstring.as_ptr(),
+                                        let work = RpcWork::Error {
+                                            zig_handler: self.zig_handler,
+                                            request_id,
+                                            protocol: protocol_cstring,
+                                            code: 3,
+                                            message: message_cstring,
+                                        };
+                                        if let Err(e) = rpc_tx.try_send(work) {
+                                            let total = INBOUND_RPC_DROPPED_TOTAL
+                                                .fetch_add(1, Ordering::Relaxed) + 1;
+                                            logger::rustLogger.warn(
+                                                self.network_id,
+                                                &format!(
+                                                    "[#942] inbound reqresp dispatch queue full (cap={}); dropped OutboundError (total={}): {:?}",
+                                                    INBOUND_RPC_CHANNEL_CAPACITY,
+                                                    total,
+                                                    e,
+                                                ),
                                             );
                                         }
                                     }
@@ -3047,6 +3256,18 @@ impl Network {
             logger::rustLogger.error(
                 self.network_id,
                 &format!("inbound gossip decode worker thread panicked: {:?}", panic),
+            );
+        }
+
+        // Mirror cleanup for the reqresp dispatch worker.
+        drop(rpc_tx);
+        if let Err(panic) = rpc_worker.join() {
+            logger::rustLogger.error(
+                self.network_id,
+                &format!(
+                    "inbound reqresp dispatch worker thread panicked: {:?}",
+                    panic
+                ),
             );
         }
 
