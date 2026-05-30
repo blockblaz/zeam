@@ -21,6 +21,14 @@ multisig-glue = { path = "../multisig-glue", optional = true }
 risc0-glue    = { path = "../risc0-glue",    optional = true }
 openvm-glue   = { path = "../openvm-glue",   optional = true }
 
+# Process-wide allocator. jemalloc returns freed memory to the OS far more
+# readily than the system allocator and fragments less under the prover's large,
+# bursty witness allocations — the dominant source of node RSS. The unprefixed
+# feature also interposes the C malloc/free symbols, so the Zig heap (when on
+# c_allocator) and rocksdb route through jemalloc too, unifying the whole
+# process on one allocator.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+
 [features]
 # Features are intentionally additive and have no defaults so `build.zig`
 # can opt into exactly the set that matches the requested `-Dprover=...`.

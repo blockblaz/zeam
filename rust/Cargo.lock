@@ -9236,6 +9236,7 @@ dependencies = [
  "multisig-glue",
  "openvm-glue",
  "risc0-glue",
+ "tikv-jemallocator",
 ]
 
 [[package]]
