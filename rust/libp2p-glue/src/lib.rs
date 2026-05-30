@@ -464,6 +464,56 @@ fn arm_name(idx: u32) -> &'static str {
     }
 }
 
+/// Sub-probe for arm 5 (`swarm_event`): which `SwarmEvent` variant's match
+/// body is the swarm task in. Set at the top of each variant's match arm.
+/// 0 = no variant seen yet, 99 = unmatched fallthrough.
+static LAST_SWARM_EVENT_VARIANT: AtomicU32 = AtomicU32::new(0);
+static LAST_SWARM_EVENT_VARIANT_UNIX: AtomicU64 = AtomicU64::new(0);
+
+/// Sub-probe for arm 6 (`cmd_rx`): which `SwarmCommand` variant's match
+/// body is being processed.
+static LAST_SWARM_COMMAND_VARIANT: AtomicU32 = AtomicU32::new(0);
+static LAST_SWARM_COMMAND_VARIANT_UNIX: AtomicU64 = AtomicU64::new(0);
+
+#[inline(always)]
+fn enter_swarm_event(idx: u32) {
+    LAST_SWARM_EVENT_VARIANT.store(idx, Ordering::Relaxed);
+    LAST_SWARM_EVENT_VARIANT_UNIX.store(unix_secs(), Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn enter_swarm_command(idx: u32) {
+    LAST_SWARM_COMMAND_VARIANT.store(idx, Ordering::Relaxed);
+    LAST_SWARM_COMMAND_VARIANT_UNIX.store(unix_secs(), Ordering::Relaxed);
+}
+
+fn swarm_event_name(idx: u32) -> &'static str {
+    match idx {
+        0 => "none",
+        1 => "NewListenAddr",
+        2 => "ConnectionEstablished",
+        3 => "ConnectionClosed",
+        4 => "OutgoingConnectionError",
+        5 => "Gossipsub",
+        6 => "Reqresp",
+        99 => "other",
+        _ => "unknown",
+    }
+}
+
+fn swarm_command_name(idx: u32) -> &'static str {
+    match idx {
+        0 => "none",
+        1 => "SubscribeGossip",
+        2 => "Publish",
+        3 => "SendRpcRequest",
+        4 => "SendRpcResponseChunk",
+        5 => "SendRpcEndOfStream",
+        6 => "SendRpcErrorResponse",
+        _ => "unknown",
+    }
+}
+
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -594,6 +644,28 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                             last_arm,
                             arm_name(last_arm),
                             cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5], cnt[6],
+                        ),
+                    );
+
+                    // Sub-probes: which variant body the swarm task last
+                    // entered inside arm 5 (SwarmEvent) and arm 6
+                    // (SwarmCommand). Steady `swarm_ev_var.age` growth while
+                    // `last=5` pins the wedge to that specific SwarmEvent
+                    // variant; same logic for cmd_rx_var when `last=6`.
+                    let sev_var = LAST_SWARM_EVENT_VARIANT.load(Ordering::Relaxed);
+                    let sev_age = now
+                        .saturating_sub(LAST_SWARM_EVENT_VARIANT_UNIX.load(Ordering::Relaxed));
+                    let scmd_var = LAST_SWARM_COMMAND_VARIANT.load(Ordering::Relaxed);
+                    let scmd_age = now
+                        .saturating_sub(LAST_SWARM_COMMAND_VARIANT_UNIX.load(Ordering::Relaxed));
+                    logger::rustLogger.info(
+                        network_id,
+                        &format!(
+                            "[#942 sub] swarm_ev_var={}({}) age={sev_age}s | cmd_var={}({}) age={scmd_age}s",
+                            sev_var,
+                            swarm_event_name(sev_var),
+                            scmd_var,
+                            swarm_command_name(scmd_var),
                         ),
                     );
                 }
@@ -2235,9 +2307,11 @@ impl Network {
                     enter_arm(5);
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
+                            enter_swarm_event(1);
                             logger::rustLogger.info(self.network_id, &format!("Listening on {}", address));
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
+                            enter_swarm_event(2);
                             let peer_id_str = peer_id.to_string();
 
                             // Determine direction from endpoint: Dialer=outbound, Listener=inbound
@@ -2286,6 +2360,7 @@ impl Network {
                                 cause,
                                 ..
                             } => {
+                                enter_swarm_event(3);
                                 // leanMetrics PR #35: a peer leaving may evict
                                 // it from the gossipsub mesh; recompute first
                                 // so the metric reflects the new state even if
@@ -2370,6 +2445,7 @@ impl Network {
                                 }
                             }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            enter_swarm_event(4);
                             let peer_str = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
 
                             // Determine if timeout or other error: 1=timeout, 2=error
@@ -2416,6 +2492,7 @@ impl Network {
                             }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub_event)) => {
+                            enter_swarm_event(5);
                             // leanMetrics PR #35: gate the mesh-peer recompute on
                             // the gossipsub event variants that actually change
                             // mesh membership. `Message` does NOT — a busy node
@@ -2533,7 +2610,9 @@ impl Network {
                             peer_id,
                             connection_id,
                             message,
-                        })) => match message {
+                        })) => {
+                            enter_swarm_event(6);
+                            match message {
                             Ok(ReqRespMessageReceived::Request { stream_id, message }) => {
                                 let request_message = *message;
                                 let protocol = request_message.protocol.clone();
@@ -2722,8 +2801,12 @@ impl Network {
                                     &format!("[reqresp] Outbound error for request {} with {}: {:?}", request_id, peer_id, err),
                                 );
                             }
-                        },
-                        e => logger::rustLogger.debug(self.network_id, &format!("{:?}", e)),
+                        }
+                        }
+                        e => {
+                            enter_swarm_event(99);
+                            logger::rustLogger.debug(self.network_id, &format!("{:?}", e));
+                        }
                     }
                 }
 
@@ -2741,6 +2824,7 @@ impl Network {
                 loop {
                     match cmd {
                     SwarmCommand::SubscribeGossip { topic } => {
+                        enter_swarm_command(1);
                         let gossipsub_topic = gossipsub::IdentTopic::new(topic.clone());
                         if let Err(e) =
                             swarm.behaviour_mut().gossipsub.subscribe(&gossipsub_topic)
@@ -2757,12 +2841,14 @@ impl Network {
                         }
                     }
                     SwarmCommand::Publish { topic, data } => {
+                        enter_swarm_command(2);
                         let t = gossipsub::IdentTopic::new(topic);
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(t, data) {
                             logger::rustLogger.error(self.network_id, &format!("Publish error: {e:?}"));
                         }
                     }
                     SwarmCommand::SendRpcRequest { peer_id, request_id, request_message } => {
+                        enter_swarm_command(3);
                         // Register the request on the timeout/protocol maps
                         // BEFORE handing the request to the swarm: by the time
                         // libp2p surfaces a response, timeout, or error event,
@@ -2778,6 +2864,7 @@ impl Network {
                         swarm.behaviour_mut().reqresp.send_request(peer_id, request_id, request_message);
                     }
                     SwarmCommand::SendRpcResponseChunk { channel_id, peer_id, connection_id, stream_id, response_message } => {
+                        enter_swarm_command(4);
                         // Channel coordinates were resolved on the FFI side
                         // under a single `RESPONSE_CHANNEL_MAP` lock; we just
                         // forward the response and log it. We do not re-look
@@ -2803,6 +2890,7 @@ impl Network {
                             "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, peer_id));
                     }
                     SwarmCommand::SendRpcEndOfStream { channel_id } => {
+                        enter_swarm_command(5);
                         let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
@@ -2817,6 +2905,7 @@ impl Network {
                         }
                     }
                     SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
+                        enter_swarm_command(6);
                         let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
