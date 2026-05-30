@@ -368,7 +368,6 @@ static QUIC_INBOUND_SUBSTREAM_ID: AtomicU64 = AtomicU64::new(0);
 /// Per-inbound-substream receive accounting (see the section comment above).
 struct InboundSubstreamStat {
     id: u64,
-    opened_unix: u64,
     /// Cumulative bytes read from this substream.
     bytes: AtomicU64,
     /// Number of successful `poll_read`s that returned >0 bytes.
@@ -398,7 +397,6 @@ fn register_inbound_substream() -> Arc<InboundSubstreamStat> {
     let now = unix_secs();
     let stat = Arc::new(InboundSubstreamStat {
         id: QUIC_INBOUND_SUBSTREAM_ID.fetch_add(1, Ordering::Relaxed),
-        opened_unix: now,
         bytes: AtomicU64::new(0),
         reads: AtomicU64::new(0),
         max_single_read: AtomicU64::new(0),
@@ -1514,6 +1512,22 @@ extern "C" {
 }
 
 fn forward_log_with_handler(zig_handler: u64, level: u32, message: &str) {
+    // The Zig log sink formats into a fixed 4096-byte stack buffer and does
+    // `bufPrint(...) catch @panic` (log.zig), so a message that overflows the
+    // buffer aborts the whole node. Defensively cap the message well below
+    // that limit (leaving headroom for the Zig-side timestamp/scope prefix),
+    // truncating on a UTF-8 char boundary, so an over-length line is truncated
+    // rather than fatal.
+    const MAX_LOG_BYTES: usize = 3500;
+    let message = if message.len() > MAX_LOG_BYTES {
+        let mut end = MAX_LOG_BYTES;
+        while end > 0 && !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        &message[..end]
+    } else {
+        message
+    };
     unsafe {
         handleLogFromRustBridge(zig_handler, level, message.as_ptr(), message.len());
     }
@@ -2574,33 +2588,54 @@ impl Network {
                     // open => bytes stopped ARRIVING from QUIC (quinn recv-stream
                     // wedge, hyp. A). All streams with delta>0 while block
                     // delivery is frozen => gossipsub reassembly stall (hyp. B).
+                    //
+                    // The line MUST stay bounded: the Zig log sink formats into a
+                    // fixed 4096-byte buffer (log.zig), so a per-stream dump of
+                    // every live substream silently overflows and is dropped once
+                    // enough peers connect. Emit aggregates plus only the top few
+                    // streams BY BYTES (the gossipsub block-carriers are the
+                    // high-volume streams), which keeps the line short regardless
+                    // of peer count while still surfacing the decisive signal.
                     let now = unix_secs();
                     let mut reg = INBOUND_SUBSTREAMS.lock_recover();
-                    reg.retain(|s| !s.closed.load(Ordering::Relaxed));
+                    // Prune closed streams and any that have been idle for a long
+                    // time (defensive against a substream whose Drop never runs).
+                    reg.retain(|s| {
+                        !s.closed.load(Ordering::Relaxed)
+                            && now.saturating_sub(s.last_read_unix.load(Ordering::Relaxed)) < 300
+                    });
                     let live = reg.len();
-                    let mut per_stream = String::new();
                     let mut idle_streams = 0u64;
+                    let mut bytes_total = 0u64;
+                    let mut delta_total = 0u64;
+                    // (bytes, delta, maxread, idle, id) per live stream.
+                    let mut rows: Vec<(u64, u64, u64, u64, u64)> = Vec::with_capacity(live);
                     for s in reg.iter() {
                         let bytes = s.bytes.load(Ordering::Relaxed);
                         let prev = s.logged_bytes.swap(bytes, Ordering::Relaxed);
                         let delta = bytes.saturating_sub(prev);
                         let idle = now.saturating_sub(s.last_read_unix.load(Ordering::Relaxed));
-                        let reads = s.reads.load(Ordering::Relaxed);
                         let maxread = s.max_single_read.load(Ordering::Relaxed);
-                        let age = now.saturating_sub(s.opened_unix);
+                        bytes_total = bytes_total.saturating_add(bytes);
+                        delta_total = delta_total.saturating_add(delta);
                         if idle > 8 {
                             idle_streams += 1;
                         }
-                        per_stream.push_str(&format!(
-                            " [id={} age={age}s bytes={bytes} d={delta} reads={reads} maxread={maxread} idle={idle}s]",
-                            s.id
-                        ));
+                        rows.push((bytes, delta, maxread, idle, s.id));
                     }
                     drop(reg);
+                    // Highest-volume streams first; show at most 8.
+                    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    let mut top = String::new();
+                    for (bytes, delta, maxread, idle, id) in rows.iter().take(8) {
+                        top.push_str(&format!(
+                            " [id={id} b={bytes} d={delta} mx={maxread} idle={idle}s]"
+                        ));
+                    }
                     logger::rustLogger.info(
                         self.network_id,
                         &format!(
-                            "[#942 quic-recv] inbound_live={live} idle_streams(>8s)={idle_streams} |{per_stream}"
+                            "[#942 quic-recv] live={live} idle>8s={idle_streams} bytes_total={bytes_total} delta_total={delta_total} | top:{top}"
                         ),
                     );
                 }
