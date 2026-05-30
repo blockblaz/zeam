@@ -260,6 +260,18 @@ enum SwarmCommand {
         channel_id: u64,
         payload: Vec<u8>,
     },
+    /// Issued by a detached `tokio::spawn` task scheduled inside
+    /// `Network::schedule_reconnection` after sleeping for the per-attempt
+    /// backoff. The swarm task is the only place with `&mut swarm`, so the
+    /// actual `swarm.dial(...)` happens here. Side-stepped the previous
+    /// `RECONNECT_QUEUE: HashMapDelay` polled from arm 3 — that delay-map
+    /// interaction with the swarm select! was the trigger for the #942
+    /// permanent waker loss.
+    DialReconnect {
+        peer_id: PeerId,
+        addr: Multiaddr,
+        attempt: u32,
+    },
 }
 
 /// Capacity for the per-network swarm command channel.
@@ -413,23 +425,6 @@ static EVENT_LOOP_SLOW_ITERS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// digits and a pathological run lights up clearly.
 const EVENT_LOOP_SLOW_ITER_THRESHOLD_MS: u64 = 100;
 
-/// #942 DIAGNOSTIC TOGGLE — DO NOT MERGE TO main WITH THIS SET TO `true`.
-///
-/// On the 2026-05-30 a7779f91/2001637c devnet runs, the per-arm probe
-/// pinned the swarm-task wedge to "right after `SwarmEvent::OutgoingConnectionError`":
-/// the last variant body the task entered was OutgoingConnectionError, then
-/// `mesh_peers_tick` (which should fire every 1 s) stopped getting polled
-/// — the swarm future was permanently parked. Every observed freeze
-/// follows a wave of HandshakeTimedOut events.
-///
-/// To A/B test whether our re-dial logic (`schedule_reconnection`) is
-/// responsible vs. a libp2p / libp2p-quic 0.13 waker-loss bug, this flag
-/// short-circuits both of our reconnect-scheduling sites
-/// (`ConnectionClosed` and `OutgoingConnectionError`). If a devnet build
-/// with this `true` still wedges in the same way → it's libp2p; if the
-/// freeze disappears → our reconnect path is at fault.
-const ZEAM_DIAG_BYPASS_RECONNECT: bool = true;
-
 /// Numeric id of the swarm-task arm whose body was MOST RECENTLY entered.
 /// 0 = none seen yet; 1..=7 mapped to the arms in `run_eventloop`'s biased
 /// select! (see `arm_name`). The diag emitter reports this together with the
@@ -472,7 +467,9 @@ fn arm_name(idx: u32) -> &'static str {
         0 => "none",
         1 => "shutdown",
         2 => "reqresp_timeout",
-        3 => "reconnect",
+        // Arm id 3 (was `reconnect`) was removed in the #942 fix; ID kept
+        // unused to preserve diagnostic-log compatibility with prior runs.
+        3 => "reconnect_removed",
         4 => "response_channel_timeout",
         5 => "swarm_event",
         6 => "cmd_rx",
@@ -527,6 +524,7 @@ fn swarm_command_name(idx: u32) -> &'static str {
         4 => "SendRpcResponseChunk",
         5 => "SendRpcEndOfStream",
         6 => "SendRpcErrorResponse",
+        7 => "DialReconnect",
         _ => "unknown",
     }
 }
@@ -1008,8 +1006,16 @@ lazy_static::lazy_static! {
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
     static ref RESPONSE_CHANNEL_MAP: Mutex<HashMapDelay<u64, PendingResponse>> = Mutex::new(HashMapDelay::new(RESPONSE_CHANNEL_IDLE_TIMEOUT));
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
-    static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
-        Mutex::new(HashMapDelay::new(Duration::from_secs(5))); // default delay, will be overridden
+    // #942 fix (post-bypass A/B verdict): the reconnect-scheduling
+    // delay map used to live here as `RECONNECT_QUEUE: HashMapDelay`,
+    // polled from arm 3 of the swarm task's biased `select!`. The bypass
+    // build (883318f5) proved that gating both `schedule_reconnection`
+    // call sites converted a deterministic 0/8-zeam-sync failure into
+    // 5/8-success — i.e., this delay-map's interaction with the swarm
+    // task was the primary trigger of the permanent waker-loss freeze.
+    // Replaced with `tokio::spawn` + `tokio::time::sleep` +
+    // `SwarmCommand::DialReconnect`: the delayed action is owned by a
+    // detached task, not by the swarm task's polling tree.
     static ref RECONNECT_ATTEMPTS: Mutex<HashMap<(u32, PeerId), (Multiaddr, u32)>> = Mutex::new(HashMap::new());
     // Track connection directions for disconnect events (network_id, peer_id, connection_id) -> direction
     static ref CONNECTION_DIRECTIONS: Mutex<HashMap<(u32, PeerId, ConnectionId), u32>> = Mutex::new(HashMap::new());
@@ -1963,12 +1969,28 @@ impl Network {
             ),
         );
 
-        let mut queue = RECONNECT_QUEUE.lock_recover();
-        queue.insert_at(
-            (self.network_id, peer_id),
-            (addr, attempt),
-            Duration::from_secs(delay_secs),
-        );
+        // #942 fix: the delayed action runs in a detached tokio task —
+        // sleep + send a `SwarmCommand::DialReconnect`. The previous
+        // implementation polled a `HashMapDelay` from arm 3 of the swarm
+        // task's biased `select!`; that pollNext + the connection-error
+        // body's interaction was the trigger for the permanent waker
+        // loss that wedged 8/8 zeam nodes at slot ~65 on prior runs
+        // (the bypass A/B test in 883318f5 produced 5/8 sync vs 0/8).
+        // A detached task only touches the per-network swarm command
+        // channel, which is the same channel Zig FFI dispatches use, so
+        // we re-use the existing back-pressure / drop bookkeeping.
+        let network_id = self.network_id;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            send_swarm_command(
+                network_id,
+                SwarmCommand::DialReconnect {
+                    peer_id,
+                    addr,
+                    attempt,
+                },
+            );
+        });
     }
 
     /// Build the swarm, bind listeners, dial connect peers, publish the per-network
@@ -2219,66 +2241,11 @@ impl Network {
                 }
             }
 
-            Some(reconnect_result) = poll_fn(|cx| {
-                let mut queue = RECONNECT_QUEUE.lock_recover();
-                std::pin::Pin::new(&mut *queue).poll_next(cx)
-            }) => {
-                    enter_arm(3);
-                    match reconnect_result {
-                        Ok(((network_id, peer_id), (addr, attempt))) => {
-                            if network_id == self.network_id {
-                                if swarm.is_connected(&peer_id) {
-                                    logger::rustLogger.debug(
-                                        self.network_id,
-                                        &format!(
-                                            "Skipping reconnection attempt to peer {} because it is already connected",
-                                            peer_id
-                                        ),
-                                    );
-                                    continue;
-                                }
-
-                                logger::rustLogger.info(
-                                    self.network_id,
-                                    &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
-                                );
-
-                            RECONNECT_ATTEMPTS
-                                .lock_recover()
-                                .insert((self.network_id, peer_id), (addr.clone(), attempt));
-
-                            let mut dial_addr = addr.clone();
-                            strip_peer_id(&mut dial_addr);
-
-                            match swarm.dial(
-                                DialOpts::peer_id(peer_id)
-                                    .addresses(vec![dial_addr.clone()])
-                                    .build(),
-                            ) {
-                                Ok(()) => {
-                                    logger::rustLogger.info(
-                                        self.network_id,
-                                        &format!("Dialing peer {} at {} for reconnection", peer_id, dial_addr),
-                                    );
-                                }
-                                Err(e) => {
-                                    logger::rustLogger.error(
-                                        self.network_id,
-                                        &format!("Failed to dial peer {} at {}: {:?}", peer_id, dial_addr, e),
-                                    );
-                                    RECONNECT_ATTEMPTS
-                                        .lock_recover()
-                                        .remove(&(self.network_id, peer_id));
-                                    self.schedule_reconnection(peer_id, addr, attempt + 1);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        logger::rustLogger.error(self.network_id, &format!("Error in reconnect queue: {}", e));
-                    }
-                }
-            }
+            // arm 3 (RECONNECT_QUEUE poll_next) removed in #942 fix: the
+            // delay-map polled here was the trigger of the swarm-task
+            // waker loss. Reconnect dials are now driven by
+            // `SwarmCommand::DialReconnect` posted by detached
+            // `tokio::spawn`s in `schedule_reconnection`.
 
             Some(response_channel_timeout) = poll_fn(|cx| {
                 let mut map = RESPONSE_CHANNEL_MAP.lock_recover();
@@ -2356,7 +2323,9 @@ impl Network {
                                 direction,
                             );
 
-                            RECONNECT_QUEUE.lock_recover().remove(&(self.network_id, peer_id));
+                            // RECONNECT_QUEUE removed; pending DialReconnect commands for
+                            // this peer become no-ops via the swarm.is_connected() guard
+                            // in the cmd_rx handler.
                             RECONNECT_ATTEMPTS
                                 .lock_recover()
                                 .remove(&(self.network_id, peer_id));
@@ -2457,10 +2426,8 @@ impl Network {
                                     )
                                 };
 
-                                if !ZEAM_DIAG_BYPASS_RECONNECT {
-                                    if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
-                                        self.schedule_reconnection(peer_id, peer_addr, 1);
-                                    }
+                                if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
+                                    self.schedule_reconnection(peer_id, peer_addr, 1);
                                 }
                             }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -2502,15 +2469,11 @@ impl Network {
                                 };
 
                                 // Schedule reconnection if this was a tracked connection attempt.
-                                // Gated for #942 diagnostic: if the freeze persists with this
-                                // skipped, the wedge is downstream of our code (libp2p / quinn).
-                                if !ZEAM_DIAG_BYPASS_RECONNECT {
-                                    if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
-                                        .lock_recover()
-                                        .remove(&(self.network_id, pid))
-                                    {
-                                        self.schedule_reconnection(pid, addr, attempt + 1);
-                                    }
+                                if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
+                                    .lock_recover()
+                                    .remove(&(self.network_id, pid))
+                                {
+                                    self.schedule_reconnection(pid, addr, attempt + 1);
                                 }
                             }
                         }
@@ -2945,6 +2908,56 @@ impl Network {
                         } else {
                             logger::rustLogger.error(self.network_id, &format!(
                                 "No response channel found for id {} (SendRpcErrorResponse)", channel_id));
+                        }
+                    }
+                    SwarmCommand::DialReconnect { peer_id, addr, attempt } => {
+                        enter_swarm_command(7);
+                        // The detached `tokio::spawn` task scheduled this after
+                        // sleeping for the backoff. Re-check liveness here (the
+                        // peer may have reconnected via some other path in the
+                        // meantime) before issuing the dial.
+                        if swarm.is_connected(&peer_id) {
+                            logger::rustLogger.debug(
+                                self.network_id,
+                                &format!(
+                                    "Skipping reconnection attempt to peer {} because it is already connected",
+                                    peer_id
+                                ),
+                            );
+                        } else {
+                            logger::rustLogger.info(
+                                self.network_id,
+                                &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
+                            );
+                            RECONNECT_ATTEMPTS
+                                .lock_recover()
+                                .insert((self.network_id, peer_id), (addr.clone(), attempt));
+
+                            let mut dial_addr = addr.clone();
+                            strip_peer_id(&mut dial_addr);
+
+                            match swarm.dial(
+                                DialOpts::peer_id(peer_id)
+                                    .addresses(vec![dial_addr.clone()])
+                                    .build(),
+                            ) {
+                                Ok(()) => {
+                                    logger::rustLogger.info(
+                                        self.network_id,
+                                        &format!("Dialing peer {} at {} for reconnection", peer_id, dial_addr),
+                                    );
+                                }
+                                Err(e) => {
+                                    logger::rustLogger.error(
+                                        self.network_id,
+                                        &format!("Failed to dial peer {} at {}: {:?}", peer_id, dial_addr, e),
+                                    );
+                                    RECONNECT_ATTEMPTS
+                                        .lock_recover()
+                                        .remove(&(self.network_id, peer_id));
+                                    self.schedule_reconnection(peer_id, addr, attempt + 1);
+                                }
+                            }
                         }
                     }
                     }
