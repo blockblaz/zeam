@@ -362,29 +362,41 @@ fn gossip_topic_kind_index(topic: &str) -> usize {
 // peer's inbound stream go idle (A) while others flow, or do all keep flowing
 // while block delivery is frozen (B)?
 
-/// Monotonic id allocator for instrumented inbound QUIC substreams.
-static QUIC_INBOUND_SUBSTREAM_ID: AtomicU64 = AtomicU64::new(0);
+/// Monotonic id allocator for instrumented QUIC substreams (both directions
+/// share the id space so log lines stay easy to cross-reference).
+static QUIC_SUBSTREAM_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Per-inbound-substream receive accounting (see the section comment above).
-struct InboundSubstreamStat {
+/// Per-substream byte accounting. The same struct is used for both inbound and
+/// outbound substreams; the relevant counters depend on direction:
+/// - inbound: poll_read drives `bytes` / `last_active_unix` (we primarily READ
+///   from peer-opened substreams).
+/// - outbound: poll_write drives `bytes` / `last_active_unix`.
+///
+/// Each direction lives in its own registry below so the diag emitter can
+/// report inbound and outbound top-N independently.
+struct SubstreamStat {
     id: u64,
-    /// Cumulative bytes read from this substream.
+    /// Cumulative bytes transferred (read for inbound, written for outbound).
     bytes: AtomicU64,
-    /// Number of successful `poll_read`s that returned >0 bytes.
-    reads: AtomicU64,
-    /// Largest single `poll_read` return — a large multi-KB read implies a big
-    /// frame body (e.g. a block) is being pulled off this stream.
-    max_single_read: AtomicU64,
-    /// Unix seconds of the most recent non-empty read.
-    last_read_unix: AtomicU64,
+    /// Largest single transfer (informational; mostly equals quinn's 8 KiB
+    /// poll chunk for steady-state streams).
+    max_single_xfer: AtomicU64,
+    /// Unix seconds of the most recent non-empty transfer.
+    last_active_unix: AtomicU64,
     /// `bytes` snapshot at the previous diag log, for per-interval delta.
     logged_bytes: AtomicU64,
-    /// Set on Drop so the diag tick can prune dead entries.
+    /// Set on Drop so the diag emitter can prune dead entries.
     closed: AtomicBool,
 }
 
-/// Registry of live instrumented inbound substreams. Pruned each diag tick.
-static INBOUND_SUBSTREAMS: Mutex<Vec<Arc<InboundSubstreamStat>>> = Mutex::new(Vec::new());
+/// Registry of live instrumented INBOUND substreams (peer-opened, we read).
+static INBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new());
+
+/// Registry of live instrumented OUTBOUND substreams (we opened, we write).
+/// If our poll_write stalls mid-frame on these, the freeze is on OUR sender
+/// side (hyp A2). If outbound flows fine while inbound wedges, the recv path
+/// is at fault (hyp A1).
+static OUTBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new());
 
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -393,19 +405,96 @@ fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn register_inbound_substream() -> Arc<InboundSubstreamStat> {
+fn new_substream_stat() -> Arc<SubstreamStat> {
     let now = unix_secs();
-    let stat = Arc::new(InboundSubstreamStat {
-        id: QUIC_INBOUND_SUBSTREAM_ID.fetch_add(1, Ordering::Relaxed),
+    Arc::new(SubstreamStat {
+        id: QUIC_SUBSTREAM_ID.fetch_add(1, Ordering::Relaxed),
         bytes: AtomicU64::new(0),
-        reads: AtomicU64::new(0),
-        max_single_read: AtomicU64::new(0),
-        last_read_unix: AtomicU64::new(now),
+        max_single_xfer: AtomicU64::new(0),
+        last_active_unix: AtomicU64::new(now),
         logged_bytes: AtomicU64::new(0),
         closed: AtomicBool::new(false),
-    });
+    })
+}
+
+fn register_inbound_substream() -> Arc<SubstreamStat> {
+    let stat = new_substream_stat();
     INBOUND_SUBSTREAMS.lock_recover().push(stat.clone());
     stat
+}
+
+fn register_outbound_substream() -> Arc<SubstreamStat> {
+    let stat = new_substream_stat();
+    OUTBOUND_SUBSTREAMS.lock_recover().push(stat.clone());
+    stat
+}
+
+/// Emit one diag line for the given direction's substream registry. Bounded
+/// output: aggregate + top-8 by cumulative bytes (see the log-overflow note on
+/// `forward_log_with_handler`).
+fn emit_substream_diag(network_id: u32, label: &str, registry: &Mutex<Vec<Arc<SubstreamStat>>>) {
+    let now = unix_secs();
+    let mut reg = registry.lock_recover();
+    // Prune closed streams and any idle longer than 5 minutes (defensive
+    // against a substream whose Drop never runs).
+    reg.retain(|s| {
+        !s.closed.load(Ordering::Relaxed)
+            && now.saturating_sub(s.last_active_unix.load(Ordering::Relaxed)) < 300
+    });
+    let live = reg.len();
+    let mut idle_streams = 0u64;
+    let mut bytes_total = 0u64;
+    let mut delta_total = 0u64;
+    // (bytes, delta, max_xfer, idle, id) per live stream.
+    let mut rows: Vec<(u64, u64, u64, u64, u64)> = Vec::with_capacity(live);
+    for s in reg.iter() {
+        let bytes = s.bytes.load(Ordering::Relaxed);
+        let prev = s.logged_bytes.swap(bytes, Ordering::Relaxed);
+        let delta = bytes.saturating_sub(prev);
+        let idle = now.saturating_sub(s.last_active_unix.load(Ordering::Relaxed));
+        let mxr = s.max_single_xfer.load(Ordering::Relaxed);
+        bytes_total = bytes_total.saturating_add(bytes);
+        delta_total = delta_total.saturating_add(delta);
+        if idle > 8 {
+            idle_streams += 1;
+        }
+        rows.push((bytes, delta, mxr, idle, s.id));
+    }
+    drop(reg);
+    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut top = String::new();
+    for (bytes, delta, mxr, idle, id) in rows.iter().take(8) {
+        top.push_str(&format!(
+            " [id={id} b={bytes} d={delta} mx={mxr} idle={idle}s]"
+        ));
+    }
+    logger::rustLogger.info(
+        network_id,
+        &format!(
+            "[{label}] live={live} idle>8s={idle_streams} bytes_total={bytes_total} delta_total={delta_total} | top:{top}"
+        ),
+    );
+}
+
+/// Spawn a dedicated tokio task that emits the per-substream QUIC diag lines
+/// every 10s. Lives outside the swarm task's biased `select!` so it keeps
+/// running even when reqresp-status retries make the mesh_peers_tick arm
+/// permanently starved (which is what kept #942 invisible at the freeze).
+fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.notified() => break,
+                _ = tick.tick() => {
+                    emit_substream_diag(network_id, "#942 quic-recv", &INBOUND_SUBSTREAMS);
+                    emit_substream_diag(network_id, "#942 quic-send", &OUTBOUND_SUBSTREAMS);
+                }
+            }
+        }
+    });
 }
 
 /// A `StreamMuxer` wrapper that tags each inbound substream with an
@@ -415,16 +504,27 @@ struct InstrumentedMuxer<M> {
     inner: M,
 }
 
-/// A substream wrapper that counts bytes read (when `stat` is `Some`, i.e.
-/// inbound) and otherwise delegates verbatim.
+/// A substream wrapper that counts bytes transferred in the substream's
+/// "natural" direction:
+/// - if it came from `poll_inbound`, `read_stat` is `Some` and `poll_read`
+///   updates it.
+/// - if it came from `poll_outbound`, `write_stat` is `Some` and `poll_write`
+///   updates it.
+///
+/// Both fields are `Option` (rather than one combined) so the diag emitter
+/// can keep inbound vs outbound stats in separate registries.
 struct InstrumentedSubstream<S> {
     inner: S,
-    stat: Option<Arc<InboundSubstreamStat>>,
+    read_stat: Option<Arc<SubstreamStat>>,
+    write_stat: Option<Arc<SubstreamStat>>,
 }
 
 impl<S> Drop for InstrumentedSubstream<S> {
     fn drop(&mut self) {
-        if let Some(stat) = &self.stat {
+        if let Some(stat) = &self.read_stat {
+            stat.closed.store(true, Ordering::Relaxed);
+        }
+        if let Some(stat) = &self.write_stat {
             stat.closed.store(true, Ordering::Relaxed);
         }
     }
@@ -442,13 +542,12 @@ where
         let this = self.get_mut();
         let r = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
         if let std::task::Poll::Ready(Ok(n)) = &r {
-            if let Some(stat) = &this.stat {
+            if let Some(stat) = &this.read_stat {
                 let n = *n as u64;
                 if n > 0 {
                     stat.bytes.fetch_add(n, Ordering::Relaxed);
-                    stat.reads.fetch_add(1, Ordering::Relaxed);
-                    stat.max_single_read.fetch_max(n, Ordering::Relaxed);
-                    stat.last_read_unix.store(unix_secs(), Ordering::Relaxed);
+                    stat.max_single_xfer.fetch_max(n, Ordering::Relaxed);
+                    stat.last_active_unix.store(unix_secs(), Ordering::Relaxed);
                 }
             }
         }
@@ -465,7 +564,19 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            if let Some(stat) = &this.write_stat {
+                let n = *n as u64;
+                if n > 0 {
+                    stat.bytes.fetch_add(n, Ordering::Relaxed);
+                    stat.max_single_xfer.fetch_max(n, Ordering::Relaxed);
+                    stat.last_active_unix.store(unix_secs(), Ordering::Relaxed);
+                }
+            }
+        }
+        r
     }
 
     fn poll_flush(
@@ -500,7 +611,8 @@ where
             .poll_inbound(cx)
             .map_ok(|s| InstrumentedSubstream {
                 inner: s,
-                stat: Some(register_inbound_substream()),
+                read_stat: Some(register_inbound_substream()),
+                write_stat: None,
             })
     }
 
@@ -513,7 +625,8 @@ where
             .poll_outbound(cx)
             .map_ok(|s| InstrumentedSubstream {
                 inner: s,
-                stat: None,
+                read_stat: None,
+                write_stat: Some(register_outbound_substream()),
             })
     }
 
@@ -1763,6 +1876,15 @@ impl Network {
         let mut mesh_peers_tick = tokio::time::interval(Duration::from_secs(1));
         mesh_peers_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // #942 fix-#5 follow-up: per-substream QUIC diag lines run in their own
+        // tokio task. The previous in-arm version sat in the LAST arm of this
+        // function's biased select! and devnet evidence (slot 65 onward) showed
+        // it was starved as soon as reqresp-status retries became continuous,
+        // exactly when the freeze deepened. The spawned task only reads atomic
+        // counters from the SUBSTREAMS registries and does not need swarm
+        // access, so it keeps emitting through the freeze.
+        spawn_quic_diag_emitter(self.network_id, shutdown.clone());
+
         // #942: hand inbound gossip off to a dedicated decode worker thread so
         // the synchronous snappy-decompress + SSZ-deserialize + chain dispatch
         // does not block this tokio thread, which also drives quinn's QUIC I/O.
@@ -2579,65 +2701,16 @@ impl Network {
                             INBOUND_GOSSIP_DROPPED_TOTAL.load(Ordering::Relaxed),
                         ),
                     );
-
-                    // #942 fix-#5: per-inbound-substream recv accounting at the
-                    // QUIC/quinn boundary. For each live inbound substream show
-                    // cumulative bytes, the delta since the last log, and the
-                    // idle time since its last read. During the block-delivery
-                    // freeze: a stream with delta=0 + rising idle while still
-                    // open => bytes stopped ARRIVING from QUIC (quinn recv-stream
-                    // wedge, hyp. A). All streams with delta>0 while block
-                    // delivery is frozen => gossipsub reassembly stall (hyp. B).
-                    //
-                    // The line MUST stay bounded: the Zig log sink formats into a
-                    // fixed 4096-byte buffer (log.zig), so a per-stream dump of
-                    // every live substream silently overflows and is dropped once
-                    // enough peers connect. Emit aggregates plus only the top few
-                    // streams BY BYTES (the gossipsub block-carriers are the
-                    // high-volume streams), which keeps the line short regardless
-                    // of peer count while still surfacing the decisive signal.
-                    let now = unix_secs();
-                    let mut reg = INBOUND_SUBSTREAMS.lock_recover();
-                    // Prune closed streams and any that have been idle for a long
-                    // time (defensive against a substream whose Drop never runs).
-                    reg.retain(|s| {
-                        !s.closed.load(Ordering::Relaxed)
-                            && now.saturating_sub(s.last_read_unix.load(Ordering::Relaxed)) < 300
-                    });
-                    let live = reg.len();
-                    let mut idle_streams = 0u64;
-                    let mut bytes_total = 0u64;
-                    let mut delta_total = 0u64;
-                    // (bytes, delta, maxread, idle, id) per live stream.
-                    let mut rows: Vec<(u64, u64, u64, u64, u64)> = Vec::with_capacity(live);
-                    for s in reg.iter() {
-                        let bytes = s.bytes.load(Ordering::Relaxed);
-                        let prev = s.logged_bytes.swap(bytes, Ordering::Relaxed);
-                        let delta = bytes.saturating_sub(prev);
-                        let idle = now.saturating_sub(s.last_read_unix.load(Ordering::Relaxed));
-                        let maxread = s.max_single_read.load(Ordering::Relaxed);
-                        bytes_total = bytes_total.saturating_add(bytes);
-                        delta_total = delta_total.saturating_add(delta);
-                        if idle > 8 {
-                            idle_streams += 1;
-                        }
-                        rows.push((bytes, delta, maxread, idle, s.id));
-                    }
-                    drop(reg);
-                    // Highest-volume streams first; show at most 8.
-                    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                    let mut top = String::new();
-                    for (bytes, delta, maxread, idle, id) in rows.iter().take(8) {
-                        top.push_str(&format!(
-                            " [id={id} b={bytes} d={delta} mx={maxread} idle={idle}s]"
-                        ));
-                    }
-                    logger::rustLogger.info(
-                        self.network_id,
-                        &format!(
-                            "[#942 quic-recv] live={live} idle>8s={idle_streams} bytes_total={bytes_total} delta_total={delta_total} | top:{top}"
-                        ),
-                    );
+                    // NOTE: the per-substream QUIC accounting lines
+                    // ([#942 quic-recv] / [#942 quic-send]) are emitted from a
+                    // dedicated spawned task (spawn_quic_diag_emitter, started in
+                    // run_eventloop). They MUST NOT live in this arm: it is the
+                    // last arm of a biased select! and devnet data showed it
+                    // never gets polled once reqresp-status retries become
+                    // continuous, so the per-stream signal disappears exactly
+                    // when the freeze deepens. The spawned task uses its own
+                    // tokio::time::interval and only reads atomic counters, so
+                    // it keeps emitting even while the swarm task is busy.
                 }
             }
 
