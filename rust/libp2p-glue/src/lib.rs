@@ -2631,10 +2631,23 @@ impl Network {
                                 };
 
                                 // Schedule reconnection if this was a tracked connection attempt.
-                                if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
+                                //
+                                // IMPORTANT: bind the `.remove()` result to a let *before* the
+                                // `if let`, so the `RECONNECT_ATTEMPTS` MutexGuard is dropped
+                                // at the end of the let-statement instead of living until the
+                                // end of the if-let block (Rust 2021 temporary-scope rules).
+                                // `schedule_reconnection` re-acquires the same Mutex on the
+                                // `attempt > MAX_RECONNECT_ATTEMPTS` branch — with the guard
+                                // still held, that's a re-entrant std::Mutex deadlock on the
+                                // same thread, which is exactly the wedge that re-appeared
+                                // on the c6cf2241 devnet run (all 8 zeam nodes frozen with
+                                // `swarm_ev_var=4(OutgoingConnectionError) age=1000s+`,
+                                // probabilistic because it only triggers once a peer's
+                                // attempt count climbs past 5).
+                                let prior_attempt = RECONNECT_ATTEMPTS
                                     .lock_recover()
-                                    .remove(&(self.network_id, pid))
-                                {
+                                    .remove(&(self.network_id, pid));
+                                if let Some((addr, attempt)) = prior_attempt {
                                     self.schedule_reconnection(pid, addr, attempt + 1);
                                 }
                             }
