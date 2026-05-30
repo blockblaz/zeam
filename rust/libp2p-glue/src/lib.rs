@@ -398,6 +398,21 @@ static INBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new(
 /// is at fault (hyp A1).
 static OUTBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new());
 
+/// Maximum wall-clock millis taken by ONE iteration of the swarm task's
+/// `tokio::select!` since the last diag emit. Devnet evidence (slot 58→61)
+/// showed both `poll_read` and `poll_write` freeze simultaneously, which can
+/// only happen if the swarm task itself stalled in a synchronous arm body —
+/// this counter is the direct measurement of that.
+static EVENT_LOOP_MAX_ITER_MS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative count of swarm-task iterations whose body wall-time exceeded
+/// `EVENT_LOOP_SLOW_ITER_THRESHOLD_MS`. Read by the diag emitter.
+static EVENT_LOOP_SLOW_ITERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Threshold for counting an iteration as "slow". 100 ms is well above the
+/// natural cost of a hot arm (gossip rx, reqresp) but well below the 10 s
+/// pause observed at slot 58→61, so a healthy run reports zero or single
+/// digits and a pathological run lights up clearly.
+const EVENT_LOOP_SLOW_ITER_THRESHOLD_MS: u64 = 100;
+
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -491,6 +506,23 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                 _ = tick.tick() => {
                     emit_substream_diag(network_id, "#942 quic-recv", &INBOUND_SUBSTREAMS);
                     emit_substream_diag(network_id, "#942 quic-send", &OUTBOUND_SUBSTREAMS);
+                    // Event-loop iteration latency + message_id_fn cache stats.
+                    // `swap(0)` on the max so each tick reports the worst
+                    // single-iteration latency since the previous tick;
+                    // `slow_total` is cumulative so we can see whether new
+                    // slow iterations are still occurring after the burst.
+                    let max_iter_ms = EVENT_LOOP_MAX_ITER_MS.swap(0, Ordering::Relaxed);
+                    let slow_total = EVENT_LOOP_SLOW_ITERS_TOTAL.load(Ordering::Relaxed);
+                    let (cache_hits, cache_misses, cache_len) = {
+                        let c = MESSAGE_ID_CACHE.lock_recover();
+                        (c.hits, c.misses, c.map.len())
+                    };
+                    logger::rustLogger.info(
+                        network_id,
+                        &format!(
+                            "[#942 loop] max_iter_ms={max_iter_ms} slow_iters>={EVENT_LOOP_SLOW_ITER_THRESHOLD_MS}ms_total={slow_total} | msg_id_cache hits={cache_hits} misses={cache_misses} len={cache_len}/{MESSAGE_ID_CACHE_CAPACITY}"
+                        ),
+                    );
                 }
             }
         }
@@ -821,6 +853,70 @@ lazy_static::lazy_static! {
     static ref CONNECTION_DIRECTIONS: Mutex<HashMap<(u32, PeerId, ConnectionId), u32>> = Mutex::new(HashMap::new());
     static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::Sender<SwarmCommand>>> = Mutex::new(HashMap::new());
     static ref COMMAND_RECEIVERS: Mutex<HashMap<u32, mpsc::Receiver<SwarmCommand>>> = Mutex::new(HashMap::new());
+
+    // #942 fix: cache message_id_fn results so we don't re-decompress the same
+    // raw-bytes payload on the gossipsub event-loop thread. With ~21 mesh
+    // peers each forwarding the same block, the spec-mandated decompress
+    // inside `message_id_fn` was running ~21x per block on the same thread
+    // that drives quinn's QUIC poll futures. Devnet evidence pinned a ~10s
+    // simultaneous freeze of every poll_read AND poll_write at slot 58→61,
+    // which fits an accumulated burst of these synchronous decompresses
+    // perfectly. The cache key is `sha2::Sha256(message.data)` (the raw
+    // wire bytes); the value is the spec-conformant content-addressed id we
+    // would otherwise have just recomputed. Bounded FIFO eviction so the
+    // mutex stays small. See `cached_message_id_fn` below.
+    static ref MESSAGE_ID_CACHE: Mutex<MessageIdCache> = Mutex::new(MessageIdCache::new(MESSAGE_ID_CACHE_CAPACITY));
+}
+
+/// Per-network cap. ~1024 distinct messages comfortably covers the ~12 s
+/// gossipsub forward window across 21 mesh peers + heartbeats; tune up if
+/// the eviction warning fires often post-deploy.
+const MESSAGE_ID_CACHE_CAPACITY: usize = 1024;
+
+/// Bounded FIFO cache keyed on the raw-bytes SHA256 of a gossipsub message.
+/// Hits avoid the synchronous snappy-decompress inside `Behaviour::message_id_fn`
+/// — see the comment on `MESSAGE_ID_CACHE`.
+struct MessageIdCache {
+    map: HashMap<[u8; 32], gossipsub::MessageId>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl MessageIdCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap),
+            order: std::collections::VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: &[u8; 32]) -> Option<gossipsub::MessageId> {
+        if let Some(id) = self.map.get(key) {
+            self.hits += 1;
+            Some(id.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: [u8; 32], id: gossipsub::MessageId) {
+        self.misses += 1;
+        if self.map.contains_key(&key) {
+            return;
+        }
+        if self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, id);
+        self.order.push_back(key);
+    }
 }
 
 /// Current number of remote peers in this node's gossipsub mesh, across all
@@ -1903,6 +1999,15 @@ impl Network {
         let mut diag_tick_count: u64 = 0;
 
         'eventloop: loop {
+            // Measure wall-clock spent inside this iteration's `select!`
+            // (which includes the chosen arm's synchronous body). Devnet
+            // evidence (slot 58→61, simultaneous bidirectional freeze of
+            // every poll_read AND poll_write) implies one arm body ran
+            // synchronously for ~10 s, since both directions are driven by
+            // this single task. The `dt_ms` capture below pins which
+            // iteration spent the time.
+            let iter_start = std::time::Instant::now();
+
             tokio::select! {
             biased;
 
@@ -2715,6 +2820,15 @@ impl Network {
             }
 
             }
+
+            // #942 iteration-latency probe: record how long this iteration
+            // of the swarm task's `select!` took. The atomics are read by
+            // `spawn_quic_diag_emitter` and reset (max) each tick.
+            let dt_ms = iter_start.elapsed().as_millis() as u64;
+            EVENT_LOOP_MAX_ITER_MS.fetch_max(dt_ms, Ordering::Relaxed);
+            if dt_ms >= EVENT_LOOP_SLOW_ITER_THRESHOLD_MS {
+                EVENT_LOOP_SLOW_ITERS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         // #942: stop the inbound gossip decode worker. Dropping the sender makes
@@ -2780,16 +2894,28 @@ impl Behaviour {
         // the same id and are dropped by gossipsub before the application
         // layer ever sees them.
         //
-        // Cost: synchronous decompress on the gossipsub event loop. The
-        // earlier abandonment of this scheme was motivated by event-loop
-        // stalls of 0.5–1 s on broken-snappy payloads — the deferred-
-        // hashTreeRoot work that landed earlier on this branch has already
-        // cut `zeam_xev_clock_until_done_slow_ge_500ms_total` from ~7,600
-        // to ~490 in the parallel measurement, so the synchronous decompress
-        // here is no longer the dominant cost on the libxev tick budget.
-        // If that regresses post-deploy, the right next step is to put
-        // a small LRU cache in front of this function keyed on the raw
-        // bytes' SHA256 so identical-bytes re-forwards never re-decompress.
+        // Cost: synchronous decompress on the gossipsub event loop. With
+        // ~21 mesh peers each forwarding the same block, this used to run
+        // ~21x per block on the same thread that drives quinn's QUIC poll
+        // futures; devnet evidence (slot 58→61 simultaneous freeze of every
+        // poll_read AND poll_write) pinned that accumulation as the proximal
+        // cause of the libp2p event-loop stall. Mitigated below by an FIFO
+        // cache keyed on the raw-bytes SHA256: identical-bytes re-forwards
+        // skip the decompress entirely.
+
+        // Fast path: cheap SHA256 of the raw wire bytes, then cache lookup.
+        // SHA256 over even a 10 MB block is ~10 ms on modern hw; snappy
+        // decompress of the same block is ~10x that AND allocates the full
+        // decoded buffer.
+        let mut raw_hasher = sha2::Sha256::new();
+        raw_hasher.update(&message.data);
+        let raw_digest = raw_hasher.finalize();
+        let raw_key: [u8; 32] = raw_digest.into();
+        if let Some(id) = MESSAGE_ID_CACHE.lock_recover().get(&raw_key) {
+            return id;
+        }
+
+        // Slow path: decompress + content-addressed hash, then cache.
         let mut hasher = sha2::Sha256::new();
         let (data_for_hash, domain): (Vec<u8>, [u8; 4]) =
             match Decoder::new().decompress_vec(&message.data) {
@@ -2801,7 +2927,9 @@ impl Behaviour {
         hasher.update(message.topic.as_str().as_bytes());
         hasher.update(&data_for_hash);
         let digest = hasher.finalize();
-        gossipsub::MessageId::from(&digest[..20])
+        let id = gossipsub::MessageId::from(&digest[..20]);
+        MESSAGE_ID_CACHE.lock_recover().insert(raw_key, id.clone());
+        id
     }
 
     fn new(key: identity::Keypair) -> Self {
