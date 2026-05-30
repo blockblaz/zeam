@@ -233,8 +233,149 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         var state_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-            opts.logger.debug("state root={x} block root={x}\n", .{ &state_root, &block.state_root });
+            // #942 follow-up: when the post-state root doesn't match the
+            // proposer's claim, log per-field hashTreeRoots of OUR computed
+            // post-state. Comparing these across nodes (or against a known
+            // healthy node's post-state at the same slot) pins down exactly
+            // which `BeamState` field is the divergent one. Without this,
+            // operators can only see "state_root mismatch" — they can't tell
+            // whether it's `historical_block_hashes`, `latest_justified`,
+            // `justifications_*`, etc. that drifted, so root-cause analysis
+            // stalls. Fail-soft on per-field hash failures — still return the
+            // primary error so the chain-worker handler logic is unchanged.
+            opts.logger.err(
+                "InvalidPostState slot={d} computed={x} expected={x}",
+                .{ block.slot, &state_root, &block.state_root },
+            );
+            logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger, "InvalidPostState", .err_level);
             return StateTransitionError.InvalidPostState;
         }
+        // #942 follow-up: matching baseline for the InvalidPostState
+        // forensics. On the 2026-05-29 devnet every zeam node hit
+        // `InvalidPostState` on slots 44, 49, 52, 57 (all ethlambda-
+        // proposed blocks). The failure-side per-field log tells us what
+        // each field hashes to AT THE POINT OF FAILURE, but without an
+        // adjacent "what does it look like when things were still working"
+        // baseline we can't see WHERE the trajectory first diverges from
+        // canonical. Logging per-field on SUCCESS for the same low-slot
+        // window gives us the per-slot ground truth from a peer that
+        // hadn't failed yet (or, post-fix, lets us confirm zeam tracks
+        // the canonical trajectory). Gated to `POSTSTATE_DIAG_SLOT_MAX`
+        // (= 80 slots = first ~5 min on a 4 s slot clock) so the diagnostic
+        // doesn't run for the lifetime of every long-lived node — the
+        // useful comparison window is the early-chain bootstrap where
+        // divergence either does or doesn't happen.
+        if (block.slot <= POSTSTATE_DIAG_SLOT_MAX) {
+            opts.logger.info(
+                "PostStateMatch slot={d} state_root={x}",
+                .{ block.slot, &state_root },
+            );
+            logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger, "PostStateMatch", .info_level);
+        }
+    }
+}
+
+/// #942 follow-up: window inside which per-field state-root diagnostics
+/// are emitted on every successful state transition (in addition to the
+/// always-on failure-side log). 80 slots covers the cluster of
+/// `InvalidPostState`-prone slots observed on the 2026-05-29 devnet
+/// (44, 49, 52, 57 — all ethlambda-proposed) with margin, and is bounded
+/// enough that the extra log volume on a healthy node is ~80 lines per
+/// process lifetime, not per slot.
+const POSTSTATE_DIAG_SLOT_MAX: u64 = 80;
+
+/// #942 follow-up: log level selector for `logBeamStatePerFieldRoots`.
+/// Failure-side calls log at `err` to surface alongside the underlying
+/// state-root mismatch; success-side calls log at `info` so they don't
+/// drown out real errors but stay visible in operator logs.
+const PerFieldLogLevel = enum { err_level, info_level };
+
+/// #942 follow-up: emit per-field hashTreeRoots of a post-state. Called
+/// from two sites in `apply_transition`:
+///   * Failure side — when the computed post-state root doesn't match
+///     the proposer's claim. `tag = "InvalidPostState"`, `level = .err_level`.
+///   * Success side — for `block.slot <= POSTSTATE_DIAG_SLOT_MAX`, as a
+///     ground-truth baseline so the failure case can be compared per-field
+///     against the last known good post-state. `tag = "PostStateMatch"`,
+///     `level = .info_level`.
+/// Errors during per-field hashing are logged-and-swallowed at err level
+/// regardless of the caller's chosen level — they indicate a genuine
+/// runtime fault and must not be masked by an info-tagged invocation.
+fn logBeamStatePerFieldRoots(
+    allocator: Allocator,
+    state: *const types.BeamState,
+    block_slot: u64,
+    logger: zeam_utils.ModuleLogger,
+    tag: []const u8,
+    level: PerFieldLogLevel,
+) void {
+    var slot_root: [32]u8 = undefined;
+    var lbh_root: [32]u8 = undefined;
+    var lj_root: [32]u8 = undefined;
+    var lf_root: [32]u8 = undefined;
+    var hbh_root: [32]u8 = undefined;
+    var js_root: [32]u8 = undefined;
+    var v_root: [32]u8 = undefined;
+    var jr_root: [32]u8 = undefined;
+    var jv_root: [32]u8 = undefined;
+
+    zeam_utils.hashTreeRoot(u64, state.slot, &slot_root, allocator) catch |e| {
+        logger.err("{s} per-field: slot hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &lbh_root, allocator) catch |e| {
+        logger.err("{s} per-field: latest_block_header hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.Checkpoint, state.latest_justified, &lj_root, allocator) catch |e| {
+        logger.err("{s} per-field: latest_justified hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.Checkpoint, state.latest_finalized, &lf_root, allocator) catch |e| {
+        logger.err("{s} per-field: latest_finalized hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.HistoricalBlockHashes, state.historical_block_hashes, &hbh_root, allocator) catch |e| {
+        logger.err("{s} per-field: historical_block_hashes hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.JustifiedSlots, state.justified_slots, &js_root, allocator) catch |e| {
+        logger.err("{s} per-field: justified_slots hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.Validators, state.validators, &v_root, allocator) catch |e| {
+        logger.err("{s} per-field: validators hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.JustificationRoots, state.justifications_roots, &jr_root, allocator) catch |e| {
+        logger.err("{s} per-field: justifications_roots hash failed: {any}", .{ tag, e });
+        return;
+    };
+    zeam_utils.hashTreeRoot(types.JustificationValidators, state.justifications_validators, &jv_root, allocator) catch |e| {
+        logger.err("{s} per-field: justifications_validators hash failed: {any}", .{ tag, e });
+        return;
+    };
+
+    const args = .{
+        tag,
+        block_slot,
+        state.slot,
+        state.historical_block_hashes.len(),
+        state.justified_slots.len(),
+        state.justifications_roots.len(),
+        &slot_root,
+        &lbh_root,
+        &lj_root,
+        &lf_root,
+        &hbh_root,
+        &js_root,
+        &v_root,
+        &jr_root,
+        &jv_root,
+    };
+    const fmt = "{s} per-field block_slot={d} state_slot={d} hbh_len={d} js_len={d} jr_len={d} | slot={x} lbh={x} lj={x} lf={x} hbh={x} js={x} v={x} jr={x} jv={x}";
+    switch (level) {
+        .err_level => logger.err(fmt, args),
+        .info_level => logger.info(fmt, args),
     }
 }

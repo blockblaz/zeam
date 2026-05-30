@@ -174,6 +174,16 @@ const Metrics = struct {
     lean_gossip_block_size_bytes: GossipBlockSizeBytesHistogram,
     lean_gossip_attestation_size_bytes: GossipAttestationSizeBytesHistogram,
     lean_gossip_aggregation_size_bytes: GossipAggregationSizeBytesHistogram,
+    /// Issue #942: count gossip-ingress decode rejections, labeled by
+    /// `topic_kind` (block | attestation | aggregation) and `reason`
+    /// (snappy_empty | snappy_varint | snappy_oversized | snappy_truncated |
+    /// snappy_decode | ssz_decode). Without this counter, the only operator-
+    /// visible signal that zeam has stopped accepting gossip is `lean_head_slot`
+    /// drifting behind wall-clock — by which point the node is already off
+    /// consensus. With it, the failure mode is dashboard-visible the moment
+    /// decode starts failing, and the `reason` label attributes upstream
+    /// vs. our-side framing mismatches vs. SSZ-body issues separately.
+    zeam_gossip_decode_failures_total: ZeamGossipDecodeFailuresCounter,
     // Attestation production time histogram
     lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
     // compactAttestations metrics
@@ -198,6 +208,12 @@ const Metrics = struct {
     zeam_xev_clock_until_done_slow_ge_500ms_total: ZeamXevClockUntilDoneSlowGe500msCounter,
     /// Count of clock-loop `run(.until_done)` drains taking ≥1s wall time.
     zeam_xev_clock_until_done_slow_ge_1s_total: ZeamXevClockUntilDoneSlowGe1sCounter,
+    /// Wall time spent inside individual libxev callbacks, labeled by callsite.
+    /// Used to attribute slow `zeam_xev_clock_until_done_drain_seconds` to a
+    /// specific synchronous chunk of work executed on the libxev thread (#942).
+    /// Each callsite name is a fixed low-cardinality string; see
+    /// `observeLibxevCallback` for the canonical site list.
+    zeam_libxev_callback_duration_seconds: LibxevCallbackDurationHistogram,
     // Fork-choice tick interval duration: actual elapsed time between forkchoice tickIntervalUnlocked calls
     zeam_fork_choice_tick_interval_duration_seconds: ForkChoiceTickIntervalDurationHistogram,
     /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
@@ -515,6 +531,7 @@ const Metrics = struct {
     const LeanNodeSyncStatusGauge = metrics_lib.GaugeVec(u64, struct { status: []const u8 });
     // Gossip message size histogram types
     const GossipBlockSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000 });
+    const ZeamGossipDecodeFailuresCounter = metrics_lib.CounterVec(u64, struct { topic_kind: []const u8, reason: []const u8 });
     const GossipAttestationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 512, 1_024, 2_048, 4_096, 8_192, 16_384 });
     const GossipAggregationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1_024, 4_096, 16_384, 65_536, 131_072, 262_144, 524_288, 1_048_576 });
     // Attestation production time histogram type
@@ -528,6 +545,16 @@ const Metrics = struct {
     });
     const ZeamXevClockUntilDoneSlowGe500msCounter = metrics_lib.Counter(u64);
     const ZeamXevClockUntilDoneSlowGe1sCounter = metrics_lib.Counter(u64);
+    /// Per-callsite libxev callback duration (issue #942). Buckets span
+    /// 100us through 5s to capture both fast dispatches (queue submits,
+    /// metric increments) and pathological CPU-bound callbacks
+    /// (hashTreeRoot of a multi-MB block, SSZ clones of a STARK proof).
+    const LibxevCallbackSiteLabel = struct { site: []const u8 };
+    const LibxevCallbackDurationHistogram = metrics_lib.HistogramVec(
+        f32,
+        LibxevCallbackSiteLabel,
+        &[_]f32{ 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5 },
+    );
     const ForkChoiceTickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
     /// Aggregation tick (interval-in-slot 2): spans sub-ms through multi-second stalls.
     const AggregationIntervalTickHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
@@ -1003,6 +1030,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Bytes size of a gossip block message" }, .{}),
         .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Bytes size of a gossip attestation message" }, .{}),
         .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Bytes size of a gossip aggregated attestation message" }, .{}),
+        .zeam_gossip_decode_failures_total = try Metrics.ZeamGossipDecodeFailuresCounter.init(allocator, io, "zeam_gossip_decode_failures_total", .{ .help = "Gossip-ingress decode rejections, labeled by topic_kind (block|attestation|aggregation) and reason (snappy_empty|snappy_varint|snappy_oversized|snappy_truncated|snappy_decode|ssz_decode). Operator-visible signal that zeam has stopped accepting gossip BEFORE lean_head_slot drifts off wall-clock. See issue #942." }, .{}),
         .lean_attestations_production_time_seconds = Metrics.AttestationProductionTimeHistogram.init("lean_attestations_production_time_seconds", .{ .help = "Time taken to produce attestation" }, .{}),
         // compactAttestations metrics
         .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
@@ -1017,6 +1045,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
+        .zeam_libxev_callback_duration_seconds = try Metrics.LibxevCallbackDurationHistogram.init(allocator, io, "zeam_libxev_callback_duration_seconds", .{ .help = "Wall-clock time spent inside individual libxev callbacks, labeled by site (issue #942). Tracks synchronous CPU work blocking the libxev thread between drain passes. Compare against zeam_xev_clock_until_done_drain_seconds and the slow_ge_*ms counters to attribute slow drains to a specific callsite. Sites include onGossip.block.hash_tree_root, onGossip.block.ssz_clone, onGossip.aggregation.ssz_clone, onGossip.attestation.dispatch, onInterval.tick, chain.onGossip.dispatch." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
         .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
@@ -1247,6 +1276,18 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
     try metrics_lib.write(&metrics, writer);
 }
 
+/// Record wall-clock time spent inside one libxev callback (issue #942).
+/// `site` must be a fixed compile-time string from the canonical list
+/// documented on `zeam_libxev_callback_duration_seconds` — runtime-built
+/// strings would inflate the Prometheus series cardinality.
+pub fn observeLibxevCallback(site: []const u8, elapsed_seconds: f32) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_libxev_callback_duration_seconds.observe(
+        .{ .site = site },
+        elapsed_seconds,
+    ) catch {};
+}
+
 /// Record a sub-phase of aggregate attestation production (see
 /// `zeam_pq_sig_aggregated_signatures_building_phase_seconds`).
 pub fn observeAggregateAttestationBuildPhase(phase: []const u8, elapsed_seconds: f32) void {
@@ -1305,6 +1346,23 @@ pub fn observeXmssRecAggregatePhase(phase: []const u8, elapsed_ns: u64) void {
     metrics.zeam_xmss_rec_aggregate_phase_seconds.observe(
         .{ .phase = phase },
         elapsed_s,
+    ) catch {};
+}
+
+/// Issue #942: record one gossip-ingress decode rejection. `topic_kind` must
+/// be one of "block" | "attestation" | "aggregation"; `reason` is one of
+/// "snappy_empty" | "snappy_varint" | "snappy_oversized" | "snappy_truncated"
+/// | "snappy_decode" | "ssz_decode" — see the metric help text on
+/// `zeam_gossip_decode_failures_total` for the full enumeration.
+///
+/// Safe to call from FFI / network callback contexts: no allocation, label
+/// keys are interned by the registry. Silently no-ops before
+/// `metrics.init()` so test runs that haven't started the registry don't
+/// crash. Cardinality bound: 3 topic_kinds × 6 reasons = 18 series.
+pub fn incrGossipDecodeFailure(topic_kind: []const u8, reason: []const u8) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_gossip_decode_failures_total.incr(
+        .{ .topic_kind = topic_kind, .reason = reason },
     ) catch {};
 }
 
@@ -1600,4 +1658,26 @@ test "issues #863/#867: xev until_done drain metrics appear in /metrics output" 
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_drain_seconds") != null);
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_500ms_total") != null);
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_1s_total") != null);
+}
+
+// Issue #942: per-callsite libxev callback duration histogram is the
+// primary attribution signal for slow xev drains. Verify both the
+// metric name and a representative `site` label show up in the
+// Prometheus scrape body.
+test "issue #942: libxev callback duration histogram appears in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    observeLibxevCallback("onGossip.block.hash_tree_root", 0.042);
+    observeLibxevCallback("onInterval.tick", 0.003);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_libxev_callback_duration_seconds") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"onGossip.block.hash_tree_root\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"onInterval.tick\"") != null);
 }

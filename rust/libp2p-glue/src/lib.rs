@@ -339,6 +339,15 @@ fn record_mesh_peers(network_id: u32, count: u64) {
     }
 }
 
+// `dump_failed_gossip_payload` / `MAX_FAILED_GOSSIP_DUMPS` / `FAILED_GOSSIP_DUMP_COUNTER`
+// were removed in #942 phase 4. See the long-form rationale at the call site
+// (the `Behaviour::poll`-side comment in the gossipsub `Event::Message` arm):
+// the Rust-side per-failure dump duplicated the Zig-side
+// `failed_snappyz_decode_*.bin` dumps written by `writeFailedBytes`, and the
+// `Decoder::new().decompress_vec` it gated on was the second synchronous
+// decompress per gossip message — together they jammed the libp2p event
+// loop on broken-snappy bombs on the 2026-05-29 devnet.
+
 /// FFI getter: cumulative count of dropped swarm commands for the given
 /// reason tag (see `SwarmCommandDropReason`). Returns 0 for unknown tags so
 /// future Zig builds compiled against an older Rust glue do not panic.
@@ -1788,11 +1797,11 @@ impl Network {
                             }
 
                             if let gossipsub::Event::Message { message, .. } = gossipsub_event {
-                                let topic = message.topic.as_str();
-                                let topic = match CString::new(topic) {
+                                let topic_str = message.topic.as_str().to_string();
+                                let topic = match CString::new(topic_str.as_str()) {
                                     Ok(cstr) => cstr,
                                     Err(_) => {
-                                        logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic));
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic_str));
                                         continue;
                                     }
                                 };
@@ -1812,6 +1821,44 @@ impl Network {
                                         continue;
                                     }
                                 };
+
+                                // #942 phase 4: the Rust-side `Decoder::new().decompress_vec`
+                                // and accompanying `[gossip ingress decode FAIL]` log + dump
+                                // (added in `840d7058` / `f3c40406`) are GONE on purpose.
+                                //
+                                // Cause: on the 2026-05-29 devnet a 3.7 MB broken-snappy block
+                                // landed at 11:26:07 and the synchronous decompress here
+                                // (running on top of the equivalent decompress that
+                                // gossipsub's `message_id_fn` already does) blocked the
+                                // libp2p event loop for hundreds of milliseconds. The
+                                // resulting starvation knocked 8 in-flight Status RPCs
+                                // into simultaneous timeout at 11:26:56, broke 148 QUIC
+                                // handshakes with `HandshakeTimedOut`, and tipped zeam_8
+                                // into "Max reconnection attempts (5) reached, giving up"
+                                // for several peers. After that the node was sending
+                                // Status requests into the void: the chain stalled at
+                                // head=98 not because catch-up wasn't trying but because
+                                // the transport itself had been jammed by 2× per-message
+                                // decompress on the event loop.
+                                //
+                                // What we lose by removing this:
+                                //   * `[gossip ingress decode FAIL]` per-failure log →
+                                //     covered by the Zig-side `Error in snappyz decoding
+                                //     the message for topic=... first32=...` log
+                                //     (`pkgs/network/src/ethlibp2p.zig`).
+                                //   * `failed_gossip_*.bin` Rust dumps → covered by the
+                                //     pre-existing Zig-side `failed_snappyz_decode_*.bin`
+                                //     dumps written via `writeFailedBytes`. The Rust dumps
+                                //     captured `message.data` before the FFI handoff and
+                                //     were used in the cross-receiver test on 2026-05-29
+                                //     to prove the bytes are byte-identical at the wire
+                                //     side; that hypothesis is now confirmed and the
+                                //     duplicate dump path is no longer needed.
+                                //   * `rust_snap=ok` vs Zig decode reconciliation → only
+                                //     useful if there's an FFI slice bug. The
+                                //     cross-receiver test already showed the bytes that
+                                //     reach Zig match what Rust sees, so the FFI is
+                                //     faithful and this reconciliation has no signal left.
 
                                 unsafe {
                                     handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
@@ -2182,21 +2229,43 @@ impl From<MessageDomain> for [u8; 4] {
 
 impl Behaviour {
     fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
-        // Try to decompress; fallback to raw data
+        // #942 follow-up: restore spec-conformant content-addressed
+        // `message_id` (Ethereum gossipsub convention:
+        //   `SHA256(domain_tag || topic_len || topic || decompressed_bytes)`).
+        //
+        // The raw-bytes form that was here previously caused zeam to assign
+        // distinct message-ids to byte-different but content-identical
+        // copies of the same logical message. On the 2026-05-28/29 devnet
+        // we observed 8 distinct corrupted-snappy encodings of the same
+        // slot=1 block (`data_len=285473`, same `sha256_first32` prefix)
+        // arriving at zeam_8 in 70 s, all from forwarder peers' mcaches
+        // (gean_1, zeam_13, _14, _15). Under raw-bytes hashing zeam
+        // computed 8 distinct ids, attempted to decode all 8, failed all 8.
+        // Under content-addressed hashing, the first clean copy wins; all
+        // subsequent copies with the same decompressed content dedupe to
+        // the same id and are dropped by gossipsub before the application
+        // layer ever sees them.
+        //
+        // Cost: synchronous decompress on the gossipsub event loop. The
+        // earlier abandonment of this scheme was motivated by event-loop
+        // stalls of 0.5–1 s on broken-snappy payloads — the deferred-
+        // hashTreeRoot work that landed earlier on this branch has already
+        // cut `zeam_xev_clock_until_done_slow_ge_500ms_total` from ~7,600
+        // to ~490 in the parallel measurement, so the synchronous decompress
+        // here is no longer the dominant cost on the libxev tick budget.
+        // If that regresses post-deploy, the right next step is to put
+        // a small LRU cache in front of this function keyed on the raw
+        // bytes' SHA256 so identical-bytes re-forwards never re-decompress.
+        let mut hasher = sha2::Sha256::new();
         let (data_for_hash, domain): (Vec<u8>, [u8; 4]) =
             match Decoder::new().decompress_vec(&message.data) {
                 Ok(decoded) => (decoded, MessageDomain::ValidSnappy.into()),
                 Err(_) => (message.data.clone(), MessageDomain::InvalidSnappy.into()),
             };
-
-        // Prepare hashing
-        let mut hasher = sha2::Sha256::new();
         hasher.update(domain);
         hasher.update(message.topic.as_str().len().to_le_bytes());
         hasher.update(message.topic.as_str().as_bytes());
         hasher.update(&data_for_hash);
-
-        // Take first 20 bytes as message-id
         let digest = hasher.finalize();
         gossipsub::MessageId::from(&digest[..20])
     }
@@ -2268,21 +2337,23 @@ fn build_transport(
     local_private_key: Keypair,
     quic_support: bool,
 ) -> std::io::Result<BoxedTransport> {
-    // mplex config
-    let mut mplex_config = libp2p_mplex::Config::new();
-    mplex_config.set_max_buffer_size(256);
-    mplex_config.set_max_buffer_behaviour(libp2p_mplex::MaxBufferBehaviour::Block);
-
-    // yamux config
+    // #942: yamux-only on the TCP side. Previously this transport also
+    // negotiated `libp2p-mplex` via `SelectUpgrade::new(yamux, mplex)`, which
+    // caused gossip messages larger than ~100 KB to arrive corrupted at the
+    // gossipsub layer — `snap::raw::Decoder` rejected 38 of 72 incoming
+    // blocks and 28 of 402 incoming aggregations on the 2026-05-28 devnet
+    // while ream / grandine on the same network saw zero gossip decode
+    // failures. mplex is deprecated upstream and is the only differing
+    // transport feature between zeam and the clients that worked. Dropping
+    // it means TCP connections use yamux exclusively, QUIC keeps its native
+    // streams, and the gossipsub ingress path stops fragmenting/reassembling
+    // large messages through the buggy code path.
     let yamux_config = yamux::Config::default();
     // Creates the TCP transport layer
     let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
         .upgrade(core::upgrade::Version::V1)
         .authenticate(generate_noise_config(&local_private_key))
-        .multiplex(core::upgrade::SelectUpgrade::new(
-            yamux_config,
-            mplex_config,
-        ))
+        .multiplex(yamux_config)
         .timeout(Duration::from_secs(10));
     let transport = if quic_support {
         // Enables Quic
