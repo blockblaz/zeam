@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 # serde = { version = "1.0", features = ["derive"] }
-# libp2p-mplex removed in #942 fix: mplex was corrupting inbound gossip
-# messages > ~100 KB on the 2026-05-28 devnet (snap::raw::Decoder rejected
+# libp2p-mplex removed: mplex was corrupting inbound gossip
+# messages > ~100 KB under load (snap::raw::Decoder rejected
 # 38/72 inbound blocks while ream/grandine on the same network saw zero
 # decode failures). TCP transport now uses yamux exclusively.
 futures = "0.3.31"
@@ -32,5 +32,5 @@ features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "s
 
 [lib]
 # Built as an rlib so its `#[no_mangle] pub extern "C"` symbols can be funnelled
-# through the `zeam-glue` staticlib shim. See blockblaz/zeam#773.
+# through the `zeam-glue` staticlib shim.
 crate-type = ["rlib"]

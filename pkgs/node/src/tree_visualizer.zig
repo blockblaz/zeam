@@ -162,7 +162,7 @@ fn createTreeIndent(allocator: Allocator, depth: usize, is_last_child: bool) ![]
 
 /// Build fork choice JSON for the /lean/v0/fork_choice API endpoint.
 ///
-/// Field shapes follow leanSpec (src/lean_spec/subspecs/api/endpoints/fork_choice.py):
+/// Field shapes follow the spec's fork-choice endpoint:
 ///   - head: bare root string "0x..."  (NOT a {slot, root} object)
 ///   - safe_target: bare root string "0x..."  (NOT a {root} object)
 ///     safe_target carries no slot because it is a root pointer, not a checkpoint;

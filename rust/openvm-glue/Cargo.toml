@@ -16,6 +16,6 @@ openvm-circuit = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3
 
 [lib]
 # Built as an rlib so its `#[no_mangle] pub extern "C"` symbols can be funnelled
-# through the `zeam-glue` staticlib shim. See blockblaz/zeam#773.
+# through the `zeam-glue` staticlib shim.
 crate-type = ["rlib"]
 name = "openvm_glue"

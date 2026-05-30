@@ -199,8 +199,8 @@ fn runCase(
     };
 
     if (blocks_array.items.len == 0 and expect_exception != null) {
-        // Slots-only monotonicity fixtures (leanSpec PR #643:
-        // test_process_slots_*) ship `pre` + `expectException` with no
+        // Slots-only monotonicity fixtures
+        // (test_process_slots_*) ship `pre` + `expectException` with no
         // blocks. The test is that `process_slots(state, state.slot)` (or
         // any `target <= state.slot`) must be rejected. There's no explicit
         // `targetSlot` in the JSON — the test name and the fixture shape

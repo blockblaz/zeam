@@ -13,7 +13,6 @@ edition = "2021"
 # On macOS, `ld64` refuses to coalesce the duplicates when Zig links multiple
 # such staticlibs into a single executable, breaking `build-all-provers`.
 # Funnelling every glue rlib through a single staticlib emits the shim once.
-# See blockblaz/zeam#773.
 
 [dependencies]
 libp2p-glue   = { path = "../libp2p-glue",   optional = true }

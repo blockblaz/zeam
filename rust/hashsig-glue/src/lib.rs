@@ -560,7 +560,7 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
 }
 
 // Test-scheme verify path. Always compiled, regardless of the test-config
-// feature flag. Used by zeam's spec-test runner against leanSpec fixtures
+// feature flag. Used by zeam's spec-test runner against spec fixtures
 // generated with leanEnv=test (LOG_LIFETIME=8, DIMENSION=4, ~424-byte signatures).
 mod test_scheme {
     use leansig::serialization::Serializable;
@@ -573,7 +573,7 @@ mod test_scheme {
     use leansig::MESSAGE_LENGTH;
     use std::slice;
 
-    /// Verify a leanSpec test-scheme XMSS signature.
+    /// Verify the spec's test-scheme XMSS signature.
     ///
     /// Returns 1 if valid, 0 if invalid, -1 on parse / pointer error.
     ///

@@ -1,4 +1,4 @@
-//! Refcounted `*BeamState` wrapper (slice c-2a of #803).
+//! Refcounted `*BeamState` wrapper.
 //!
 //! Background: `BeamChain.states` is a hashmap of `Root → *BeamState`.
 //! Slice (a-2) wrapped reads in `BorrowedState` so callers couldn't
@@ -266,9 +266,8 @@ pub const RcBeamState = struct {
     /// stale release runs. The assert is best-effort, NOT a
     /// guaranteed safety net; it catches some double-releases but
     /// release-build / racy-stale-pointer behaviour is silent UB.
-    /// Slice c-2b will need the `tryAcquire` upgrade-from-weak
-    /// pattern to make stale-pointer acquires safe; see the
-    /// follow-up note in #803.
+    /// A later slice will need the `tryAcquire` upgrade-from-weak
+    /// pattern to make stale-pointer acquires safe.
     pub fn release(self: *const Self) void {
         // Cast: refcount is logically internal mutable state even
         // on a const view, and the freeing branch needs to call
@@ -862,8 +861,7 @@ test "RcBeamState.tryAcquire: returns null after refcount reaches 0" {
 
 test "RcBeamState.tryAcquire: succeeds while caller holds a pre-bump (no UAF under release-to-zero of separate ref)" {
     // Renamed from "race against release-to-zero — producer + freer"
-    // because that title oversold what the test actually exercises
-    // (PR #828 review by @ch4r10t33r):
+    // because that title oversold what the test actually exercises:
     //
     // Each Trier thread is HANDED its own pre-bumped reference by
     // the spawning thread (`rc.acquireWriter()` before spawn). So

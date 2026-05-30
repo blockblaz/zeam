@@ -1,4 +1,4 @@
-//! Slot-driver stall watchdog (#863).
+//! Slot-driver stall watchdog.
 //!
 //! Spawns a background OS thread that probes `Clock.lastTickMs()` at
 //! a fixed interval. When the gap between wall clock and the last tick
@@ -39,7 +39,7 @@ pub const DEFAULT_PROBE_MS: u64 = 1000;
 
 /// Threshold above which the watchdog declares a stall. Picked so a
 /// single nominal slot interval (~800ms) plus normal jitter does not
-/// trip it; multi-second stalls (the #863 symptom) do.
+/// trip it; multi-second stalls do.
 pub const DEFAULT_THRESHOLD_MS: u64 = 5000;
 
 /// Hysteresis: after firing, suppress further firings until the slot

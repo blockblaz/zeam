@@ -6,8 +6,6 @@
 //! the only things we care about are the `#[no_mangle] pub extern "C"`
 //! functions defined in those crates, which rustc preserves in the final
 //! archive as long as the rlib is part of the link set.
-//!
-//! See blockblaz/zeam#773 for the motivation.
 
 #[cfg(feature = "libp2p")]
 extern crate libp2p_glue;

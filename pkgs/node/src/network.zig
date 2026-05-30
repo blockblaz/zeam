@@ -154,8 +154,8 @@ pub const BlockByRangeContext = struct {
 };
 
 /// Identifies an outbound `blocks_by_range` request by its slot window.
-/// Issue #893: allow many concurrent ranges, but reject overlapping slot windows
-/// (review PR #894 / zclawz: overlapping windows corrupt async import accounting).
+/// Allow many concurrent ranges, but reject overlapping slot windows:
+/// overlapping windows corrupt async import accounting.
 pub const BlocksByRangeKey = struct {
     start_slot: types.Slot,
     count: u64,
@@ -235,8 +235,8 @@ pub const BlocksByRootRequestResult = struct {
     }
 };
 
-/// Issue #863 P3: cap on outbound `BlocksByRoot` RPCs in flight at any
-/// given moment. The pre-#863 path issued one RPC per attestation that
+/// Cap on outbound `BlocksByRoot` RPCs in flight at any
+/// given moment. The earlier path issued one RPC per attestation that
 /// referenced an unknown head, multiplied by 4× subnet fanout for an
 /// aggregator — under flood the libxev thread fanned hundreds of
 /// concurrent RPCs that themselves timed out (8s default per
@@ -271,7 +271,7 @@ pub const Network = struct {
     timed_out_requests: std.ArrayList(u64) = .empty,
     timed_out_requests_lock: zeam_utils.SyncMutex = .{},
 
-    /// Issue #863 P3: in-flight outbound `BlocksByRoot` RPC count.
+    /// In-flight outbound `BlocksByRoot` RPC count.
     /// Incremented by `ensureBlocksByRootRequest` after a successful
     /// dispatch, decremented by `finalizePendingRequest` regardless of
     /// success / timeout / peer disconnect. Read by
@@ -282,7 +282,7 @@ pub const Network = struct {
     /// path on the libxev thread don't tear it.
     blocks_by_root_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    /// Issue #893: active outbound `blocks_by_range` windows (one in-flight per key).
+    /// Active outbound `blocks_by_range` windows (one in-flight per key).
     blocks_by_range_active: std.AutoHashMap(BlocksByRangeKey, void),
     blocks_by_range_active_lock: zeam_utils.SyncMutex = .{},
 
@@ -357,8 +357,8 @@ pub const Network = struct {
 
     /// Publish a gossip message via the configured backend. Returns `true`
     /// when the message was successfully accepted by the backend, `false`
-    /// when the backend dropped it (e.g. rust-libp2p command channel full,
-    /// see issue #808). Callers should treat `false` as "this message did not
+    /// when the backend dropped it (e.g. rust-libp2p command channel
+    /// full). Callers should treat `false` as "this message did not
     /// leave the host" and surface it accordingly.
     pub fn publish(self: *Self, data: *const networks.GossipMessage) !bool {
         return self.backend.gossip.publish(data);
@@ -590,7 +590,7 @@ pub const Network = struct {
     /// data into `chain.onBlock` (STF + XMSS verify, hundreds of ms
     /// during which a concurrent `removeFetchedBlock` could free the
     /// underlying storage). The borrow-shape `getFetchedBlockWithSsz`
-    /// was removed in PR #820 (slice a-3 follow-up); see the
+    /// was removed; see the
     /// `OwnedBlockAndSsz` docstring in `locking.zig` for the full UAF
     /// rationale.
     pub fn cloneFetchedBlockAndSsz(
@@ -613,8 +613,7 @@ pub const Network = struct {
     /// All three updates happen under the cache's lock in one critical
     /// section — the legacy two-step (getBlock then removeOne) leaked a
     /// TOCTOU window where another thread could remove the entry or its
-    /// parent's children list, leaving the cache in a torn state. See
-    /// PR #820 / issue #803.
+    /// parent's children list, leaving the cache in a torn state.
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
         return self.block_cache.removeFetchedBlock(root);
     }
@@ -992,7 +991,7 @@ pub const Network = struct {
         run_sync_end: bool = false,
     };
 
-    /// Single lock acquisition for range-chunk bookkeeping (issue #893).
+    /// Single lock acquisition for range-chunk bookkeeping.
     pub fn updateBlocksByRangeRequest(
         self: *Self,
         request_id: u64,
@@ -1034,7 +1033,7 @@ pub const Network = struct {
         return ctx.result;
     }
 
-    /// Issue #863 P3: errors that signal "request would exceed the
+    /// Errors that signal "request would exceed the
     /// in-flight cap" so the caller can bucket them as a soft-rejection
     /// rather than a hard error. This is intentionally a separate error
     /// from `error.NoPeersAvailable` because the calling code in
@@ -1042,7 +1041,7 @@ pub const Network = struct {
     /// `lean_block_fetch_dedup_total{outcome=…}` buckets.
     pub const EnsureBlocksByRootError = error{InFlightCapReached};
 
-    /// Issue #909 review #5: single public entry-point for blocks-by-root
+    /// Single public entry-point for blocks-by-root
     /// requests.  `preferred_peer` is a **hint**, not a hard requirement
     /// (see TOCTOU contract below): when the preferred peer is still
     /// connected it will be used; otherwise we fall back to `selectPeer()`.
@@ -1057,7 +1056,7 @@ pub const Network = struct {
 
         if (!self.shouldRequestBlocksByRoot(roots)) return null;
 
-        // Issue #863 P3: enforce the in-flight cap BEFORE `selectPeer`
+        // Enforce the in-flight cap before `selectPeer`
         // so a saturated cap doesn't burn a peer-selection round trip.
         // The compare-and-set loop is monotonic; under contention each
         // attempt observes the latest count, so a concurrent finalize
@@ -1146,7 +1145,6 @@ pub const Network = struct {
         // aliased the in-map allocator-owned bytes, and a concurrent
         // `finalizePendingRequest` could `fetchRemove` + free the entry
         // between the `get` returning and the dupes running — UAF.
-        // PR #820 / issue #803.
         const Ctx = struct {
             self: *Self,
             out: ?PendingRequestSnapshot = null,
@@ -1230,7 +1228,7 @@ pub const Network = struct {
                     for (block_ctx.requested_roots) |root| {
                         _ = self.removePendingBlockRoot(root);
                     }
-                    // Issue #863 P3: release the in-flight slot reserved by
+                    // Release the in-flight slot reserved by
                     // `ensureBlocksByRootRequest`. Decrement is unconditional
                     // (success / timeout / disconnect / cancellation all flow
                     // through here).
