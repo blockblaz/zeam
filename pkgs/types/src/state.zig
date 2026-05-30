@@ -478,7 +478,17 @@ pub const BeamState = struct {
             // ceilDiv is not available so this seems like a less compute intensive way without
             // requring float division, can be further optimized
             if (3 * target_justifications_count >= 2 * num_validators) {
-                self.latest_justified = attestation_data.target;
+                // The block becomes justified
+                //
+                // The chain now considers this block part of its safe head.
+                // Only advance the checkpoint forward.
+                // Attestations within a block can resolve in any order, and
+                // an earlier target processed after a later one must not
+                // drag latest_justified backwards.
+                if (attestation_data.target.slot > self.latest_justified.slot) {
+                    self.latest_justified = attestation_data.target;
+                }
+
                 try utils.setSlotJustified(finalized_slot, &self.justified_slots, target_slot, true);
                 // Free the removed justifications array before removing from map
                 if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
@@ -1198,6 +1208,104 @@ test "root_to_slot_cache lifecycle" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "same-block multi-target attestations advance latest_justified to highest slot" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 4);
+    defer state.deinit();
+
+    // Build an empty linear chain block_1 .. block_9.
+    var empty_blocks: [9]block.BeamBlock = undefined;
+    var built: usize = 0;
+    defer for (empty_blocks[0..built]) |*b| b.deinit();
+
+    var slot_i: Slot = 1;
+    while (slot_i <= 9) : (slot_i += 1) {
+        try state.process_slots(std.testing.allocator, slot_i, logger);
+        empty_blocks[built] = try makeBlock(
+            std.testing.allocator,
+            &state,
+            state.slot,
+            &[_]attestation.AggregatedAttestation{},
+        );
+        built += 1;
+        try state.process_block(std.testing.allocator, empty_blocks[built - 1], logger, null);
+    }
+
+    // Advance to slot 10 and snapshot the canonical roots needed for the
+    // attestations. block_9's root isn't in historical_block_hashes until
+    // block_10 is processed, so derive it from the now-complete latest header.
+    try state.process_slots(std.testing.allocator, 10, logger);
+
+    const genesis_root = try state.historical_block_hashes.get(0);
+    const block_4_root = try state.historical_block_hashes.get(4);
+    const block_6_root = try state.historical_block_hashes.get(6);
+    var block_9_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_9_root, std.testing.allocator);
+
+    // Supermajority across validators {0, 1, 2} (3 of 4 = 2/3+ threshold).
+    // Source is the genesis checkpoint, which is implicitly justified.
+    const source = Checkpoint{ .root = genesis_root, .slot = 0 };
+
+    var att_to_4 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        source,
+        .{ .root = block_4_root, .slot = 4 },
+    );
+    var att_to_4_transferred = false;
+    defer if (!att_to_4_transferred) att_to_4.deinit();
+
+    var att_to_9 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        source,
+        .{ .root = block_9_root, .slot = 9 },
+    );
+    var att_to_9_transferred = false;
+    defer if (!att_to_9_transferred) att_to_9.deinit();
+
+    var att_to_6 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        source,
+        .{ .root = block_6_root, .slot = 6 },
+    );
+    var att_to_6_transferred = false;
+    defer if (!att_to_6_transferred) att_to_6.deinit();
+
+    // Body order is [4, 9, 6]: slot 6 is processed after slot 9 so it would
+    // drag latest_justified backwards if iteration weren't careful.
+    var block_10 = try makeBlock(
+        std.testing.allocator,
+        &state,
+        state.slot,
+        &[_]attestation.AggregatedAttestation{ att_to_4, att_to_9, att_to_6 },
+    );
+    att_to_4_transferred = true;
+    att_to_9_transferred = true;
+    att_to_6_transferred = true;
+    defer block_10.deinit();
+
+    try state.process_block(std.testing.allocator, block_10, logger, null);
+
+    // latest_justified must land on slot 9 (the highest justified target),
+    // not slot 6 which was processed last.
+    try std.testing.expectEqual(@as(Slot, 9), state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &state.latest_justified.root, &block_9_root));
+
+    // No finalization expected; the chain is still anchored at genesis.
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_finalized.slot);
+
+    // Slots 4, 6, and 9 are all individually marked justified.
+    try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 4));
+    try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 6));
+    try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 9));
 }
 
 test "encode decode state roundtrip" {

@@ -543,17 +543,8 @@ pub const BeamChain = struct {
         });
 
         var states = std.AutoHashMap(types.Root, *RcBeamState).init(allocator);
-        // Build the anchor state on the stack via sszClone, then
-        // hand it to RcBeamState.create which embeds it into the
-        // heap allocation (and consumes it on either success or
-        // OOM — always-consume contract per c-2a).
-        var cloned_anchor_state: types.BeamState = undefined;
-        try types.sszClone(
-            allocator,
-            types.BeamState,
-            opts.anchorState.*,
-            &cloned_anchor_state,
-        );
+
+        const cloned_anchor_state = try zeam_utils.clone(types.BeamState, opts.anchorState, allocator);
         // Past this line, `cloned_anchor_state` owns interior
         // allocations. RcBeamState.create takes ownership; on OOM
         // it will deinit them for us.
@@ -1264,8 +1255,7 @@ pub const BeamChain = struct {
                 error.UnknownTargetBlock,
                 error.MissingState,
                 => {
-                    var cloned: types.SignedAggregatedAttestation = undefined;
-                    types.sszClone(self.allocator, types.SignedAggregatedAttestation, agg, &cloned) catch |clone_err| {
+                    const cloned = zeam_utils.clone(types.SignedAggregatedAttestation, &agg, self.allocator) catch |clone_err| {
                         zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "worker_validation_failed" }) catch {};
                         self.logger.warn(
                             "chain-worker: aggregation buffer clone failed slot={d}: {any}",
@@ -1277,8 +1267,7 @@ pub const BeamChain = struct {
                     return;
                 },
                 error.AttestationTooFarInFuture => {
-                    var cloned: types.SignedAggregatedAttestation = undefined;
-                    types.sszClone(self.allocator, types.SignedAggregatedAttestation, agg, &cloned) catch |clone_err| {
+                    const cloned = zeam_utils.clone(types.SignedAggregatedAttestation, &agg, self.allocator) catch |clone_err| {
                         zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "worker_validation_failed" }) catch {};
                         self.logger.warn(
                             "chain-worker: aggregation buffer clone failed slot={d}: {any}",
@@ -1739,7 +1728,7 @@ pub const BeamChain = struct {
     /// Why a `*bool` gate parameter rather than nulling an
     /// `?*BeamState` (the original `produceBlock` shape)? The
     /// `onBlock` path also distinguishes a NOT-OWNED case (caller
-    /// supplied `post_state` and we sszClone before wrapping) where
+    /// supplied `post_state` and we clone before wrapping) where
     /// the upstream errdefer is gated by an additional
     /// `post_state_owned` flag, not by an optional. A bool gate
     /// matches both call sites; the optional gate did not. Pre-c-2b
@@ -1747,7 +1736,7 @@ pub const BeamChain = struct {
     /// (PR #828 review by @ch4r10t33r) — this helper unifies them.
     ///
     /// NOTE: the helper is for the OWNED case only. `onBlock`'s
-    /// caller-supplied path still does its own `sszClone` +
+    /// caller-supplied path still does its own clone ++
     /// `RcBeamState.create` inline because the value-source there
     /// is not a heap wrapper to free.
     fn wrapOwnedStateIntoRc(
@@ -2509,7 +2498,7 @@ pub const BeamChain = struct {
         // bool gate to match `onBlock`'s post_state_settled shape.
         // `wrapOwnedStateIntoRc` flips this on consume; the upstream
         // errdefer below covers every early-return path before the
-        // wrap, including a partial sszClone that left interior
+        // wrap, including a partial clone that left interior
         // allocations behind (BeamState.deinit is tolerant of
         // partial init by design).
         var post_state_consumed = false;
@@ -2517,7 +2506,7 @@ pub const BeamChain = struct {
             post_state.deinit();
             self.allocator.destroy(post_state);
         };
-        try types.sszClone(self.allocator, types.BeamState, pre_snapshot.*, post_state);
+        post_state.* = try zeam_utils.clone(types.BeamState, pre_snapshot, self.allocator);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         // FFI call against the owned snapshot — no lock held during this
@@ -2849,8 +2838,7 @@ pub const BeamChain = struct {
                             // Need block_root for the pending queue key — compute lazily.
                             var lazy_root: types.Root = undefined;
                             try zeam_utils.hashTreeRoot(types.BeamBlock, block, &lazy_root, self.allocator);
-                            var cloned: types.SignedBlock = undefined;
-                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                            const cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator);
                             const queued = self.enqueuePendingBlock(cloned, lazy_root);
                             if (queued) {
                                 self.logger.info(
@@ -2879,8 +2867,7 @@ pub const BeamChain = struct {
                             "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
                             .{ block.slot, &lazy_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
                         );
-                        var cloned: types.SignedBlock = undefined;
-                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                        var cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator);
                         if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
                             const queued = self.enqueuePendingBlock(cloned, lazy_root);
                             if (queued) {
@@ -2900,8 +2887,7 @@ pub const BeamChain = struct {
                     }
 
                     // Worker dispatch: SSZ clone + queue push on libxev — no hash.
-                    var cloned: types.SignedBlock = undefined;
-                    try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                    var cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator);
                     var cloned_consumed = false;
                     defer if (!cloned_consumed) cloned.deinit();
                     // Pass null block_root: worker thunk computes it off-thread.
@@ -2969,8 +2955,7 @@ pub const BeamChain = struct {
                     //     metric bump for visibility.
                     self.validateBlock(block, true) catch |err| switch (err) {
                         error.FutureSlotQueueable => {
-                            var cloned: types.SignedBlock = undefined;
-                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                            const cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator);
                             const queued = self.enqueuePendingBlock(cloned, block_root);
                             if (queued) {
                                 self.logger.info(
@@ -2999,8 +2984,7 @@ pub const BeamChain = struct {
                             "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
                             .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
                         );
-                        var cloned: types.SignedBlock = undefined;
-                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                        var cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator);
 
                         // Re-check after the clone in case `onInterval`
                         // ticked the clock past this block's slot while
@@ -3052,8 +3036,7 @@ pub const BeamChain = struct {
                     //     fan out `processCachedDescendants(root)` and
                     //     give cached children a retry chance.
                     if (self.chain_worker != null) {
-                        var cloned: types.SignedBlock = undefined;
-                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                        var cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator);
                         var cloned_consumed = false;
                         // `defer` (not `errdefer`): QueueFull / QueueClosed return
                         // `.{}` from the catch arm — a normal return — so `errdefer`
@@ -3267,8 +3250,7 @@ pub const BeamChain = struct {
                     // failure or queue-full/closed, `defer` frees the clone if the
                     // worker did not take ownership (`errdefer` would miss the
                     // catch-arm `return .{}` paths — zclawz review, #886).
-                    var cloned: types.SignedAggregatedAttestation = undefined;
-                    try types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned);
+                    var cloned = try zeam_utils.clone(types.SignedAggregatedAttestation, &signed_aggregation, self.allocator);
                     var cloned_consumed = false;
                     defer if (!cloned_consumed) cloned.deinit();
                     self.submitGossipAggregatedAttestation(cloned) catch |err| switch (err) {
@@ -3311,8 +3293,7 @@ pub const BeamChain = struct {
                         error.UnknownTargetBlock,
                         error.MissingState,
                         => {
-                            var cloned: types.SignedAggregatedAttestation = undefined;
-                            types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned) catch {
+                            const cloned = zeam_utils.clone(types.SignedAggregatedAttestation, &signed_aggregation, self.allocator) catch {
                                 zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                                 return .{};
                             };
@@ -3320,8 +3301,7 @@ pub const BeamChain = struct {
                             return .{};
                         },
                         error.AttestationTooFarInFuture => {
-                            var cloned: types.SignedAggregatedAttestation = undefined;
-                            types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned) catch {
+                            const cloned = zeam_utils.clone(types.SignedAggregatedAttestation, &signed_aggregation, self.allocator) catch {
                                 zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                                 return .{};
                             };
@@ -3398,11 +3378,11 @@ pub const BeamChain = struct {
             }
 
             const cpost_state = try self.allocator.create(types.BeamState);
-            // If sszClone or anything after fails, destroy the outer allocation.
+            // If clone or anything after fails, destroy the outer allocation.
             errdefer self.allocator.destroy(cpost_state);
 
-            try types.sszClone(self.allocator, types.BeamState, pre_snapshot.*, cpost_state);
-            // sszClone succeeded — interior heap fields are now allocated.
+            cpost_state.* = try zeam_utils.clone(types.BeamState, pre_snapshot, self.allocator);
+            // clone succeeded — interior heap fields are now allocated.
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
             step_watch.lap("parent_state_clone");
@@ -3493,7 +3473,7 @@ pub const BeamChain = struct {
 
         const block_ssz_for_db: []const u8 = if (blockInfo.sszBytes) |precomputed| precomputed else blk: {
             // No pre-serialized bytes: clone the block and serialize the clone only.
-            try types.sszClone(self.allocator, types.SignedBlock, signedBlock, &fallback_clone);
+            fallback_clone = try zeam_utils.clone(types.SignedBlock, &signedBlock, self.allocator);
             fallback_clone_initialized = true;
             try ssz.serialize(types.SignedBlock, fallback_clone, &fallback_ssz, self.allocator);
             step_watch.lap("ssz_serialize_fallback");
@@ -3656,7 +3636,7 @@ pub const BeamChain = struct {
         //     value-move + wrapper-destroy + create + gate-flip
         //     dance, identical to `produceBlock`'s commit path.
         //   * !post_state_owned (caller supplied a *BeamState we
-        //     don't own): sszClone into a fresh value, then
+        //     don't own): clone into a fresh value, then
         //     `RcBeamState.create` consumes that. The caller's
         //     allocation is left untouched; nothing to free, no
         //     gate to flip (post_state_settled stays false here
@@ -3675,11 +3655,10 @@ pub const BeamChain = struct {
             post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_settled);
         } else {
             // Caller owns post_state; clone its value into a fresh
-            // BeamState, then wrap. Past sszClone success, `value`
+            // BeamState, then wrap. Past clone success, `value`
             // owns interior allocations; `RcBeamState.create`'s
             // always-consume contract handles cleanup on OOM.
-            var value: types.BeamState = undefined;
-            try types.sszClone(self.allocator, types.BeamState, post_state.*, &value);
+            const value = try zeam_utils.clone(types.BeamState, post_state, self.allocator);
             post_state_rc = try RcBeamState.create(self.allocator, value);
         }
         // statesCommitKeepExisting takes the rc on either path:
@@ -4581,8 +4560,7 @@ pub const BeamChain = struct {
         };
         defer borrow.deinit();
 
-        var validators_owned: types.Validators = undefined;
-        types.sszClone(chain.allocator, types.Validators, borrow.state.validators, &validators_owned) catch |err| {
+        var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, chain.allocator) catch |err| {
             chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
             return;
         };
@@ -5820,18 +5798,14 @@ test "enqueuePendingBlock #788: deduplicates by root" {
     var root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, signed.block, &root, allocator);
 
-    var clone1: types.SignedBlock = undefined;
-    try types.sszClone(allocator, types.SignedBlock, signed, &clone1);
-    var clone2: types.SignedBlock = undefined;
-    try types.sszClone(allocator, types.SignedBlock, signed, &clone2);
+    var clone1 = try zeam_utils.clone(types.SignedBlock, &signed, allocator);
+    var clone2 = try zeam_utils.clone(types.SignedBlock, &signed, allocator);
 
     // Stash the chain's allocator so we hand the clones to it (matches
     // how `onGossip` does it via `self.allocator`). Use that here too.
     const chain_allocator = fx.beam_chain.allocator;
-    var clone1_in_chain: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, signed, &clone1_in_chain);
-    var clone2_in_chain: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, signed, &clone2_in_chain);
+    const clone1_in_chain = try zeam_utils.clone(types.SignedBlock, &signed, chain_allocator);
+    const clone2_in_chain = try zeam_utils.clone(types.SignedBlock, &signed, chain_allocator);
     clone1.deinit();
     clone2.deinit();
 
@@ -5858,8 +5832,7 @@ test "enqueuePendingBlock #788: cap eviction drops oldest by receive order" {
     const base = fx.mock_chain.blocks[1];
     var i: usize = 0;
     while (i < constants.MAX_PENDING_BLOCKS) : (i += 1) {
-        var clone: types.SignedBlock = undefined;
-        try types.sszClone(chain_allocator, types.SignedBlock, base, &clone);
+        var clone = try zeam_utils.clone(types.SignedBlock, &base, chain_allocator);
         // Distinct slot → distinct root after re-hash.
         clone.block.slot = @intCast(i + 100);
         var root: types.Root = undefined;
@@ -5872,8 +5845,7 @@ test "enqueuePendingBlock #788: cap eviction drops oldest by receive order" {
     // The first slot in the queue is currently 100 (the oldest by
     // receive order). Enqueue one more; the cap-evictor must drop
     // slot=100 and leave a length-MAX queue with slot=200..MAX+99.
-    var newest: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, base, &newest);
+    var newest = try zeam_utils.clone(types.SignedBlock, &base, chain_allocator);
     newest.block.slot = constants.MAX_PENDING_BLOCKS + 200;
     var newest_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, newest.block, &newest_root, chain_allocator);
@@ -5899,8 +5871,7 @@ test "enqueuePendingBlock #788: drops blocks before latest_finalized" {
     // case where queued entries fall behind finalization between
     // arrival and the next drain. enqueueing a new block triggers the
     // pre-finalized eviction sweep.
-    var stale: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &stale);
+    var stale = try zeam_utils.clone(types.SignedBlock, &fx.mock_chain.blocks[1], chain_allocator);
     stale.block.slot = 5;
     var stale_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, stale.block, &stale_root, chain_allocator);
@@ -5917,8 +5888,7 @@ test "enqueuePendingBlock #788: drops blocks before latest_finalized" {
     // Enqueue a fresh future block; the helper's pre-finalized sweep
     // should drop the stale entry and accept the fresh one, leaving
     // a length-1 queue with the newer block.
-    var fresh: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &fresh);
+    var fresh = try zeam_utils.clone(types.SignedBlock, &fx.mock_chain.blocks[1], chain_allocator);
     fresh.block.slot = 200;
     var fresh_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, fresh.block, &fresh_root, chain_allocator);
@@ -5936,8 +5906,7 @@ test "processPendingBlocks #788: evicts pre-finalized entries during scan" {
     // Queue an entry, then move finalization past it without going
     // through enqueue (so the gossip-path sweep doesn't get a chance).
     // processPendingBlocks must still drop it during its own scan.
-    var stale: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &stale);
+    var stale = try zeam_utils.clone(types.SignedBlock, &fx.mock_chain.blocks[1], chain_allocator);
     stale.block.slot = 5;
     var stale_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, stale.block, &stale_root, chain_allocator);
@@ -5974,8 +5943,7 @@ test "processPendingBlocks #788: evicts too-far-future entries during scan" {
     // legitimately have such an entry in the queue if e.g. a previous
     // build tolerated a wider window or finalization advancement
     // shifted the boundary.
-    var entry: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &entry);
+    var entry = try zeam_utils.clone(types.SignedBlock, &fx.mock_chain.blocks[1], chain_allocator);
     entry.block.slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE + 1;
     var entry_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, entry.block, &entry_root, chain_allocator);
@@ -6041,8 +6009,7 @@ test "enqueuePendingBlock #788: append_oom path returns false without evicting" 
 
     // Build the candidate clone using the parent (real) allocator so
     // its construction itself doesn't OOM.
-    var clone: types.SignedBlock = undefined;
-    try types.sszClone(orig_alloc, types.SignedBlock, fx.mock_chain.blocks[1], &clone);
+    const clone = try zeam_utils.clone(types.SignedBlock, &fx.mock_chain.blocks[1], orig_alloc);
     var clone_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, clone.block, &clone_root, orig_alloc);
 
@@ -6075,8 +6042,7 @@ test "enqueuePendingBlock #788: dedup uses cached root, not re-hash" {
     const chain_allocator = fx.beam_chain.allocator;
 
     // Enqueue one legitimate entry.
-    var clone1: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &clone1);
+    var clone1 = try zeam_utils.clone(types.SignedBlock, &fx.mock_chain.blocks[1], chain_allocator);
     clone1.block.slot = 50;
     var root1: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlock, clone1.block, &root1, chain_allocator);
@@ -6092,8 +6058,7 @@ test "enqueuePendingBlock #788: dedup uses cached root, not re-hash" {
     // Enqueue a second clone of the SAME block (same root). The dedup
     // loop must hit on memcmp without re-hashing either side, and the
     // duplicate must be dropped (return false).
-    var clone2: types.SignedBlock = undefined;
-    try types.sszClone(chain_allocator, types.SignedBlock, clone1, &clone2);
+    const clone2 = try zeam_utils.clone(types.SignedBlock, &clone1, chain_allocator);
     const dedup_result = fx.beam_chain.enqueuePendingBlock(clone2, root1);
     try std.testing.expect(!dedup_result);
     try std.testing.expectEqual(@as(usize, 1), fx.beam_chain.pending_blocks.items.len);
@@ -6777,8 +6742,7 @@ test "BlockCache: insert + get + removeChildrenOf bounded" {
     // takes ownership of the block + ssz buffer; clone both so the mock
     // chain's storage stays valid for assertions.
     for (1..mock_chain.blocks.len) |i| {
-        var clone: types.SignedBlock = undefined;
-        try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[i], &clone);
+        const clone = try zeam_utils.clone(types.SignedBlock, &mock_chain.blocks[i], std.testing.allocator);
 
         var ssz_buf: std.ArrayList(u8) = .empty;
         defer ssz_buf.deinit(std.testing.allocator);
@@ -6824,8 +6788,7 @@ test "BlockCache: partial-state invariant (re-insert leaves no orphans)" {
     // consistent triple-present state — in particular, the second insert
     // must free the previous block + ssz so a leak detector stays happy.
     for (0..2) |_| {
-        var clone: types.SignedBlock = undefined;
-        try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], &clone);
+        const clone = try zeam_utils.clone(types.SignedBlock, &mock_chain.blocks[1], std.testing.allocator);
 
         var ssz_buf: std.ArrayList(u8) = .empty;
         defer ssz_buf.deinit(std.testing.allocator);
@@ -6869,9 +6832,9 @@ test "BlockCache: insertBlockPtr+ssz atomic visibility" {
     const root = mock_chain.blockRoots[1];
 
     // Pre-allocate the heap pointer + ssz buffer the way Network does.
-    const block_ptr = try std.testing.allocator.create(types.SignedBlock);
-    errdefer std.testing.allocator.destroy(block_ptr);
-    try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], block_ptr);
+    var block = try zeam_utils.clone(types.SignedBlock, &mock_chain.blocks[1], std.testing.allocator);
+    errdefer block.deinit();
+    defer block.deinit();
 
     var ssz_buf: std.ArrayList(u8) = .empty;
     defer ssz_buf.deinit(std.testing.allocator);
@@ -6881,11 +6844,7 @@ test "BlockCache: insertBlockPtr+ssz atomic visibility" {
     // Before insert: both-null.
     try std.testing.expect((try bc.cloneBlockAndSsz(root, std.testing.allocator)) == null);
 
-    try bc.insertBlockPtr(root, block_ptr, mock_chain.blocks[1].block.parent_root, ssz_bytes);
-    // Cache took the inner SignedBlock value (struct copy). Free the outer
-    // heap pointer; the inner allocations and ssz bytes are owned by the
-    // cache now.
-    std.testing.allocator.destroy(block_ptr);
+    try bc.insertBlockPtr(root, &block, mock_chain.blocks[1].block.parent_root, ssz_bytes);
 
     // After atomic insert: both-Some.
     const got_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);
@@ -6912,7 +6871,7 @@ test "BlockCache: insertBlockPtr null-ssz then attachSsz still observable atomic
     const root = mock_chain.blockRoots[1];
 
     const block_ptr = try std.testing.allocator.create(types.SignedBlock);
-    try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], block_ptr);
+    block_ptr.* = try zeam_utils.clone(types.SignedBlock, &mock_chain.blocks[1], std.testing.allocator);
 
     try bc.insertBlockPtr(root, block_ptr, mock_chain.blocks[1].block.parent_root, null);
     std.testing.allocator.destroy(block_ptr);
@@ -6957,16 +6916,15 @@ test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
     const root = mock_chain.blockRoots[1];
     const parent_root = mock_chain.blocks[1].block.parent_root;
 
-    const block_ptr = try std.testing.allocator.create(types.SignedBlock);
-    try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], block_ptr);
+    var block = try zeam_utils.clone(types.SignedBlock, &mock_chain.blocks[1], std.testing.allocator);
+    errdefer block.deinit();
 
     var ssz_buf: std.ArrayList(u8) = .empty;
     defer ssz_buf.deinit(std.testing.allocator);
     try ssz.serialize(types.SignedBlock, mock_chain.blocks[1], &ssz_buf, std.testing.allocator);
     const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
 
-    try bc.insertBlockPtr(root, block_ptr, parent_root, ssz_bytes);
-    std.testing.allocator.destroy(block_ptr);
+    try bc.insertBlockPtr(root, &block, parent_root, ssz_bytes);
 
     {
         const present_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);
@@ -7026,7 +6984,7 @@ test "BlockCache: 3-thread stress — insert / read / remove preserves invariant
 
     const Worker = struct {
         // Insert N blocks under fake roots key=base..base+N. Each block
-        // is a fresh sszClone of the template + a fresh ssz buffer so
+        // is a fresh clone of the template + a fresh ssz buffer so
         // ownership transfers cleanly to the cache (matches the
         // production insertBlockPtr contract).
         fn insert(cache: *locking.BlockCache, base: u32, count: usize, template: types.SignedBlock, parent: types.Root) void {
@@ -7035,42 +6993,31 @@ test "BlockCache: 3-thread stress — insert / read / remove preserves invariant
                 var root: types.Root = std.mem.zeroes(types.Root);
                 std.mem.writeInt(u32, root[0..4], base + i, .little);
 
-                const block_ptr = std.testing.allocator.create(types.SignedBlock) catch continue;
-                types.sszClone(std.testing.allocator, types.SignedBlock, template, block_ptr) catch {
-                    std.testing.allocator.destroy(block_ptr);
-                    continue;
-                };
+                var block = zeam_utils.clone(types.SignedBlock, &template, std.testing.allocator) catch continue;
+                errdefer block.deinit();
 
                 var ssz_buf: std.ArrayList(u8) = .empty;
                 ssz.serialize(types.SignedBlock, template, &ssz_buf, std.testing.allocator) catch {
-                    block_ptr.deinit();
-                    std.testing.allocator.destroy(block_ptr);
+                    block.deinit();
                     ssz_buf.deinit(std.testing.allocator);
                     continue;
                 };
                 const ssz_bytes = ssz_buf.toOwnedSlice(std.testing.allocator) catch {
-                    block_ptr.deinit();
-                    std.testing.allocator.destroy(block_ptr);
+                    block.deinit();
                     ssz_buf.deinit(std.testing.allocator);
                     continue;
                 };
 
-                cache.insertBlockPtr(root, block_ptr, parent, ssz_bytes) catch {
+                cache.insertBlockPtr(root, &block, parent, ssz_bytes) catch {
                     // Either AlreadyCached (race with self after remove +
                     // re-insert by another iteration — won't happen with
                     // non-overlapping bases) or OOM. Either way, free and
                     // skip.
-                    block_ptr.deinit();
-                    std.testing.allocator.destroy(block_ptr);
+                    block.deinit();
                     std.testing.allocator.free(ssz_bytes);
-                    std.testing.allocator.destroy(block_ptr);
                     continue;
                 };
-                // After insertBlockPtr success the cache took the inner
-                // SignedBlock value (struct copy). Free the outer heap
-                // pointer; inner allocations + ssz bytes belong to the
-                // cache.
-                std.testing.allocator.destroy(block_ptr);
+                block.deinit();
             }
         }
 
@@ -7219,8 +7166,9 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
         // The 0-keyed root would alias genesis (zeroes); we offset by +1.
         unrelated_roots[k] = r;
 
-        var cloned_value: types.BeamState = undefined;
-        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &cloned_value);
+        // RcBeamState.create has always-consume semantics — on OOM it deinits
+        // `cloned_value` itself, so no defer/errdefer is needed here.
+        const cloned_value = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
         const cloned_rc = try RcBeamState.create(std.testing.allocator, cloned_value);
         // Insert directly under exclusive lock (test-internal access).
         beam_chain.states_lock.lock();
@@ -7330,7 +7278,7 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
     //      AutoHashMap exposes its allocator as a public field, so
     //      this is a one-line swap.
     //   3. Build a BeamState + RcBeamState the same way `onBlock`
-    //      does (sszClone the genesis state, wrap with
+    //      does (clone the genesis state, wrap with
     //      RcBeamState.create — both via testing.allocator so the
     //      FailingAllocator only affects the map).
     //   4. Pick a fresh root that is NOT already in the map (so the
@@ -7361,8 +7309,7 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -7434,8 +7381,9 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
     // fresh value, hand to RcBeamState.create. Both via
     // testing.allocator so the FailingAllocator above only affects
     // the states map.
-    var cloned_value: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &cloned_value);
+    // RcBeamState.create has always-consume semantics — on OOM it deinits
+    // `cloned_value` itself, so no defer/errdefer is needed here.
+    const cloned_value = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     const post_state_rc = try RcBeamState.create(std.testing.allocator, cloned_value);
     // No errdefer post_state_rc.release() here — the helper under
     // test is responsible for releasing it on its own OOM path.
@@ -7528,8 +7476,7 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
             },
         };
 
-        var beam_state: types.BeamState = undefined;
-        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+        var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
         defer beam_state.deinit();
 
         var tmp_dir = std.testing.tmpDir(.{});
@@ -7689,8 +7636,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
             },
         };
 
-        var beam_state: types.BeamState = undefined;
-        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+        var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
         defer beam_state.deinit();
 
         var tmp_dir = std.testing.tmpDir(.{});
@@ -7924,8 +7870,7 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8145,8 +8090,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8205,8 +8149,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     // send, so we must clone the mock-chain block (which is owned by
     // the arena and will be freed when the arena deinits, NOT by the
     // worker after dispatch).
-    var cloned: types.SignedBlock = undefined;
-    try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &cloned);
+    var cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, std.testing.allocator);
     var cloned_consumed = false;
     defer if (!cloned_consumed) cloned.deinit();
 
@@ -8256,8 +8199,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     // returns ChainWorkerDisabled rather than silently doing the
     // synchronous path. We can't test that on this chain (the
     // worker is started), so spot-check it on a fresh chain.
-    var beam_state_2: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state_2);
+    var beam_state_2 = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state_2.deinit();
 
     const spec_name_2 = try std.testing.allocator.dupe(u8, "beamdev");
@@ -8312,8 +8254,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     try std.testing.expect(beam_chain_off.chain_worker == null);
     // Caller still owns this clone (errdefer below frees it after the
     // expected ChainWorkerDisabled comes back).
-    var off_cloned: types.SignedBlock = undefined;
-    try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &off_cloned);
+    var off_cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, std.testing.allocator);
     defer off_cloned.deinit();
     try std.testing.expectError(
         error.ChainWorkerDisabled,
@@ -8431,8 +8372,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8486,8 +8426,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
         false,
     );
 
-    var cloned: types.SignedBlock = undefined;
-    try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &cloned);
+    var cloned = try zeam_utils.clone(types.SignedBlock, &signed_block, std.testing.allocator);
     var cloned_consumed = false;
     defer if (!cloned_consumed) cloned.deinit();
     try beam_chain.submitBlock(cloned, false, block_root);
@@ -8548,8 +8487,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8605,8 +8543,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
         false,
     );
 
-    var cloned: types.SignedBlock = undefined;
-    try types.sszClone(std.testing.allocator, types.SignedBlock, orphan_block, &cloned);
+    var cloned = try zeam_utils.clone(types.SignedBlock, &orphan_block, std.testing.allocator);
     var cloned_consumed = false;
     defer if (!cloned_consumed) cloned.deinit();
     try beam_chain.submitBlock(cloned, false, orphan_root);
@@ -8659,8 +8596,7 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8722,8 +8658,7 @@ test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
         beam_chain.forkChoice.fcStore.latest_finalized.slot = block.block.slot + 100;
     }
 
-    var cloned: types.SignedBlock = undefined;
-    try types.sszClone(std.testing.allocator, types.SignedBlock, block, &cloned);
+    var cloned = try zeam_utils.clone(types.SignedBlock, &block, std.testing.allocator);
     var cloned_consumed = false;
     defer if (!cloned_consumed) cloned.deinit();
     try beam_chain.submitBlock(cloned, false, block_root);
@@ -8772,8 +8707,7 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8875,8 +8809,7 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, std.testing.allocator);
     defer beam_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -8942,8 +8875,7 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
             var fake_root: types.Root = std.mem.zeroes(types.Root);
             fake_root[0] = 0xab;
 
-            var cloned_value: types.BeamState = undefined;
-            types.sszClone(std.testing.allocator, types.BeamState, ctx.genesis_state.*, &cloned_value) catch return;
+            const cloned_value = zeam_utils.clone(types.BeamState, ctx.genesis_state, std.testing.allocator) catch return;
             const new_rc = RcBeamState.create(std.testing.allocator, cloned_value) catch return;
 
             // Take the exclusive side. With the lock-free reader this
