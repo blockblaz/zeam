@@ -26,7 +26,7 @@ use std::ffi::{CStr, CString};
 use delay_map::HashMapDelay;
 use futures::future::poll_fn;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -413,6 +413,57 @@ static EVENT_LOOP_SLOW_ITERS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// digits and a pathological run lights up clearly.
 const EVENT_LOOP_SLOW_ITER_THRESHOLD_MS: u64 = 100;
 
+/// Numeric id of the swarm-task arm whose body was MOST RECENTLY entered.
+/// 0 = none seen yet; 1..=7 mapped to the arms in `run_eventloop`'s biased
+/// select! (see `arm_name`). The diag emitter reports this together with the
+/// unix-second timestamp of when it was set, so a stuck swarm task shows up
+/// as `last_arm=X` with a steadily growing `age=Ns` — that pins the wedge
+/// to the body of arm X rather than to "somewhere in the loop". Devnet
+/// evidence on a7779f91 ruled out a long synchronous body (max_iter_ms=0
+/// for 120+ s post-freeze) and pointed at a permanent waker-loss / deadlock
+/// inside one arm's body; this probe identifies which arm.
+static LAST_ARM_ENTERED: AtomicU32 = AtomicU32::new(0);
+/// Unix seconds at which `LAST_ARM_ENTERED` was last updated. Stale value =
+/// the loop hasn't entered any arm body since that timestamp = wedged.
+static LAST_ARM_ENTERED_UNIX: AtomicU64 = AtomicU64::new(0);
+/// Cumulative entry count per arm; index = arm id (1..=7), index 0 unused.
+/// Logged as a `cnt[…]` array each diag tick.
+static ARM_ENTRY_COUNTS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Mark the start of arm `idx`'s body. Inlined so the compiler folds the
+/// const-id into the atomic store.
+#[inline(always)]
+fn enter_arm(idx: u32) {
+    LAST_ARM_ENTERED.store(idx, Ordering::Relaxed);
+    LAST_ARM_ENTERED_UNIX.store(unix_secs(), Ordering::Relaxed);
+    if let Some(slot) = ARM_ENTRY_COUNTS.get(idx as usize) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn arm_name(idx: u32) -> &'static str {
+    match idx {
+        0 => "none",
+        1 => "shutdown",
+        2 => "reqresp_timeout",
+        3 => "reconnect",
+        4 => "response_channel_timeout",
+        5 => "swarm_event",
+        6 => "cmd_rx",
+        7 => "mesh_peers_tick",
+        _ => "unknown",
+    }
+}
+
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -521,6 +572,28 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                         network_id,
                         &format!(
                             "[#942 loop] max_iter_ms={max_iter_ms} slow_iters>={EVENT_LOOP_SLOW_ITER_THRESHOLD_MS}ms_total={slow_total} | msg_id_cache hits={cache_hits} misses={cache_misses} len={cache_len}/{MESSAGE_ID_CACHE_CAPACITY}"
+                        ),
+                    );
+
+                    // Per-arm tracking. `last_arm` + `age` pin a wedge to one
+                    // arm's body (steadily growing age with no other arm
+                    // entries == that arm's body never returned). `cnt[…]`
+                    // shows cumulative entry counts so we can tell which arms
+                    // are firing in a healthy run.
+                    let last_arm = LAST_ARM_ENTERED.load(Ordering::Relaxed);
+                    let last_arm_unix = LAST_ARM_ENTERED_UNIX.load(Ordering::Relaxed);
+                    let now = unix_secs();
+                    let age = now.saturating_sub(last_arm_unix);
+                    let cnt: Vec<u64> = (1..=7)
+                        .map(|i| ARM_ENTRY_COUNTS[i].load(Ordering::Relaxed))
+                        .collect();
+                    logger::rustLogger.info(
+                        network_id,
+                        &format!(
+                            "[#942 arm] last={}({}) age={age}s | shutdown={} reqresp_to={} reconnect={} resp_ch_to={} swarm_ev={} cmd_rx={} mesh_tick={}",
+                            last_arm,
+                            arm_name(last_arm),
+                            cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5], cnt[6],
                         ),
                     );
                 }
@@ -2012,6 +2085,7 @@ impl Network {
             biased;
 
             _ = shutdown.notified() => {
+                enter_arm(1);
                 logger::rustLogger.info(
                     self.network_id,
                     "stop_network signaled; exiting libp2p event loop",
@@ -2023,6 +2097,7 @@ impl Network {
                 let mut map = REQUEST_ID_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
+                enter_arm(2);
                 match timeout_result {
                     Ok((request_id, ())) => {
                         logger::rustLogger.warn(
@@ -2059,6 +2134,7 @@ impl Network {
                 let mut queue = RECONNECT_QUEUE.lock_recover();
                 std::pin::Pin::new(&mut *queue).poll_next(cx)
             }) => {
+                    enter_arm(3);
                     match reconnect_result {
                         Ok(((network_id, peer_id), (addr, attempt))) => {
                             if network_id == self.network_id {
@@ -2119,6 +2195,7 @@ impl Network {
                 let mut map = RESPONSE_CHANNEL_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
+                enter_arm(4);
                 match response_channel_timeout {
                     Ok((channel_id, channel)) => {
                         logger::rustLogger.warn(
@@ -2155,6 +2232,7 @@ impl Network {
             // arm additionally caps each iteration at MAX_SWARM_COMMANDS_PER_TICK so
             // we never sit inside it indefinitely.
                 event = swarm.select_next_some() => {
+                    enter_arm(5);
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             logger::rustLogger.info(self.network_id, &format!("Listening on {}", address));
@@ -2657,6 +2735,7 @@ impl Network {
             // (above) plus this cap means a flood of FFI publishes cannot
             // starve gossip ingestion or reqresp event handling.
             Some(first_cmd) = cmd_rx.recv() => {
+                enter_arm(6);
                 let mut cmd = first_cmd;
                 let mut drained = 0usize;
                 loop {
@@ -2775,6 +2854,7 @@ impl Network {
             // store is lock-free; no `await` here, so the swarm task is
             // never blocked.
             _ = mesh_peers_tick.tick() => {
+                enter_arm(7);
                 let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
                 record_mesh_peers(self.network_id, mesh_count);
 
