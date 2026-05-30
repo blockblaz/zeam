@@ -302,8 +302,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             errdefer proof.deinit();
 
             // Clone participants for the attestation entry
-            var att_bits: types.AggregationBits = undefined;
-            try types.sszClone(allocator, types.AggregationBits, proof.participants, &att_bits);
+            var att_bits = try zeam_utils.clone(types.AggregationBits, &proof.participants, allocator);
             errdefer att_bits.deinit();
 
             try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });

@@ -213,34 +213,6 @@ pub const ChainSpec = struct {
     }
 };
 
-// TODO: a super hacky cloning utility for ssz container structs
-// replace by a better mechanisms which could be upstreated into the ssz lib as well
-// pass a pointer where you want to clone the data
-pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !void {
-    var bytes: std.ArrayList(u8) = .empty;
-    defer bytes.deinit(allocator);
-
-    try ssz.serialize(T, data, &bytes, allocator);
-    try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
-}
-
-// Like sszClone but also returns the serialized bytes (caller owns the slice).
-// Using the same ssz.serialize pass for both clone and bytes avoids a second
-// serialize call on the same value, which has been observed to corrupt in-memory
-// List/Bitlist state when the value is later reused (e.g. cached blocks).
-//
-// On success, `data` is corrupted by ssz.serialize and must not be reused, but
-// its heap allocations can still be freed via `deinit` (see regression test below).
-// If this function fails after serialization, `data` is still corrupted and
-// must not be deinit'd; callers with errdefer cleanup need sszSerializeAndGetBytes
-// plus a separate deserialize step instead.
-pub fn sszCloneAndGetBytes(allocator: Allocator, comptime T: type, data: T, cloned: *T) ![]u8 {
-    const bytes = try sszSerializeAndGetBytes(allocator, T, data);
-    errdefer allocator.free(bytes);
-    try ssz.deserialize(T, bytes, cloned, allocator);
-    return bytes;
-}
-
 /// Serialize `data` once and return owned SSZ bytes. On success, `data` is
 /// corrupted by ssz.serialize and must not be reused; call `deinit` on the source
 /// to release its heap allocations. Use this when the caller needs to mark the
