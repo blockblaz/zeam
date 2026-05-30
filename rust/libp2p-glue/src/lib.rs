@@ -2565,8 +2565,37 @@ fn build_transport(
         .timeout(Duration::from_secs(10));
     let transport = if quic_support {
         // Enables Quic
-        // The default quic configuration suits us for now.
-        let quic_config = libp2p::quic::Config::new(&local_private_key);
+        //
+        // #942 fix #4 — QUIC receive flow-control windows.
+        //
+        // libp2p-quic's defaults are max_stream_data = 10 MB and
+        // max_connection_data = 15 MB. Two problems on this gossip workload:
+        //
+        // 1. A single Ethereum-consensus gossip message can be up to
+        //    `max_message_size()` ≈ 12.2 MB (snappy worst-case of the 10 MiB
+        //    payload + framing). That is LARGER than the 10 MB per-stream
+        //    receive window, so a max-size block cannot be received within one
+        //    stream's flow-control window — quinn stalls waiting for a window
+        //    update that gossipsub never triggers mid-message.
+        // 2. The 15 MB connection window is shared across ALL concurrent
+        //    streams on a peer connection (block topic + every attestation
+        //    subnet + RPC). During a catch-up burst of ~3.3 MB blocks plus the
+        //    attestation fan-in, the connection-level window exhausts; QUIC
+        //    flow control then blocks new STREAM_DATA frames. Small
+        //    attestation streams that already arrived still complete and get
+        //    delivered, but new LARGE block streams wedge mid-reassembly —
+        //    exactly the pinned #942 signature (block-topic delivery goes
+        //    silent after the burst while attestations keep flowing on the
+        //    same healthy connections).
+        //
+        // Raise both windows so one max-size message fits comfortably in a
+        // stream window and many concurrent large streams cannot exhaust the
+        // connection window. `max_stream_data` / `max_connection_data` are
+        // public fields on the config; they map to quinn's
+        // stream_receive_window / receive_window.
+        let mut quic_config = libp2p::quic::Config::new(&local_private_key);
+        quic_config.max_stream_data = 16 * 1024 * 1024; // 16 MB > max_message_size (~12.2 MB)
+        quic_config.max_connection_data = 64 * 1024 * 1024; // 64 MB headroom for concurrent large streams
         let quic = libp2p::quic::tokio::Transport::new(quic_config);
         let transport = tcp
             .or_transport(quic)
