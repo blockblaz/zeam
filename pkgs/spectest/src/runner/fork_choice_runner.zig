@@ -710,10 +710,16 @@ fn processBlockStep(
     const target_intervals = slotToIntervals(block.slot);
     try advanceForkchoiceIntervals(ctx, target_intervals, true);
 
-    const new_state = try zeam_utils.clone(types.BeamState, parent_state_ptr, ctx.allocator);
-    errdefer new_state.deinit();
+    // Heap-allocate so the pointer we store in `state_map`/`allocated_states`
+    // outlives this function. A stack var would leave dangling pointers
+    // for cleanup defer at the end of runCase.
+    const new_state_ptr = try ctx.allocator.create(types.BeamState);
+    var new_state_tracked = false;
+    errdefer if (!new_state_tracked) ctx.allocator.destroy(new_state_ptr);
+    new_state_ptr.* = try zeam_utils.clone(types.BeamState, parent_state_ptr, ctx.allocator);
+    errdefer if (!new_state_tracked) new_state_ptr.deinit();
 
-    state_transition.apply_transition(ctx.allocator, &new_state, block, .{ .logger = ctx.fork_logger, .validateResult = false }) catch |err| {
+    state_transition.apply_transition(ctx.allocator, new_state_ptr, block, .{ .logger = ctx.fork_logger, .validateResult = false }) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: state transition failed {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -723,7 +729,7 @@ fn processBlockStep(
 
     const finalized_slot_before = ctx.fork_choice.fcStore.latest_finalized.slot;
 
-    _ = ctx.fork_choice.onBlock(block, &new_state, .{
+    _ = ctx.fork_choice.onBlock(block, new_state_ptr, .{
         .currentSlot = block.slot,
         .blockDelayMs = 0,
         .blockRoot = block_root,
@@ -752,20 +758,21 @@ fn processBlockStep(
         };
     }
 
-    ctx.state_map.put(ctx.allocator, block_root, &new_state) catch |err| {
+    ctx.state_map.put(ctx.allocator, block_root, new_state_ptr) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: failed to index block state ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
     };
-    ctx.allocated_states.append(ctx.allocator, &new_state) catch |err| {
+    ctx.allocated_states.append(ctx.allocator, new_state_ptr) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: failed to track state allocation ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
     };
+    new_state_tracked = true;
 
     // Store block body attestations as known aggregated payloads (spec-aligned).
     for (aggregated_attestations) |aggregated_attestation| {
