@@ -2089,9 +2089,25 @@ impl Network {
                 ),
             );
             self.peer_addr_map.remove(&peer_id);
-            RECONNECT_ATTEMPTS
-                .lock_recover()
-                .remove(&(self.network_id, peer_id));
+            // RECONNECT_ATTEMPTS cleanup REMOVED here intentionally (#942).
+            //
+            // Every caller that can reach this branch already removed the
+            // entry from RECONNECT_ATTEMPTS BEFORE calling us (that's how
+            // they knew the attempt count had reached the cap):
+            //   - OutgoingConnectionError body: `let prior_attempt =
+            //     RECONNECT_ATTEMPTS.lock_recover().remove(...)` then
+            //     `schedule_reconnection(.., attempt+1)`
+            //   - DialReconnect cmd_rx handler on dial error: same pattern
+            // So re-acquiring the lock here was always a no-op (`.remove(&K)`
+            // on a key already absent) AND empirically it wedges the swarm
+            // task — devnet image e6c3c1d3 (commit 03b4ef39) on 2026-05-30
+            // froze zeam_13 at 18:48:14.894, the very first time this branch
+            // was hit: "Max reconnection attempts" warn fires, then zero
+            // further rust-bridge log lines from the swarm task. The
+            // `let`-binding fix in 03b4ef39 SHOULD have released the outer
+            // guard at the `;` (Rust temporary scope rules say so), but
+            // rather than hunt theoretical reasons why it didn't, the
+            // cleanest fix is to not take the lock here at all.
             return;
         }
 
