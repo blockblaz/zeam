@@ -413,6 +413,23 @@ static EVENT_LOOP_SLOW_ITERS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// digits and a pathological run lights up clearly.
 const EVENT_LOOP_SLOW_ITER_THRESHOLD_MS: u64 = 100;
 
+/// #942 DIAGNOSTIC TOGGLE — DO NOT MERGE TO main WITH THIS SET TO `true`.
+///
+/// On the 2026-05-30 a7779f91/2001637c devnet runs, the per-arm probe
+/// pinned the swarm-task wedge to "right after `SwarmEvent::OutgoingConnectionError`":
+/// the last variant body the task entered was OutgoingConnectionError, then
+/// `mesh_peers_tick` (which should fire every 1 s) stopped getting polled
+/// — the swarm future was permanently parked. Every observed freeze
+/// follows a wave of HandshakeTimedOut events.
+///
+/// To A/B test whether our re-dial logic (`schedule_reconnection`) is
+/// responsible vs. a libp2p / libp2p-quic 0.13 waker-loss bug, this flag
+/// short-circuits both of our reconnect-scheduling sites
+/// (`ConnectionClosed` and `OutgoingConnectionError`). If a devnet build
+/// with this `true` still wedges in the same way → it's libp2p; if the
+/// freeze disappears → our reconnect path is at fault.
+const ZEAM_DIAG_BYPASS_RECONNECT: bool = true;
+
 /// Numeric id of the swarm-task arm whose body was MOST RECENTLY entered.
 /// 0 = none seen yet; 1..=7 mapped to the arms in `run_eventloop`'s biased
 /// select! (see `arm_name`). The diag emitter reports this together with the
@@ -2440,8 +2457,10 @@ impl Network {
                                     )
                                 };
 
-                                if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
-                                    self.schedule_reconnection(peer_id, peer_addr, 1);
+                                if !ZEAM_DIAG_BYPASS_RECONNECT {
+                                    if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
+                                        self.schedule_reconnection(peer_id, peer_addr, 1);
+                                    }
                                 }
                             }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -2482,12 +2501,16 @@ impl Network {
                                     )
                                 };
 
-                                // Schedule reconnection if this was a tracked connection attempt
-                                if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
-                                    .lock_recover()
-                                    .remove(&(self.network_id, pid))
-                                {
-                                    self.schedule_reconnection(pid, addr, attempt + 1);
+                                // Schedule reconnection if this was a tracked connection attempt.
+                                // Gated for #942 diagnostic: if the freeze persists with this
+                                // skipped, the wedge is downstream of our code (libp2p / quinn).
+                                if !ZEAM_DIAG_BYPASS_RECONNECT {
+                                    if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
+                                        .lock_recover()
+                                        .remove(&(self.network_id, pid))
+                                    {
+                                        self.schedule_reconnection(pid, addr, attempt + 1);
+                                    }
                                 }
                             }
                         }
