@@ -1732,7 +1732,11 @@ pub const EthLibp2p = struct {
             },
         };
 
-        self.logger.info(
+        // Periodic publish-side forensic. Kept at debug now that the
+        // upstream snappy / cross-copy investigation is closed (commits
+        // 71f24084 + c6cf2241 verified on devnet 2026-05-30). Switch
+        // the network log scope to debug to revive these for triage.
+        self.logger.debug(
             "[#942 publish] net={d} kind={s} topic={s} slot={d} proposer={d} block_root={x} sha256_ssz={x} sha256_compressed={x} compressed_len={d} self_decode_ok={any} msg_id={x} git_sha={s} snappy_lib=zig-snappy-0.0.5",
             .{
                 self.params.networkId,

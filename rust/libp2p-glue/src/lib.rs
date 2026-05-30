@@ -599,7 +599,12 @@ fn emit_substream_diag(network_id: u32, label: &str, registry: &Mutex<Vec<Arc<Su
             " [id={id} b={bytes} d={delta} mx={mxr} idle={idle}s]"
         ));
     }
-    logger::rustLogger.info(
+    // Periodic per-substream diag. Kept at `debug` so production runs (info+
+    // by default) stay quiet; flip the Zig logger to debug for the network
+    // scope to revive these when triaging a regression. Counters live in the
+    // SUBSTREAMS atomic registries regardless of log level so the data is
+    // always there to query.
+    logger::rustLogger.debug(
         network_id,
         &format!(
             "[{label}] live={live} idle>8s={idle_streams} bytes_total={bytes_total} delta_total={delta_total} | top:{top}"
@@ -633,7 +638,7 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                         let c = MESSAGE_ID_CACHE.lock_recover();
                         (c.hits, c.misses, c.map.len())
                     };
-                    logger::rustLogger.info(
+                    logger::rustLogger.debug(
                         network_id,
                         &format!(
                             "[#942 loop] max_iter_ms={max_iter_ms} slow_iters>={EVENT_LOOP_SLOW_ITER_THRESHOLD_MS}ms_total={slow_total} | msg_id_cache hits={cache_hits} misses={cache_misses} len={cache_len}/{MESSAGE_ID_CACHE_CAPACITY}"
@@ -652,7 +657,7 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                     let cnt: Vec<u64> = (1..=7)
                         .map(|i| ARM_ENTRY_COUNTS[i].load(Ordering::Relaxed))
                         .collect();
-                    logger::rustLogger.info(
+                    logger::rustLogger.debug(
                         network_id,
                         &format!(
                             "[#942 arm] last={}({}) age={age}s | shutdown={} reqresp_to={} reconnect={} resp_ch_to={} swarm_ev={} cmd_rx={} mesh_tick={}",
@@ -673,7 +678,7 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                     let scmd_var = LAST_SWARM_COMMAND_VARIANT.load(Ordering::Relaxed);
                     let scmd_age = now
                         .saturating_sub(LAST_SWARM_COMMAND_VARIANT_UNIX.load(Ordering::Relaxed));
-                    logger::rustLogger.info(
+                    logger::rustLogger.debug(
                         network_id,
                         &format!(
                             "[#942 sub] swarm_ev_var={}({}) age={sev_age}s | cmd_var={}({}) age={scmd_age}s",
@@ -865,7 +870,7 @@ fn run_inbound_gossip_worker(rx: std::sync::mpsc::Receiver<InboundGossip>) {
         let mut ingress_hasher = sha2::Sha256::new();
         ingress_hasher.update(msg.data.as_slice());
         let ingress_digest = ingress_hasher.finalize();
-        logger::rustLogger.info(
+        logger::rustLogger.debug(
             msg.network_id,
             &format!(
                 "[#942 rx] topic={} len={} sha256_libp2p_ingress={} peer={}",
@@ -3213,7 +3218,7 @@ impl Network {
                         };
                         topic_mesh.push_str(&format!(" {label}={n}"));
                     }
-                    logger::rustLogger.info(
+                    logger::rustLogger.debug(
                         self.network_id,
                         &format!(
                             "[#942 gossip-recv] delivered_total block={block_recv} attn={attn_recv} other={other_recv} | mesh_peers total={mesh_count}{topic_mesh} | inbound_decode_dropped={}",
