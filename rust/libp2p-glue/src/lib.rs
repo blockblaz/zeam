@@ -26,7 +26,7 @@ use std::ffi::{CStr, CString};
 use delay_map::HashMapDelay;
 use futures::future::poll_fn;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -334,6 +334,203 @@ fn gossip_topic_kind_index(topic: &str) -> usize {
         1
     } else {
         2
+    }
+}
+
+// ===== #942 fix-#5 diagnostic: QUIC inbound recv-stream accounting =====
+//
+// The #942 stall is now pinned to a narrow band: AFTER the catch-up burst,
+// gossipsub delivers zero block-topic messages while attestations keep flowing
+// on the SAME QUIC connections (block-topic mesh stays healthy). The fault is
+// downstream of the QUIC connection and upstream of gossipsub delivery, and is
+// size-dependent (only large multi-frame block streams wedge). Four blind fixes
+// (off-thread decode, libp2p 0.56 bump, multi-thread runtime, QUIC recv windows)
+// all failed.
+//
+// This instrumentation wraps the QUIC `StreamMuxer` so we observe per-inbound-
+// substream byte flow at the libp2p-quic / quinn boundary, BELOW gossipsub's
+// length-delimited frame reassembly. It distinguishes the two remaining
+// hypotheses:
+//   (A) quinn recv-stream wedge — an open inbound substream's byte counter
+//       PLATEAUS and its last-read goes stale (delta==0, idle climbs) while it
+//       is still open: bytes have stopped ARRIVING from QUIC on that stream.
+//   (B) gossipsub reassembly/delivery stall — byte counters KEEP advancing on
+//       open substreams (delta>0) yet no block Message is delivered: bytes
+//       arrive but gossipsub never reassembles/hands up the large frame.
+// gossipsub keeps one persistent inbound substream per peer carrying all
+// topics, so the decisive signal is per-substream: during the freeze, does some
+// peer's inbound stream go idle (A) while others flow, or do all keep flowing
+// while block delivery is frozen (B)?
+
+/// Monotonic id allocator for instrumented inbound QUIC substreams.
+static QUIC_INBOUND_SUBSTREAM_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Per-inbound-substream receive accounting (see the section comment above).
+struct InboundSubstreamStat {
+    id: u64,
+    opened_unix: u64,
+    /// Cumulative bytes read from this substream.
+    bytes: AtomicU64,
+    /// Number of successful `poll_read`s that returned >0 bytes.
+    reads: AtomicU64,
+    /// Largest single `poll_read` return — a large multi-KB read implies a big
+    /// frame body (e.g. a block) is being pulled off this stream.
+    max_single_read: AtomicU64,
+    /// Unix seconds of the most recent non-empty read.
+    last_read_unix: AtomicU64,
+    /// `bytes` snapshot at the previous diag log, for per-interval delta.
+    logged_bytes: AtomicU64,
+    /// Set on Drop so the diag tick can prune dead entries.
+    closed: AtomicBool,
+}
+
+/// Registry of live instrumented inbound substreams. Pruned each diag tick.
+static INBOUND_SUBSTREAMS: Mutex<Vec<Arc<InboundSubstreamStat>>> = Mutex::new(Vec::new());
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn register_inbound_substream() -> Arc<InboundSubstreamStat> {
+    let now = unix_secs();
+    let stat = Arc::new(InboundSubstreamStat {
+        id: QUIC_INBOUND_SUBSTREAM_ID.fetch_add(1, Ordering::Relaxed),
+        opened_unix: now,
+        bytes: AtomicU64::new(0),
+        reads: AtomicU64::new(0),
+        max_single_read: AtomicU64::new(0),
+        last_read_unix: AtomicU64::new(now),
+        logged_bytes: AtomicU64::new(0),
+        closed: AtomicBool::new(false),
+    });
+    INBOUND_SUBSTREAMS.lock_recover().push(stat.clone());
+    stat
+}
+
+/// A `StreamMuxer` wrapper that tags each inbound substream with an
+/// `InboundSubstreamStat`. Outbound substreams are passed through untracked
+/// (the recv path is what #942 concerns). Used only on the QUIC transport.
+struct InstrumentedMuxer<M> {
+    inner: M,
+}
+
+/// A substream wrapper that counts bytes read (when `stat` is `Some`, i.e.
+/// inbound) and otherwise delegates verbatim.
+struct InstrumentedSubstream<S> {
+    inner: S,
+    stat: Option<Arc<InboundSubstreamStat>>,
+}
+
+impl<S> Drop for InstrumentedSubstream<S> {
+    fn drop(&mut self) {
+        if let Some(stat) = &self.stat {
+            stat.closed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<S> futures::io::AsyncRead for InstrumentedSubstream<S>
+where
+    S: futures::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            if let Some(stat) = &this.stat {
+                let n = *n as u64;
+                if n > 0 {
+                    stat.bytes.fetch_add(n, Ordering::Relaxed);
+                    stat.reads.fetch_add(1, Ordering::Relaxed);
+                    stat.max_single_read.fetch_max(n, Ordering::Relaxed);
+                    stat.last_read_unix.store(unix_secs(), Ordering::Relaxed);
+                }
+            }
+        }
+        r
+    }
+}
+
+impl<S> futures::io::AsyncWrite for InstrumentedSubstream<S>
+where
+    S: futures::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
+impl<M> libp2p::core::muxing::StreamMuxer for InstrumentedMuxer<M>
+where
+    M: libp2p::core::muxing::StreamMuxer + Unpin,
+    M::Substream: Unpin,
+{
+    type Substream = InstrumentedSubstream<M::Substream>;
+    type Error = M::Error;
+
+    fn poll_inbound(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner)
+            .poll_inbound(cx)
+            .map_ok(|s| InstrumentedSubstream {
+                inner: s,
+                stat: Some(register_inbound_substream()),
+            })
+    }
+
+    fn poll_outbound(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner)
+            .poll_outbound(cx)
+            .map_ok(|s| InstrumentedSubstream {
+                inner: s,
+                stat: None,
+            })
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<libp2p::core::muxing::StreamMuxerEvent, Self::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll(cx)
     }
 }
 
@@ -2368,6 +2565,44 @@ impl Network {
                             INBOUND_GOSSIP_DROPPED_TOTAL.load(Ordering::Relaxed),
                         ),
                     );
+
+                    // #942 fix-#5: per-inbound-substream recv accounting at the
+                    // QUIC/quinn boundary. For each live inbound substream show
+                    // cumulative bytes, the delta since the last log, and the
+                    // idle time since its last read. During the block-delivery
+                    // freeze: a stream with delta=0 + rising idle while still
+                    // open => bytes stopped ARRIVING from QUIC (quinn recv-stream
+                    // wedge, hyp. A). All streams with delta>0 while block
+                    // delivery is frozen => gossipsub reassembly stall (hyp. B).
+                    let now = unix_secs();
+                    let mut reg = INBOUND_SUBSTREAMS.lock_recover();
+                    reg.retain(|s| !s.closed.load(Ordering::Relaxed));
+                    let live = reg.len();
+                    let mut per_stream = String::new();
+                    let mut idle_streams = 0u64;
+                    for s in reg.iter() {
+                        let bytes = s.bytes.load(Ordering::Relaxed);
+                        let prev = s.logged_bytes.swap(bytes, Ordering::Relaxed);
+                        let delta = bytes.saturating_sub(prev);
+                        let idle = now.saturating_sub(s.last_read_unix.load(Ordering::Relaxed));
+                        let reads = s.reads.load(Ordering::Relaxed);
+                        let maxread = s.max_single_read.load(Ordering::Relaxed);
+                        let age = now.saturating_sub(s.opened_unix);
+                        if idle > 8 {
+                            idle_streams += 1;
+                        }
+                        per_stream.push_str(&format!(
+                            " [id={} age={age}s bytes={bytes} d={delta} reads={reads} maxread={maxread} idle={idle}s]",
+                            s.id
+                        ));
+                    }
+                    drop(reg);
+                    logger::rustLogger.info(
+                        self.network_id,
+                        &format!(
+                            "[#942 quic-recv] inbound_live={live} idle_streams(>8s)={idle_streams} |{per_stream}"
+                        ),
+                    );
                 }
             }
 
@@ -2601,7 +2836,12 @@ fn build_transport(
             .or_transport(quic)
             .map(|either_output, _| match either_output {
                 Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-                Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+                // #942 fix-#5 diagnostic: wrap the QUIC muxer so inbound
+                // substream byte flow is accounted at the quinn boundary.
+                Either::Right((peer_id, muxer)) => (
+                    peer_id,
+                    StreamMuxerBox::new(InstrumentedMuxer { inner: muxer }),
+                ),
             });
         transport.boxed()
     } else {
