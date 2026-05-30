@@ -2818,6 +2818,11 @@ fn setupTestPrimitives() !*ThreadPool {
     return @import("./testing.zig").setupTestPrimitives(std.testing.allocator);
 }
 
+/// Alias for setupTestPrimitives for backward compatibility with existing tests.
+fn initTestThreadPool() !*ThreadPool {
+    return setupTestPrimitives();
+}
+
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "forkchoice block tree" {
