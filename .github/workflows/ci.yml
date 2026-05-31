@@ -303,9 +303,63 @@ jobs:
         echo "All build attempts failed"
         exit 1
 
+  gen-fixtures:
+    name: gen-fixtures
+    # LeanSpec fixtures are produced by the real recursive-STARK prover
+    # (lean-multisig-py). That proving is done ONCE here on the fast Apple-silicon
+    # macOS runner (~30m with -n auto) and published as an artifact. The `test`
+    # matrix job downloads it and runs only the cheap spec generate/run on both
+    # OSes. This keeps fixture proving off the ubuntu runner, where parallel `fill`
+    # saturates its 4 vCPU / 16 GB and the prover's process-global setup wedges,
+    # hanging the step for hours.
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+        cache: false
+
+    - name: Ensure rustup proxy shims (macOS)
+      run: |
+        # The macos runner ships cargo/rustup shims that resolve to rustup-init
+        # (see the fuller note in the `test` job); recreate them before any cargo
+        # call so `uv run fill` can build the lean-multisig-py prover extension.
+        if ! command -v cargo >/dev/null 2>&1 || ! cargo --version >/dev/null 2>&1; then
+          echo "Rustup proxy shims are broken; reinstalling via rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain nightly --no-modify-path \
+                       --profile minimal --force
+        fi
+        cargo --version
+        rustup run nightly cargo --version
+
+    - name: Install uv
+      shell: bash
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Generate LeanSpec fixtures
+      working-directory: leanSpec
+      run: uv run fill --clean --fork=Lstar -n auto
+
+    - name: Upload LeanSpec fixtures
+      uses: actions/upload-artifact@v4
+      with:
+        name: leanspec-fixtures
+        path: leanSpec/fixtures
+        retention-days: 1
+        if-no-files-found: error
+
   test:
     name: test
     runs-on: ${{ matrix.os }}
+    needs: gen-fixtures
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -426,16 +480,25 @@ jobs:
         echo "All sim test attempts failed"
         exit 1
 
-    - name: Install uv
-      shell: bash
-      run: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+    - name: Download LeanSpec fixtures
+      uses: actions/download-artifact@v4
+      with:
+        name: leanspec-fixtures
+        path: leanSpec/fixtures
 
-    - name: Generate LeanSpec fixtures
-      working-directory: leanSpec
-      run: uv run fill --clean --fork=Lstar -n auto
-    
+    - name: Verify fixtures present
+      shell: bash
+      # Guard against a silent false-green: spectest:generate emits an empty stub
+      # (and spectest:run then "passes" with 0 tests) when leanSpec/fixtures is
+      # missing or empty. Require the real fixture set before continuing.
+      run: |
+        count=$(find leanSpec/fixtures -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+        echo "Downloaded fixture JSON files: $count"
+        if [ "$count" -lt 50 ]; then
+          echo "::error::Expected the LeanSpec fixture set at leanSpec/fixtures (hundreds of JSON files), found $count — artifact download path is wrong or generation produced nothing."
+          exit 1
+        fi
+
     - name: Generate spec fixtures
       run: zig build spectest:generate --summary all
 
