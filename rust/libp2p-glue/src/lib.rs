@@ -592,7 +592,8 @@ fn emit_substream_diag(network_id: u32, label: &str, registry: &Mutex<Vec<Arc<Su
         rows.push((bytes, delta, mxr, idle, s.id));
     }
     drop(reg);
-    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    // Top streams by cumulative bytes, highest first.
+    rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
     let mut top = String::new();
     for (bytes, delta, mxr, idle, id) in rows.iter().take(8) {
         top.push_str(&format!(
