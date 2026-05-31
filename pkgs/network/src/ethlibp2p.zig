@@ -18,6 +18,13 @@ const snappyz = @import("snappyz");
 const snappyframesz = @import("snappyframesz");
 const node_registry = @import("./node_registry.zig");
 const NodeNameRegistry = node_registry.NodeNameRegistry;
+// #942 follow-up: publish-side forensic logging includes the build git SHA so
+// receivers across the fleet can correlate broken-byte receipts back to the
+// exact producer binary.
+const build_options = @import("build_options");
+
+// Gossipsub spec message-id domain (matches Rust libp2p-glue / leanSpec).
+const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = .{ 0x01, 0x00, 0x00, 0x00 };
 
 const ServerStreamError = error{
     StreamAlreadyFinished,
@@ -417,8 +424,14 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
 /// disk with one debug file per message (PR #855 review #5). We only persist
 /// `1` of every `MALFORMED_DUMP_SAMPLE_RATE` rejections; the rest are logged
 /// inline. The counter is process-local and racy across threads, which is
-/// fine — the goal is *not* exact 1:1024 sampling, just bounded disk pressure.
-const MALFORMED_DUMP_SAMPLE_RATE: usize = 1024;
+/// fine — the goal is *not* exact 1:N sampling, just bounded disk pressure.
+///
+/// Lowered 1024 → 32 for the #942 in-transit-corruption investigation
+/// (2026-05-29 devnet). Worst-case observed failure rate was ~30 dumps/min
+/// on a single node, at <300 KB per dump → ~9 MB/min on disk, bounded by
+/// the rolling `deserialization_dumps/` cleanup in the ops playbook.
+/// Restore to 1024 once the libp2p-layer corruption is fixed (issue #942).
+const MALFORMED_DUMP_SAMPLE_RATE: usize = 32;
 var malformed_dump_counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
 /// Returns true iff the caller should persist this malformed message to disk.
@@ -594,11 +607,22 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         // #942: inline first-bytes preview + per-failure counter so a stalled
         // zeam fleet shows up on dashboards (`zeam_gossip_decode_failures_total`)
         // and the framing format on the wire is diagnosable from logs alone.
+        //
+        // #942 producer attribution: sha256(compressed) of the inbound bytes
+        // is the byte-exact fingerprint to look up against the publish-side
+        // `[#942 publish]` log line's `sha256_compressed`. Length alone has
+        // been observed to collide (devnet 2026-05-29 dump showed length
+        // 284553 match between ethlambda publish and zeam_8 inbound, but
+        // sha256 differed — proving in-transit byte mutation rather than
+        // codec interop bug). Adding the hash lets correlation become a
+        // single fleet-wide grep.
         const preview = byteHexPreview(message_bytes, GOSSIP_PREVIEW_MAX_BYTES);
         const preview_bytes = @min(message_bytes.len, GOSSIP_PREVIEW_MAX_BYTES);
+        var inbound_sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(message_bytes, &inbound_sha256, .{});
         zigHandler.logger.err(
-            "Error in snappyz decoding the message for topic={s} (len={d}) from peer={s}: {any}; first{d}={s}",
-            .{ topic_slice, message_bytes.len, sender_peer_id_slice, e, preview_bytes, preview.slice() },
+            "Error in snappyz decoding the message for topic={s} (len={d}) sha256_inbound={x} from peer={s}: {any}; first{d}={s}",
+            .{ topic_slice, message_bytes.len, &inbound_sha256, sender_peer_id_slice, e, preview_bytes, preview.slice() },
         );
         zeam_metrics.incrGossipDecodeFailure(topic_kind_label, "snappy_decode");
         if (shouldPersistMalformedDump()) {
@@ -1630,8 +1654,105 @@ pub const EthLibp2p = struct {
 
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
+
+        // #942 publish-side forensic log. If a peer reports
+        // `snappy.error.Corrupt` on bytes whose sha256 matches the
+        // `sha256_compressed` field below, the producer of those bytes is the
+        // node that emitted this line (identified by `git_sha`). Conversely,
+        // if no producer log matches the broken hash, the corruption
+        // originated downstream (forwarder re-encode or wire-level damage).
+        self.emitPublishForensicLog(data, topic_str, message, compressed_message);
+
         self.logger.debug("network-{d}:: publishing to rust bridge data={f} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
         return publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
+    }
+
+    /// Emit a single structured log line capturing the pre-snappy and
+    /// post-snappy hashes of an outbound gossip message plus the spec
+    /// message-id. Intended for cross-fleet log correlation under #942.
+    /// Failures here are swallowed: instrumentation must not block publish.
+    fn emitPublishForensicLog(
+        self: *Self,
+        data: *const interface.GossipMessage,
+        topic_str: [:0]u8,
+        ssz_bytes: []const u8,
+        compressed: []const u8,
+    ) void {
+        // Pre/post-snappy content hashes.
+        var ssz_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(ssz_bytes, &ssz_hash, .{});
+        var compressed_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(compressed, &compressed_hash, .{});
+
+        // Spec gossipsub message_id:
+        //   SHA256(MESSAGE_DOMAIN_VALID_SNAPPY || u64_le(topic_len) || topic || ssz_bytes)[:20]
+        // Mirrors the formula in `rust/libp2p-glue/src/lib.rs` so a producer's
+        // message_id matches what any receiver computes from the same payload.
+        var msg_id_20: [20]u8 = undefined;
+        {
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(&MESSAGE_DOMAIN_VALID_SNAPPY);
+            var topic_len_le: [8]u8 = undefined;
+            const topic_slice: []const u8 = topic_str[0..topic_str.len];
+            std.mem.writeInt(u64, &topic_len_le, @as(u64, topic_slice.len), .little);
+            hasher.update(&topic_len_le);
+            hasher.update(topic_slice);
+            hasher.update(ssz_bytes);
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            @memcpy(&msg_id_20, digest[0..20]);
+        }
+
+        // Self-decode roundtrip: a `false` here means the local snappyz
+        // encoder produced a payload its own decoder rejects — strong signal
+        // that the producer (this binary) is the source of broken-snappy.
+        const self_decoded = snappyz.decodeWithMax(self.allocator, compressed, MAX_GOSSIP_BLOCK_SIZE) catch null;
+        defer if (self_decoded) |d| self.allocator.free(d);
+        const self_decode_ok: bool = if (self_decoded) |d| std.mem.eql(u8, d, ssz_bytes) else false;
+
+        // Per-kind fields. Block root is only meaningful for the block kind;
+        // attestation/aggregation leave it zeroed.
+        var slot: u64 = 0;
+        var proposer: u64 = 0;
+        var block_root: [32]u8 = std.mem.zeroes([32]u8);
+        const kind_label: []const u8 = switch (data.*) {
+            .block => |sb| blk: {
+                slot = sb.block.slot;
+                proposer = sb.block.proposer_index;
+                zeam_utils.hashTreeRoot(types.BeamBlock, sb.block, &block_root, self.allocator) catch {};
+                break :blk "block";
+            },
+            .aggregation => |agg| blk: {
+                slot = agg.data.slot;
+                break :blk "aggregation";
+            },
+            .attestation => |att| blk: {
+                slot = att.message.message.slot;
+                break :blk "attestation";
+            },
+        };
+
+        // Periodic publish-side forensic. Kept at debug now that the
+        // upstream snappy / cross-copy investigation is closed (commits
+        // 71f24084 + c6cf2241 verified on devnet 2026-05-30). Switch
+        // the network log scope to debug to revive these for triage.
+        self.logger.debug(
+            "[#942 publish] net={d} kind={s} topic={s} slot={d} proposer={d} block_root={x} sha256_ssz={x} sha256_compressed={x} compressed_len={d} self_decode_ok={any} msg_id={x} git_sha={s} snappy_lib=zig-snappy-0.0.5",
+            .{
+                self.params.networkId,
+                kind_label,
+                topic_str,
+                slot,
+                proposer,
+                &block_root,
+                &ssz_hash,
+                &compressed_hash,
+                compressed.len,
+                self_decode_ok,
+                &msg_id_20,
+                build_options.version,
+            },
+        );
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -2073,6 +2194,32 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
         MAX_GOSSIP_BLOCK_SIZE,
     );
     try std.testing.expectEqual(@as(usize, MAX_GOSSIP_BLOCK_SIZE), at_limit_ok.value);
+}
+
+test "issue_942 inbound corruption: real on-the-wire bytes captured from devnet must surface as error.Corrupt" {
+    // Captured 2026-05-29 from zeam_8 (root@77.42.121.211) during devnet run
+    // with PR #953 deployed. The byte stream arrived at zeam_8's gossipsub
+    // ingress with `compressed_len=284553` (matching ethlambda_8's slot-1
+    // block publish at 18:18:19.929 UTC, length 284553) but with a DIFFERENT
+    // sha256 than ethlambda's published `compressed_sha256=0c83964d…`.
+    //
+    // sha256(this file) = c8700b167c3550add606cdef67ab385d061165c141fd76718bc2a35ff13a496e
+    //
+    // Cross-checked locally: `rust-snap 1.1.1` (the exact same crate version
+    // ethlambda, ream, and grandine all use) also fails to decode these
+    // bytes with `Offset { offset: 2265232849, dst_pos: 98776 }`. That rules
+    // out a zig-snappy ↔ rust-snap interop bug and pins the corruption to
+    // somewhere between ethlambda's publish and zeam_8's receive — almost
+    // certainly inside the libp2p framing / muxer layer (echoes #39 +
+    // ruled out by #37 for mplex specifically).
+    //
+    // Locking the symptom in as a test means any future "fix" to snappyz
+    // that starts accepting these mangled bytes goes through a deliberate
+    // code review rather than silently masking the upstream transport bug.
+    const corrupt = @embedFile("testdata_issue_942_inbound_corrupt.bin");
+    try std.testing.expectEqual(@as(usize, 284553), corrupt.len);
+    const result = snappyz.decodeWithMax(std.testing.allocator, corrupt, MAX_GOSSIP_BLOCK_SIZE);
+    try std.testing.expectError(error.Corrupt, result);
 }
 
 test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic" {
