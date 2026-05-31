@@ -50,6 +50,33 @@ const freeJsonValue = utils.freeJsonValue;
 /// sub-threshold aggregates on chatty subnets.
 pub const default_min_aggregation_inputs: u32 = 2;
 
+/// Default `max_aggregation_children` for the aggregator-role STARK budget.
+///
+/// Surfaced on the CLI as `--max-aggregation-children` (see
+/// `pkgs/cli/src/main.zig`) and consumed by `prepareAggregateAttData` after
+/// greedy + subset-prune select children for this `att_data`. Caps the
+/// number of child STARK proofs passed into `rec_xmss_aggregate`; excess
+/// children are dropped (sorted by descending validator coverage).
+///
+/// Default `0`: aggregator worker NEVER takes the recursive code path,
+/// always proves flat over the raw signature set. Peer-published aggregates
+/// for the same `att_data` remain in `latest_known_aggregated_payloads`
+/// (gossip already propagated them; not re-publishing is information-
+/// preserving on the wire), and the block proposer's `compactAttestations`
+/// step can still merge them at block-proposal time. This keeps the
+/// worker's per-call latency bounded by flat-prove cost (~3.6 ms/sig on
+/// 16-core Hetzner per lean-bench `aggregate.flat_*_r2` at log_inv_rate=2,
+/// so well under 1 s for committee-sized inputs) instead of paying ~4.5 s
+/// for a recursive merge.
+///
+/// `1`: allow at most one peer child to be merged with raws — useful when
+/// operators want broader on-the-wire coverage from a single aggregator
+/// publish, accepting ~1.5 s per recursive prove. Higher values approach
+/// the pre-cap behaviour and reintroduce the multi-second tail (#940
+/// devnet snapshot: `num_children=3-4` proves averaged ~4.5 s, dominated
+/// the p95).
+pub const default_max_aggregation_children: u32 = 0;
+
 // signatures_map types for aggregation
 
 /// Stored signatures_map entry: per-validator signature + slot metadata.
@@ -687,6 +714,7 @@ pub const AggregatedAttestationsResult = struct {
         known_payloads: ?*const AggregatedPayloadsMap,
         slot_filter: ?[]const Slot,
         thread_pool: *ThreadPool,
+        max_aggregation_children: u32,
     ) !void {
         const allocator = self.allocator;
 
@@ -736,6 +764,7 @@ pub const AggregatedAttestationsResult = struct {
                 new_payloads,
                 known_payloads,
                 data,
+                max_aggregation_children,
             );
         }
         observeAggregateAttDataPrepPhase(prep_start_ns);
@@ -973,6 +1002,11 @@ pub const SingleAggregatedSignature = CompactGroupResult;
 
 /// Single `att_data` aggregation: serial prep then one XMSS prove (ethlambda
 /// `aggregate_job` shape). Used by the aggregator per-job loop.
+///
+/// `max_aggregation_children` caps the number of child STARK proofs merged
+/// with raw signatures by the recursive prover (#940 follow-up). See
+/// `default_max_aggregation_children` for the rationale; threaded from
+/// `ForkChoice.max_aggregation_children` through `aggregateUnlocked`.
 pub fn computeSingleAggregatedSignature(
     allocator: Allocator,
     validators: *const Validators,
@@ -980,6 +1014,7 @@ pub fn computeSingleAggregatedSignature(
     new_payloads: ?*const AggregatedPayloadsMap,
     known_payloads: ?*const AggregatedPayloadsMap,
     data: attestation.AttestationData,
+    max_aggregation_children: u32,
 ) !?SingleAggregatedSignature {
     var prep = try prepareAggregateAttData(
         allocator,
@@ -988,6 +1023,7 @@ pub fn computeSingleAggregatedSignature(
         new_payloads,
         known_payloads,
         data,
+        max_aggregation_children,
     );
     defer prep.deinit(allocator);
 
@@ -1067,6 +1103,7 @@ fn prepareAggregateAttData(
     new_payloads: ?*const AggregatedPayloadsMap,
     known_payloads: ?*const AggregatedPayloadsMap,
     data: attestation.AttestationData,
+    max_aggregation_children: u32,
 ) !AggregateAttDataPrep {
     const epoch: u64 = data.slot;
     var message_hash: [32]u8 = undefined;
@@ -1209,6 +1246,61 @@ fn prepareAggregateAttData(
                 },
             },
         };
+    }
+
+    // Cap the number of children passed to the recursive STARK at
+    // `max_aggregation_children`. Greedy + prune left only proofs that each
+    // add validator coverage raws don't have, but every additional child is
+    // a ~1.3 s adder to `rec_xmss_aggregate` (#940 devnet snapshot:
+    // num_children=1 proves averaged ~1.5 s, num_children=3-4 averaged
+    // ~4.8 s). Operators who would rather bound worker latency than publish
+    // a maximally-covering aggregate per tick set this to 0 — peers' own
+    // gossipped aggregates remain in `latest_known_aggregated_payloads` for
+    // the block proposer to compact at proposal time. Children are dropped
+    // lowest-coverage first so the retained set keeps the most validators
+    // per remaining child.
+    //
+    // Placement: AFTER the `!has_gossip and len==1` fast-path above, so the
+    // cheap clone-only case still fires for cap=0. The cap is strictly a
+    // STARK-cost guard; the fast-path doesn't invoke `rec_xmss_aggregate`,
+    // so capping it would lose validator coverage for no latency benefit.
+    if (selected_children.items.len > @as(usize, max_aggregation_children)) {
+        const PopCountIndex = struct {
+            popcount: usize,
+            index: usize,
+        };
+        var rankings = try allocator.alloc(PopCountIndex, selected_children.items.len);
+        defer allocator.free(rankings);
+        for (selected_children.items, 0..) |*child, i| {
+            var count: usize = 0;
+            const bits = child.participants;
+            var bit_idx: usize = 0;
+            while (bit_idx < bits.len()) : (bit_idx += 1) {
+                if (bits.get(bit_idx) catch false) count += 1;
+            }
+            rankings[i] = .{ .popcount = count, .index = i };
+        }
+        const lessThan = struct {
+            fn cmp(_: void, a: PopCountIndex, b: PopCountIndex) bool {
+                if (a.popcount != b.popcount) return a.popcount > b.popcount; // desc
+                return a.index < b.index; // stable tie-break
+            }
+        }.cmp;
+        std.mem.sort(PopCountIndex, rankings, {}, lessThan);
+
+        var keep = try allocator.alloc(bool, selected_children.items.len);
+        defer allocator.free(keep);
+        @memset(keep, false);
+        for (rankings[0..@as(usize, max_aggregation_children)]) |entry| keep[entry.index] = true;
+
+        var idx_back = selected_children.items.len;
+        while (idx_back > 0) {
+            idx_back -= 1;
+            if (!keep[idx_back]) {
+                selected_children.items[idx_back].deinit();
+                _ = selected_children.swapRemove(idx_back);
+            }
+        }
     }
 
     var xmss_participants: ?attestation.AggregationBits = null;
@@ -1871,7 +1963,7 @@ test "computeAggregatedSignatures filters attestation data by slot list" {
     defer thread_pool.deinit();
 
     const allowed_slots = [_]Slot{10};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool, default_max_aggregation_children);
 
     try std.testing.expectEqual(@as(usize, 1), result.attestations.len());
     const aggregated = try result.attestations.get(0);
@@ -1903,12 +1995,12 @@ test "computeAggregatedSignatures slot filter matches unfiltered for same-slot i
 
     const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
-    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool);
+    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool, default_max_aggregation_children);
 
     var filtered = try AggregatedAttestationsResult.init(allocator);
     defer filtered.deinit();
     const allowed_slots = [_]Slot{12};
-    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..], thread_pool);
+    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..], thread_pool, default_max_aggregation_children);
 
     try std.testing.expectEqual(unfiltered.attestations.len(), filtered.attestations.len());
     try std.testing.expectEqual(unfiltered.attestation_signatures.len(), filtered.attestation_signatures.len());
@@ -1937,7 +2029,7 @@ test "computeAggregatedSignatures empty slot filter result is clean" {
     const allowed_slots = [_]Slot{14};
     const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool, default_max_aggregation_children);
 
     try std.testing.expectEqual(@as(usize, 0), result.attestations.len());
     try std.testing.expectEqual(@as(usize, 0), result.attestation_signatures.len());
@@ -2156,6 +2248,7 @@ test "computeSingleAggregatedSignature: single-child passthrough survives prep d
         &payloads,
         null,
         att_data,
+        default_max_aggregation_children,
     );
     var result = maybe_result orelse return error.TestExpectedSome;
     defer {

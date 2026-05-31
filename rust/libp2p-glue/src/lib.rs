@@ -26,7 +26,7 @@ use std::ffi::{CStr, CString};
 use delay_map::HashMapDelay;
 use futures::future::poll_fn;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -260,6 +260,18 @@ enum SwarmCommand {
         channel_id: u64,
         payload: Vec<u8>,
     },
+    /// Issued by a detached `tokio::spawn` task scheduled inside
+    /// `Network::schedule_reconnection` after sleeping for the per-attempt
+    /// backoff. The swarm task is the only place with `&mut swarm`, so the
+    /// actual `swarm.dial(...)` happens here. Side-stepped the previous
+    /// `RECONNECT_QUEUE: HashMapDelay` polled from arm 3 — that delay-map
+    /// interaction with the swarm select! was the trigger for the #942
+    /// permanent waker loss.
+    DialReconnect {
+        peer_id: PeerId,
+        addr: Multiaddr,
+        attempt: u32,
+    },
 }
 
 /// Capacity for the per-network swarm command channel.
@@ -287,6 +299,739 @@ const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 8192;
 /// the 1024-slot channel. Still small enough that one busy network can't
 /// monopolize the executor.
 const MAX_SWARM_COMMANDS_PER_TICK: usize = 256;
+
+/// Capacity of the inbound-gossip hand-off channel (issue #942).
+///
+/// Each slot owns one inbound gossip payload (the compressed bytes moved out
+/// of `gossipsub::Message`). The libp2p event loop `try_send`s onto this
+/// channel; a single dedicated worker thread drains it and performs the heavy
+/// synchronous snappy-decompress + SSZ-deserialize + chain dispatch via
+/// `handleMsgFromRustBridge`. The point is to keep that hundreds-of-ms-per-block
+/// work OFF the `new_current_thread` tokio runtime that also drives quinn's
+/// QUIC I/O — that starvation corrupted the QUIC receive path and stalled
+/// gossip (the cross-message byte-bleed pinned in `issue_942_layer.md`, and the
+/// earlier 148 broken QUIC handshakes / 8 Status-RPC timeouts).
+///
+/// Bounded so a burst of large blocks cannot grow memory without limit. On a
+/// full channel the message is dropped (counted in `INBOUND_GOSSIP_DROPPED_TOTAL`)
+/// — gossip is best-effort and a missed block is recovered via the
+/// blocks_by_root / blocks_by_range RPC sync fallback. 256 slots × the common
+/// ~286 KB block ≈ 73 MB worst case; drops only occur during a decode backlog,
+/// which is exactly when shedding load (instead of stalling the transport) is
+/// the right behaviour.
+const INBOUND_GOSSIP_CHANNEL_CAPACITY: usize = 256;
+
+/// Count of inbound gossip messages dropped because the decode worker's queue
+/// was full (issue #942). Process-wide; surfaced in logs at the drop site.
+static INBOUND_GOSSIP_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// #942 diagnosis: count of gossipsub `Message` events DELIVERED to the swarm
+/// event loop, split by topic kind ([0]=block, [1]=attestation/aggregation,
+/// [2]=other). This counts messages gossipsub handed up *before* our decode
+/// worker runs, so comparing the block vs attestation arrival rates across the
+/// stall tells us whether BLOCK gossip stops ARRIVING (a transport/mesh fault,
+/// e.g. QUIC recv-stream wedge or block-topic mesh collapse) or keeps arriving
+/// but fails downstream in decode. A periodic event-loop log prints the totals
+/// alongside the per-topic mesh size so a frozen block counter with a healthy
+/// mesh is immediately visible. Process-wide (one zeam node = one network).
+static GOSSIP_RECV_BY_KIND_TOTAL: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Classify a gossipsub topic string into a `GOSSIP_RECV_BY_KIND_TOTAL` index.
+/// Topics are Ethereum-style `/leanconsensus/<fork>/<kind>/ssz_snappy`.
+fn gossip_topic_kind_index(topic: &str) -> usize {
+    if topic.contains("/block") {
+        0
+    } else if topic.contains("agg") || topic.contains("attest") {
+        1
+    } else {
+        2
+    }
+}
+
+// ===== #942 fix-#5 diagnostic: QUIC inbound recv-stream accounting =====
+//
+// The #942 stall is now pinned to a narrow band: AFTER the catch-up burst,
+// gossipsub delivers zero block-topic messages while attestations keep flowing
+// on the SAME QUIC connections (block-topic mesh stays healthy). The fault is
+// downstream of the QUIC connection and upstream of gossipsub delivery, and is
+// size-dependent (only large multi-frame block streams wedge). Four blind fixes
+// (off-thread decode, libp2p 0.56 bump, multi-thread runtime, QUIC recv windows)
+// all failed.
+//
+// This instrumentation wraps the QUIC `StreamMuxer` so we observe per-inbound-
+// substream byte flow at the libp2p-quic / quinn boundary, BELOW gossipsub's
+// length-delimited frame reassembly. It distinguishes the two remaining
+// hypotheses:
+//   (A) quinn recv-stream wedge — an open inbound substream's byte counter
+//       PLATEAUS and its last-read goes stale (delta==0, idle climbs) while it
+//       is still open: bytes have stopped ARRIVING from QUIC on that stream.
+//   (B) gossipsub reassembly/delivery stall — byte counters KEEP advancing on
+//       open substreams (delta>0) yet no block Message is delivered: bytes
+//       arrive but gossipsub never reassembles/hands up the large frame.
+// gossipsub keeps one persistent inbound substream per peer carrying all
+// topics, so the decisive signal is per-substream: during the freeze, does some
+// peer's inbound stream go idle (A) while others flow, or do all keep flowing
+// while block delivery is frozen (B)?
+
+/// Monotonic id allocator for instrumented QUIC substreams (both directions
+/// share the id space so log lines stay easy to cross-reference).
+static QUIC_SUBSTREAM_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Per-substream byte accounting. The same struct is used for both inbound and
+/// outbound substreams; the relevant counters depend on direction:
+/// - inbound: poll_read drives `bytes` / `last_active_unix` (we primarily READ
+///   from peer-opened substreams).
+/// - outbound: poll_write drives `bytes` / `last_active_unix`.
+///
+/// Each direction lives in its own registry below so the diag emitter can
+/// report inbound and outbound top-N independently.
+struct SubstreamStat {
+    id: u64,
+    /// Cumulative bytes transferred (read for inbound, written for outbound).
+    bytes: AtomicU64,
+    /// Largest single transfer (informational; mostly equals quinn's 8 KiB
+    /// poll chunk for steady-state streams).
+    max_single_xfer: AtomicU64,
+    /// Unix seconds of the most recent non-empty transfer.
+    last_active_unix: AtomicU64,
+    /// `bytes` snapshot at the previous diag log, for per-interval delta.
+    logged_bytes: AtomicU64,
+    /// Set on Drop so the diag emitter can prune dead entries.
+    closed: AtomicBool,
+}
+
+/// Registry of live instrumented INBOUND substreams (peer-opened, we read).
+static INBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new());
+
+/// Registry of live instrumented OUTBOUND substreams (we opened, we write).
+/// If our poll_write stalls mid-frame on these, the freeze is on OUR sender
+/// side (hyp A2). If outbound flows fine while inbound wedges, the recv path
+/// is at fault (hyp A1).
+static OUTBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new());
+
+/// Maximum wall-clock millis taken by ONE iteration of the swarm task's
+/// `tokio::select!` since the last diag emit. Devnet evidence (slot 58→61)
+/// showed both `poll_read` and `poll_write` freeze simultaneously, which can
+/// only happen if the swarm task itself stalled in a synchronous arm body —
+/// this counter is the direct measurement of that.
+static EVENT_LOOP_MAX_ITER_MS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative count of swarm-task iterations whose body wall-time exceeded
+/// `EVENT_LOOP_SLOW_ITER_THRESHOLD_MS`. Read by the diag emitter.
+static EVENT_LOOP_SLOW_ITERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Threshold for counting an iteration as "slow". 100 ms is well above the
+/// natural cost of a hot arm (gossip rx, reqresp) but well below the 10 s
+/// pause observed at slot 58→61, so a healthy run reports zero or single
+/// digits and a pathological run lights up clearly.
+const EVENT_LOOP_SLOW_ITER_THRESHOLD_MS: u64 = 100;
+
+/// Numeric id of the swarm-task arm whose body was MOST RECENTLY entered.
+/// 0 = none seen yet; 1..=7 mapped to the arms in `run_eventloop`'s biased
+/// select! (see `arm_name`). The diag emitter reports this together with the
+/// unix-second timestamp of when it was set, so a stuck swarm task shows up
+/// as `last_arm=X` with a steadily growing `age=Ns` — that pins the wedge
+/// to the body of arm X rather than to "somewhere in the loop". Devnet
+/// evidence on a7779f91 ruled out a long synchronous body (max_iter_ms=0
+/// for 120+ s post-freeze) and pointed at a permanent waker-loss / deadlock
+/// inside one arm's body; this probe identifies which arm.
+static LAST_ARM_ENTERED: AtomicU32 = AtomicU32::new(0);
+/// Unix seconds at which `LAST_ARM_ENTERED` was last updated. Stale value =
+/// the loop hasn't entered any arm body since that timestamp = wedged.
+static LAST_ARM_ENTERED_UNIX: AtomicU64 = AtomicU64::new(0);
+/// Cumulative entry count per arm; index = arm id (1..=7), index 0 unused.
+/// Logged as a `cnt[…]` array each diag tick.
+static ARM_ENTRY_COUNTS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Mark the start of arm `idx`'s body. Inlined so the compiler folds the
+/// const-id into the atomic store.
+#[inline(always)]
+fn enter_arm(idx: u32) {
+    LAST_ARM_ENTERED.store(idx, Ordering::Relaxed);
+    LAST_ARM_ENTERED_UNIX.store(unix_secs(), Ordering::Relaxed);
+    if let Some(slot) = ARM_ENTRY_COUNTS.get(idx as usize) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn arm_name(idx: u32) -> &'static str {
+    match idx {
+        0 => "none",
+        1 => "shutdown",
+        2 => "reqresp_timeout",
+        // Arm id 3 (was `reconnect`) was removed in the #942 fix; ID kept
+        // unused to preserve diagnostic-log compatibility with prior runs.
+        3 => "reconnect_removed",
+        4 => "response_channel_timeout",
+        5 => "swarm_event",
+        6 => "cmd_rx",
+        7 => "mesh_peers_tick",
+        _ => "unknown",
+    }
+}
+
+/// Sub-probe for arm 5 (`swarm_event`): which `SwarmEvent` variant's match
+/// body is the swarm task in. Set at the top of each variant's match arm.
+/// 0 = no variant seen yet, 99 = unmatched fallthrough.
+static LAST_SWARM_EVENT_VARIANT: AtomicU32 = AtomicU32::new(0);
+static LAST_SWARM_EVENT_VARIANT_UNIX: AtomicU64 = AtomicU64::new(0);
+
+/// Sub-probe for arm 6 (`cmd_rx`): which `SwarmCommand` variant's match
+/// body is being processed.
+static LAST_SWARM_COMMAND_VARIANT: AtomicU32 = AtomicU32::new(0);
+static LAST_SWARM_COMMAND_VARIANT_UNIX: AtomicU64 = AtomicU64::new(0);
+
+#[inline(always)]
+fn enter_swarm_event(idx: u32) {
+    LAST_SWARM_EVENT_VARIANT.store(idx, Ordering::Relaxed);
+    LAST_SWARM_EVENT_VARIANT_UNIX.store(unix_secs(), Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn enter_swarm_command(idx: u32) {
+    LAST_SWARM_COMMAND_VARIANT.store(idx, Ordering::Relaxed);
+    LAST_SWARM_COMMAND_VARIANT_UNIX.store(unix_secs(), Ordering::Relaxed);
+}
+
+fn swarm_event_name(idx: u32) -> &'static str {
+    match idx {
+        0 => "none",
+        1 => "NewListenAddr",
+        2 => "ConnectionEstablished",
+        3 => "ConnectionClosed",
+        4 => "OutgoingConnectionError",
+        5 => "Gossipsub",
+        6 => "Reqresp",
+        99 => "other",
+        _ => "unknown",
+    }
+}
+
+fn swarm_command_name(idx: u32) -> &'static str {
+    match idx {
+        0 => "none",
+        1 => "SubscribeGossip",
+        2 => "Publish",
+        3 => "SendRpcRequest",
+        4 => "SendRpcResponseChunk",
+        5 => "SendRpcEndOfStream",
+        6 => "SendRpcErrorResponse",
+        7 => "DialReconnect",
+        _ => "unknown",
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn new_substream_stat() -> Arc<SubstreamStat> {
+    let now = unix_secs();
+    Arc::new(SubstreamStat {
+        id: QUIC_SUBSTREAM_ID.fetch_add(1, Ordering::Relaxed),
+        bytes: AtomicU64::new(0),
+        max_single_xfer: AtomicU64::new(0),
+        last_active_unix: AtomicU64::new(now),
+        logged_bytes: AtomicU64::new(0),
+        closed: AtomicBool::new(false),
+    })
+}
+
+fn register_inbound_substream() -> Arc<SubstreamStat> {
+    let stat = new_substream_stat();
+    INBOUND_SUBSTREAMS.lock_recover().push(stat.clone());
+    stat
+}
+
+fn register_outbound_substream() -> Arc<SubstreamStat> {
+    let stat = new_substream_stat();
+    OUTBOUND_SUBSTREAMS.lock_recover().push(stat.clone());
+    stat
+}
+
+/// Emit one diag line for the given direction's substream registry. Bounded
+/// output: aggregate + top-8 by cumulative bytes (see the log-overflow note on
+/// `forward_log_with_handler`).
+fn emit_substream_diag(network_id: u32, label: &str, registry: &Mutex<Vec<Arc<SubstreamStat>>>) {
+    let now = unix_secs();
+    let mut reg = registry.lock_recover();
+    // Prune closed streams and any idle longer than 5 minutes (defensive
+    // against a substream whose Drop never runs).
+    reg.retain(|s| {
+        !s.closed.load(Ordering::Relaxed)
+            && now.saturating_sub(s.last_active_unix.load(Ordering::Relaxed)) < 300
+    });
+    let live = reg.len();
+    let mut idle_streams = 0u64;
+    let mut bytes_total = 0u64;
+    let mut delta_total = 0u64;
+    // (bytes, delta, max_xfer, idle, id) per live stream.
+    let mut rows: Vec<(u64, u64, u64, u64, u64)> = Vec::with_capacity(live);
+    for s in reg.iter() {
+        let bytes = s.bytes.load(Ordering::Relaxed);
+        let prev = s.logged_bytes.swap(bytes, Ordering::Relaxed);
+        let delta = bytes.saturating_sub(prev);
+        let idle = now.saturating_sub(s.last_active_unix.load(Ordering::Relaxed));
+        let mxr = s.max_single_xfer.load(Ordering::Relaxed);
+        bytes_total = bytes_total.saturating_add(bytes);
+        delta_total = delta_total.saturating_add(delta);
+        if idle > 8 {
+            idle_streams += 1;
+        }
+        rows.push((bytes, delta, mxr, idle, s.id));
+    }
+    drop(reg);
+    // Top streams by cumulative bytes, highest first.
+    rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
+    let mut top = String::new();
+    for (bytes, delta, mxr, idle, id) in rows.iter().take(8) {
+        top.push_str(&format!(
+            " [id={id} b={bytes} d={delta} mx={mxr} idle={idle}s]"
+        ));
+    }
+    // Periodic per-substream diag. Kept at `debug` so production runs (info+
+    // by default) stay quiet; flip the Zig logger to debug for the network
+    // scope to revive these when triaging a regression. Counters live in the
+    // SUBSTREAMS atomic registries regardless of log level so the data is
+    // always there to query.
+    logger::rustLogger.debug(
+        network_id,
+        &format!(
+            "[{label}] live={live} idle>8s={idle_streams} bytes_total={bytes_total} delta_total={delta_total} | top:{top}"
+        ),
+    );
+}
+
+/// Spawn a dedicated tokio task that emits the per-substream QUIC diag lines
+/// every 10s. Lives outside the swarm task's biased `select!` so it keeps
+/// running even when reqresp-status retries make the mesh_peers_tick arm
+/// permanently starved (which is what kept #942 invisible at the freeze).
+fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.notified() => break,
+                _ = tick.tick() => {
+                    emit_substream_diag(network_id, "#942 quic-recv", &INBOUND_SUBSTREAMS);
+                    emit_substream_diag(network_id, "#942 quic-send", &OUTBOUND_SUBSTREAMS);
+                    // Event-loop iteration latency + message_id_fn cache stats.
+                    // `swap(0)` on the max so each tick reports the worst
+                    // single-iteration latency since the previous tick;
+                    // `slow_total` is cumulative so we can see whether new
+                    // slow iterations are still occurring after the burst.
+                    let max_iter_ms = EVENT_LOOP_MAX_ITER_MS.swap(0, Ordering::Relaxed);
+                    let slow_total = EVENT_LOOP_SLOW_ITERS_TOTAL.load(Ordering::Relaxed);
+                    let (cache_hits, cache_misses, cache_len) = {
+                        let c = MESSAGE_ID_CACHE.lock_recover();
+                        (c.hits, c.misses, c.map.len())
+                    };
+                    logger::rustLogger.debug(
+                        network_id,
+                        &format!(
+                            "[#942 loop] max_iter_ms={max_iter_ms} slow_iters>={EVENT_LOOP_SLOW_ITER_THRESHOLD_MS}ms_total={slow_total} | msg_id_cache hits={cache_hits} misses={cache_misses} len={cache_len}/{MESSAGE_ID_CACHE_CAPACITY}"
+                        ),
+                    );
+
+                    // Per-arm tracking. `last_arm` + `age` pin a wedge to one
+                    // arm's body (steadily growing age with no other arm
+                    // entries == that arm's body never returned). `cnt[…]`
+                    // shows cumulative entry counts so we can tell which arms
+                    // are firing in a healthy run.
+                    let last_arm = LAST_ARM_ENTERED.load(Ordering::Relaxed);
+                    let last_arm_unix = LAST_ARM_ENTERED_UNIX.load(Ordering::Relaxed);
+                    let now = unix_secs();
+                    let age = now.saturating_sub(last_arm_unix);
+                    let cnt: Vec<u64> = (1..=7)
+                        .map(|i| ARM_ENTRY_COUNTS[i].load(Ordering::Relaxed))
+                        .collect();
+                    logger::rustLogger.debug(
+                        network_id,
+                        &format!(
+                            "[#942 arm] last={}({}) age={age}s | shutdown={} reqresp_to={} reconnect={} resp_ch_to={} swarm_ev={} cmd_rx={} mesh_tick={}",
+                            last_arm,
+                            arm_name(last_arm),
+                            cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5], cnt[6],
+                        ),
+                    );
+
+                    // Sub-probes: which variant body the swarm task last
+                    // entered inside arm 5 (SwarmEvent) and arm 6
+                    // (SwarmCommand). Steady `swarm_ev_var.age` growth while
+                    // `last=5` pins the wedge to that specific SwarmEvent
+                    // variant; same logic for cmd_rx_var when `last=6`.
+                    let sev_var = LAST_SWARM_EVENT_VARIANT.load(Ordering::Relaxed);
+                    let sev_age = now
+                        .saturating_sub(LAST_SWARM_EVENT_VARIANT_UNIX.load(Ordering::Relaxed));
+                    let scmd_var = LAST_SWARM_COMMAND_VARIANT.load(Ordering::Relaxed);
+                    let scmd_age = now
+                        .saturating_sub(LAST_SWARM_COMMAND_VARIANT_UNIX.load(Ordering::Relaxed));
+                    logger::rustLogger.debug(
+                        network_id,
+                        &format!(
+                            "[#942 sub] swarm_ev_var={}({}) age={sev_age}s | cmd_var={}({}) age={scmd_age}s",
+                            sev_var,
+                            swarm_event_name(sev_var),
+                            scmd_var,
+                            swarm_command_name(scmd_var),
+                        ),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// A `StreamMuxer` wrapper that tags each inbound substream with an
+/// `InboundSubstreamStat`. Outbound substreams are passed through untracked
+/// (the recv path is what #942 concerns). Used only on the QUIC transport.
+struct InstrumentedMuxer<M> {
+    inner: M,
+}
+
+/// A substream wrapper that counts bytes transferred in the substream's
+/// "natural" direction:
+/// - if it came from `poll_inbound`, `read_stat` is `Some` and `poll_read`
+///   updates it.
+/// - if it came from `poll_outbound`, `write_stat` is `Some` and `poll_write`
+///   updates it.
+///
+/// Both fields are `Option` (rather than one combined) so the diag emitter
+/// can keep inbound vs outbound stats in separate registries.
+struct InstrumentedSubstream<S> {
+    inner: S,
+    read_stat: Option<Arc<SubstreamStat>>,
+    write_stat: Option<Arc<SubstreamStat>>,
+}
+
+impl<S> Drop for InstrumentedSubstream<S> {
+    fn drop(&mut self) {
+        if let Some(stat) = &self.read_stat {
+            stat.closed.store(true, Ordering::Relaxed);
+        }
+        if let Some(stat) = &self.write_stat {
+            stat.closed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<S> futures::io::AsyncRead for InstrumentedSubstream<S>
+where
+    S: futures::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            if let Some(stat) = &this.read_stat {
+                let n = *n as u64;
+                if n > 0 {
+                    stat.bytes.fetch_add(n, Ordering::Relaxed);
+                    stat.max_single_xfer.fetch_max(n, Ordering::Relaxed);
+                    stat.last_active_unix.store(unix_secs(), Ordering::Relaxed);
+                }
+            }
+        }
+        r
+    }
+}
+
+impl<S> futures::io::AsyncWrite for InstrumentedSubstream<S>
+where
+    S: futures::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            if let Some(stat) = &this.write_stat {
+                let n = *n as u64;
+                if n > 0 {
+                    stat.bytes.fetch_add(n, Ordering::Relaxed);
+                    stat.max_single_xfer.fetch_max(n, Ordering::Relaxed);
+                    stat.last_active_unix.store(unix_secs(), Ordering::Relaxed);
+                }
+            }
+        }
+        r
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
+impl<M> libp2p::core::muxing::StreamMuxer for InstrumentedMuxer<M>
+where
+    M: libp2p::core::muxing::StreamMuxer + Unpin,
+    M::Substream: Unpin,
+{
+    type Substream = InstrumentedSubstream<M::Substream>;
+    type Error = M::Error;
+
+    fn poll_inbound(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner)
+            .poll_inbound(cx)
+            .map_ok(|s| InstrumentedSubstream {
+                inner: s,
+                read_stat: Some(register_inbound_substream()),
+                write_stat: None,
+            })
+    }
+
+    fn poll_outbound(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner)
+            .poll_outbound(cx)
+            .map_ok(|s| InstrumentedSubstream {
+                inner: s,
+                read_stat: None,
+                write_stat: Some(register_outbound_substream()),
+            })
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<libp2p::core::muxing::StreamMuxerEvent, Self::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll(cx)
+    }
+}
+
+/// One inbound gossip message handed from the libp2p event loop to the decode
+/// worker thread. Owns every buffer the FFI call reads so the raw pointers
+/// passed into Zig stay valid while the call runs off the event-loop thread.
+struct InboundGossip {
+    network_id: u32,
+    zig_handler: u64,
+    topic: CString,
+    sender_peer_id: CString,
+    data: Vec<u8>,
+}
+
+/// Drain loop for the dedicated inbound-gossip decode worker thread (issue
+/// #942). Blocks on `recv()`; exits once the event loop drops the sender and
+/// the channel is drained. Runs `handleMsgFromRustBridge` — i.e. the full
+/// snappy decompress + SSZ deserialize + `chain.onGossip` dispatch — here, off
+/// the tokio/quinn event-loop thread. A single worker preserves the serial
+/// `onGossip` ordering the chain layer assumed when this ran inline.
+fn run_inbound_gossip_worker(rx: std::sync::mpsc::Receiver<InboundGossip>) {
+    while let Ok(msg) = rx.recv() {
+        // #942 forensic: hash the bytes about to cross the FFI boundary into
+        // Zig. Moved off the event loop into this worker so the O(len) sha256
+        // no longer competes with quinn for event-loop time. Pairs with the
+        // Zig-side `sha256_inbound` and the producer's `sha256_compressed` for
+        // cross-fleet correlation; remove once the in-transit corruption is
+        // confirmed fixed.
+        let mut ingress_hasher = sha2::Sha256::new();
+        ingress_hasher.update(msg.data.as_slice());
+        let ingress_digest = ingress_hasher.finalize();
+        logger::rustLogger.debug(
+            msg.network_id,
+            &format!(
+                "[#942 rx] topic={} len={} sha256_libp2p_ingress={} peer={}",
+                msg.topic.to_string_lossy(),
+                msg.data.len(),
+                hex::encode(ingress_digest),
+                msg.sender_peer_id.to_string_lossy(),
+            ),
+        );
+
+        // SAFETY: `msg` owns `topic`, `sender_peer_id` and `data` for the whole
+        // duration of this call, so all three pointers are valid until
+        // `handleMsgFromRustBridge` returns. The Zig handler copies/consumes
+        // what it needs before returning (it must not stash the buffers — see
+        // the lifetime invariant comment in `node.onGossip`).
+        unsafe {
+            handleMsgFromRustBridge(
+                msg.zig_handler,
+                msg.topic.as_ptr(),
+                msg.data.as_ptr(),
+                msg.data.len(),
+                msg.sender_peer_id.as_ptr(),
+            );
+        }
+    }
+}
+
+/// One reqresp FFI dispatch handed off from the swarm task to the dedicated
+/// reqresp worker. Owns every buffer the FFI call reads so the raw pointers
+/// passed to Zig stay valid for the duration of the call. Mirrors
+/// `InboundGossip` for the gossip side.
+///
+/// The 2026-05-30 a7779f91 / 883318f5 devnet probes showed that the swarm
+/// task could spend ~15 s inside one `SwarmEvent::Behaviour(Reqresp(_))`
+/// body — the Zig-side `handleRPCResponseFromRustBridge` synchronously runs
+/// snappy-framed decompress + SSZ deserialize + chain dispatch on the
+/// caller thread (ethlibp2p.zig::handleRPCResponseFromRustBridge:991-1037),
+/// and a single BlocksByRangeV1 response can stack many MB of work.
+/// Moving the call to a worker thread mirrors the existing fix #59 pattern
+/// for inbound gossip and lets quinn + gossipsub keep getting polled while
+/// the chain layer is busy.
+enum RpcWork {
+    Request {
+        zig_handler: u64,
+        channel_id: u64,
+        peer_id: CString,
+        protocol: CString,
+        payload: Vec<u8>,
+    },
+    Response {
+        zig_handler: u64,
+        request_id: u64,
+        peer_id: CString,
+        protocol: CString,
+        payload: Vec<u8>,
+    },
+    EndOfStream {
+        zig_handler: u64,
+        request_id: u64,
+        peer_id: CString,
+        protocol: CString,
+    },
+    Error {
+        zig_handler: u64,
+        request_id: u64,
+        protocol: CString,
+        code: u32,
+        message: CString,
+    },
+}
+
+/// Capacity for the inbound-reqresp dispatch channel. Sized to absorb a
+/// burst of `BlocksByRangeV1` chunks (the chain layer typically requests
+/// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` blocks per peer per sweep). Drops on
+/// overflow are logged + counted via `INBOUND_RPC_DROPPED_TOTAL` so a
+/// chronically saturated worker is visible without crashing the loop.
+const INBOUND_RPC_CHANNEL_CAPACITY: usize = 256;
+
+/// Cumulative count of reqresp FFI dispatches dropped because the worker's
+/// channel was full. Read by the diag emitter (and could be exported via
+/// FFI for metrics later).
+static INBOUND_RPC_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Drain loop for the dedicated reqresp worker thread. Blocks on `recv()`;
+/// exits once the event loop drops the sender and the channel is drained.
+/// Single worker so per-request ordering with the Zig chain layer matches
+/// the prior inline behavior.
+fn run_inbound_rpc_worker(rx: std::sync::mpsc::Receiver<RpcWork>) {
+    while let Ok(work) = rx.recv() {
+        match work {
+            RpcWork::Request {
+                zig_handler,
+                channel_id,
+                peer_id,
+                protocol,
+                payload,
+            } => {
+                // SAFETY: `peer_id`, `protocol`, and `payload` are owned by
+                // this `RpcWork` value, which stays alive until the FFI
+                // call returns. The Zig handler must copy any bytes it
+                // wants to retain (it does — see `handleRPCRequestFromRustBridge`
+                // in ethlibp2p.zig).
+                unsafe {
+                    handleRPCRequestFromRustBridge(
+                        zig_handler,
+                        channel_id,
+                        peer_id.as_ptr(),
+                        protocol.as_ptr(),
+                        payload.as_ptr(),
+                        payload.len(),
+                    );
+                }
+            }
+            RpcWork::Response {
+                zig_handler,
+                request_id,
+                peer_id,
+                protocol,
+                payload,
+            } => unsafe {
+                handleRPCResponseFromRustBridge(
+                    zig_handler,
+                    request_id,
+                    peer_id.as_ptr(),
+                    protocol.as_ptr(),
+                    payload.as_ptr(),
+                    payload.len(),
+                );
+            },
+            RpcWork::EndOfStream {
+                zig_handler,
+                request_id,
+                peer_id,
+                protocol,
+            } => unsafe {
+                handleRPCEndOfStreamFromRustBridge(
+                    zig_handler,
+                    request_id,
+                    peer_id.as_ptr(),
+                    protocol.as_ptr(),
+                );
+            },
+            RpcWork::Error {
+                zig_handler,
+                request_id,
+                protocol,
+                code,
+                message,
+            } => unsafe {
+                handleRPCErrorFromRustBridge(
+                    zig_handler,
+                    request_id,
+                    protocol.as_ptr(),
+                    code,
+                    message.as_ptr(),
+                );
+            },
+        }
+    }
+}
 
 /// Reason tags for `SWARM_COMMAND_DROPPED_TOTAL` and the matching FFI getter
 /// `get_swarm_command_dropped_total`. Mirrored on the Zig side as a plain
@@ -400,13 +1145,85 @@ lazy_static::lazy_static! {
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
     static ref RESPONSE_CHANNEL_MAP: Mutex<HashMapDelay<u64, PendingResponse>> = Mutex::new(HashMapDelay::new(RESPONSE_CHANNEL_IDLE_TIMEOUT));
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
-    static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
-        Mutex::new(HashMapDelay::new(Duration::from_secs(5))); // default delay, will be overridden
+    // #942 fix (post-bypass A/B verdict): the reconnect-scheduling
+    // delay map used to live here as `RECONNECT_QUEUE: HashMapDelay`,
+    // polled from arm 3 of the swarm task's biased `select!`. The bypass
+    // build (883318f5) proved that gating both `schedule_reconnection`
+    // call sites converted a deterministic 0/8-zeam-sync failure into
+    // 5/8-success — i.e., this delay-map's interaction with the swarm
+    // task was the primary trigger of the permanent waker-loss freeze.
+    // Replaced with `tokio::spawn` + `tokio::time::sleep` +
+    // `SwarmCommand::DialReconnect`: the delayed action is owned by a
+    // detached task, not by the swarm task's polling tree.
     static ref RECONNECT_ATTEMPTS: Mutex<HashMap<(u32, PeerId), (Multiaddr, u32)>> = Mutex::new(HashMap::new());
     // Track connection directions for disconnect events (network_id, peer_id, connection_id) -> direction
     static ref CONNECTION_DIRECTIONS: Mutex<HashMap<(u32, PeerId, ConnectionId), u32>> = Mutex::new(HashMap::new());
     static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::Sender<SwarmCommand>>> = Mutex::new(HashMap::new());
     static ref COMMAND_RECEIVERS: Mutex<HashMap<u32, mpsc::Receiver<SwarmCommand>>> = Mutex::new(HashMap::new());
+
+    // #942 fix: cache message_id_fn results so we don't re-decompress the same
+    // raw-bytes payload on the gossipsub event-loop thread. With ~21 mesh
+    // peers each forwarding the same block, the spec-mandated decompress
+    // inside `message_id_fn` was running ~21x per block on the same thread
+    // that drives quinn's QUIC poll futures. Devnet evidence pinned a ~10s
+    // simultaneous freeze of every poll_read AND poll_write at slot 58→61,
+    // which fits an accumulated burst of these synchronous decompresses
+    // perfectly. The cache key is `sha2::Sha256(message.data)` (the raw
+    // wire bytes); the value is the spec-conformant content-addressed id we
+    // would otherwise have just recomputed. Bounded FIFO eviction so the
+    // mutex stays small. See `cached_message_id_fn` below.
+    static ref MESSAGE_ID_CACHE: Mutex<MessageIdCache> = Mutex::new(MessageIdCache::new(MESSAGE_ID_CACHE_CAPACITY));
+}
+
+/// Per-network cap. ~1024 distinct messages comfortably covers the ~12 s
+/// gossipsub forward window across 21 mesh peers + heartbeats; tune up if
+/// the eviction warning fires often post-deploy.
+const MESSAGE_ID_CACHE_CAPACITY: usize = 1024;
+
+/// Bounded FIFO cache keyed on the raw-bytes SHA256 of a gossipsub message.
+/// Hits avoid the synchronous snappy-decompress inside `Behaviour::message_id_fn`
+/// — see the comment on `MESSAGE_ID_CACHE`.
+struct MessageIdCache {
+    map: HashMap<[u8; 32], gossipsub::MessageId>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl MessageIdCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap),
+            order: std::collections::VecDeque::with_capacity(cap),
+            cap,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: &[u8; 32]) -> Option<gossipsub::MessageId> {
+        if let Some(id) = self.map.get(key) {
+            self.hits += 1;
+            Some(id.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: [u8; 32], id: gossipsub::MessageId) {
+        self.misses += 1;
+        if self.map.contains_key(&key) {
+            return;
+        }
+        if self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, id);
+        self.order.push_back(key);
+    }
 }
 
 /// Current number of remote peers in this node's gossipsub mesh, across all
@@ -680,7 +1497,27 @@ unsafe fn create_and_run_network_inner(
 
     release_params();
 
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    // #942: run the libp2p/quinn stack on a multi-threaded tokio runtime.
+    //
+    // Previously this was `new_current_thread()`, which drove BOTH the swarm
+    // future (which calls the spec-mandated synchronous snappy decompress
+    // inside `message_id_fn`) AND quinn's UDP endpoint-driver task on a single
+    // thread. A 3.3MB block decompressing for hundreds of ms therefore starved
+    // quinn's receive path mid-reassembly -> the cross-copy byte-bleed
+    // corruption that only zeam exhibited. The healthy rust-libp2p clients
+    // (grandine/ream) run multi-threaded executors, so quinn keeps draining the
+    // socket on another worker while the swarm thread decompresses.
+    //
+    // Safe now that inbound gossip dispatch is on a dedicated worker thread
+    // (run_inbound_gossip_worker) which preserves serial onGossip ordering
+    // regardless of tokio flavor. 2 workers suffice: one runs the block_on'd
+    // event loop, the other keeps the quinn endpoint driver live. Kept low to
+    // avoid oversubscribing the box's rayon/chain-worker/libxev threads.
+    let rt = Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
 
     rt.block_on(async move {
         let mut p2p_net = Network::new(network_id, zig_handler);
@@ -1190,6 +2027,22 @@ extern "C" {
 }
 
 fn forward_log_with_handler(zig_handler: u64, level: u32, message: &str) {
+    // The Zig log sink formats into a fixed 4096-byte stack buffer and does
+    // `bufPrint(...) catch @panic` (log.zig), so a message that overflows the
+    // buffer aborts the whole node. Defensively cap the message well below
+    // that limit (leaving headroom for the Zig-side timestamp/scope prefix),
+    // truncating on a UTF-8 char boundary, so an over-length line is truncated
+    // rather than fatal.
+    const MAX_LOG_BYTES: usize = 3500;
+    let message = if message.len() > MAX_LOG_BYTES {
+        let mut end = MAX_LOG_BYTES;
+        while end > 0 && !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        &message[..end]
+    } else {
+        message
+    };
     unsafe {
         handleLogFromRustBridge(zig_handler, level, message.as_ptr(), message.len());
     }
@@ -1235,9 +2088,25 @@ impl Network {
                 ),
             );
             self.peer_addr_map.remove(&peer_id);
-            RECONNECT_ATTEMPTS
-                .lock_recover()
-                .remove(&(self.network_id, peer_id));
+            // RECONNECT_ATTEMPTS cleanup REMOVED here intentionally (#942).
+            //
+            // Every caller that can reach this branch already removed the
+            // entry from RECONNECT_ATTEMPTS BEFORE calling us (that's how
+            // they knew the attempt count had reached the cap):
+            //   - OutgoingConnectionError body: `let prior_attempt =
+            //     RECONNECT_ATTEMPTS.lock_recover().remove(...)` then
+            //     `schedule_reconnection(.., attempt+1)`
+            //   - DialReconnect cmd_rx handler on dial error: same pattern
+            // So re-acquiring the lock here was always a no-op (`.remove(&K)`
+            // on a key already absent) AND empirically it wedges the swarm
+            // task — devnet image e6c3c1d3 (commit 03b4ef39) on 2026-05-30
+            // froze zeam_13 at 18:48:14.894, the very first time this branch
+            // was hit: "Max reconnection attempts" warn fires, then zero
+            // further rust-bridge log lines from the swarm task. The
+            // `let`-binding fix in 03b4ef39 SHOULD have released the outer
+            // guard at the `;` (Rust temporary scope rules say so), but
+            // rather than hunt theoretical reasons why it didn't, the
+            // cleanest fix is to not take the lock here at all.
             return;
         }
 
@@ -1254,12 +2123,28 @@ impl Network {
             ),
         );
 
-        let mut queue = RECONNECT_QUEUE.lock_recover();
-        queue.insert_at(
-            (self.network_id, peer_id),
-            (addr, attempt),
-            Duration::from_secs(delay_secs),
-        );
+        // #942 fix: the delayed action runs in a detached tokio task —
+        // sleep + send a `SwarmCommand::DialReconnect`. The previous
+        // implementation polled a `HashMapDelay` from arm 3 of the swarm
+        // task's biased `select!`; that pollNext + the connection-error
+        // body's interaction was the trigger for the permanent waker
+        // loss that wedged 8/8 zeam nodes at slot ~65 on prior runs
+        // (the bypass A/B test in 883318f5 produced 5/8 sync vs 0/8).
+        // A detached task only touches the per-network swarm command
+        // channel, which is the same channel Zig FFI dispatches use, so
+        // we re-use the existing back-pressure / drop bookkeeping.
+        let network_id = self.network_id;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            send_swarm_command(
+                network_id,
+                SwarmCommand::DialReconnect {
+                    peer_id,
+                    addr,
+                    attempt,
+                },
+            );
+        });
     }
 
     /// Build the swarm, bind listeners, dial connect peers, publish the per-network
@@ -1425,11 +2310,59 @@ impl Network {
         let mut mesh_peers_tick = tokio::time::interval(Duration::from_secs(1));
         mesh_peers_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // #942 fix-#5 follow-up: per-substream QUIC diag lines run in their own
+        // tokio task. The previous in-arm version sat in the LAST arm of this
+        // function's biased select! and devnet evidence (slot 65 onward) showed
+        // it was starved as soon as reqresp-status retries became continuous,
+        // exactly when the freeze deepened. The spawned task only reads atomic
+        // counters from the SUBSTREAMS registries and does not need swarm
+        // access, so it keeps emitting through the freeze.
+        spawn_quic_diag_emitter(self.network_id, shutdown.clone());
+
+        // #942: hand inbound gossip off to a dedicated decode worker thread so
+        // the synchronous snappy-decompress + SSZ-deserialize + chain dispatch
+        // does not block this tokio thread, which also drives quinn's QUIC I/O.
+        // A single worker keeps `onGossip` serialized exactly as it was when the
+        // call ran inline below.
+        let (gossip_tx, gossip_rx) =
+            std::sync::mpsc::sync_channel::<InboundGossip>(INBOUND_GOSSIP_CHANNEL_CAPACITY);
+        let gossip_worker = std::thread::Builder::new()
+            .name(format!("zeam-gossip-decode-{}", self.network_id))
+            .spawn(move || run_inbound_gossip_worker(gossip_rx))
+            .expect("failed to spawn inbound gossip decode worker thread");
+
+        // #942 fix: reqresp FFI dispatch also off the event-loop thread.
+        // The 15 s arm-body spikes observed on the 883318f5 devnet were
+        // SwarmEvent::Behaviour(Reqresp(_)) bodies running synchronous
+        // snappy-framed-decompress + SSZ-deserialize + chain dispatch on
+        // the swarm task; mirrors the gossip worker pattern above.
+        let (rpc_tx, rpc_rx) =
+            std::sync::mpsc::sync_channel::<RpcWork>(INBOUND_RPC_CHANNEL_CAPACITY);
+        let rpc_worker = std::thread::Builder::new()
+            .name(format!("zeam-rpc-dispatch-{}", self.network_id))
+            .spawn(move || run_inbound_rpc_worker(rpc_rx))
+            .expect("failed to spawn inbound reqresp dispatch worker thread");
+
+        // #942 diagnosis: throttle the per-kind gossip-arrival summary to roughly
+        // every 10th mesh_peers tick (~10s) so the log shows the block/attestation
+        // delivery trend without flooding.
+        let mut diag_tick_count: u64 = 0;
+
         'eventloop: loop {
+            // Measure wall-clock spent inside this iteration's `select!`
+            // (which includes the chosen arm's synchronous body). Devnet
+            // evidence (slot 58→61, simultaneous bidirectional freeze of
+            // every poll_read AND poll_write) implies one arm body ran
+            // synchronously for ~10 s, since both directions are driven by
+            // this single task. The `dt_ms` capture below pins which
+            // iteration spent the time.
+            let iter_start = std::time::Instant::now();
+
             tokio::select! {
             biased;
 
             _ = shutdown.notified() => {
+                enter_arm(1);
                 logger::rustLogger.info(
                     self.network_id,
                     "stop_network signaled; exiting libp2p event loop",
@@ -1441,6 +2374,7 @@ impl Network {
                 let mut map = REQUEST_ID_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
+                enter_arm(2);
                 match timeout_result {
                     Ok((request_id, ())) => {
                         logger::rustLogger.warn(
@@ -1455,13 +2389,24 @@ impl Network {
                                 CString::new(protocol_id.as_str()),
                                 CString::new("request timed out"),
                             ) {
-                                unsafe {
-                                    handleRPCErrorFromRustBridge(
-                                        self.zig_handler,
-                                        request_id,
-                                        protocol_cstring.as_ptr(),
-                                        408,
-                                        message_cstring.as_ptr(),
+                                let work = RpcWork::Error {
+                                    zig_handler: self.zig_handler,
+                                    request_id,
+                                    protocol: protocol_cstring,
+                                    code: 408,
+                                    message: message_cstring,
+                                };
+                                if let Err(e) = rpc_tx.try_send(work) {
+                                    let total = INBOUND_RPC_DROPPED_TOTAL
+                                        .fetch_add(1, Ordering::Relaxed) + 1;
+                                    logger::rustLogger.warn(
+                                        self.network_id,
+                                        &format!(
+                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Timeout (total={}): {:?}",
+                                            INBOUND_RPC_CHANNEL_CAPACITY,
+                                            total,
+                                            e,
+                                        ),
                                     );
                                 }
                             }
@@ -1473,70 +2418,17 @@ impl Network {
                 }
             }
 
-            Some(reconnect_result) = poll_fn(|cx| {
-                let mut queue = RECONNECT_QUEUE.lock_recover();
-                std::pin::Pin::new(&mut *queue).poll_next(cx)
-            }) => {
-                    match reconnect_result {
-                        Ok(((network_id, peer_id), (addr, attempt))) => {
-                            if network_id == self.network_id {
-                                if swarm.is_connected(&peer_id) {
-                                    logger::rustLogger.debug(
-                                        self.network_id,
-                                        &format!(
-                                            "Skipping reconnection attempt to peer {} because it is already connected",
-                                            peer_id
-                                        ),
-                                    );
-                                    continue;
-                                }
-
-                                logger::rustLogger.info(
-                                    self.network_id,
-                                    &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
-                                );
-
-                            RECONNECT_ATTEMPTS
-                                .lock_recover()
-                                .insert((self.network_id, peer_id), (addr.clone(), attempt));
-
-                            let mut dial_addr = addr.clone();
-                            strip_peer_id(&mut dial_addr);
-
-                            match swarm.dial(
-                                DialOpts::peer_id(peer_id)
-                                    .addresses(vec![dial_addr.clone()])
-                                    .build(),
-                            ) {
-                                Ok(()) => {
-                                    logger::rustLogger.info(
-                                        self.network_id,
-                                        &format!("Dialing peer {} at {} for reconnection", peer_id, dial_addr),
-                                    );
-                                }
-                                Err(e) => {
-                                    logger::rustLogger.error(
-                                        self.network_id,
-                                        &format!("Failed to dial peer {} at {}: {:?}", peer_id, dial_addr, e),
-                                    );
-                                    RECONNECT_ATTEMPTS
-                                        .lock_recover()
-                                        .remove(&(self.network_id, peer_id));
-                                    self.schedule_reconnection(peer_id, addr, attempt + 1);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        logger::rustLogger.error(self.network_id, &format!("Error in reconnect queue: {}", e));
-                    }
-                }
-            }
+            // arm 3 (RECONNECT_QUEUE poll_next) removed in #942 fix: the
+            // delay-map polled here was the trigger of the swarm-task
+            // waker loss. Reconnect dials are now driven by
+            // `SwarmCommand::DialReconnect` posted by detached
+            // `tokio::spawn`s in `schedule_reconnection`.
 
             Some(response_channel_timeout) = poll_fn(|cx| {
                 let mut map = RESPONSE_CHANNEL_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
+                enter_arm(4);
                 match response_channel_timeout {
                     Ok((channel_id, channel)) => {
                         logger::rustLogger.warn(
@@ -1573,11 +2465,14 @@ impl Network {
             // arm additionally caps each iteration at MAX_SWARM_COMMANDS_PER_TICK so
             // we never sit inside it indefinitely.
                 event = swarm.select_next_some() => {
+                    enter_arm(5);
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
+                            enter_swarm_event(1);
                             logger::rustLogger.info(self.network_id, &format!("Listening on {}", address));
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
+                            enter_swarm_event(2);
                             let peer_id_str = peer_id.to_string();
 
                             // Determine direction from endpoint: Dialer=outbound, Listener=inbound
@@ -1605,7 +2500,9 @@ impl Network {
                                 direction,
                             );
 
-                            RECONNECT_QUEUE.lock_recover().remove(&(self.network_id, peer_id));
+                            // RECONNECT_QUEUE removed; pending DialReconnect commands for
+                            // this peer become no-ops via the swarm.is_connected() guard
+                            // in the cmd_rx handler.
                             RECONNECT_ATTEMPTS
                                 .lock_recover()
                                 .remove(&(self.network_id, peer_id));
@@ -1626,6 +2523,7 @@ impl Network {
                                 cause,
                                 ..
                             } => {
+                                enter_swarm_event(3);
                                 // A peer leaving may evict
                                 // it from the gossipsub mesh; recompute first
                                 // so the metric reflects the new state even if
@@ -1710,6 +2608,7 @@ impl Network {
                                 }
                             }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            enter_swarm_event(4);
                             let peer_str = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
 
                             // Determine if timeout or other error: 1=timeout, 2=error
@@ -1746,16 +2645,30 @@ impl Network {
                                     )
                                 };
 
-                                // Schedule reconnection if this was a tracked connection attempt
-                                if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
+                                // Schedule reconnection if this was a tracked connection attempt.
+                                //
+                                // IMPORTANT: bind the `.remove()` result to a let *before* the
+                                // `if let`, so the `RECONNECT_ATTEMPTS` MutexGuard is dropped
+                                // at the end of the let-statement instead of living until the
+                                // end of the if-let block (Rust 2021 temporary-scope rules).
+                                // `schedule_reconnection` re-acquires the same Mutex on the
+                                // `attempt > MAX_RECONNECT_ATTEMPTS` branch — with the guard
+                                // still held, that's a re-entrant std::Mutex deadlock on the
+                                // same thread, which is exactly the wedge that re-appeared
+                                // on the c6cf2241 devnet run (all 8 zeam nodes frozen with
+                                // `swarm_ev_var=4(OutgoingConnectionError) age=1000s+`,
+                                // probabilistic because it only triggers once a peer's
+                                // attempt count climbs past 5).
+                                let prior_attempt = RECONNECT_ATTEMPTS
                                     .lock_recover()
-                                    .remove(&(self.network_id, pid))
-                                {
+                                    .remove(&(self.network_id, pid));
+                                if let Some((addr, attempt)) = prior_attempt {
                                     self.schedule_reconnection(pid, addr, attempt + 1);
                                 }
                             }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub_event)) => {
+                            enter_swarm_event(5);
                             // Gate the mesh-peer recompute on
                             // the gossipsub event variants that actually change
                             // mesh membership. `Message` does NOT — a busy node
@@ -1795,21 +2708,37 @@ impl Network {
                             }
 
                             if let gossipsub::Event::Message { message, .. } = gossipsub_event {
-                                let topic_str = message.topic.as_str().to_string();
-                                let topic = match CString::new(topic_str.as_str()) {
+                                // #942: do NOT decode here. The full
+                                // snappy-decompress + SSZ-deserialize + chain
+                                // dispatch (`handleMsgFromRustBridge`) used to
+                                // run inline on this thread, which also drives
+                                // quinn's QUIC I/O. On a 286 KB–9 MB block that
+                                // blocked the event loop for hundreds of ms,
+                                // starving the QUIC receive path — the root
+                                // cause of the inbound snappy corruption (the
+                                // cross-message byte-bleed in issue_942_layer.md)
+                                // and the earlier 148 broken QUIC handshakes / 8
+                                // Status-RPC timeouts. We now only build the
+                                // hand-off record (cheap) and pass ownership of
+                                // the payload to the decode worker thread; the
+                                // ingress sha256 forensic log moved there too.
+                                let topic_str = message.topic.as_str();
+                                // #942 diagnosis: count this DELIVERED message by
+                                // topic kind before any decode work, so the
+                                // periodic log can show whether block-topic
+                                // delivery has gone silent while the mesh is up.
+                                GOSSIP_RECV_BY_KIND_TOTAL[gossip_topic_kind_index(topic_str)]
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let topic = match CString::new(topic_str) {
                                     Ok(cstr) => cstr,
                                     Err(_) => {
                                         logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic_str));
                                         continue;
                                     }
                                 };
-                                let topic = topic.as_ptr();
-
-                                let message_ptr = message.data.as_ptr();
-                                let message_len = message.data.len();
 
                                 let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
-                                let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
+                                let sender_peer_id = match CString::new(sender_peer_id_string.as_str()) {
                                     Ok(cstring) => cstring,
                                     Err(_) => {
                                         logger::rustLogger.error(
@@ -1820,50 +2749,46 @@ impl Network {
                                     }
                                 };
 
-                                // The Rust-side `Decoder::new().decompress_vec`
-                                // and accompanying decode-failure log + dump are
-                                // gone on purpose.
-                                //
-                                // Cause: a 3.7 MB broken-snappy block arrived and the
-                                // synchronous decompress here (running on top of the
-                                // equivalent decompress that gossipsub's `message_id_fn`
-                                // already does) blocked the libp2p event loop for hundreds
-                                // of milliseconds. The resulting starvation knocked
-                                // in-flight Status RPCs into simultaneous timeout, broke
-                                // QUIC handshakes with `HandshakeTimedOut`, and tipped a
-                                // node into "Max reconnection attempts (5) reached, giving
-                                // up" for several peers. After that the node was sending
-                                // Status requests into the void: the chain stalled not
-                                // because catch-up wasn't trying but because the transport
-                                // itself had been jammed by 2× per-message decompress on
-                                // the event loop.
-                                //
-                                // What we lose by removing this:
-                                //   * The per-failure decode log → covered by the Zig-side
-                                //     snappy-decode error log.
-                                //   * The Rust failed-gossip dumps → covered by the
-                                //     pre-existing Zig-side failed-decode dumps. The Rust
-                                //     dumps captured `message.data` before the FFI handoff
-                                //     and were used to prove the bytes are byte-identical
-                                //     at the wire side; that's now confirmed and the
-                                //     duplicate dump path is no longer needed.
-                                //   * The `rust_snap=ok` vs Zig decode reconciliation →
-                                //     only useful if there's an FFI slice bug. We already
-                                //     showed the bytes that reach Zig match what Rust sees,
-                                //     so the FFI is faithful and this reconciliation has no
-                                //     signal left.
-
-                                unsafe {
-                                    handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
+                                let work = InboundGossip {
+                                    network_id: self.network_id,
+                                    zig_handler: self.zig_handler,
+                                    topic,
+                                    sender_peer_id,
+                                    // Move the owned payload off the event loop;
+                                    // the worker holds it for the FFI call.
+                                    data: message.data,
                                 };
-                                logger::rustLogger.debug(self.network_id, "zig callback completed");
+
+                                match gossip_tx.try_send(work) {
+                                    Ok(()) => {}
+                                    Err(std::sync::mpsc::TrySendError::Full(dropped)) => {
+                                        let total = INBOUND_GOSSIP_DROPPED_TOTAL
+                                            .fetch_add(1, Ordering::Relaxed)
+                                            + 1;
+                                        logger::rustLogger.warn(self.network_id, &format!(
+                                            "[#942] inbound gossip decode queue full (cap={}); dropped topic={} len={} (dropped_total={}). Missed block recoverable via blocks_by_root/range RPC sync.",
+                                            INBOUND_GOSSIP_CHANNEL_CAPACITY,
+                                            dropped.topic.to_string_lossy(),
+                                            dropped.data.len(),
+                                            total,
+                                        ));
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                        logger::rustLogger.error(
+                                            self.network_id,
+                                            "[#942] inbound gossip decode worker gone; dropping message",
+                                        );
+                                    }
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Reqresp(ReqRespMessage {
                             peer_id,
                             connection_id,
                             message,
-                        })) => match message {
+                        })) => {
+                            enter_swarm_event(6);
+                            match message {
                             Ok(ReqRespMessageReceived::Request { stream_id, message }) => {
                                 let request_message = *message;
                                 let protocol = request_message.protocol.clone();
@@ -1908,14 +2833,28 @@ impl Network {
                                     }
                                 };
 
-                                unsafe {
-                                    handleRPCRequestFromRustBridge(
-                                        self.zig_handler,
-                                        channel_id,
-                                        peer_id_cstring.as_ptr(),
-                                        protocol_cstring.as_ptr(),
-                                        payload.as_ptr(),
-                                        payload.len(),
+                                // Hand off to the reqresp worker thread; the
+                                // FFI call's synchronous snappy + SSZ +
+                                // chain work used to stall the swarm task
+                                // for many seconds (see RpcWork comment).
+                                let work = RpcWork::Request {
+                                    zig_handler: self.zig_handler,
+                                    channel_id,
+                                    peer_id: peer_id_cstring,
+                                    protocol: protocol_cstring,
+                                    payload,
+                                };
+                                if let Err(e) = rpc_tx.try_send(work) {
+                                    let total = INBOUND_RPC_DROPPED_TOTAL
+                                        .fetch_add(1, Ordering::Relaxed) + 1;
+                                    logger::rustLogger.warn(
+                                        self.network_id,
+                                        &format!(
+                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Request (total={}): {:?}",
+                                            INBOUND_RPC_CHANNEL_CAPACITY,
+                                            total,
+                                            e,
+                                        ),
                                     );
                                 }
                             }
@@ -1955,14 +2894,30 @@ impl Network {
                                     }
                                 };
 
-                                unsafe {
-                                    handleRPCResponseFromRustBridge(
-                                        self.zig_handler,
-                                        request_id,
-                                        peer_id_cstring.as_ptr(),
-                                        protocol_cstring.as_ptr(),
-                                        response_message.payload.as_ptr(),
-                                        response_message.payload.len(),
+                                // Hand off to the reqresp worker thread. The
+                                // synchronous Zig handler does snappy-framed
+                                // decompress + SSZ deserialize + chain
+                                // dispatch (handleRPCResponseFromRustBridge);
+                                // on the 883318f5 devnet this stalled the
+                                // swarm task for ~15 s per large response.
+                                let work = RpcWork::Response {
+                                    zig_handler: self.zig_handler,
+                                    request_id,
+                                    peer_id: peer_id_cstring,
+                                    protocol: protocol_cstring,
+                                    payload: response_message.payload,
+                                };
+                                if let Err(e) = rpc_tx.try_send(work) {
+                                    let total = INBOUND_RPC_DROPPED_TOTAL
+                                        .fetch_add(1, Ordering::Relaxed) + 1;
+                                    logger::rustLogger.warn(
+                                        self.network_id,
+                                        &format!(
+                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Response (total={}): {:?}",
+                                            INBOUND_RPC_CHANNEL_CAPACITY,
+                                            total,
+                                            e,
+                                        ),
                                     );
                                 }
                             }
@@ -1995,12 +2950,23 @@ impl Network {
                                         }
                                     };
 
-                                    unsafe {
-                                        handleRPCEndOfStreamFromRustBridge(
-                                            self.zig_handler,
-                                            request_id,
-                                            peer_id_cstring.as_ptr(),
-                                            protocol_cstring.as_ptr(),
+                                    let work = RpcWork::EndOfStream {
+                                        zig_handler: self.zig_handler,
+                                        request_id,
+                                        peer_id: peer_id_cstring,
+                                        protocol: protocol_cstring,
+                                    };
+                                    if let Err(e) = rpc_tx.try_send(work) {
+                                        let total = INBOUND_RPC_DROPPED_TOTAL
+                                            .fetch_add(1, Ordering::Relaxed) + 1;
+                                        logger::rustLogger.warn(
+                                            self.network_id,
+                                            &format!(
+                                                "[#942] inbound reqresp dispatch queue full (cap={}); dropped EndOfStream (total={}): {:?}",
+                                                INBOUND_RPC_CHANNEL_CAPACITY,
+                                                total,
+                                                e,
+                                            ),
                                         );
                                     }
                                 } else {
@@ -2036,13 +3002,24 @@ impl Network {
                                         CString::new(protocol_id.as_str()),
                                         CString::new(format!("{:?}", err)),
                                     ) {
-                                        unsafe {
-                                            handleRPCErrorFromRustBridge(
-                                                self.zig_handler,
-                                                request_id,
-                                                protocol_cstring.as_ptr(),
-                                                3,
-                                                message_cstring.as_ptr(),
+                                        let work = RpcWork::Error {
+                                            zig_handler: self.zig_handler,
+                                            request_id,
+                                            protocol: protocol_cstring,
+                                            code: 3,
+                                            message: message_cstring,
+                                        };
+                                        if let Err(e) = rpc_tx.try_send(work) {
+                                            let total = INBOUND_RPC_DROPPED_TOTAL
+                                                .fetch_add(1, Ordering::Relaxed) + 1;
+                                            logger::rustLogger.warn(
+                                                self.network_id,
+                                                &format!(
+                                                    "[#942] inbound reqresp dispatch queue full (cap={}); dropped OutboundError (total={}): {:?}",
+                                                    INBOUND_RPC_CHANNEL_CAPACITY,
+                                                    total,
+                                                    e,
+                                                ),
                                             );
                                         }
                                     }
@@ -2052,8 +3029,12 @@ impl Network {
                                     &format!("[reqresp] Outbound error for request {} with {}: {:?}", request_id, peer_id, err),
                                 );
                             }
-                        },
-                        e => logger::rustLogger.debug(self.network_id, &format!("{:?}", e)),
+                        }
+                        }
+                        e => {
+                            enter_swarm_event(99);
+                            logger::rustLogger.debug(self.network_id, &format!("{:?}", e));
+                        }
                     }
                 }
 
@@ -2065,11 +3046,13 @@ impl Network {
             // (above) plus this cap means a flood of FFI publishes cannot
             // starve gossip ingestion or reqresp event handling.
             Some(first_cmd) = cmd_rx.recv() => {
+                enter_arm(6);
                 let mut cmd = first_cmd;
                 let mut drained = 0usize;
                 loop {
                     match cmd {
                     SwarmCommand::SubscribeGossip { topic } => {
+                        enter_swarm_command(1);
                         let gossipsub_topic = gossipsub::IdentTopic::new(topic.clone());
                         if let Err(e) =
                             swarm.behaviour_mut().gossipsub.subscribe(&gossipsub_topic)
@@ -2086,12 +3069,14 @@ impl Network {
                         }
                     }
                     SwarmCommand::Publish { topic, data } => {
+                        enter_swarm_command(2);
                         let t = gossipsub::IdentTopic::new(topic);
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(t, data) {
                             logger::rustLogger.error(self.network_id, &format!("Publish error: {e:?}"));
                         }
                     }
                     SwarmCommand::SendRpcRequest { peer_id, request_id, request_message } => {
+                        enter_swarm_command(3);
                         // Register the request on the timeout/protocol maps
                         // BEFORE handing the request to the swarm: by the time
                         // libp2p surfaces a response, timeout, or error event,
@@ -2107,6 +3092,7 @@ impl Network {
                         swarm.behaviour_mut().reqresp.send_request(peer_id, request_id, request_message);
                     }
                     SwarmCommand::SendRpcResponseChunk { channel_id, peer_id, connection_id, stream_id, response_message } => {
+                        enter_swarm_command(4);
                         // Channel coordinates were resolved on the FFI side
                         // under a single `RESPONSE_CHANNEL_MAP` lock; we just
                         // forward the response and log it. We do not re-look
@@ -2132,6 +3118,7 @@ impl Network {
                             "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, peer_id));
                     }
                     SwarmCommand::SendRpcEndOfStream { channel_id } => {
+                        enter_swarm_command(5);
                         let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
@@ -2146,6 +3133,7 @@ impl Network {
                         }
                     }
                     SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
+                        enter_swarm_command(6);
                         let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
@@ -2162,6 +3150,56 @@ impl Network {
                         } else {
                             logger::rustLogger.error(self.network_id, &format!(
                                 "No response channel found for id {} (SendRpcErrorResponse)", channel_id));
+                        }
+                    }
+                    SwarmCommand::DialReconnect { peer_id, addr, attempt } => {
+                        enter_swarm_command(7);
+                        // The detached `tokio::spawn` task scheduled this after
+                        // sleeping for the backoff. Re-check liveness here (the
+                        // peer may have reconnected via some other path in the
+                        // meantime) before issuing the dial.
+                        if swarm.is_connected(&peer_id) {
+                            logger::rustLogger.debug(
+                                self.network_id,
+                                &format!(
+                                    "Skipping reconnection attempt to peer {} because it is already connected",
+                                    peer_id
+                                ),
+                            );
+                        } else {
+                            logger::rustLogger.info(
+                                self.network_id,
+                                &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
+                            );
+                            RECONNECT_ATTEMPTS
+                                .lock_recover()
+                                .insert((self.network_id, peer_id), (addr.clone(), attempt));
+
+                            let mut dial_addr = addr.clone();
+                            strip_peer_id(&mut dial_addr);
+
+                            match swarm.dial(
+                                DialOpts::peer_id(peer_id)
+                                    .addresses(vec![dial_addr.clone()])
+                                    .build(),
+                            ) {
+                                Ok(()) => {
+                                    logger::rustLogger.info(
+                                        self.network_id,
+                                        &format!("Dialing peer {} at {} for reconnection", peer_id, dial_addr),
+                                    );
+                                }
+                                Err(e) => {
+                                    logger::rustLogger.error(
+                                        self.network_id,
+                                        &format!("Failed to dial peer {} at {}: {:?}", peer_id, dial_addr, e),
+                                    );
+                                    RECONNECT_ATTEMPTS
+                                        .lock_recover()
+                                        .remove(&(self.network_id, peer_id));
+                                    self.schedule_reconnection(peer_id, addr, attempt + 1);
+                                }
+                            }
                         }
                     }
                     }
@@ -2183,11 +3221,87 @@ impl Network {
             // store is lock-free; no `await` here, so the swarm task is
             // never blocked.
             _ = mesh_peers_tick.tick() => {
+                enter_arm(7);
                 let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
                 record_mesh_peers(self.network_id, mesh_count);
+
+                // #942 diagnosis: every ~10s, log the per-topic-kind count of
+                // gossipsub Messages delivered so far plus the per-topic mesh
+                // size. If the block counter stops climbing while the block
+                // topic still has mesh peers, blocks have stopped ARRIVING
+                // (transport/mesh fault) rather than failing to decode.
+                diag_tick_count = diag_tick_count.wrapping_add(1);
+                if diag_tick_count.is_multiple_of(10) {
+                    let block_recv = GOSSIP_RECV_BY_KIND_TOTAL[0].load(Ordering::Relaxed);
+                    let attn_recv = GOSSIP_RECV_BY_KIND_TOTAL[1].load(Ordering::Relaxed);
+                    let other_recv = GOSSIP_RECV_BY_KIND_TOTAL[2].load(Ordering::Relaxed);
+                    let gs = &swarm.behaviour().gossipsub;
+                    let mut topic_mesh = String::new();
+                    for topic in gs.topics() {
+                        let n = gs.mesh_peers(topic).count();
+                        let label = match gossip_topic_kind_index(&topic.to_string()) {
+                            0 => "block",
+                            1 => "attn",
+                            _ => "other",
+                        };
+                        topic_mesh.push_str(&format!(" {label}={n}"));
+                    }
+                    logger::rustLogger.debug(
+                        self.network_id,
+                        &format!(
+                            "[#942 gossip-recv] delivered_total block={block_recv} attn={attn_recv} other={other_recv} | mesh_peers total={mesh_count}{topic_mesh} | inbound_decode_dropped={}",
+                            INBOUND_GOSSIP_DROPPED_TOTAL.load(Ordering::Relaxed),
+                        ),
+                    );
+                    // NOTE: the per-substream QUIC accounting lines
+                    // ([#942 quic-recv] / [#942 quic-send]) are emitted from a
+                    // dedicated spawned task (spawn_quic_diag_emitter, started in
+                    // run_eventloop). They MUST NOT live in this arm: it is the
+                    // last arm of a biased select! and devnet data showed it
+                    // never gets polled once reqresp-status retries become
+                    // continuous, so the per-stream signal disappears exactly
+                    // when the freeze deepens. The spawned task uses its own
+                    // tokio::time::interval and only reads atomic counters, so
+                    // it keeps emitting even while the swarm task is busy.
+                }
             }
 
             }
+
+            // #942 iteration-latency probe: record how long this iteration
+            // of the swarm task's `select!` took. The atomics are read by
+            // `spawn_quic_diag_emitter` and reset (max) each tick.
+            let dt_ms = iter_start.elapsed().as_millis() as u64;
+            EVENT_LOOP_MAX_ITER_MS.fetch_max(dt_ms, Ordering::Relaxed);
+            if dt_ms >= EVENT_LOOP_SLOW_ITER_THRESHOLD_MS {
+                EVENT_LOOP_SLOW_ITERS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // #942: stop the inbound gossip decode worker. Dropping the sender makes
+        // the worker's blocking `recv()` return `Err` once the channel drains,
+        // so it finishes any queued messages and exits. Joining here — on the
+        // rust-bridge thread, before this function returns and Zig joins it —
+        // guarantees no in-flight `handleMsgFromRustBridge` call is still running
+        // when Zig tears down the EthLibp2p handler after `stop_network`.
+        drop(gossip_tx);
+        if let Err(panic) = gossip_worker.join() {
+            logger::rustLogger.error(
+                self.network_id,
+                &format!("inbound gossip decode worker thread panicked: {:?}", panic),
+            );
+        }
+
+        // Mirror cleanup for the reqresp dispatch worker.
+        drop(rpc_tx);
+        if let Err(panic) = rpc_worker.join() {
+            logger::rustLogger.error(
+                self.network_id,
+                &format!(
+                    "inbound reqresp dispatch worker thread panicked: {:?}",
+                    panic
+                ),
+            );
         }
 
         // Clean up per-network state so any later `stop_network`/`start_network`
@@ -2236,16 +3350,28 @@ impl Behaviour {
         // the same id and are dropped by gossipsub before the application
         // layer ever sees them.
         //
-        // Cost: synchronous decompress on the gossipsub event loop. The
-        // earlier abandonment of this scheme was motivated by event-loop
-        // stalls of 0.5–1 s on broken-snappy payloads — the deferred-
-        // hashTreeRoot work that landed earlier on this branch has already
-        // cut `zeam_xev_clock_until_done_slow_ge_500ms_total` from ~7,600
-        // to ~490 in the parallel measurement, so the synchronous decompress
-        // here is no longer the dominant cost on the libxev tick budget.
-        // If that regresses post-deploy, the right next step is to put
-        // a small LRU cache in front of this function keyed on the raw
-        // bytes' SHA256 so identical-bytes re-forwards never re-decompress.
+        // Cost: synchronous decompress on the gossipsub event loop. With
+        // ~21 mesh peers each forwarding the same block, this used to run
+        // ~21x per block on the same thread that drives quinn's QUIC poll
+        // futures; devnet evidence (slot 58→61 simultaneous freeze of every
+        // poll_read AND poll_write) pinned that accumulation as the proximal
+        // cause of the libp2p event-loop stall. Mitigated below by an FIFO
+        // cache keyed on the raw-bytes SHA256: identical-bytes re-forwards
+        // skip the decompress entirely.
+
+        // Fast path: cheap SHA256 of the raw wire bytes, then cache lookup.
+        // SHA256 over even a 10 MB block is ~10 ms on modern hw; snappy
+        // decompress of the same block is ~10x that AND allocates the full
+        // decoded buffer.
+        let mut raw_hasher = sha2::Sha256::new();
+        raw_hasher.update(&message.data);
+        let raw_digest = raw_hasher.finalize();
+        let raw_key: [u8; 32] = raw_digest.into();
+        if let Some(id) = MESSAGE_ID_CACHE.lock_recover().get(&raw_key) {
+            return id;
+        }
+
+        // Slow path: decompress + content-addressed hash, then cache.
         let mut hasher = sha2::Sha256::new();
         let (data_for_hash, domain): (Vec<u8>, [u8; 4]) =
             match Decoder::new().decompress_vec(&message.data) {
@@ -2257,7 +3383,9 @@ impl Behaviour {
         hasher.update(message.topic.as_str().as_bytes());
         hasher.update(&data_for_hash);
         let digest = hasher.finalize();
-        gossipsub::MessageId::from(&digest[..20])
+        let id = gossipsub::MessageId::from(&digest[..20]);
+        MESSAGE_ID_CACHE.lock_recover().insert(raw_key, id.clone());
+        id
     }
 
     fn new(key: identity::Keypair) -> Self {
@@ -2306,7 +3434,24 @@ impl Behaviour {
 }
 
 fn new_swarm(local_keypair: Keypair, network_id: u32) -> libp2p::swarm::Swarm<Behaviour> {
-    let transport = build_transport(local_keypair.clone(), true).unwrap();
+    // #942 transport bisection: the inbound snappy corruption is provably
+    // introduced on zeam's receive path after AEAD decryption (ingress hash
+    // differs from the producer's publish hash, and both QUIC and TCP+noise
+    // are integrity-protected, ruling out the wire). To split the search
+    // between the QUIC stack (quinn/libp2p-quic) and the TCP stack
+    // (yamux/gossipsub codec), set ZEAM_DISABLE_QUIC=1 to run TCP+yamux+noise
+    // only. If `error.Corrupt` vanishes, the bug is in the QUIC reassembly;
+    // if it persists, it is in yamux or the gossipsub length-delimited codec.
+    // Default (unset) keeps QUIC enabled, i.e. current behaviour.
+    let quic_support = !matches!(
+        std::env::var("ZEAM_DISABLE_QUIC").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
+    logger::rustLogger.info(
+        network_id,
+        &format!("[#942 transport] quic_support={quic_support} (set ZEAM_DISABLE_QUIC=1 to force TCP+yamux+noise only)"),
+    );
+    let transport = build_transport(local_keypair.clone(), quic_support).unwrap();
     logger::rustLogger.debug(network_id, "build the transport");
 
     // No gossipsub topics joined here. Mesh subscriptions are driven from
@@ -2347,14 +3492,48 @@ fn build_transport(
         .timeout(Duration::from_secs(10));
     let transport = if quic_support {
         // Enables Quic
-        // The default quic configuration suits us for now.
-        let quic_config = libp2p::quic::Config::new(&local_private_key);
+        //
+        // #942 fix #4 — QUIC receive flow-control windows.
+        //
+        // libp2p-quic's defaults are max_stream_data = 10 MB and
+        // max_connection_data = 15 MB. Two problems on this gossip workload:
+        //
+        // 1. A single Ethereum-consensus gossip message can be up to
+        //    `max_message_size()` ≈ 12.2 MB (snappy worst-case of the 10 MiB
+        //    payload + framing). That is LARGER than the 10 MB per-stream
+        //    receive window, so a max-size block cannot be received within one
+        //    stream's flow-control window — quinn stalls waiting for a window
+        //    update that gossipsub never triggers mid-message.
+        // 2. The 15 MB connection window is shared across ALL concurrent
+        //    streams on a peer connection (block topic + every attestation
+        //    subnet + RPC). During a catch-up burst of ~3.3 MB blocks plus the
+        //    attestation fan-in, the connection-level window exhausts; QUIC
+        //    flow control then blocks new STREAM_DATA frames. Small
+        //    attestation streams that already arrived still complete and get
+        //    delivered, but new LARGE block streams wedge mid-reassembly —
+        //    exactly the pinned #942 signature (block-topic delivery goes
+        //    silent after the burst while attestations keep flowing on the
+        //    same healthy connections).
+        //
+        // Raise both windows so one max-size message fits comfortably in a
+        // stream window and many concurrent large streams cannot exhaust the
+        // connection window. `max_stream_data` / `max_connection_data` are
+        // public fields on the config; they map to quinn's
+        // stream_receive_window / receive_window.
+        let mut quic_config = libp2p::quic::Config::new(&local_private_key);
+        quic_config.max_stream_data = 16 * 1024 * 1024; // 16 MB > max_message_size (~12.2 MB)
+        quic_config.max_connection_data = 64 * 1024 * 1024; // 64 MB headroom for concurrent large streams
         let quic = libp2p::quic::tokio::Transport::new(quic_config);
         let transport = tcp
             .or_transport(quic)
             .map(|either_output, _| match either_output {
                 Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-                Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+                // #942 fix-#5 diagnostic: wrap the QUIC muxer so inbound
+                // substream byte flow is accounted at the quinn boundary.
+                Either::Right((peer_id, muxer)) => (
+                    peer_id,
+                    StreamMuxerBox::new(InstrumentedMuxer { inner: muxer }),
+                ),
             });
         transport.boxed()
     } else {

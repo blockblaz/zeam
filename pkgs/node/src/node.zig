@@ -61,6 +61,10 @@ const NodeOpts = struct {
     /// CLI knob (`--min-aggregation-inputs`) for the per-att_data
     /// aggregation threshold; see `default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// CLI knob (`--max-aggregation-children`) capping child STARK proofs
+    /// merged with raw signatures by the aggregator worker. See
+    /// `pkgs/types/src/block.zig:default_max_aggregation_children`.
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
     /// Soft cap on concurrent aggregate workers (`BeamChain.aggregate_inflight`).
     aggregate_max_inflight: u32 = 4,
 };
@@ -192,6 +196,7 @@ pub const BeamNode = struct {
                 .is_aggregator = opts.is_aggregator,
                 .thread_pool = opts.thread_pool,
                 .min_aggregation_inputs = opts.min_aggregation_inputs,
+                .max_aggregation_children = opts.max_aggregation_children,
                 .aggregate_max_inflight = opts.aggregate_max_inflight,
             },
             network.connected_peers,

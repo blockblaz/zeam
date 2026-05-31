@@ -75,6 +75,10 @@ pub const ChainOpts = struct {
     /// per-`ForkChoice` aggregation threshold. See `default_min_aggregation_inputs`
     /// for the default and `isTrivialAggregationInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Surfaces the `--max-aggregation-children` CLI flag to the
+    /// per-`ForkChoice` recursive-child cap. See
+    /// `pkgs/types/src/block.zig:default_max_aggregation_children`.
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
     /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
     /// enforced lock-free by `submitAggregateOnInterval`. When the cap is
     /// reached the trigger is coalesced into `aggregate_reschedule_intervals`
@@ -549,6 +553,7 @@ pub const BeamChain = struct {
             .logger = logger_config.logger(.forkchoice),
             .thread_pool = opts.thread_pool,
             .min_aggregation_inputs = opts.min_aggregation_inputs,
+            .max_aggregation_children = opts.max_aggregation_children,
         });
 
         var states = std.AutoHashMap(types.Root, *RcBeamState).init(allocator);
