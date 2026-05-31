@@ -128,6 +128,36 @@ pub const SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS: u64 = 4;
 // observed to time out en masse on devnet (#926) and leave catch-up stuck.
 pub const SYNC_STATUS_REFRESH_PEERS_PER_TICK: usize = 8;
 
+// Wall-clock slots the best-known peer head_slot is allowed to lag wall-clock
+// before we treat the entire connected-peer pool as a "stuck mesh cluster"
+// and trigger a one-shot full-fanout status refresh (#942 follow-up).
+//
+// Observed on the 2026-05-29 devnet: zeam_8 was 254 wall slots behind, but
+// every cached `latest_status.head_slot` it knew about topped out at 45 (a
+// peer that was itself stuck behind the broken-snappy gossip ingress at the
+// same network position). `findBestCatchUpPeerStatus` correctly picked the
+// best-of-stale option each slot, fired `blocks_by_root` to it, got a stale
+// response, and made no progress — for 25+ minutes — because the rotating
+// status-refresh batch (`SYNC_STATUS_REFRESH_PEERS_PER_TICK = 8`, full
+// rotation = ~8 slots over a 50-peer mesh) was the only path that could ever
+// learn that some non-batch-current peer might have a fresher head. Sixteen
+// slots = 64 s tolerance: anything below this is normal proactive-catch-up
+// territory; anything above signals "the visible mesh is not on the chain
+// tip."
+pub const SYNC_STATUS_STUCK_CLUSTER_PEER_LAG_THRESHOLD_SLOTS: u64 = 16;
+
+// Minimum slot gap between consecutive full-fanout status refreshes after the
+// "stuck mesh cluster" detector fires (#942 follow-up). Rate-limits the
+// otherwise-unbatched RPC burst so that, in the pathological case where a
+// genuine network-wide pause keeps us stuck, we don't blast every connected
+// peer with status requests every interval and re-create the en-masse RPC
+// timeout cascade that motivated the original batching (#926).
+//
+// 16 slots = 64 s at 4 s/slot lines up with the wall-lag threshold above so
+// at most one force-refresh fires per detection cycle even if the condition
+// stays continuously true.
+pub const SYNC_STATUS_STUCK_CLUSTER_REFRESH_COOLDOWN_SLOTS: u64 = 16;
+
 // When no gossip has been received for this many wall-clock slots, treat
 // ingress as stalled and initiate RPC catch-up from the best known peer
 // head without waiting for a status response (#926).
