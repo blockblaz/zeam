@@ -426,33 +426,42 @@ pub const BeamNode = struct {
 
                     _ = self.network.removePendingBlockRoot(block_root);
 
-                    // Cache this block for later processing when parent arrives
-                    if (self.cacheBlockAndFetchParent(block_root, signed_block, 0)) |_| {
-                        self.logger.debug(
-                            "Cached gossip block 0x{x} at slot {d}, fetching parent 0x{x}",
-                            .{
-                                &block_root,
-                                block.slot,
-                                &parent_root,
-                            },
+                    // Skip the destructive `cacheBlockAndFetchParent` (→ sszClone
+                    // → ssz.serialize) — it corrupts the upstream `data.*`'s
+                    // SignedBlock allocations, which the inbound-gossip worker
+                    // thread then deinits, causing a thread-N "Invalid free"
+                    // panic. Same bug + same fix pattern as
+                    // cacheMissingParentRpcChunk (commit 77d21e52); this is the
+                    // gossip-path twin. zeam_9 on devnet image a0faf5b
+                    // (post-77d21e52) showed 2 panics here in 12 min — all in
+                    // onGossip at node.zig:430.
+                    //
+                    // The orphan gossip chunk is NOT pre-cached. When the
+                    // parent arrives, the chain will re-fetch this block via
+                    // blocks_by_root (using the parent-root enqueue below).
+                    // One extra round-trip per orphan gossip block; no panic.
+                    if (block.slot <= self.chain.forkChoice.getLatestFinalized().slot) {
+                        // Block is pre-finalized - prune any cached descendants waiting for this parent
+                        self.logger.info(
+                            "gossip block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
+                            .{ &block_root, block.slot },
                         );
-                    } else |err| {
-                        if (err == CacheBlockError.PreFinalized) {
-                            // Block is pre-finalized - prune any cached descendants waiting for this parent
-                            self.logger.info(
-                                "gossip block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
-                                .{
-                                    &block_root,
-                                    block.slot,
-                                },
+                        _ = self.network.pruneCachedBlocks(block_root, null);
+                    } else {
+                        // Enqueue the parent root for batched fetching so chain
+                        // catch-up still drives to completion when parent arrives.
+                        self.batch_pending_parent_roots_lock.lock();
+                        defer self.batch_pending_parent_roots_lock.unlock();
+                        self.batch_pending_parent_roots.put(parent_root, 1) catch |err| {
+                            self.logger.warn(
+                                "failed to enqueue parent root 0x{x} for orphan gossip block 0x{x}: {any}",
+                                .{ &parent_root, &block_root, err },
                             );
-                            _ = self.network.pruneCachedBlocks(block_root, null);
-                        } else {
-                            self.logger.warn("failed to cache gossip block 0x{x}: {any}", .{
-                                &block_root,
-                                err,
-                            });
-                        }
+                        };
+                        self.logger.debug(
+                            "Orphan gossip block 0x{x} at slot {d}: cache skipped (sszClone source-corruption guard); queued parent 0x{x}",
+                            .{ &block_root, block.slot, &parent_root },
+                        );
                     }
                     // Flush any pending parent root fetches accumulated during caching.
                     self.flushPendingParentFetches(null);
