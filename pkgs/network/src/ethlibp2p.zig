@@ -31,10 +31,22 @@ const ServerStreamError = error{
     InvalidResponseVariant,
 };
 
-/// General RPC message size limit (4 MB). Used for req/resp protocol messages
-/// (BlocksByRoot, Status, etc.) and as a baseline gossip limit for small messages
-/// such as attestations and aggregations.
-const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+/// General RPC message size limit. Used for req/resp protocol messages
+/// (BlocksByRoot, BlocksByRange, Status, etc.) and as a baseline gossip limit
+/// for small messages such as attestations and aggregations.
+///
+/// Sized to match `MAX_GOSSIP_BLOCK_SIZE`: `blocks_by_range` and
+/// `blocks_by_root` carry the same XMSS-heavy blocks as the gossip block
+/// topic, so the RPC cap must accommodate the same per-block payload. A
+/// lower RPC cap (was 4 MB before #960) caused `error.PayloadTooLarge`
+/// during `buildResponseFrame` for every legitimately-sized block that
+/// fit in gossip but not in the RPC frame check, breaking blocks_by_range
+/// catch-up across all peer clients and preventing finalisation.
+///
+/// TODO(#855 review #9 follow-up): split into per-protocol caps so
+/// attestations / aggregations / Status / Goodbye can keep a tighter
+/// ceiling than block-carrying responses. Tracked separately.
+const MAX_RPC_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Gossip block message size limit.
 ///
@@ -563,13 +575,15 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     const sender_peer_id_slice = std.mem.span(sender_peer_id);
     const topic_slice = std.mem.span(topic_str);
 
-    // Block gossip messages carry XMSS/post-quantum aggregated signatures and can be
-    // substantially larger than the 4 MB RPC limit (devnet4 saw ~9.37 MB — issue #723).
-    // Use the larger MAX_GOSSIP_BLOCK_SIZE for block topics; keep the tighter limit for
-    // small messages (attestations, aggregations) to bound memory use.
+    // Block gossip messages carry XMSS/post-quantum aggregated signatures and
+    // can reach tens of MB (devnet4 saw ~9.37 MB — issue #723). Use
+    // MAX_GOSSIP_BLOCK_SIZE for block topics and MAX_RPC_MESSAGE_SIZE for the
+    // smaller-message topics; both are 50 MB today (see #960), so this
+    // distinction is currently a no-op but kept for the per-kind tightening
+    // TODO below.
     //
     // TODO(#855 review #9): attestations/aggregations rarely approach
-    // MAX_RPC_MESSAGE_SIZE (4 MB). Tighter per-kind ceilings would let us
+    // MAX_RPC_MESSAGE_SIZE. Tighter per-kind ceilings would let us
     // reject earlier and reduce attacker amplification. Track separately.
     const decode_limit: usize = switch (topic.gossip_topic.kind) {
         .block => MAX_GOSSIP_BLOCK_SIZE,
