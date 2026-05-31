@@ -7081,7 +7081,10 @@ test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
     const parent_root = mock_chain.blocks[1].block.parent_root;
 
     var block = try zeam_utils.clone(types.SignedBlock, &mock_chain.blocks[1], std.testing.allocator);
-    errdefer block.deinit();
+    // insertBlockPtr moves block's interior into the cache on success; bc.deinit
+    // then owns it. Only deinit here if the insert never happened.
+    var block_consumed = false;
+    errdefer if (!block_consumed) block.deinit();
 
     var ssz_buf: std.ArrayList(u8) = .empty;
     defer ssz_buf.deinit(std.testing.allocator);
@@ -7089,6 +7092,7 @@ test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
     const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
 
     try bc.insertBlockPtr(root, &block, parent_root, ssz_bytes);
+    block_consumed = true;
 
     {
         const present_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);

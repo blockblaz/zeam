@@ -1165,14 +1165,25 @@ pub const BeamNode = struct {
             return CacheBlockError.CachingFailed;
         }
 
-        var block = zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator) catch {
-            return CacheBlockError.CloneFailed;
-        };
-        errdefer block.deinit();
-
-        self.network.cacheFetchedBlock(block_root, &block) catch {
+        // cacheFetchedBlock takes ownership of a HEAP pointer: it moves the inner
+        // SignedBlock into the cache and destroys the outer pointer (deinit+destroy
+        // on a duplicate). It must therefore be given an allocator-owned pointer,
+        // not the address of a stack local. Allocate on the heap and hand it over;
+        // disable the errdefers once ownership has transferred to the cache.
+        const block_ptr = self.allocator.create(types.SignedBlock) catch {
             return CacheBlockError.CachingFailed;
         };
+        var block_owned = true;
+        errdefer if (block_owned) self.allocator.destroy(block_ptr);
+        block_ptr.* = zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator) catch {
+            return CacheBlockError.CloneFailed;
+        };
+        errdefer if (block_owned) block_ptr.deinit();
+
+        self.network.cacheFetchedBlock(block_root, block_ptr) catch {
+            return CacheBlockError.CachingFailed;
+        };
+        block_owned = false;
 
         // Enqueue the parent root for batched fetching rather than firing an individual
         // request immediately. All accumulated roots are sent as one blocks_by_root
