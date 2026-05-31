@@ -286,6 +286,13 @@ pub const ForkChoiceParams = struct {
     /// `pruneTrivialFromAggregateSnapshot` (NOT by the FFI). See
     /// `isAggregatorTrivialInput` for the predicate semantics.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Cap on the number of child STARK proofs the aggregator worker
+    /// merges with raw signatures via `rec_xmss_aggregate`. Threaded from
+    /// the `--max-aggregation-children` CLI flag. Default `0` keeps
+    /// per-call latency bounded by flat-prove cost; see
+    /// `types.default_max_aggregation_children` for the full rationale
+    /// and operator trade-offs.
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
 };
 
 // Use shared signature map types from types package
@@ -348,6 +355,14 @@ pub const ForkChoice = struct {
     /// level so test struct literals that don't care about the
     /// threshold can omit it.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Cap on the number of child STARK proofs merged with raw signatures
+    /// by the aggregator-worker path. Threaded from
+    /// `ForkChoiceParams.max_aggregation_children` (and ultimately from
+    /// the `--max-aggregation-children` CLI flag). Default
+    /// `types.default_max_aggregation_children` keeps worker latency
+    /// bounded by flat-prove cost; see that constant's doc for trade-offs.
+    /// Field-level default so test struct literals can omit it.
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
     last_node_tick_time_ms: ?i64,
 
     const Self = @This();
@@ -441,6 +456,7 @@ pub const ForkChoice = struct {
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
             .thread_pool = opts.thread_pool,
             .min_aggregation_inputs = opts.min_aggregation_inputs,
+            .max_aggregation_children = opts.max_aggregation_children,
             .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
@@ -2122,6 +2138,7 @@ pub const ForkChoice = struct {
                 &snap.new_payloads,
                 &snap.known_payloads,
                 data,
+                self.max_aggregation_children,
             );
             if (maybe_result) |*result| {
                 defer result.attestation.deinit();

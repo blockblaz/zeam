@@ -26,7 +26,12 @@ thiserror = "2.0.11"
 tracing = "0.1"
 
 [dependencies.libp2p]
-version = "0.55"
+# #942: bumped 0.55 -> 0.56 to pick up libp2p-quic 0.13.0 (was 0.12.0). The
+# verified Rust lean clients (ream, grandine) both run libp2p 0.56 / quic 0.13
+# and see zero inbound snappy decode failures; the QUIC adapter (libp2p-quic)
+# was the only receive-side transport crate where zeam diverged from them
+# (yamux 0.12.1, quinn 0.11.9/quinn-proto 0.11.14 were already identical).
+version = "0.56"
 default-features = false
 features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub"]
 

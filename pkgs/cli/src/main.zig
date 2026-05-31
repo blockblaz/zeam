@@ -100,6 +100,16 @@ pub const NodeCommand = struct {
     /// on chatty subnets. See issue #907 finding 4.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
 
+    /// Cap on the number of child STARK proofs the aggregator worker merges
+    /// with raw signatures via `rec_xmss_aggregate` (#940 follow-up).
+    /// Default `0` keeps per-call latency bounded by flat-prove cost
+    /// (~0.5 s on 16-core Hetzner per lean-bench at log_inv_rate=2). Higher
+    /// values let the worker emit broader aggregates per tick at the cost
+    /// of ~1.3 s per additional child (devnet snapshot:
+    /// `num_children=3-4` proves averaged ~4.8 s, dominated the p95 tail).
+    /// See `types.default_max_aggregation_children` for full rationale.
+    @"max-aggregation-children": u32 = types.default_max_aggregation_children,
+
     pub const __shorts__ = .{
         .help = .h,
     };
@@ -128,6 +138,7 @@ pub const NodeCommand = struct {
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
         .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to pre-#908 behavior. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
+        .@"max-aggregation-children" = "Cap on the number of child STARK proofs the aggregator worker merges with raw signatures via rec_xmss_aggregate. Default 0 keeps per-call latency bounded by flat-prove cost (~0.5 s/call on devnet aggregator hardware) by never taking the recursive code path; peer-published aggregates for the same att_data remain in latest_known_aggregated_payloads for the block proposer to compact at proposal time. Set 1 to allow at most one peer child to be merged (~1.5 s/call). Higher values reintroduce the multi-second tail (#940 devnet snapshot: num_children=3-4 averaged ~4.8 s).",
         .help = "Show help information for the node command",
     };
 };
@@ -871,6 +882,7 @@ fn mainInner(init: std.process.Init) !void {
                 .db_backend = leancmd.@"db-backend",
                 .rayon_threads = leancmd.@"rayon-threads",
                 .min_aggregation_inputs = leancmd.@"min-aggregation-inputs",
+                .max_aggregation_children = leancmd.@"max-aggregation-children",
             };
 
             defer start_options.deinit(allocator);

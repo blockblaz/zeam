@@ -323,6 +323,10 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
     zeam_network.addImport("@zeam/metrics", zeam_metrics);
+    // #942 follow-up: the publish-side forensic log line in `ethlibp2p.zig`
+    // includes the build git SHA so receivers across the fleet can correlate
+    // broken-byte receipts back to the exact producer binary.
+    zeam_network.addImport("build_options", build_options_module);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
