@@ -725,7 +725,7 @@ pub const BeamNode = struct {
         _ = self.network.removeFetchedBlock(block_root);
 
         // The block was just imported, so any cached descendants
-        // waiting on it can now be retried. Mirrors the post-import
+        // waiting on it can now be retried. This matches the post-import
         // recursion in the inline RPC paths
         // (`processBlockByRootChunk` / `processBlockByRangeChunk`).
         // Internally uses cache-lock-protected helpers + chain.onBlock
@@ -785,8 +785,9 @@ pub const BeamNode = struct {
         switch (reason) {
             .missing_pre_state => {
                 self.clearRangeAsyncChunkImport(block_root);
-                // Mirror the inline `processBlockByRootChunk`
-                // MissingPreState arm. Use depth=1 since the libxev
+                // Handle this the same way as the inline
+                // `processBlockByRootChunk` MissingPreState arm. Use
+                // depth=1 since the libxev
                 // caller already accepted this block (depth 0); a
                 // subsequent parent fetch is the next hop.
                 if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
@@ -2108,7 +2109,7 @@ pub const BeamNode = struct {
             .blocks_by_root => |request| {
                 const roots = request.roots.constSlice();
 
-                // Reject over-limit requests per spec (INVALID_REQUEST, code 1).
+                // Reject requests asking for more roots than allowed (INVALID_REQUEST, code 1).
                 if (roots.len > params.MAX_REQUEST_BLOCKS) {
                     self.logger.warn(
                         "node-{d}:: blocks_by_root: requested {d} roots exceeds MAX_REQUEST_BLOCKS={d}, sending INVALID_REQUEST",
@@ -2148,7 +2149,7 @@ pub const BeamNode = struct {
                 const start_slot = request.start_slot;
                 const requested_count = request.count;
 
-                // Reject invalid counts per spec (INVALID_REQUEST, code 1).
+                // Reject invalid counts (INVALID_REQUEST, code 1).
                 if (requested_count == 0) {
                     self.logger.warn(
                         "node-{d}:: blocks_by_range: count=0 is invalid, sending INVALID_REQUEST",
@@ -4543,7 +4544,7 @@ const TestHarness = struct {
     }
 };
 
-test "Issue #837: BeamNode.onInterval advances last_interval despite validator/aggregator errors" {
+test "BeamNode.onInterval advances last_interval despite validator/aggregator errors" {
     var harness: TestHarness = undefined;
     try harness.init(std.testing.allocator);
     defer harness.deinit();
@@ -4557,7 +4558,7 @@ test "Issue #837: BeamNode.onInterval advances last_interval despite validator/a
     }
 }
 
-test "Issue #837: validator-layer failure does NOT replay the failing interval" {
+test "validator-layer failure does NOT replay the failing interval" {
     var harness: TestHarness = undefined;
     try harness.init(std.testing.allocator);
     defer harness.deinit();
@@ -4575,7 +4576,7 @@ test "Issue #837: validator-layer failure does NOT replay the failing interval" 
     try std.testing.expectEqual(@as(isize, 6), harness.node.last_interval);
 }
 
-test "Issue #837: aggregator-layer failure does NOT replay the failing interval" {
+test "aggregator-layer failure does NOT replay the failing interval" {
     // Interval 7 is the aggregation interval in slot 1.
     var harness: TestHarness = undefined;
     try harness.init(std.testing.allocator);
@@ -4595,7 +4596,7 @@ test "Issue #837: aggregator-layer failure does NOT replay the failing interval"
     try std.testing.expectEqual(@as(isize, 8), harness.node.last_interval);
 }
 
-test "Issue #837: last_interval commits per-iteration on a multi-interval onInterval call" {
+test "last_interval commits per-iteration on a multi-interval onInterval call" {
     // One call spans intervals 1–8; failure at 5 must not lose later progress.
     var harness: TestHarness = undefined;
     try harness.init(std.testing.allocator);

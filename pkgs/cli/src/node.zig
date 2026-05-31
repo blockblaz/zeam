@@ -114,7 +114,7 @@ pub const NodeOptions = struct {
     /// Threaded through to `ForkChoice.min_aggregation_inputs` and
     /// applied by `pruneTrivialFromAggregateSnapshot` before
     /// `computeAggregatedSignatures` runs (the FFI itself stays
-    /// spec-pure). Surfaced as `--min-aggregation-inputs` on the
+    /// free of this filtering). Surfaced as `--min-aggregation-inputs` on the
     /// `zeam node` CLI; default is `default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     /// Cap on the number of child STARK proofs merged with raw signatures
@@ -123,7 +123,7 @@ pub const NodeOptions = struct {
     /// `prepareAggregateAttData` after greedy + subset-prune. Surfaced as
     /// `--max-aggregation-children` on the `zeam node` CLI; default is
     /// `pkgs/types/src/block.zig:default_max_aggregation_children` (0 —
-    /// flat-only worker path). See #940 follow-up.
+    /// flat-only worker path).
     max_aggregation_children: u32 = types.default_max_aggregation_children,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
@@ -431,7 +431,7 @@ pub const Node = struct {
                         self.anchor_state.* = downloaded_state;
                         // Fetch the real anchor block from the checkpoint provider and store
                         // it in the DB so blocks_by_root can serve it with the correct
-                        // hash_tree_root.  Mirrors spec fetch_finalized_anchor: compute
+                        // hash_tree_root.  Compute the finalized anchor: derive
                         // anchor_block_root + expected_state_root, then fetch + verify both
                         // root and state_root pairing before persisting.
                         //
@@ -573,7 +573,7 @@ pub const Node = struct {
         // exactly how `--min-aggregation-inputs` was resolved (default vs
         // override). The threshold is enforced by the aggregator-side
         // pre-filter in `pruneTrivialFromAggregateSnapshot`,
-        // not inside the spec-pure `computeAggregatedSignatures` FFI.
+        // not inside the core `computeAggregatedSignatures` FFI.
         self.logger.info(
             "aggregator threshold: min_aggregation_inputs={d}{s}",
             .{
@@ -1319,7 +1319,7 @@ fn downloadAndStoreCheckpointBlock(
     }
 
     // Pairing check: block.state_root must equal hash_tree_root(anchor_state).
-    // Mirrors spec fetch_finalized_anchor assertion. Detects server advancing
+    // This is the finalized-anchor assertion: it detects a server advancing
     // finalization between the two requests (state then block).
     if (!std.mem.eql(u8, &block.block.state_root, &expected_state_root)) {
         logger.warn(

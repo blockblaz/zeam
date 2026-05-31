@@ -72,9 +72,8 @@ pub const default_min_aggregation_inputs: u32 = 2;
 /// `1`: allow at most one peer child to be merged with raws — useful when
 /// operators want broader on-the-wire coverage from a single aggregator
 /// publish, accepting ~1.5 s per recursive prove. Higher values approach
-/// the pre-cap behaviour and reintroduce the multi-second tail (#940
-/// devnet snapshot: `num_children=3-4` proves averaged ~4.5 s, dominated
-/// the p95).
+/// the pre-cap behaviour and reintroduce the multi-second tail (measured
+/// `num_children=3-4` proves averaged ~4.5 s, dominating the p95).
 pub const default_max_aggregation_children: u32 = 0;
 
 // signatures_map types for aggregation
@@ -1004,7 +1003,7 @@ pub const SingleAggregatedSignature = CompactGroupResult;
 /// `aggregate_job` shape). Used by the aggregator per-job loop.
 ///
 /// `max_aggregation_children` caps the number of child STARK proofs merged
-/// with raw signatures by the recursive prover (#940 follow-up). See
+/// with raw signatures by the recursive prover. See
 /// `default_max_aggregation_children` for the rationale; threaded from
 /// `ForkChoice.max_aggregation_children` through `aggregateUnlocked`.
 pub fn computeSingleAggregatedSignature(
@@ -1251,7 +1250,7 @@ fn prepareAggregateAttData(
     // Cap the number of children passed to the recursive STARK at
     // `max_aggregation_children`. Greedy + prune left only proofs that each
     // add validator coverage raws don't have, but every additional child is
-    // a ~1.3 s adder to `rec_xmss_aggregate` (#940 devnet snapshot:
+    // a ~1.3 s adder to `rec_xmss_aggregate` (measured:
     // num_children=1 proves averaged ~1.5 s, num_children=3-4 averaged
     // ~4.8 s). Operators who would rather bound worker latency than publish
     // a maximally-covering aggregate per tick set this to 0 — peers' own

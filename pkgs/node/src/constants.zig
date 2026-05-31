@@ -60,20 +60,20 @@ pub const MAX_FUTURE_SLOT_QUEUE_TOLERANCE: u64 = 256;
 // chain state. Older entries (lower-slot, lower-receive-time) are evicted
 // first when the cap is hit.
 //
-// Mirrors the spec's cached-blocks cap (also 1024; same magnitude, same
-// FIFO-eviction policy on overflow). Naming differs because `pending_blocks`
+// The cap of 1024 and the FIFO-eviction policy on overflow match the
+// related cached-blocks cap. Naming differs because `pending_blocks`
 // is zeam's pre-existing identifier for the future-block queue and renaming it
 // would touch every callsite without behavioural benefit.
 pub const MAX_PENDING_BLOCKS: usize = 1024;
 
 // Maximum buffered gossip attestations / aggregations awaiting their
-// referenced block to be processed. Mirrors the spec's pending-attestation
-// cap (also 1024).
+// referenced block to be processed. Capped at 1024, matching the
+// pending-blocks cap.
 //
 // The buffer underwrites the "validate, on failure buffer for replay"
-// lifecycle, retried on every successful block processed. Keeping the bound in
-// sync with the spec value keeps replay churn within test vectors. FIFO
-// eviction matches the spec's "drop oldest" policy.
+// lifecycle, retried on every successful block processed. Keeping this bound
+// stable keeps replay churn within the range exercised by the test vectors.
+// When the cap is hit, the oldest buffered entry is dropped first (FIFO).
 pub const MAX_PENDING_ATTESTATIONS: usize = 1024;
 
 // Maximum depth for recursive block fetching
@@ -83,8 +83,9 @@ pub const MAX_BLOCK_FETCH_DEPTH = 512;
 // Maximum number of blocks to keep in the fetched blocks cache
 // This prevents unbounded memory growth from malicious peers sending orphaned blocks.
 //
-// Mirrors the spec's cached-blocks cap by name; see `MAX_PENDING_BLOCKS` for
-// the related future-block queue cap with a different scope.
+// Caps the number of recently fetched blocks held in cache; see
+// `MAX_PENDING_BLOCKS` for the related future-block queue cap with a different
+// scope.
 pub const MAX_CACHED_BLOCKS = 1024;
 
 // Periodic state pruning interval: prune non-canonical states every N slots
@@ -156,13 +157,12 @@ pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 4;
 pub const MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS: u8 = 3;
 
 // Minimum number of recent slots that a blocksByRange responder MUST keep available.
-// Mirrors the spec's MIN_SLOTS_FOR_BLOCK_REQUESTS networking constant.
 // Requests whose start_slot falls before (head_slot - MIN_SLOTS_FOR_BLOCK_REQUESTS)
 // receive a RESOURCE_UNAVAILABLE error (code 3).
 pub const MIN_SLOTS_FOR_BLOCK_REQUESTS: u64 = 3600;
 
-/// RPC error code for INVALID_REQUEST (per the ReqResp spec, code 1).
+/// RPC error code for INVALID_REQUEST (code 1).
 /// Peers that do not implement `blocks_by_range` often reply with code 1 + "unsupported".
 pub const RPC_ERR_INVALID_REQUEST: u32 = 1;
-/// RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec, code 3).
+/// RPC error code for RESOURCE_UNAVAILABLE (code 3).
 pub const RPC_ERR_RESOURCE_UNAVAILABLE: u32 = 3;

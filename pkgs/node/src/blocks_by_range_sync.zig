@@ -444,7 +444,7 @@ test "gossipSilentMs handles never-received and elapsed silence" {
     try std.testing.expectEqual(@as(u64, 3_000), gossipSilentMs(10_000, 7_000));
 }
 
-test "classifyChunkImport: queue_full drops, never falls back to inline (#894 regression guard)" {
+test "classifyChunkImport: queue_full drops, never falls back to inline (regression guard)" {
     // The regression: under aggregator load the chain-worker block queue
     // saturates, `trySubmitImportToWorker` returns `queue_full`, and
     // (pre-fix) `processBlockByRootChunk` / `processBlockByRangeChunk`

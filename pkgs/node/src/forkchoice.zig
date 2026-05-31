@@ -1031,7 +1031,7 @@ pub const ForkChoice = struct {
         // the first attestation-free block on a competing fork would erase the heavier
         // fork's weight (head then falls to the lexicographic tie-break / deeper fork).
         // accept_new_attestations unions latest_new into latest_known
-        // (head reads the highest-slot vote per validator), so mirror that: keep the
+        // (head reads the highest-slot vote per validator), so do the same: keep the
         // fresher of the two, gossip winning ties as it reflects the validator's
         // current view, and never drop a known vote when latestNew is null/older.
         for (0..self.config.genesis.numValidators()) |validator_id| {
@@ -1087,7 +1087,6 @@ pub const ForkChoice = struct {
         return justified_slots.get(idx) catch false;
     }
 
-    /// Mirrors `_attestation_data_matches_chain`.
     /// Checks whether `att_data`'s source and target roots are consistent with
     /// the *extended* historical block hashes view — i.e. `state.historical_block_hashes`
     /// as it would appear after `process_block_header` on the candidate block:
@@ -1236,9 +1235,10 @@ pub const ForkChoice = struct {
                 if (isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
 
                 if (!self.protoArray.indices.contains(att_data.head.root)) continue;
-                // Spec divergence (intentional): the spec removed the processed_att_data
-                // dedup, relying on a final proof_groups compaction pass.
-                // Zeam keeps it because we compact *inside* the loop and each AttestationData
+                // Intentional behavior difference: rather than dropping this
+                // processed_att_data dedup and relying on a final proof_groups
+                // compaction pass,
+                // zeam keeps it because we compact *inside* the loop and each AttestationData
                 // is processed exactly once per outer iteration. Removing the skip here would
                 // re-select the same entry on loop restarts, producing duplicate attestations
                 // in the candidate without changing the final justified checkpoint.
@@ -1753,11 +1753,10 @@ pub const ForkChoice = struct {
                 // The gossip ("new") and on-chain
                 // ("known") pools stay strictly separate: `update_safe_target`
                 // operates on the new pool only, while head selection uses
-                // the known pool. Mirroring `latestKnown → latestNew` here
+                // the known pool. Copying `latestKnown → latestNew` here
                 // would smuggle on-chain weight back into the safe-target
-                // computation and break the
-                // `test_safe_target_ignores_known_pool_at_interval_3`
-                // contract from the spec test vectors.
+                // computation and violate the requirement that the
+                // safe-target computation at interval 3 ignore the known pool.
             }
         } else {
             // Attestations are allowed up to 1 slot in the future:
@@ -2141,7 +2140,7 @@ pub const ForkChoice = struct {
         }
     }
 
-    /// Optional per-aggregate publish hook (ethlambda `AggregateProduced` path).
+    /// Optional per-aggregate publish hook (the produced-aggregate path).
     /// When set, each successful prove is committed and published before the
     /// next job starts; when null, results are collected into the return slice.
     pub const AggregatePublishCallback = *const fn (
@@ -2190,7 +2189,7 @@ pub const ForkChoice = struct {
         // Cap the pass at AGGREGATION_DEADLINE_MS. The per-att_data prove is multi-second
         // at the prod scheme, so an unbounded pass over every group can run past the slot and
         // starve justification. Once the budget is spent we stop scheduling new groups and emit the
-        // aggregations already committed below (a partial pass) — matching ethlambda.
+        // aggregations already committed below (a partial pass).
         const deadline_ns = compute_start_ns + @as(i128, @intCast(params.AGGREGATION_DEADLINE_MS)) * std.time.ns_per_ms;
 
         for (att_data_keys, 0..) |data, processed| {
@@ -2244,7 +2243,7 @@ pub const ForkChoice = struct {
         return collected.toOwnedSlice(self.allocator);
     }
 
-    /// Commit one worker-produced aggregate (ethlambda `apply_aggregated_group`).
+    /// Commit one worker-produced aggregate into the live maps.
     fn commitOneAggregateResult(
         self: *Self,
         snap: *AggregateSnapshot,
@@ -2551,14 +2550,14 @@ pub const ForkChoice = struct {
                 // safety net for future call sites that thread a
                 // stale or wrong root through
                 // `OnBlockOpts.blockRoot`. The forkchoice's
-                // protoArray indexes by this root and the spec
-                // guarantees uniqueness via SSZ collision-
+                // protoArray indexes by this root and SSZ hashing
+                // guarantees uniqueness via collision-
                 // resistance; if a caller fabricates a root, we'd
                 // silently corrupt the protoArray. Per-call cost is
                 // one `hashTreeRoot(BeamBlock, ...)` and is paid
                 // ONLY in `Debug` / `ReleaseSafe`; `ReleaseFast` /
                 // `ReleaseSmall` skip the block entirely so
-                // production keeps the slice-(e) win.
+                // production keeps the saved root-recompute.
                 if (std.debug.runtime_safety) verify: {
                     var verify_root: [32]u8 = undefined;
                     zeam_utils.hashTreeRoot(types.BeamBlock, block, &verify_root, self.allocator) catch |err| {
@@ -2962,7 +2961,7 @@ test "forkchoice block tree" {
     }
 }
 
-test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence semantics" {
+test "hasBlocksBatch: empty + length-mismatch + presence semantics" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -3136,7 +3135,7 @@ test "aggregate prunes attestation signatures" {
     try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(attestation_data) != null);
 }
 
-test "aggregate (#890): does not acquire forkchoice main mutex" {
+test "aggregate: does not acquire forkchoice main mutex" {
     // Regression for the slot-driver stall on aggregator nodes:
     // previously, `forkChoice.aggregate` took `mutex.lock()` for the
     // entire ~70s XMSS aggregate FFI, blocking libxev's `chain.onInterval`
@@ -3280,7 +3279,7 @@ fn createTestProtoBlock(slot: types.Slot, block_root_byte: u8, parent_root_byte:
     };
 }
 
-test "protoarray tie-break aligns with leanSpec hash ordering" {
+test "protoarray tie-break uses lexicographic hash ordering" {
     const allocator = std.testing.allocator;
 
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
@@ -3737,8 +3736,8 @@ fn aggregationSlotAllowed(slot: types.Slot, slot_filter: ?[]const types.Slot) bo
     return false;
 }
 
-/// Collect `AttestationData` keys to snapshot, mirroring ethlambda's two-pass
-/// `snapshot_aggregation_inputs`: gossip groups first, then payload-only groups
+/// Collect `AttestationData` keys to snapshot in two passes:
+/// gossip groups first, then payload-only groups
 /// with at least two pending proofs. Scoped by `slot_filter` so zeam does not
 /// deep-clone every stale map entry on each worker run.
 fn collectAggregationSnapshotKeys(
@@ -3866,7 +3865,7 @@ fn cloneAggregatedPayloadsMap(
 }
 
 /// Owned snapshot of signature/aggregation inputs for one aggregate worker pass.
-/// Taken under `signatures_mutex` using ethlambda-style job scoping: only
+/// Taken under `signatures_mutex` using job scoping: only
 /// in-window `att_data` keys (plus payload-only groups with ≥2 proofs) are
 /// cloned, not every entry retained in the live maps.
 const AggregateSnapshot = struct {
@@ -3963,7 +3962,7 @@ test "isAggregatorTrivialInput default threshold (2): 0 or 1 sig is trivial, 2+ 
     try std.testing.expect(!isAggregatorTrivialInput(0, 8, 2));
 }
 
-test "isAggregatorTrivialInput threshold=1 reverts to pre-#908 (only 0+0 trivial)" {
+test "isAggregatorTrivialInput threshold=1 keeps only 0+0 trivial" {
     try std.testing.expect(isAggregatorTrivialInput(0, 0, 1));
     try std.testing.expect(!isAggregatorTrivialInput(0, 1, 1));
     try std.testing.expect(!isAggregatorTrivialInput(0, 2, 1));
@@ -5650,7 +5649,7 @@ test "rebase: deltas array is properly shrunk" {
     try std.testing.expect(ctx.fork_choice.deltas.items.len == 7);
 }
 
-test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
+test "rebase: bestChild/bestDescendant null handled in rebase" {
     // ========================================
     // Test: rebase does not panic when a node has bestChild set but bestDescendant null
     // ========================================

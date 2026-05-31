@@ -1084,8 +1084,8 @@ test "pruning keeps pending justifications" {
     try std.testing.expect(found);
 }
 
-// Helper: build a chain block_1..block_6 with the same shape as the upstream
-// leanSpec PR #802 finalization fixture. Each block sits on top of the
+// Helper: build a chain block_1..block_6 shaped for the finalization scenario.
+// Each block sits on top of the
 // previous one; supermajority attestations from block_2, block_5, and block_6
 // drive justification forward and finalize block_4 by the end of block_6.
 //
@@ -1211,7 +1211,7 @@ fn buildFinalizedSlot4Chain(
     try state.process_block(allocator, out_blocks[5], logger, null);
 }
 
-// Port of leanSpec PR #802 `test_stale_finalized_source_justifies_without_rewinding_finalization`.
+// A stale finalized source can justify a newer target without rewinding finalization.
 //
 // After finalizing block_4 through ordinary attestations, process a block_7
 // whose attestation uses a source (block_1, slot 1) that sits BELOW the
@@ -1282,7 +1282,7 @@ test "stale finalized source justifies without rewinding finalization" {
     try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
 }
 
-// Port of leanSpec PR #802 `test_source_at_finalized_boundary_justifies_without_refinalizing`.
+// A source whose slot is exactly at the finalized boundary justifies without refinalizing.
 //
 // Pins the boundary case: a source whose slot equals the finalized slot is
 // already final and may justify a newer target, but must never re-finalize.

@@ -1314,7 +1314,7 @@ pub const BeamChain = struct {
             // log scraping.
             zeam_metrics.metrics.lean_chain_worker_process_pending_blocks_dropped_missing_roots_total.incr();
             self.logger.warn(
-                "chain-worker processPendingBlocks dropped {d} missing root fetch(es) — no backchannel wired (#863 followup)",
+                "chain-worker processPendingBlocks dropped {d} missing root fetch(es) — no backchannel wired",
                 .{missing_roots.len},
             );
         }
@@ -5895,7 +5895,7 @@ const FutureSlotTestFixture = struct {
     }
 };
 
-test "validateBlock #788: FutureSlotQueueable for block within queue tolerance" {
+test "validateBlock: FutureSlotQueueable for block within queue tolerance" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -5911,7 +5911,7 @@ test "validateBlock #788: FutureSlotQueueable for block within queue tolerance" 
     );
 }
 
-test "validateBlock #788: FutureSlot hard-reject for block beyond queue tolerance" {
+test "validateBlock: FutureSlot hard-reject for block beyond queue tolerance" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -5927,7 +5927,7 @@ test "validateBlock #788: FutureSlot hard-reject for block beyond queue toleranc
     );
 }
 
-test "validateBlock #788: queue-tolerance boundary is inclusive" {
+test "validateBlock: queue-tolerance boundary is inclusive" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -5951,7 +5951,7 @@ test "validateBlock #788: queue-tolerance boundary is inclusive" {
     );
 }
 
-test "enqueuePendingBlock #788: deduplicates by root" {
+test "enqueuePendingBlock: deduplicates by root" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -5985,7 +5985,7 @@ test "enqueuePendingBlock #788: deduplicates by root" {
     try std.testing.expectEqual(@as(usize, 1), fx.beam_chain.pending_blocks.items.len);
 }
 
-test "enqueuePendingBlock #788: cap eviction drops oldest by receive order" {
+test "enqueuePendingBlock: cap eviction drops oldest by receive order" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -6027,7 +6027,7 @@ test "enqueuePendingBlock #788: cap eviction drops oldest by receive order" {
     try std.testing.expectEqual(@as(types.Slot, constants.MAX_PENDING_BLOCKS + 200), last.signed_block.block.slot);
 }
 
-test "enqueuePendingBlock #788: drops blocks before latest_finalized" {
+test "enqueuePendingBlock: drops blocks before latest_finalized" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -6064,7 +6064,7 @@ test "enqueuePendingBlock #788: drops blocks before latest_finalized" {
     try std.testing.expectEqual(@as(types.Slot, 200), fx.beam_chain.pending_blocks.items[0].signed_block.block.slot);
 }
 
-test "processPendingBlocks #788: evicts pre-finalized entries during scan" {
+test "processPendingBlocks: evicts pre-finalized entries during scan" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -6094,7 +6094,7 @@ test "processPendingBlocks #788: evicts pre-finalized entries during scan" {
 // them sitting in the queue forever — they never become processable
 // until the forkchoice clock advances by 200 slots. The drain now
 // evicts them in the same compaction pass that handles pre-finalized.
-test "processPendingBlocks #788: evicts too-far-future entries during scan" {
+test "processPendingBlocks: evicts too-far-future entries during scan" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -6132,7 +6132,7 @@ test "processPendingBlocks #788: evicts too-far-future entries during scan" {
 // OOM event (one evicted, one rejected). Use a FailingAllocator
 // pinned to the chain's pending-blocks ArrayList so we can drive it
 // to OOM on the reservation step deterministically.
-test "enqueuePendingBlock #788: append_oom path returns false without evicting" {
+test "enqueuePendingBlock: append_oom path returns false without evicting" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -6202,7 +6202,7 @@ test "enqueuePendingBlock #788: append_oom path returns false without evicting" 
 // duplicate-check; now it does 1024 32-byte memcmp's. Lock the
 // behaviour in code so a future contributor cannot accidentally drop
 // `PendingBlockEntry.block_root` and silently regress the perf.
-test "enqueuePendingBlock #788: dedup uses cached root, not re-hash" {
+test "enqueuePendingBlock: dedup uses cached root, not re-hash" {
     var fx = try FutureSlotTestFixture.init(std.testing.allocator);
     defer fx.deinit(std.testing.allocator);
 
@@ -6241,7 +6241,7 @@ test "enqueuePendingBlock #788: dedup uses cached root, not re-hash" {
 // name + every label appears in the Prometheus body. If any of the
 // four metrics gets dropped from the `Metrics` struct, gets renamed,
 // or loses a label, this test fails immediately.
-test "#788 metrics: queue + drop counters appear in /metrics output" {
+test "metrics: queue + drop counters appear in /metrics output" {
     if (zeam_metrics.isZKVM()) return;
 
     try zeam_metrics.init(std.heap.page_allocator);
@@ -8518,7 +8518,7 @@ const TestCallbackObserver = struct {
     }
 };
 
-test "chain-worker (#890): imported_block_fn fires once per successful submitBlock with the correct root" {
+test "chain-worker: imported_block_fn fires once per successful submitBlock with the correct root" {
     // The `imported_block_fn` backchannel is
     // the formal channel for the missing-attestation-roots fan-out
     // and the cached-descendant retry that previously had no
@@ -8625,7 +8625,7 @@ test "chain-worker (#890): imported_block_fn fires once per successful submitBlo
     try std.testing.expectEqualSlices(u8, &block_root, &observer.imported.items[0].block_root);
 }
 
-test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU race)" {
+test "chain-worker: rejected_block_fn fires on MissingPreState (TOCTOU race)" {
     // The libxev producer
     // (`trySubmitImportToWorker`) checks `forkChoice.hasBlock(parent)`
     // before submitting; finalization can race and prune the parent
@@ -8740,7 +8740,7 @@ test "chain-worker (#890): rejected_block_fn fires on MissingPreState (TOCTOU ra
     try std.testing.expectEqual(BeamChain.RejectedBlockReason.missing_pre_state, rec.reason);
 }
 
-test "chain-worker (#890): rejected_block_fn fires on PreFinalizedSlot" {
+test "chain-worker: rejected_block_fn fires on PreFinalizedSlot" {
     // The `pre_finalized` arm of
     // `RejectedBlockReason` is a separate code path
     // (`pruneCachedBlocks` instead of `cacheBlockAndFetchParent`)

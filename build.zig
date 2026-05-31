@@ -326,7 +326,7 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
     zeam_network.addImport("@zeam/metrics", zeam_metrics);
-    // #942 follow-up: the publish-side forensic log line in `ethlibp2p.zig`
+    // The publish-side forensic log line in `ethlibp2p.zig`
     // includes the build git SHA so receivers across the fleet can correlate
     // broken-byte receipts back to the exact producer binary.
     zeam_network.addImport("build_options", build_options_module);
@@ -465,7 +465,7 @@ pub fn build(b: *Builder) !void {
     //
     // Run with `zig build stress` (or `zig build stress -Doptimize=Debug`).
     // Configurable via env vars:
-    //   ZEAM_STRESS_DURATION_SECS  default 1800 (30 min, design-doc r3 merge gate)
+    //   ZEAM_STRESS_DURATION_SECS  default 1800 (30 min, the full merge-gate run)
     //   ZEAM_STRESS_NUM_BLOCKS     default 6
     //   ZEAM_STRESS_GOSSIP_THREADS default 3
     //   ZEAM_STRESS_RPC_THREADS    default 4
@@ -500,16 +500,16 @@ pub fn build(b: *Builder) !void {
     stress_exe.step.dependOn(&build_rust_lib_steps.step);
     const run_stress = b.addRunArtifact(stress_exe);
     if (b.args) |args| run_stress.addArgs(args);
-    const stress_step = b.step("stress", "Run single-node ingestion stress harness (issue #803 slice b)");
+    const stress_step = b.step("stress", "Run single-node ingestion stress harness");
     stress_step.dependOn(&run_stress.step);
 
     // -----------------------------------------------------------------
     // `stress-quick`: short-form stress harness wired into `zig build
     // test`. The full 30-min run is operator-driven; this 30s run is
-    // what CI executes on every PR so the slice-(a)/(b) merge gate
-    // actually has automated enforcement, not just a PR-comment
-    // attestation. The quick run uses the same code paths as the full
-    // run and will fail CI on:
+    // what CI executes on every change so the ingestion merge gate
+    // actually has automated enforcement, rather than relying on a
+    // manual attestation. The quick run uses the same code paths as the
+    // full run and will fail CI on:
     //   * any `MissingPreState` (states-map race),
     //   * any unexpected `chain.onBlock` error in gossip-flood,
     //   * any `recordFatal` from coherence checks (BlockCache,
@@ -524,7 +524,7 @@ pub fn build(b: *Builder) !void {
     const run_stress_quick = b.addRunArtifact(stress_exe);
     run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
     run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
-    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate, slice b)");
+    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate)");
     stress_quick_step.dependOn(&run_stress_quick.step);
     test_step.dependOn(&run_stress_quick.step);
 
@@ -552,7 +552,7 @@ pub fn build(b: *Builder) !void {
     if (b.args) |args| run_stress_saturation.addArgs(args);
     const stress_saturation_step = b.step(
         "stress-saturation",
-        "Run the chain-worker queue saturation harness (issue #803 slice c-2c)",
+        "Run the chain-worker queue saturation harness",
     );
     stress_saturation_step.dependOn(&run_stress_saturation.step);
 
@@ -567,7 +567,7 @@ pub fn build(b: *Builder) !void {
     run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_SAT_ATTN_PRODUCERS", "16");
     const stress_quick_saturation_step = b.step(
         "stress-quick-saturation",
-        "Run a 15s chain-worker queue saturation harness (CI gate, slice c-2c)",
+        "Run a 15s chain-worker queue saturation harness (CI gate)",
     );
     stress_quick_saturation_step.dependOn(&run_stress_quick_saturation.step);
     test_step.dependOn(&run_stress_quick_saturation.step);
