@@ -3392,14 +3392,32 @@ pub const BeamNode = struct {
 
         try self.network.backend.gossip.subscribe(topics_slice, handler);
 
+        // Peer + req-resp handlers are subscribed earlier via
+        // `subscribeNetworkEventHandlers` (called before `EthLibp2p.run()`),
+        // so an inbound connection or RPC request that arrives the instant the
+        // listener comes up is never dispatched to zero handlers. Only gossip
+        // mesh subscribe must stay here — it enqueues a swarm command that
+        // requires the running network.
+
+        const chainOnSlot = try self.getOnIntervalCbWrapper();
+        try self.clock.subscribeOnSlot(chainOnSlot);
+    }
+
+    /// Register the peer-event and req-resp request handlers on the network
+    /// backend. These only append to in-process handler lists (no swarm
+    /// command channel needed), so they MUST be called BEFORE `EthLibp2p.run()`
+    /// starts the rust bridge listener. Doing so closes the startup race where
+    /// the bridge accepts an inbound connection (or receives a STATUS request)
+    /// before `BeamNode.run()` would have subscribed — which otherwise left
+    /// `connected_peers` empty (sync status stuck at `.no_peers`, gossip
+    /// attestations dropped, no finalization) and surfaced
+    /// `error.NoHandlerSubscribed` for early RPC requests.
+    pub fn subscribeNetworkEventHandlers(self: *Self) !void {
         const peer_handler = self.getPeerEventHandler();
         try self.network.backend.peers.subscribe(peer_handler);
 
         const req_handler = self.getOnReqRespRequestCbHandler();
         try self.network.backend.reqresp.subscribe(req_handler);
-
-        const chainOnSlot = try self.getOnIntervalCbWrapper();
-        try self.clock.subscribeOnSlot(chainOnSlot);
     }
 };
 
@@ -3486,6 +3504,11 @@ test "Node peer tracking on connect/disconnect" {
     });
     defer node.deinit();
 
+    // Peer/req-resp handler registration moved out of `run()` into
+    // `subscribeNetworkEventHandlers` (called before the network starts in
+    // production); the test drives the mock peer handler directly, so register
+    // here to wire the node's onPeerConnected/onPeerDisconnected callbacks.
+    try node.subscribeNetworkEventHandlers();
     try node.run();
 
     // Verify initial state: 0 peers

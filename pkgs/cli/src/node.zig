@@ -695,6 +695,12 @@ pub const Node = struct {
         // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
         // command already does network-first; this is the matching swap for
         // the production node path.
+        //
+        // Peer + req-resp handlers are subscribed before the network starts so
+        // the one-shot peer-connect event and early STATUS requests are not
+        // lost to a handler-not-yet-registered race; only gossip mesh subscribe
+        // needs the running channel and stays inside `BeamNode.run()`.
+        try self.beam_node.subscribeNetworkEventHandlers();
         try self.network.run();
         try self.beam_node.run();
 

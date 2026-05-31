@@ -1661,7 +1661,7 @@ pub const ForkChoice = struct {
     }
 
     // Internal unlocked version - assumes caller holds lock
-    fn onSignedAttestationUnlocked(self: *Self, signed_attestation: types.SignedAttestation) !void {
+    fn onSignedAttestationUnlocked(self: *Self, signed_attestation: types.SignedAttestation, is_aggregator: bool) !void {
         // Attestation validation is done by the caller (chain layer)
         // This function assumes the attestation has already been validated
 
@@ -1669,20 +1669,33 @@ pub const ForkChoice = struct {
         const validator_id = signed_attestation.validator_id;
         const attestation_slot = attestation_data.slot;
 
-        var attestation_sigs_count: usize = 0;
-        {
-            self.signatures_mutex.lock();
-            defer self.signatures_mutex.unlock();
+        // Aggregation signature buffer (the zeam analog of leanSpec's
+        // `attestation_signatures`) is written ONLY by aggregators — they
+        // re-aggregate these raw gossip sigs into proofs. Non-aggregators
+        // "validate and drop" the raw signature (leanSpec
+        // `on_gossip_attestation` gates ONLY this store on `is_aggregator`).
+        if (is_aggregator) {
+            var attestation_sigs_count: usize = 0;
+            {
+                self.signatures_mutex.lock();
+                defer self.signatures_mutex.unlock();
 
-            try self.attestation_signatures.addSignature(attestation_data, validator_id, .{
-                .slot = attestation_slot,
-                .signature = signed_attestation.signature,
-            });
-            attestation_sigs_count = self.attestation_signatures.count();
+                try self.attestation_signatures.addSignature(attestation_data, validator_id, .{
+                    .slot = attestation_slot,
+                    .signature = signed_attestation.signature,
+                });
+                attestation_sigs_count = self.attestation_signatures.count();
+            }
+            // Update metric outside lock scope
+            zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(attestation_sigs_count));
         }
-        // Update metric outside lock scope
-        zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(attestation_sigs_count));
 
+        // Fork-choice vote tracker (`latestNew`) drives head selection and
+        // `safeTarget`. This is NOT role-gated: every node must fold every
+        // validated vote into fork choice so `safeTarget` (and the derived
+        // attestation target) converges across aggregators and
+        // non-aggregators. Gating this was the cause of devnet target
+        // divergence that wedged justification at the genesis checkpoint.
         const attestation = types.Attestation{
             .validator_id = validator_id,
             .data = attestation_data,
@@ -2126,7 +2139,7 @@ pub const ForkChoice = struct {
         // `fcStore.latest_justified`. All gossip sigs and child payloads
         // (new + known) registered against the chosen key are still folded
         // into the aggregate; only the choice of key is narrowed.
-        const latest_justified = self.fcStore.latest_justified;
+        const latest_justified = self.anchorState.latest_justified;
         if (selectJustificationAdvancingKey(&snap, att_data_keys, latest_justified)) |data| {
             var maybe_result = try types.computeSingleAggregatedSignature(
                 self.allocator,
@@ -2592,10 +2605,10 @@ pub const ForkChoice = struct {
         return self.onAttestationUnlocked(attestation, is_from_block);
     }
 
-    pub fn onSignedAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
+    pub fn onSignedAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_aggregator: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.onSignedAttestationUnlocked(signed_attestation);
+        return self.onSignedAttestationUnlocked(signed_attestation, is_aggregator);
     }
 
     pub fn updateSafeTarget(self: *Self) !ProtoBlock {
@@ -3019,14 +3032,14 @@ test "aggregate prunes attestation signatures" {
     // the aggregator's justification-advancing selection to pick this key.
     // source matches latest_justified so the key lands in the preferred tier.
     const attestation_data = types.AttestationData{
-        .slot = 1,
+        .slot = 0,
         .head = .{
             .root = fork_choice.head.blockRoot,
             .slot = 0,
         },
         .target = .{
             .root = fork_choice.head.blockRoot,
-            .slot = 1,
+            .slot = 0,
         },
         .source = .{
             .root = fork_choice.head.blockRoot,
@@ -3050,10 +3063,10 @@ test "aggregate prunes attestation signatures" {
             .validator_id = validator_id,
             .message = attestation_data,
             .signature = signature,
-        });
+        }, true);
     }
 
-    const aggregations = try fork_choice.aggregateForSlotsFromState(&mock_chain.genesis_state, &.{1});
+    const aggregations = try fork_choice.aggregateForSlotsFromState(&mock_chain.genesis_state, &.{0});
     defer {
         for (aggregations) |*signed_aggregation| {
             signed_aggregation.deinit();
@@ -3163,7 +3176,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
             .validator_id = validator_id,
             .message = attestation_data,
             .signature = signature,
-        });
+        }, true);
     }
 
     // Hold the forkchoice main mutex exclusive on the test thread for
@@ -3635,7 +3648,7 @@ fn stageAggregatedAttestation(
     fork_choice: *ForkChoice,
     signed_attestation: types.SignedAttestation,
 ) !void {
-    try fork_choice.onSignedAttestation(signed_attestation);
+    try fork_choice.onSignedAttestation(signed_attestation, true);
 
     var proof = try types.AggregatedSignatureProof.init(allocator);
     defer proof.deinit();
@@ -3889,11 +3902,16 @@ fn snapshotInputCount(snap: *const AggregateSnapshot, key: types.AttestationData
 /// favouring keys whose votes would advance `latest_justified`.
 ///
 /// Selection tiers (preferred always wins over fallback, regardless of weight):
-///   1. preferred: `source == latest_justified` AND `target.slot > latest_justified.slot`
+///   1. preferred: `source == latest_justified` AND `target.slot >= latest_justified.slot`
 ///      Ranked by deepest `target.slot`, then max snapshot input count.
-///   2. fallback:  `source.slot > latest_justified.slot` (any target).
+///   2. fallback:  `source.slot >= latest_justified.slot` (any target).
 ///      Ranked by deepest `source.slot`, then max snapshot input count.
 ///   3. neither populated -> null (caller skips the tick entirely)
+///
+/// The comparisons are `>=`, not `>`: the caller passes the genesis anchor's
+/// `latest_justified` (slot 0), so genesis-sourced bootstrap votes
+/// (`source.slot == 0`) must remain eligible — a strict `>` would exclude them
+/// and the chain would never start justifying. See the aggregate-tick caller.
 ///
 /// Final tiebreak within a tier: first occurrence in `att_data_keys` (callers
 /// pre-sort lex via `attestationDataLessThan`, so this yields the
@@ -3913,7 +3931,7 @@ fn selectJustificationAdvancingKey(
     for (att_data_keys) |key| {
         const inputs = snapshotInputCount(snap, key);
 
-        if (checkpointsEqual(key.source, latest_justified) and key.target.slot > latest_justified.slot) {
+        if (checkpointsEqual(key.source, latest_justified) and key.target.slot >= latest_justified.slot) {
             const replace = if (best_preferred) |cur|
                 (key.target.slot > cur.target.slot or
                     (key.target.slot == cur.target.slot and inputs > best_preferred_inputs))
@@ -3926,7 +3944,7 @@ fn selectJustificationAdvancingKey(
             continue;
         }
 
-        if (key.source.slot > latest_justified.slot) {
+        if (key.source.slot >= latest_justified.slot) {
             const replace = if (best_fallback) |cur|
                 (key.source.slot > cur.source.slot or
                     (key.source.slot == cur.source.slot and inputs > best_fallback_inputs))
@@ -3971,8 +3989,8 @@ test "selectJustificationAdvancingKey: no preferred and no fallback eligible -> 
         .{
             .slot = 6,
             .head = .{ .root = zero_root, .slot = 0 },
-            .target = .{ .root = zero_root, .slot = 5 },
-            .source = .{ .root = zero_root, .slot = 5 },
+            .target = .{ .root = zero_root, .slot = 4 },
+            .source = .{ .root = zero_root, .slot = 4 },
         },
         .{
             .slot = 6,
@@ -5877,7 +5895,7 @@ test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
     // Only vote on canonical chain — fork branch has zero weight
     for (0..4) |validator_id| {
         const att = createTestSignedAttestation(validator_id, createTestRoot(0xFF), 8);
-        try ctx.fork_choice.onSignedAttestation(att);
+        try ctx.fork_choice.onSignedAttestation(att, true);
     }
 
     // applyDeltas with cutoff_weight=1 can leave some nodes with bestChild set, bestDescendant null

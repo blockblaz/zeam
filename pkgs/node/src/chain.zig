@@ -1064,15 +1064,14 @@ pub const BeamChain = struct {
             &gossip.message.signature,
         );
 
-        // Role-gated storage — leanSpec: `if is_aggregator: ...`.
-        // zeam's analog of `attestation_signatures` is the per-validator
-        // attestation tracker maintained by `forkChoice.onSignedAttestation`,
-        // which in turn feeds head selection. Skipping it for non-
-        // aggregators matches the spec's "Non-aggregator nodes validate
-        // and drop — they never store gossip signatures" contract.
-        if (is_aggregator_role) {
-            try self.forkChoice.onSignedAttestation(gossip.message);
-        }
+        // Fork-choice vote tracking runs for ALL nodes so head selection and
+        // `safeTarget` converge across aggregators and non-aggregators —
+        // gating it (as this path used to) left non-aggregators voting a
+        // divergent attestation target, which wedged justification at
+        // genesis. Only the `attestation_signatures` aggregation buffer is
+        // role-gated (leanSpec "non-aggregators validate and drop the raw
+        // signature"); that gate now lives inside `onSignedAttestation`.
+        try self.forkChoice.onSignedAttestation(gossip.message, is_aggregator_role);
     }
 
     // ------------------------------------------------------------------
@@ -4383,7 +4382,7 @@ pub const BeamChain = struct {
             &signedAttestation.message.signature,
         );
 
-        return self.forkChoice.onSignedAttestation(signedAttestation.message);
+        return self.forkChoice.onSignedAttestation(signedAttestation.message, self.isAggregator());
     }
 
     /// Update fork-choice attestation trackers for an aggregated proof.
@@ -4832,17 +4831,6 @@ pub const BeamChain = struct {
             self.logger.warn(
                 "proposal partial proposer mismatch: slot={d} expected={d} got={d}",
                 .{ slot, proposer_index, body.proposer_index },
-            );
-            return null;
-        }
-
-        // Skip the proposal if the worker couldn't compact even one
-        // attestation under the deadline budget.
-        if (body.attestations.constSlice().len == 0) {
-            zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
-            self.logger.info(
-                "skipping proposal for slot={d}: build worker produced no compacted attestations within deadline",
-                .{slot},
             );
             return null;
         }
@@ -6533,7 +6521,13 @@ test "attestation processing - valid block attestation" {
     const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
+    // is_aggregator = true: this test asserts the raw signature is recorded
+    // into `attestation_signatures` (the aggregation buffer). Per leanSpec,
+    // only aggregators store gossip signatures for re-aggregation; a
+    // non-aggregator validates and drops them (it still updates the
+    // fork-choice vote tracker). Make the chain an aggregator so the
+    // "recorded for aggregation" assertion below exercises the right role.
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool, .is_aggregator = true }, connected_peers);
     defer beam_chain.deinit();
 
     // Add blocks to chain

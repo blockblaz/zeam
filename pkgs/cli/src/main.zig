@@ -753,24 +753,32 @@ fn mainInner(init: std.process.Init) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.started) return;
 
-                    // Wait until finalization has advanced beyond genesis on the reference node
-                    const finalized_slot = self.reference_node.chain.forkChoice.fcStore.latest_finalized.slot;
+                    // Wait until finalization has advanced beyond genesis on the
+                    // reference node. Read through the shared-locked accessor:
+                    // `fcStore.latest_finalized` is a multi-field Checkpoint
+                    // written under the fork-choice mutex by the reference
+                    // node's chain-worker thread, so a raw field read from this
+                    // clock-callback thread is a data race (observed as a torn
+                    // garbage slot under a non-serializing allocator).
+                    const finalized_slot = self.reference_node.chain.forkChoice.getLatestFinalized().slot;
                     if (finalized_slot == 0) return;
 
                     std.debug.print("\n=== STARTING NODE 3 (delayed sync node) at interval {d} ===\n", .{interval});
                     std.debug.print("=== Finalization reached slot {d} on reference node — starting node 3 ===\n", .{finalized_slot});
                     std.debug.print("=== Node 3 will sync from genesis using parent block syncing ===\n\n", .{});
 
-                    // Start BeamNode first so it registers selective gossip
-                    // topic handlers; EthLibp2p.run() then derives the
-                    // gossipsub subscribe set from those handlers (instead of
-                    // joining every attestation subnet). See
-                    // pkgs/network/src/ethlibp2p.zig run() for the rationale.
-                    try self.beam_node.run();
+                    // Register peer + req-resp handlers before the network
+                    // starts (same race-fix as nodes 1/2): otherwise node 3's
+                    // inbound STATUS handling and peer registration can be lost,
+                    // leaving it unable to sync. Gossip subscribe still happens
+                    // inside `beam_node.run()` after `net.run()`.
+                    try self.beam_node.subscribeNetworkEventHandlers();
 
                     if (self.network) |net| {
                         try net.run();
                     }
+
+                    try self.beam_node.run();
                     self.started = true;
 
                     std.debug.print("=== NODE 3 STARTED - will now sync via STATUS and parent block requests ===\n\n", .{});
@@ -787,6 +795,15 @@ fn mainInner(init: std.process.Init) !void {
                 .ptr = &delayed_runner,
                 .onIntervalCb = DelayedNodeRunner.onInterval,
             };
+
+            // Subscribe peer + req-resp handlers BEFORE the networks start
+            // accepting connections, so the one-shot peer-connect event (and
+            // early STATUS requests) are never lost to a handler-not-yet-
+            // registered race. These only append to in-process handler lists;
+            // gossip mesh subscribe still happens later in `BeamNode.run()`
+            // because it needs the running swarm command channel.
+            try beam_node_1.subscribeNetworkEventHandlers();
+            try beam_node_2.subscribeNetworkEventHandlers();
 
             // Start the rust libp2p networks BEFORE the beam nodes:
             // `BeamNode.run()` calls `gossip.subscribe(...)`, which now
