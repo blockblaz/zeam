@@ -1196,23 +1196,71 @@ pub const BeamNode = struct {
             return;
         }
 
-        const fetch_depth = pending_depth + 1;
-        if (self.cacheBlockAndFetchParent(block_root, signed_block.*, fetch_depth)) |parent_root| {
-            self.logger.debug(
-                "Cached block 0x{x} at depth {d}, fetching parent 0x{x}",
-                .{ &block_root, pending_depth, &parent_root },
+        // #942 / #958 follow-up: do NOT call `cacheBlockAndFetchParent` here.
+        //
+        // The full path used to be: cacheBlockAndFetchParent → `types.sszClone`
+        // → `ssz.serialize`. `ssz.serialize` is destructive to its input
+        // (mutates List/Bitlist internal state — see the comment on
+        // `sszSerializeAndGetBytes` in `pkgs/types/src/utils.zig`). The
+        // input here is `signed_block.*`, whose slices alias the SignedBlock
+        // inside the upstream `ReqRespResponseEvent`. When this function
+        // returns and `handleRPCResponseFromRustBridge`'s
+        // `defer event.deinit(zigHandler.allocator)` fires, deinit walks the
+        // corrupted List state and panics with "Invalid free".
+        //
+        // Devnet image ae722ada (commit 7942c299) reproduced this with
+        // SIGSEGV (exit 139) on 6/8 zeam containers within 15 minutes —
+        // 13–22 panics each, every one with `cacheMissingParentRpcChunk` →
+        // `cacheBlockAndFetchParent` in the trace. The race surface
+        // widened after the PR #953 c6cf2241 reqresp-worker move-off
+        // (FFI dispatch on a dedicated thread now drives blocks_by_root
+        // responses through this path back-to-back at higher rate) and
+        // again after PR #954 added the stuck-mesh-cluster detector
+        // (more peer status refreshes → more `blocks_by_root` fetches).
+        //
+        // We still ENQUEUE the parent root so chain catch-up makes
+        // progress — when the parent arrives, the chain will re-fetch
+        // this block via blocks_by_root. The lost optimization is that
+        // we no longer pre-cache the orphan chunk; the round-trip cost
+        // of one extra fetch per orphan is acceptable next to the
+        // alternative (panicking).
+        //
+        // Reading scalar fields off `signed_block` (slot, parent_root)
+        // is safe — they're fixed-size and don't go through any List
+        // or Bitlist allocation, so serialize-style corruption can't
+        // affect them.
+
+        // Mirror the pre-finalized check the old `cacheBlockAndFetchParent`
+        // path performed before any sszClone, so behaviour for pre-finalized
+        // chunks (log + prune descendants) is preserved verbatim.
+        const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+        const block_slot = signed_block.block.slot;
+        if (block_slot <= finalized_slot) {
+            self.logger.info(
+                "block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
+                .{ &block_root, block_slot },
             );
-        } else |cache_err| {
-            if (cache_err == CacheBlockError.PreFinalized) {
-                self.logger.info(
-                    "block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
-                    .{ &block_root, signed_block.block.slot },
-                );
-                _ = self.network.pruneCachedBlocks(block_root, null);
-            } else {
-                self.logger.warn("failed to cache block 0x{x}: {any}", .{ &block_root, cache_err });
-            }
+            _ = self.network.pruneCachedBlocks(block_root, null);
+            return;
         }
+
+        const parent_root = signed_block.block.parent_root;
+        const fetch_depth = pending_depth + 1;
+        {
+            self.batch_pending_parent_roots_lock.lock();
+            defer self.batch_pending_parent_roots_lock.unlock();
+            self.batch_pending_parent_roots.put(parent_root, fetch_depth) catch |err| {
+                self.logger.warn(
+                    "failed to enqueue parent root 0x{x} for orphan 0x{x}: {any}",
+                    .{ &parent_root, &block_root, err },
+                );
+                return;
+            };
+        }
+        self.logger.debug(
+            "Orphan block 0x{x} at depth {d}: cache skipped (sszClone source-corruption guard); queued parent 0x{x}",
+            .{ &block_root, pending_depth, &parent_root },
+        );
         self.flushPendingParentFetches(peer_id);
     }
 
