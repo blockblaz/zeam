@@ -6994,8 +6994,10 @@ test "BlockCache: insertBlockPtr+ssz atomic visibility" {
 
     // Pre-allocate the heap pointer + ssz buffer the way Network does.
     var block = try zeam_utils.clone(types.SignedBlock, &mock_chain.blocks[1], std.testing.allocator);
-    errdefer block.deinit();
-    defer block.deinit();
+    // insertBlockPtr moves block's interior into the cache on success, after
+    // which bc.deinit owns it; only deinit here if the insert never happened.
+    var block_consumed = false;
+    errdefer if (!block_consumed) block.deinit();
 
     var ssz_buf: std.ArrayList(u8) = .empty;
     defer ssz_buf.deinit(std.testing.allocator);
@@ -7006,6 +7008,7 @@ test "BlockCache: insertBlockPtr+ssz atomic visibility" {
     try std.testing.expect((try bc.cloneBlockAndSsz(root, std.testing.allocator)) == null);
 
     try bc.insertBlockPtr(root, &block, mock_chain.blocks[1].block.parent_root, ssz_bytes);
+    block_consumed = true;
 
     // After atomic insert: both-Some.
     const got_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);
@@ -7173,12 +7176,13 @@ test "BlockCache: 3-thread stress — insert / read / remove preserves invariant
                     // Either AlreadyCached (race with self after remove +
                     // re-insert by another iteration — won't happen with
                     // non-overlapping bases) or OOM. Either way, free and
-                    // skip.
+                    // skip — the failed insert did not take ownership.
                     block.deinit();
                     std.testing.allocator.free(ssz_bytes);
                     continue;
                 };
-                block.deinit();
+                // Success: insertBlockPtr moved block's interior into the cache,
+                // which owns it now — do not deinit here.
             }
         }
 
