@@ -460,7 +460,7 @@ pub const BeamNode = struct {
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip attestation for slot={d} validator={d}{f} from peer={s}{f}", .{
+                self.logger.debug("received gossip attestation for slot={d} validator={d}{f} from peer={s}{f}", .{
                     slot,
                     validator_id,
                     validator_node_name,
