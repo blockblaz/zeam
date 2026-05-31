@@ -3211,7 +3211,7 @@ pub const BeamChain = struct {
                         return err;
                     };
                 }
-                self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
+                self.logger.debug("processed gossip attestation for slot={d} validator={d}{f}", .{
                     slot,
                     validator_id,
                     validator_node_name,
