@@ -51,6 +51,10 @@ pub const jsonToString = json_factory.jsonToString;
 const ssz_factory = @import("./ssz.zig");
 pub const hashTreeRoot = ssz_factory.hashTreeRoot;
 
+const clone_factory = @import("./clone.zig");
+pub const clone = clone_factory.clone;
+pub const hasNoPointers = clone_factory.hasNoPointers;
+
 const fmt_factory = @import("./fmt.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
 pub const LazyJson = fmt_factory.LazyJson;

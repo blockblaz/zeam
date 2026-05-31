@@ -277,6 +277,22 @@ pub const BeamBlockBody = struct {
         self.attestations.deinit();
     }
 
+    /// `ssz.utils.List.clone` is a shallow `appendSlice` that bit-copies items;
+    /// items containing `Bitlist` (`aggregation_bits`) need a per-item deep
+    /// clone so the destination doesn't alias the source's interior buffer.
+    pub fn clone(self: *const BeamBlockBody, allocator: Allocator) !BeamBlockBody {
+        var cloned_atts = try AggregatedAttestations.init(allocator);
+        errdefer {
+            for (cloned_atts.slice()) |*att| att.deinit();
+            cloned_atts.deinit();
+        }
+        for (self.attestations.constSlice()) |*att| {
+            const att_clone = try zeam_utils.clone(attestation.AggregatedAttestation, att, allocator);
+            try cloned_atts.append(att_clone);
+        }
+        return .{ .attestations = cloned_atts };
+    }
+
     pub fn toJson(self: *const BeamBlockBody, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.empty;
 
@@ -425,6 +441,26 @@ pub const BlockSignatures = struct {
             group.deinit();
         }
         self.attestation_signatures.deinit();
+    }
+
+    /// `ssz.utils.List.clone` is a shallow `appendSlice` that bit-copies items;
+    /// `AggregatedSignatureProof` items carry `participants: Bitlist` +
+    /// `proof_data: List(u8)`, so deep-clone per item to avoid aliasing the
+    /// source's interior buffers.
+    pub fn clone(self: *const BlockSignatures, allocator: Allocator) !BlockSignatures {
+        var cloned_sigs = try AttestationSignatures.init(allocator);
+        errdefer {
+            for (cloned_sigs.slice()) |*group| group.deinit();
+            cloned_sigs.deinit();
+        }
+        for (self.attestation_signatures.constSlice()) |*group| {
+            const group_clone = try zeam_utils.clone(aggregation.AggregatedSignatureProof, group, allocator);
+            try cloned_sigs.append(group_clone);
+        }
+        return .{
+            .attestation_signatures = cloned_sigs,
+            .proposer_signature = self.proposer_signature,
+        };
     }
 
     pub fn toJson(self: *const BlockSignatures, allocator: Allocator) !json.Value {
@@ -678,8 +714,7 @@ fn extendProofsGreedily(
 
         // Clone and select the best proof
         used[best_idx.?] = true;
-        var cloned: aggregation.AggregatedSignatureProof = undefined;
-        try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, candidates.items[best_idx.?].proof, &cloned);
+        var cloned = try zeam_utils.clone(aggregation.AggregatedSignatureProof, &candidates.items[best_idx.?].proof, allocator);
         errdefer cloned.deinit();
         try selected.append(allocator, cloned);
 
@@ -1059,12 +1094,10 @@ fn prepareAggregateAttData(
     if (!has_gossip and selected_children.items.len == 1) {
         const child = &selected_children.items[0];
 
-        var att_bits: attestation.AggregationBits = undefined;
-        try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits);
+        var att_bits = try zeam_utils.clone(attestation.AggregationBits, &child.participants, allocator);
         errdefer att_bits.deinit();
 
-        var cloned_child: aggregation.AggregatedSignatureProof = undefined;
-        try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, child.*, &cloned_child);
+        var cloned_child = try zeam_utils.clone(aggregation.AggregatedSignatureProof, child, allocator);
         errdefer cloned_child.deinit();
 
         selected_children.items[0].deinit();
@@ -1274,8 +1307,7 @@ fn runAggregateAttDataFfi(
     );
     _ = pq_sig_timer.observe();
 
-    var att_bits: attestation.AggregationBits = undefined;
-    try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
+    var att_bits = try zeam_utils.clone(attestation.AggregationBits, &proof.participants, allocator);
     errdefer att_bits.deinit();
 
     return .{
@@ -1330,12 +1362,10 @@ fn compactSingleProof(
     att_data: attestation.AttestationData,
     sig: *const aggregation.AggregatedSignatureProof,
 ) !CompactGroupResult {
-    var cloned_proof: aggregation.AggregatedSignatureProof = undefined;
-    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, sig.*, &cloned_proof);
+    var cloned_proof = try zeam_utils.clone(aggregation.AggregatedSignatureProof, sig, allocator);
     errdefer cloned_proof.deinit();
 
-    var att_bits: attestation.AggregationBits = undefined;
-    try utils.sszClone(allocator, attestation.AggregationBits, cloned_proof.participants, &att_bits);
+    var att_bits = try zeam_utils.clone(attestation.AggregationBits, &cloned_proof.participants, allocator);
     errdefer att_bits.deinit();
 
     return .{
@@ -1382,8 +1412,7 @@ fn compactMultiProofWithPrep(
         &proof,
     );
 
-    var att_bits: attestation.AggregationBits = undefined;
-    try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
+    var att_bits = try zeam_utils.clone(attestation.AggregationBits, &proof.participants, allocator);
     errdefer att_bits.deinit();
 
     return .{
@@ -2108,8 +2137,7 @@ test "computeSingleAggregatedSignature: single-child passthrough survives prep d
         result.signature.deinit();
     }
 
-    var cloned: aggregation.AggregatedSignatureProof = undefined;
-    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, result.signature, &cloned);
+    var cloned = try zeam_utils.clone(aggregation.AggregatedSignatureProof, &result.signature, allocator);
     defer cloned.deinit();
 
     try std.testing.expect(cloned.participants.len() > 0);

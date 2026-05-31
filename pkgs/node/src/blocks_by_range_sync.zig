@@ -168,7 +168,7 @@ pub const ImportSubmitOutcome = enum {
     /// Caller falls through to the inline path — that path is the
     /// legitimate import flow when no worker exists.
     worker_disabled,
-    /// `sszClone` or other allocator failure pre-submission. Caller
+    /// `clone` or other allocator failure pre-submission. Caller
     /// falls through to inline as a last-resort best effort.
     failed,
 };
@@ -184,7 +184,7 @@ pub const ChunkImportDisposition = enum {
     /// libxev. The catch-up RPC cycle will refetch on the next status
     /// round.
     drop_backpressure,
-    /// Worker is not available (or sszClone failed). Fall through to
+    /// Worker is not available (or clone failed). Fall through to
     /// the inline `chain.onBlock` path.
     fallback_inline,
 };
@@ -471,7 +471,7 @@ test "classifyChunkImport: submitted is handled" {
 test "classifyChunkImport: worker_disabled and failed fall back to inline" {
     // `worker_disabled`: legitimate test / single-thread mode, no
     // worker exists so inline `chain.onBlock` IS the import path.
-    // `failed`: sszClone or allocator failure pre-submission — last-
+    // `failed`: clone or allocator failure pre-submission — last-
     // resort best-effort inline. Both must NOT be confused with
     // `queue_full`, which is the load-shedding case.
     try std.testing.expectEqual(ChunkImportDisposition.fallback_inline, classifyChunkImport(.worker_disabled));
