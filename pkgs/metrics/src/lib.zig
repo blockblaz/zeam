@@ -199,6 +199,10 @@ const Metrics = struct {
     lean_block_proposal_child_payloads_consumed_total: BlockProposalChildPayloadsConsumedTotalCounter,
     lean_block_proposal_attestation_data_selected: BlockProposalAttestationDataSelectedHistogram,
     lean_block_proposal_aggregates_selected: BlockProposalAggregatesSelectedHistogram,
+    // Interval-aware proposer metrics.
+    zeam_proposal_deadline_hits_total: ZeamProposalDeadlineHitsCounter,
+    zeam_proposal_partial_prefix_size: ZeamProposalPartialPrefixSizeHistogram,
+    zeam_proposal_skipped_empty_total: ZeamProposalSkippedEmptyCounter,
     // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
     /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run` (issues #863, #867).
@@ -565,6 +569,10 @@ const Metrics = struct {
     const BlockProposalChildPayloadsConsumedTotalCounter = metrics_lib.Counter(u64);
     const BlockProposalAttestationDataSelectedHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16, 32 });
     const BlockProposalAggregatesSelectedHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16, 32, 64, 128 });
+    // Interval-aware proposer types.
+    const ZeamProposalDeadlineHitsCounter = metrics_lib.Counter(u64);
+    const ZeamProposalPartialPrefixSizeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16 });
+    const ZeamProposalSkippedEmptyCounter = metrics_lib.Counter(u64);
     // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
     // both fast acquisitions and long stalls observed when STF runs under the lock.
     const NodeMutexLabel = struct { site: []const u8 };
@@ -771,6 +779,12 @@ fn observeBlockProposalAggregatesSelected(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeZeamProposalPartialPrefixSize(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ZeamProposalPartialPrefixSizeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeCompactAttestations(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.CompactAttestationsTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -911,6 +925,10 @@ pub var lean_block_proposal_aggregates_selected: Histogram = .{
     .context = null,
     .observe = &observeBlockProposalAggregatesSelected,
 };
+pub var zeam_proposal_partial_prefix_size: Histogram = .{
+    .context = null,
+    .observe = &observeZeamProposalPartialPrefixSize,
+};
 pub var lean_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeTickIntervalDuration,
@@ -1041,6 +1059,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_block_proposal_child_payloads_consumed_total = Metrics.BlockProposalChildPayloadsConsumedTotalCounter.init("lean_block_proposal_child_payloads_consumed_total", .{ .help = "Child aggregated payloads selected during greedy proof picking (before recursive compaction)." }, .{}),
         .lean_block_proposal_attestation_data_selected = Metrics.BlockProposalAttestationDataSelectedHistogram.init("lean_block_proposal_attestation_data_selected", .{ .help = "Distinct AttestationData entries in the proposal block body." }, .{}),
         .lean_block_proposal_aggregates_selected = Metrics.BlockProposalAggregatesSelectedHistogram.init("lean_block_proposal_aggregates_selected", .{ .help = "Aggregated signature proofs in the proposal result after compaction." }, .{}),
+        .zeam_proposal_deadline_hits_total = Metrics.ZeamProposalDeadlineHitsCounter.init("zeam_proposal_deadline_hits_total", .{ .help = "Number of compactAttestations runs whose returned prefix was truncated because the caller-supplied deadline elapsed mid-loop." }, .{}),
+        .zeam_proposal_partial_prefix_size = Metrics.ZeamProposalPartialPrefixSizeHistogram.init("zeam_proposal_partial_prefix_size", .{ .help = "Number of AttestationData groups fully committed by deadline-aware compactAttestations when the deadline truncated the loop." }, .{}),
+        .zeam_proposal_skipped_empty_total = Metrics.ZeamProposalSkippedEmptyCounter.init("zeam_proposal_skipped_empty_total", .{ .help = "Number of interval-0 finalize calls that found no partial proposal body for the proposer's slot." }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
@@ -1141,6 +1162,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
     lean_block_proposal_attestation_data_selected.context = @ptrCast(&metrics.lean_block_proposal_attestation_data_selected);
     lean_block_proposal_aggregates_selected.context = @ptrCast(&metrics.lean_block_proposal_aggregates_selected);
+    zeam_proposal_partial_prefix_size.context = @ptrCast(&metrics.zeam_proposal_partial_prefix_size);
     lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
     zeam_xev_clock_until_done_drain_seconds.context = @ptrCast(&metrics.zeam_xev_clock_until_done_drain_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);

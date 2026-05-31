@@ -137,25 +137,35 @@ pub const ValidatorClient = struct {
             }
 
             self.logger.debug("constructing block for slot={d} proposer={d}", .{ slot, slot_proposer_id });
-            const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
-            self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
+            // Spawn the deadline-aware build worker, then block until it
+            // self-truncates and exits. The worker bounds its own runtime
+            // by `chain.proposal_deadline_pct`, so this wait is bounded.
+            self.chain.submitBlockBuildOnInterval(slot, slot_proposer_id);
+            self.chain.thread_pool.waitAndWork(&self.chain.proposal_build_wg);
+
+            var produced = (try self.chain.finalizeProposalIfReady(slot, slot_proposer_id)) orelse return null;
+            var produced_cleanup = true;
+            errdefer if (produced_cleanup) produced.deinit();
+
+            self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced.blockRoot });
 
             // Sign block root with proposer's proposal key
             const proposer_signature = try self.key_manager.signBlockRoot(
                 slot_proposer_id,
-                &produced_block.blockRoot,
+                &produced.blockRoot,
                 @intCast(slot),
             );
 
             const signed_block = types.SignedBlock{
-                .block = produced_block.block,
+                .block = produced.block,
                 .signature = .{
-                    .attestation_signatures = produced_block.attestation_signatures,
+                    .attestation_signatures = produced.attestation_signatures,
                     .proposer_signature = proposer_signature,
                 },
             };
+            produced_cleanup = false; // ownership moved into signed_block
 
-            self.logger.info("signed produced block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+            self.logger.info("signed produced block for slot={d} root={x}", .{ slot, &produced.blockRoot });
 
             var result = ValidatorClientOutput.init(self.allocator);
             try result.addBlock(signed_block);

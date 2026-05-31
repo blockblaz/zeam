@@ -121,6 +121,9 @@ pub const NodeOptions = struct {
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
     /// issue #907 finding 4.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Percentage of the proposal interval allocated as the build-worker
+    /// deadline budget.
+    proposal_deadline_pct: u32 = node_lib.default_proposal_deadline_pct,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -598,6 +601,7 @@ pub const Node = struct {
             .chain_worker_enabled = options.chain_worker_enabled,
             .min_aggregation_inputs = options.min_aggregation_inputs,
             .aggregate_max_inflight = aggregate_max_inflight,
+            .proposal_deadline_pct = options.proposal_deadline_pct,
         });
         errdefer self.beam_node.deinit();
 

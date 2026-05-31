@@ -1109,6 +1109,7 @@ pub const ForkChoice = struct {
         slot: types.Slot,
         proposer_index: types.ValidatorIndex,
         parent_root: [32]u8,
+        deadline_ns: ?i64,
     ) !ProposalAttestationsResult {
         var agg_attestations = try types.AggregatedAttestations.init(self.allocator);
         var agg_att_cleanup = true;
@@ -1282,6 +1283,7 @@ pub const ForkChoice = struct {
                 &attestation_signatures,
                 &pre_state.validators,
                 self.thread_pool,
+                deadline_ns,
             );
             _ = compact_timer.observe();
             zeam_metrics.metrics.zeam_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
@@ -1289,6 +1291,12 @@ pub const ForkChoice = struct {
             attestation_signatures = compacted.signatures;
             zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
             observeProposalBuildPhase("compact", compact_start_ns);
+
+            // Deadline elapsed → ship what we have; another full iteration
+            // wouldn't finish in time.
+            if (deadline_ns) |d| {
+                if (zeam_utils.monotonicTimestampNs() >= @as(i128, d)) break;
+            }
 
             const stf_start_ns = zeam_utils.monotonicTimestampNs();
 
@@ -2114,7 +2122,12 @@ pub const ForkChoice = struct {
 
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
 
-        for (att_data_keys) |data| {
+        // Aggregate only the single AttestationData most likely to advance
+        // `fcStore.latest_justified`. All gossip sigs and child payloads
+        // (new + known) registered against the chosen key are still folded
+        // into the aggregate; only the choice of key is narrowed.
+        const latest_justified = self.fcStore.latest_justified;
+        if (selectJustificationAdvancingKey(&snap, att_data_keys, latest_justified)) |data| {
             var maybe_result = try types.computeSingleAggregatedSignature(
                 self.allocator,
                 validators,
@@ -2135,6 +2148,11 @@ pub const ForkChoice = struct {
                     }
                 }
             }
+        } else {
+            self.logger.debug(
+                "aggregator: no justification-advancing att_data this tick (latest_justified.slot={d}, candidates={d})",
+                .{ latest_justified.slot, att_data_keys.len },
+            );
         }
         observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 
@@ -2588,16 +2606,19 @@ pub const ForkChoice = struct {
 
     //  READ-ONLY API - SHARED LOCK
 
+    /// Build the proposer's attestation list. `deadline_ns` is an optional
+    /// monotonic-ns cutoff for parallel compaction (`null` = unbounded).
     pub fn getProposalAttestations(
         self: *Self,
         pre_state: *const types.BeamState,
         slot: types.Slot,
         proposer_index: types.ValidatorIndex,
         parent_root: [32]u8,
+        deadline_ns: ?i64,
     ) !ProposalAttestationsResult {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        return self.getProposalAttestationsUnlocked(pre_state, slot, proposer_index, parent_root);
+        return self.getProposalAttestationsUnlocked(pre_state, slot, proposer_index, parent_root, deadline_ns);
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
@@ -2994,15 +3015,18 @@ test "aggregate prunes attestation signatures" {
     });
     defer fork_choice.deinit();
 
+    // target.slot must be > fcStore.latest_justified.slot (0 at genesis) for
+    // the aggregator's justification-advancing selection to pick this key.
+    // source matches latest_justified so the key lands in the preferred tier.
     const attestation_data = types.AttestationData{
-        .slot = 0,
+        .slot = 1,
         .head = .{
             .root = fork_choice.head.blockRoot,
             .slot = 0,
         },
         .target = .{
             .root = fork_choice.head.blockRoot,
-            .slot = 0,
+            .slot = 1,
         },
         .source = .{
             .root = fork_choice.head.blockRoot,
@@ -3029,7 +3053,7 @@ test "aggregate prunes attestation signatures" {
         });
     }
 
-    const aggregations = try fork_choice.aggregateForSlotsFromState(&mock_chain.genesis_state, &.{0});
+    const aggregations = try fork_choice.aggregateForSlotsFromState(&mock_chain.genesis_state, &.{1});
     defer {
         for (aggregations) |*signed_aggregation| {
             signed_aggregation.deinit();
@@ -3124,10 +3148,12 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
     // payloads is now dropped from the snapshot before
     // `computeAggregatedSignatures` runs, so it would not exercise the
     // FFI-bearing path this mutex-contract test is guarding.
+    // target.slot must be > fcStore.latest_justified.slot (0 at genesis) for
+    // the aggregator's justification-advancing selection to pick this key.
     const attestation_data = types.AttestationData{
-        .slot = 0,
+        .slot = 1,
         .head = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
-        .target = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
+        .target = .{ .root = fork_choice.head.blockRoot, .slot = 1 },
         .source = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
     };
     inline for ([_]u32{ 0, 1 }) |validator_id| {
@@ -3154,7 +3180,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
         result: anyerror![]types.SignedAggregatedAttestation = undefined,
 
         fn run(ctx: *@This()) void {
-            ctx.result = ctx.fork_choice.aggregateForSlotsFromState(ctx.state, &.{0});
+            ctx.result = ctx.fork_choice.aggregateForSlotsFromState(ctx.state, &.{1});
         }
     };
     var worker: Worker = .{ .fork_choice = &fork_choice, .state = &mock_chain.genesis_state };
@@ -3843,6 +3869,276 @@ const AggregateSnapshot = struct {
         deinitAggregatedPayloadsMap(allocator, &self.known_payloads);
     }
 };
+
+fn checkpointsEqual(a: types.Checkpoint, b: types.Checkpoint) bool {
+    return a.slot == b.slot and std.mem.eql(u8, &a.root, &b.root);
+}
+
+/// Total snapshot inputs available for `key`: raw gossip signatures plus
+/// child proofs in both new and known payload maps. Mirrors the counting
+/// used by `pruneTrivialFromAggregateSnapshot`.
+fn snapshotInputCount(snap: *const AggregateSnapshot, key: types.AttestationData) usize {
+    var n: usize = 0;
+    if (snap.signatures.get(key)) |inner| n += @intCast(inner.count());
+    if (snap.new_payloads.get(key)) |list| n += list.items.len;
+    if (snap.known_payloads.get(key)) |list| n += list.items.len;
+    return n;
+}
+
+/// Picks the single AttestationData this aggregator tick should aggregate,
+/// favouring keys whose votes would advance `latest_justified`.
+///
+/// Selection tiers (preferred always wins over fallback, regardless of weight):
+///   1. preferred: `source == latest_justified` AND `target.slot > latest_justified.slot`
+///      Ranked by deepest `target.slot`, then max snapshot input count.
+///   2. fallback:  `source.slot > latest_justified.slot` (any target).
+///      Ranked by deepest `source.slot`, then max snapshot input count.
+///   3. neither populated -> null (caller skips the tick entirely)
+///
+/// Final tiebreak within a tier: first occurrence in `att_data_keys` (callers
+/// pre-sort lex via `attestationDataLessThan`, so this yields the
+/// lex-smallest key).
+///
+/// Pure / unit-testable: no I/O, no allocator, no locking.
+fn selectJustificationAdvancingKey(
+    snap: *const AggregateSnapshot,
+    att_data_keys: []const types.AttestationData,
+    latest_justified: types.Checkpoint,
+) ?types.AttestationData {
+    var best_preferred: ?types.AttestationData = null;
+    var best_preferred_inputs: usize = 0;
+    var best_fallback: ?types.AttestationData = null;
+    var best_fallback_inputs: usize = 0;
+
+    for (att_data_keys) |key| {
+        const inputs = snapshotInputCount(snap, key);
+
+        if (checkpointsEqual(key.source, latest_justified) and key.target.slot > latest_justified.slot) {
+            const replace = if (best_preferred) |cur|
+                (key.target.slot > cur.target.slot or
+                    (key.target.slot == cur.target.slot and inputs > best_preferred_inputs))
+            else
+                true;
+            if (replace) {
+                best_preferred = key;
+                best_preferred_inputs = inputs;
+            }
+            continue;
+        }
+
+        if (key.source.slot > latest_justified.slot) {
+            const replace = if (best_fallback) |cur|
+                (key.source.slot > cur.source.slot or
+                    (key.source.slot == cur.source.slot and inputs > best_fallback_inputs))
+            else
+                true;
+            if (replace) {
+                best_fallback = key;
+                best_fallback_inputs = inputs;
+            }
+        }
+    }
+
+    return best_preferred orelse best_fallback;
+}
+
+test "selectJustificationAdvancingKey: empty keys -> null" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 0 };
+    try std.testing.expect(selectJustificationAdvancingKey(&snap, &.{}, latest_justified) == null);
+}
+
+test "selectJustificationAdvancingKey: no preferred and no fallback eligible -> null" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const keys = [_]types.AttestationData{
+        .{
+            .slot = 6,
+            .head = .{ .root = zero_root, .slot = 0 },
+            .target = .{ .root = zero_root, .slot = 5 },
+            .source = .{ .root = zero_root, .slot = 5 },
+        },
+        .{
+            .slot = 6,
+            .head = .{ .root = zero_root, .slot = 0 },
+            .target = .{ .root = zero_root, .slot = 3 },
+            .source = .{ .root = zero_root, .slot = 0 },
+        },
+    };
+    try std.testing.expect(selectJustificationAdvancingKey(&snap, &keys, latest_justified) == null);
+}
+
+test "selectJustificationAdvancingKey: preferred wins even when fallback heavier and deeper" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xAA;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+
+    const preferred_key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 6 },
+        .source = latest_justified,
+    };
+    const fallback_key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 9 },
+        .source = .{ .root = alt_root, .slot = 6 },
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var fallback_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try fallback_inner.put(0, stored_sig);
+    try fallback_inner.put(1, stored_sig);
+    try fallback_inner.put(2, stored_sig);
+    try snap.signatures.put(fallback_key, fallback_inner);
+
+    const keys = [_]types.AttestationData{ preferred_key, fallback_key };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(preferred_key, picked.?);
+}
+
+test "selectJustificationAdvancingKey: deepest target wins within preferred tier" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xBB;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const shallow = types.AttestationData{
+        .slot = 7,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 6 },
+        .source = latest_justified,
+    };
+    const deep = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 10 },
+        .source = latest_justified,
+    };
+    const keys = [_]types.AttestationData{ shallow, deep };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(deep, picked.?);
+}
+
+test "selectJustificationAdvancingKey: tie on target.slot -> max input count wins" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var root_a = std.mem.zeroes(types.Root);
+    root_a[0] = 0x01;
+    var root_b = std.mem.zeroes(types.Root);
+    root_b[0] = 0x02;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const key_light = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = root_a, .slot = 7 },
+        .source = latest_justified,
+    };
+    const key_heavy = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = root_b, .slot = 7 },
+        .source = latest_justified,
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var light_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try light_inner.put(0, stored_sig);
+    try snap.signatures.put(key_light, light_inner);
+    var heavy_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try heavy_inner.put(0, stored_sig);
+    try heavy_inner.put(1, stored_sig);
+    try heavy_inner.put(2, stored_sig);
+    try snap.signatures.put(key_heavy, heavy_inner);
+
+    const keys = [_]types.AttestationData{ key_light, key_heavy };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(key_heavy, picked.?);
+}
+
+test "selectJustificationAdvancingKey: deepest source wins within fallback tier" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xCC;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const shallow = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 4 },
+        .source = .{ .root = alt_root, .slot = 6 },
+    };
+    const deep = types.AttestationData{
+        .slot = 9,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 3 },
+        .source = .{ .root = alt_root, .slot = 8 },
+    };
+    const keys = [_]types.AttestationData{ shallow, deep };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(deep, picked.?);
+}
 
 /// Returns true when an `att_data` in the aggregator's snapshot is
 /// trivial under the operator's threshold and should be dropped before

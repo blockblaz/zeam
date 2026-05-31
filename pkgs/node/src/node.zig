@@ -64,6 +64,8 @@ const NodeOpts = struct {
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
     /// Soft cap on concurrent aggregate workers (`BeamChain.aggregate_inflight`).
     aggregate_max_inflight: u32 = 4,
+    /// See `chainFactory.ChainOpts.proposal_deadline_pct`.
+    proposal_deadline_pct: u32 = chainFactory.default_proposal_deadline_pct,
 };
 
 pub const BeamNode = struct {
@@ -162,6 +164,7 @@ pub const BeamNode = struct {
                 .thread_pool = opts.thread_pool,
                 .min_aggregation_inputs = opts.min_aggregation_inputs,
                 .aggregate_max_inflight = opts.aggregate_max_inflight,
+                .proposal_deadline_pct = opts.proposal_deadline_pct,
             },
             network.connected_peers,
         ) catch |init_err| {

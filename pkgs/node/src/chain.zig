@@ -80,7 +80,17 @@ pub const ChainOpts = struct {
     /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
     /// further-back slots are wasted work. See `BeamChain.aggregateImpl`.
     aggregate_max_inflight: u32 = 4,
+    /// Percentage of one proposal interval (`SECONDS_PER_INTERVAL_MS`)
+    /// allocated as the deadline budget for the interval-aware proposer
+    /// build worker.
+    ///
+    /// Default 90: ~720ms compaction budget + ~80ms finalize budget at
+    /// the default 800ms interval.
+    proposal_deadline_pct: u32 = default_proposal_deadline_pct,
 };
+
+/// Default value for `ChainOpts.proposal_deadline_pct`
+pub const default_proposal_deadline_pct: u32 = 90;
 
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
@@ -110,6 +120,24 @@ pub const ProducedBlock = struct {
             sig_group.deinit();
         }
         self.attestation_signatures.deinit();
+    }
+};
+
+/// Worker-produced body. Worker moves its `compactAttestations` result
+/// here; `finalizeProposalIfReady` takes ownership and finishes the
+/// proposal (STF + sign + broadcast).
+pub const PartialProposalBody = struct {
+    slot: types.Slot,
+    proposer_index: types.ValidatorIndex,
+    parent_root: types.Root,
+    attestations: types.AggregatedAttestations,
+    signatures: types.AttestationSignatures,
+
+    pub fn deinit(self: *PartialProposalBody) void {
+        for (self.attestations.slice()) |*att| att.deinit();
+        self.attestations.deinit();
+        for (self.signatures.slice()) |*sig| sig.deinit();
+        self.signatures.deinit();
     }
 };
 
@@ -416,6 +444,15 @@ pub const BeamChain = struct {
     /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
     aggregate_max_inflight: u32,
 
+    /// See `ChainOpts.proposal_deadline_pct`.
+    proposal_deadline_pct: u32,
+
+    proposal_partial_mutex: zeam_utils.SyncMutex = .{},
+    proposal_partial_slot: ?types.Slot = null,
+    proposal_partial_body: ?*PartialProposalBody = null,
+    proposal_build_inflight: std.atomic.Value(bool) = .init(false),
+    proposal_build_wg: WaitGroup = .{},
+
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -601,6 +638,12 @@ pub const BeamChain = struct {
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
+            .proposal_deadline_pct = opts.proposal_deadline_pct,
+            .proposal_partial_mutex = .{},
+            .proposal_partial_slot = null,
+            .proposal_partial_body = null,
+            .proposal_build_inflight = .init(false),
+            .proposal_build_wg = .{},
             // leanSpec _pending_attestations / _pending_aggregated_attestations
             // buffers — empty at init; FIFO-bounded by
             // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
@@ -1520,6 +1563,11 @@ pub const BeamChain = struct {
         // Issue #907: join any in-flight aggregate workers before
         // tearing down chain state they reference.
         self.thread_pool.waitAndWork(&self.aggregate_wg);
+
+        // Join proposer build worker before tearing down chain state it
+        // references (pre_snapshot, forkChoice, partial body slot).
+        self.thread_pool.waitAndWork(&self.proposal_build_wg);
+        self.freeProposalPartialUnderLock();
 
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
@@ -2511,7 +2559,7 @@ pub const BeamChain = struct {
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         // FFI call against the owned snapshot — no lock held during this
         // window.
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root);
+        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, null);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -4596,6 +4644,314 @@ pub const BeamChain = struct {
             node.publishProducedAggregations(aggregations);
         }
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
+    }
+
+    /// Caller must hold `proposal_partial_mutex` or be in `deinit`.
+    fn freeProposalPartialUnderLock(self: *Self) void {
+        if (self.proposal_partial_body) |body| {
+            body.deinit();
+            self.allocator.destroy(body);
+            self.proposal_partial_body = null;
+        }
+        self.proposal_partial_slot = null;
+    }
+
+    /// Interval-0 entry: spawn the build worker. Boolean inflight gate
+    /// (proposer slots produce at most one block; no coalesce semantics).
+    pub fn submitBlockBuildOnInterval(
+        self: *Self,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+    ) void {
+        if (self.proposal_build_inflight.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) {
+            self.logger.info(
+                "skipping block build for slot={d}: previous build still in flight",
+                .{slot},
+            );
+            return;
+        }
+
+        var inflight_owned = true;
+        defer if (inflight_owned) self.proposal_build_inflight.store(false, .release);
+
+        const proposal_head = self.forkChoice.getProposalHead(slot) catch |err| {
+            self.logger.warn(
+                "failed to get proposal head for slot={d}: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+        const parent_root = proposal_head.root;
+
+        var pre_borrow = self.statesGet(parent_root) orelse {
+            self.logger.warn(
+                "skipping block build for slot={d}: missing pre-state for parent_root",
+                .{slot},
+            );
+            return;
+        };
+        defer pre_borrow.assertReleasedOrPanic();
+        const pre_snapshot = pre_borrow.cloneAndRelease(self.allocator) catch |err| {
+            self.logger.warn(
+                "failed to clone pre-state for slot={d}: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+        var pre_snapshot_handed_off = false;
+        defer if (!pre_snapshot_handed_off) {
+            pre_snapshot.deinit();
+            self.allocator.destroy(pre_snapshot);
+        };
+
+        // Deadline = pct% of the proposal interval, reserving (100-pct)% for
+        // interval-1 finalize. Clamp to [0, 99] so finalize always has
+        // headroom.
+        const pct_clamped: i64 = @intCast(@min(self.proposal_deadline_pct, 99));
+        const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
+        const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
+
+        self.thread_pool.spawnWg(
+            &self.proposal_build_wg,
+            produceBlockWorker,
+            .{ self, slot, proposer_index, parent_root, pre_snapshot, deadline_ns },
+        ) catch {
+            self.logger.warn(
+                "failed to spawn block build worker for slot={d}",
+                .{slot},
+            );
+            return;
+        };
+        inflight_owned = false;
+        pre_snapshot_handed_off = true;
+    }
+
+    /// Build-worker body. Owns `pre_snapshot` until exit. Moves the
+    /// compaction result into `chain.proposal_partial_body` atomically.
+    fn produceBlockWorker(
+        chain: *Self,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+        parent_root: types.Root,
+        pre_snapshot: *types.BeamState,
+        deadline_ns: i64,
+    ) void {
+        defer chain.proposal_build_inflight.store(false, .release);
+        defer {
+            pre_snapshot.deinit();
+            chain.allocator.destroy(pre_snapshot);
+        }
+
+        var result = chain.forkChoice.getProposalAttestations(
+            pre_snapshot,
+            slot,
+            proposer_index,
+            parent_root,
+            deadline_ns,
+        ) catch |err| {
+            chain.logger.warn(
+                "proposal build worker for slot={d} failed: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+
+        const body = chain.allocator.create(PartialProposalBody) catch |err| {
+            for (result.attestations.slice()) |*att| att.deinit();
+            result.attestations.deinit();
+            for (result.signatures.slice()) |*sig| sig.deinit();
+            result.signatures.deinit();
+            chain.logger.warn(
+                "proposal build worker for slot={d} body alloc failed: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+        body.* = .{
+            .slot = slot,
+            .proposer_index = proposer_index,
+            .parent_root = parent_root,
+            .attestations = result.attestations,
+            .signatures = result.signatures,
+        };
+
+        chain.proposal_partial_mutex.lock();
+        defer chain.proposal_partial_mutex.unlock();
+        if (chain.proposal_partial_body) |old| {
+            old.deinit();
+            chain.allocator.destroy(old);
+        }
+        chain.proposal_partial_slot = slot;
+        chain.proposal_partial_body = body;
+    }
+
+    /// Take the latest published partial, run STF, register, return for
+    /// signing. Mirrors `produceBlock`'s tail; null if no partial ready.
+    pub fn finalizeProposalIfReady(
+        self: *Self,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+    ) !?ProducedBlock {
+        var body_ptr: ?*PartialProposalBody = null;
+        {
+            self.proposal_partial_mutex.lock();
+            defer self.proposal_partial_mutex.unlock();
+
+            if (self.proposal_partial_slot) |partial_slot| {
+                if (partial_slot < slot and self.proposal_partial_body != null) {
+                    // Reap stale partial from prior slot.
+                    self.freeProposalPartialUnderLock();
+                    zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+                    return null;
+                }
+                if (partial_slot != slot) {
+                    zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+                    return null;
+                }
+            } else {
+                zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+                return null;
+            }
+
+            body_ptr = self.proposal_partial_body;
+            self.proposal_partial_slot = null;
+            self.proposal_partial_body = null;
+        }
+
+        var body = body_ptr orelse {
+            zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+            return null;
+        };
+        var body_owned = true;
+        defer if (body_owned) {
+            body.deinit();
+            self.allocator.destroy(body);
+        };
+
+        if (body.proposer_index != proposer_index) {
+            self.logger.warn(
+                "proposal partial proposer mismatch: slot={d} expected={d} got={d}",
+                .{ slot, proposer_index, body.proposer_index },
+            );
+            return null;
+        }
+
+        // Skip the proposal if the worker couldn't compact even one
+        // attestation under the deadline budget.
+        if (body.attestations.constSlice().len == 0) {
+            zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+            self.logger.info(
+                "skipping proposal for slot={d}: build worker produced no compacted attestations within deadline",
+                .{slot},
+            );
+            return null;
+        }
+
+        // Re-acquire pre-state from the state store (immutable per root).
+        var pre_borrow = self.statesGet(body.parent_root) orelse {
+            self.logger.warn(
+                "finalize failed for slot={d}: missing pre-state for parent_root",
+                .{slot},
+            );
+            return null;
+        };
+        defer pre_borrow.assertReleasedOrPanic();
+        const pre_snapshot = try pre_borrow.cloneAndRelease(self.allocator);
+        defer {
+            pre_snapshot.deinit();
+            self.allocator.destroy(pre_snapshot);
+        }
+
+        const post_state = try self.allocator.create(types.BeamState);
+        var post_state_initialized = false;
+        var post_state_consumed = false;
+        errdefer if (!post_state_consumed) {
+            if (post_state_initialized) post_state.deinit();
+            self.allocator.destroy(post_state);
+        };
+        post_state.* = try zeam_utils.clone(types.BeamState, pre_snapshot, self.allocator);
+        post_state_initialized = true;
+
+        // Move out before the body's defer fires. body.deinit MUST NOT run
+        // after this — only `allocator.destroy(body)`.
+        var agg_attestations = body.attestations;
+        var attestation_signatures = body.signatures;
+        body_owned = false;
+        // The body struct itself still needs freeing — its fields point
+        // at memory now owned by `block` / `attestation_signatures`.
+        defer self.allocator.destroy(body);
+
+        var agg_att_cleanup = true;
+        errdefer if (agg_att_cleanup) {
+            for (agg_attestations.slice()) |*att| att.deinit();
+            agg_attestations.deinit();
+        };
+
+        var agg_sig_cleanup = true;
+        errdefer if (agg_sig_cleanup) {
+            for (attestation_signatures.slice()) |*sig| sig.deinit();
+            attestation_signatures.deinit();
+        };
+
+        var block = types.BeamBlock{
+            .slot = slot,
+            .proposer_index = proposer_index,
+            .parent_root = body.parent_root,
+            .state_root = undefined,
+            .body = types.BeamBlockBody{
+                .attestations = agg_attestations,
+            },
+        };
+        agg_att_cleanup = false; // ownership moved into block.body.attestations
+        errdefer block.deinit();
+
+        agg_sig_cleanup = false; // ownership moved into the returned ProducedBlock
+        errdefer {
+            for (attestation_signatures.slice()) |*sig| sig.deinit();
+            attestation_signatures.deinit();
+        }
+
+        {
+            var t_rts = LockTimer.start("root_to_slot", "finalizeProposalIfReady.stf");
+            locking.assertNoTier5SiblingHeld("finalizeProposalIfReady.stf");
+            self.root_to_slot_lock.lock();
+            locking.enterTier5();
+            t_rts.acquired();
+            defer {
+                self.root_to_slot_lock.unlock();
+                locking.leaveTier5();
+                t_rts.released();
+            }
+            try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
+        }
+
+        var block_root: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+
+        const post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_consumed);
+        try self.statesPutExclusive("finalizeProposalIfReady.commit", block_root, post_state_rc);
+
+        var forkchoice_added = false;
+        errdefer if (!forkchoice_added) {
+            if (self.statesFetchRemoveExclusivePtr("finalizeProposalIfReady.errdefer", block_root)) |rc_ptr| {
+                rc_ptr.release();
+            }
+        };
+
+        _ = try self.forkChoice.onBlock(block, post_state, .{
+            .currentSlot = block.slot,
+            .blockDelayMs = 0,
+            .blockRoot = block_root,
+            .confirmed = false,
+        });
+        forkchoice_added = true;
+        _ = try self.forkChoice.updateHead();
+
+        return .{
+            .block = block,
+            .blockRoot = block_root,
+            .attestation_signatures = attestation_signatures,
+        };
     }
 
     /// Find the subnet of the first set participant in `participants`.
