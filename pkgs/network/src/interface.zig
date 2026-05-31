@@ -331,28 +331,6 @@ pub const GossipMessage = union(GossipTopicKind) {
         return serialized.toOwnedSlice(allocator);
     }
 
-    pub fn clone(self: *const Self, allocator: Allocator) !*Self {
-        const cloned_data = try allocator.create(Self);
-
-        switch (self.*) {
-            .block => {
-                cloned_data.* = .{ .block = undefined };
-                try types.sszClone(allocator, types.SignedBlock, self.block, &cloned_data.block);
-            },
-            .attestation => {
-                cloned_data.* = .{ .attestation = undefined };
-                cloned_data.attestation.subnet_id = self.attestation.subnet_id;
-                try types.sszClone(allocator, types.SignedAttestation, self.attestation.message, &cloned_data.attestation.message);
-            },
-            .aggregation => {
-                cloned_data.* = .{ .aggregation = undefined };
-                try types.sszClone(allocator, types.SignedAggregatedAttestation, self.aggregation, &cloned_data.aggregation);
-            },
-        }
-
-        return cloned_data;
-    }
-
     pub fn deinit(self: *Self) void {
         switch (self.*) {
             .block => |*block| block.deinit(),

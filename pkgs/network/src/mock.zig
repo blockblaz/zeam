@@ -407,12 +407,11 @@ pub const Mock = struct {
     }
 
     fn enqueuePublish(self: *Self, data: *const interface.GossipMessage, sender_peer_id: []const u8) !void {
-        const cloned_message = try data.clone(self.allocator);
+        const cloned_message = try self.allocator.create(interface.GossipMessage);
         var message_owned_by_queue = false;
-        errdefer if (!message_owned_by_queue) {
-            cloned_message.deinit();
-            self.allocator.destroy(cloned_message);
-        };
+        errdefer if (!message_owned_by_queue) self.allocator.destroy(cloned_message);
+        cloned_message.* = try zeam_utils.clone(interface.GossipMessage, data, self.allocator);
+        errdefer if (!message_owned_by_queue) cloned_message.deinit();
 
         const sender_peer_id_copy = try self.allocator.dupe(u8, sender_peer_id);
         var sender_peer_id_owned_by_queue = false;
@@ -560,34 +559,6 @@ pub const Mock = struct {
         }
     }
 
-    fn cloneResponse(self: *Self, response: *const interface.ReqRespResponse) !interface.ReqRespResponse {
-        return switch (response.*) {
-            .status => |status_resp| interface.ReqRespResponse{ .status = status_resp },
-            .blocks_by_root => |block_resp| blk: {
-                var cloned_block: types.SignedBlock = undefined;
-                try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
-                break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
-            },
-            .blocks_by_range => |block_resp| blk: {
-                var cloned_block: types.SignedBlock = undefined;
-                try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
-                break :blk interface.ReqRespResponse{ .blocks_by_range = cloned_block };
-            },
-        };
-    }
-
-    fn cloneRequest(self: *Self, request: *const interface.ReqRespRequest) !interface.ReqRespRequest {
-        return switch (request.*) {
-            .status => |status_req| interface.ReqRespRequest{ .status = status_req },
-            .blocks_by_root => |block_req| blk: {
-                var cloned_request: types.BlockByRootRequest = undefined;
-                try types.sszClone(self.allocator, types.BlockByRootRequest, block_req, &cloned_request);
-                break :blk interface.ReqRespRequest{ .blocks_by_root = cloned_request };
-            },
-            .blocks_by_range => |block_req| interface.ReqRespRequest{ .blocks_by_range = block_req },
-        };
-    }
-
     fn notifySuccess(self: *Self, request_id: u64, method: interface.LeanSupportedProtocol, response: interface.ReqRespResponse) void {
         var event = interface.ReqRespResponseEvent.initSuccess(request_id, method, response);
         defer event.deinit(self.allocator);
@@ -643,7 +614,7 @@ pub const Mock = struct {
 
         // Buffer the response for async delivery instead of immediate notification
         // This fixes timing issues where responses arrive before request tracking is set up
-        const cloned = try ctx.mock.cloneResponse(response);
+        const cloned = try zeam_utils.clone(interface.ReqRespResponse, response, ctx.mock.allocator);
         try ctx.buffered_responses.append(ctx.mock.allocator, cloned);
     }
 
@@ -802,7 +773,7 @@ pub const Mock = struct {
         const target_idx = try self.ensurePeerEntry(peer_id);
         const target_peer = &self.peers.items[target_idx];
 
-        var request_copy = try self.cloneRequest(req);
+        var request_copy = try zeam_utils.clone(interface.ReqRespRequest, req, self.allocator);
         defer request_copy.deinit();
 
         const method = std.meta.activeTag(request_copy);
@@ -1142,11 +1113,10 @@ test "Mock pending publish drain callback rearms without allocation" {
             self.calls += 1;
 
             if (message.block.block.slot == 1) {
-                const cloned_message = try self.nested_message.clone(self.allocator);
-                errdefer {
-                    cloned_message.deinit();
-                    self.allocator.destroy(cloned_message);
-                }
+                const cloned_message = try self.allocator.create(interface.GossipMessage);
+                errdefer self.allocator.destroy(cloned_message);
+                cloned_message.* = try zeam_utils.clone(interface.GossipMessage, self.nested_message, self.allocator);
+                errdefer cloned_message.deinit();
 
                 const sender_peer_id_copy = try self.allocator.dupe(u8, "reentrant");
                 errdefer self.allocator.free(sender_peer_id_copy);
@@ -1191,12 +1161,12 @@ test "Mock pending publish drain callback rearms without allocation" {
 
     var initial_message = try initTestBlockMessage(allocator, 1);
     defer initial_message.deinit();
-    const initial_clone = try initial_message.clone(allocator);
+
+    const initial_clone = try allocator.create(interface.GossipMessage);
     var initial_clone_owned_by_queue = false;
-    errdefer if (!initial_clone_owned_by_queue) {
-        initial_clone.deinit();
-        allocator.destroy(initial_clone);
-    };
+    errdefer if (!initial_clone_owned_by_queue) allocator.destroy(initial_clone);
+    initial_clone.* = try zeam_utils.clone(interface.GossipMessage, &initial_message, allocator);
+    errdefer if (!initial_clone_owned_by_queue) initial_clone.deinit();
     const sender_peer_id_copy = try allocator.dupe(u8, "mock_publisher");
     var sender_peer_id_owned_by_queue = false;
     errdefer if (!sender_peer_id_owned_by_queue) allocator.free(sender_peer_id_copy);
@@ -1417,7 +1387,7 @@ test "Mock status RPC between peers" {
 //     bare `completed`. Pins the MIN_SLOTS_FOR_BLOCK_REQUESTS gate at
 //     `node.zig:1196-1206`.
 //   * Single-chunk happy path: just a sanity check that the
-//     blocks_by_range payload variant flows through cloneResponse +
+//     blocks_by_range payload variant flows through the response clone +
 //     deferred delivery cleanly (no UAF on the SignedBlock interior).
 //
 // What these tests deliberately do NOT cover:

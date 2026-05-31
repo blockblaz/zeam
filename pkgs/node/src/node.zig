@@ -878,10 +878,9 @@ pub const BeamNode = struct {
         signed_block: *const types.SignedBlock,
         block_root: types.Root,
     ) blocks_by_range_sync.ImportSubmitOutcome {
-        var cloned: types.SignedBlock = undefined;
-        types.sszClone(self.allocator, types.SignedBlock, signed_block.*, &cloned) catch |err| {
+        var cloned = zeam_utils.clone(types.SignedBlock, signed_block, self.allocator) catch |err| {
             self.logger.warn(
-                "chain-worker submit: sszClone failed for slot={d} root=0x{x}: {any}, falling back to inline import",
+                "chain-worker submit: clone failed for slot={d} root=0x{x}: {any}, falling back to inline import",
                 .{ signed_block.block.slot, &block_root, err },
             );
             return .failed;
@@ -1147,23 +1146,14 @@ pub const BeamNode = struct {
             return CacheBlockError.CachingFailed;
         }
 
-        // Allocate and clone the block
-        const block_ptr = self.allocator.create(types.SignedBlock) catch {
-            return CacheBlockError.AllocationFailed;
-        };
-        var block_owned = true;
-        errdefer if (block_owned) self.allocator.destroy(block_ptr);
-
-        types.sszClone(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
+        var block = zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator) catch {
             return CacheBlockError.CloneFailed;
         };
-        errdefer if (block_owned) block_ptr.deinit();
+        errdefer block.deinit();
 
-        self.network.cacheFetchedBlock(block_root, block_ptr) catch {
+        self.network.cacheFetchedBlock(block_root, &block) catch {
             return CacheBlockError.CachingFailed;
         };
-        // Ownership transferred to the network cache — disable errdefers
-        block_owned = false;
 
         // Enqueue the parent root for batched fetching rather than firing an individual
         // request immediately. All accumulated roots are sent as one blocks_by_root
@@ -1254,15 +1244,24 @@ pub const BeamNode = struct {
         var block_owned = true;
         errdefer if (block_owned) self.allocator.destroy(block_ptr);
 
-        // Clone the block and capture its SSZ bytes in one pass.
-        // sszCloneAndGetBytes serializes the original block once (read-only on `signed_block`),
-        // then deserializes into the clone. The returned bytes are stored alongside the cached
-        // block so that onBlock never needs to re-serialize a live SignedBlock, which has been
-        // observed to cause memory corruption on the next cached block's processing.
-        const ssz_bytes = types.sszCloneAndGetBytes(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
+        // Deep-clone the block first, then serialize the *clone* to capture
+        // its SSZ bytes. The bytes are stored alongside the cached block so
+        // that onBlock never needs to re-serialize a live SignedBlock, which
+        // has been observed to cause memory corruption on the next cached
+        // block's processing.
+        block_ptr.* = zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator) catch {
             return CacheBlockError.CloneFailed;
         };
         errdefer if (block_owned) block_ptr.deinit();
+
+        var ssz_buf: std.ArrayList(u8) = .empty;
+        errdefer ssz_buf.deinit(self.allocator);
+        ssz.serialize(types.SignedBlock, block_ptr.*, &ssz_buf, self.allocator) catch {
+            return CacheBlockError.CloneFailed;
+        };
+        const ssz_bytes = ssz_buf.toOwnedSlice(self.allocator) catch {
+            return CacheBlockError.CloneFailed;
+        };
         errdefer self.allocator.free(ssz_bytes);
 
         self.network.cacheFetchedBlock(block_root, block_ptr) catch {
@@ -2094,8 +2093,9 @@ pub const BeamNode = struct {
                         var signed_block = signed_block_value;
                         defer signed_block.deinit();
 
-                        var response = networks.ReqRespResponse{ .blocks_by_root = undefined };
-                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_root);
+                        var response = networks.ReqRespResponse{
+                            .blocks_by_root = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator),
+                        };
                         defer response.deinit();
 
                         try responder.sendResponse(&response);
@@ -2173,8 +2173,9 @@ pub const BeamNode = struct {
                             var signed_block = signed_block_value;
                             defer signed_block.deinit();
 
-                            var response = networks.ReqRespResponse{ .blocks_by_range = undefined };
-                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_range);
+                            var response = networks.ReqRespResponse{
+                                .blocks_by_range = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator),
+                            };
                             defer response.deinit();
 
                             try responder.sendResponse(&response);
@@ -2217,8 +2218,9 @@ pub const BeamNode = struct {
                             var signed_block = signed_block_value;
                             defer signed_block.deinit();
 
-                            var response = networks.ReqRespResponse{ .blocks_by_range = undefined };
-                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_range);
+                            var response = networks.ReqRespResponse{
+                                .blocks_by_range = try zeam_utils.clone(types.SignedBlock, &signed_block, self.allocator),
+                            };
                             defer response.deinit();
 
                             try responder.sendResponse(&response);
@@ -3754,7 +3756,7 @@ test "Node: processCachedDescendants basic flow" {
 
     // Cache block2 (which will fail to process because block1 is missing)
     const block2_ptr = try allocator.create(types.SignedBlock);
-    try types.sszClone(allocator, types.SignedBlock, block2, block2_ptr);
+    block2_ptr.* = try zeam_utils.clone(types.SignedBlock, &block2, allocator);
     try node.network.cacheFetchedBlock(block2_root, block2_ptr);
 
     // Verify block2 is cached
