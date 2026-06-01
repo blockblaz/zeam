@@ -4506,14 +4506,13 @@ pub const BeamChain = struct {
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
-                var behind_peers_buf: [1024]u8 = undefined;
-                const behind_peers = info.peerListForLog(&behind_peers_buf);
-                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peers={s})", .{
+                self.logBehindPeersDebug("skipping aggregation production", info);
+                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
                     slot,
                     info.head_slot,
                     info.finalized_slot,
                     info.max_peer_finalized_slot,
-                    behind_peers,
+                    info.peer_count,
                 });
                 zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
                 return;
@@ -4872,39 +4871,6 @@ pub const BeamChain = struct {
         peer_count: usize = 0,
         peers_truncated: bool = false,
 
-        pub fn peerListForLog(self: *const @This(), buf: []u8) []const u8 {
-            var pos: usize = 0;
-            appendText(buf, &pos, "[");
-            for (self.peers[0..self.peer_count], 0..) |peer, idx| {
-                if (idx != 0) appendText(buf, &pos, ", ");
-                appendFmt(buf, &pos, "{s}(finalized_slot={d})", .{ peer.peerId(), peer.finalized_slot });
-            }
-            if (self.peers_truncated) {
-                if (self.peer_count != 0) appendText(buf, &pos, ", ");
-                appendText(buf, &pos, "...");
-            }
-            appendText(buf, &pos, "]");
-            return buf[0..pos];
-        }
-
-        fn appendText(buf: []u8, pos: *usize, text: []const u8) void {
-            if (pos.* >= buf.len) return;
-            const copy_len = @min(text.len, buf.len - pos.*);
-            @memcpy(buf[pos.*..][0..copy_len], text[0..copy_len]);
-            pos.* += copy_len;
-        }
-
-        fn appendFmt(buf: []u8, pos: *usize, comptime fmt: []const u8, args: anytype) void {
-            if (pos.* >= buf.len) return;
-            const written = std.fmt.bufPrint(buf[pos.*..], fmt, args) catch |err| switch (err) {
-                error.NoSpaceLeft => {
-                    pos.* = buf.len;
-                    return;
-                },
-            };
-            pos.* += written.len;
-        }
-
         fn addPeer(self: *@This(), peer_id: []const u8, finalized_slot: types.Slot) void {
             if (self.peer_count >= self.peers.len) {
                 self.peers_truncated = true;
@@ -4918,6 +4884,21 @@ pub const BeamChain = struct {
             if (copy_len < peer_id.len) self.peers_truncated = true;
         }
     };
+
+    pub fn logBehindPeersDebug(self: *Self, context: []const u8, info: BehindPeersInfo) void {
+        for (info.peers[0..info.peer_count]) |peer| {
+            self.logger.debug("{s}: behind_peers peer {s}{f} finalized_slot={d} max_peer_finalized_slot={d}", .{
+                context,
+                peer.peerId(),
+                self.node_registry.getNodeNameFromPeerId(peer.peerId()),
+                peer.finalized_slot,
+                info.max_peer_finalized_slot,
+            });
+        }
+        if (info.peers_truncated) {
+            self.logger.debug("{s}: behind_peers peer list truncated after {d} entries", .{ context, info.peer_count });
+        }
+    }
 
     /// Returns detailed sync status information.
     pub fn getSyncStatus(self: *Self) SyncStatus {
