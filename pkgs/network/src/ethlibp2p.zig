@@ -38,14 +38,14 @@ const ServerStreamError = error{
 /// Sized to match `MAX_GOSSIP_BLOCK_SIZE`: `blocks_by_range` and
 /// `blocks_by_root` carry the same XMSS-heavy blocks as the gossip block
 /// topic, so the RPC cap must accommodate the same per-block payload. A
-/// lower RPC cap (was 4 MB before #960) caused `error.PayloadTooLarge`
+/// lower RPC cap (previously 4 MB) caused `error.PayloadTooLarge`
 /// during `buildResponseFrame` for every legitimately-sized block that
 /// fit in gossip but not in the RPC frame check, breaking blocks_by_range
 /// catch-up across all peer clients and preventing finalisation.
 ///
-/// TODO(#855 review #9 follow-up): split into per-protocol caps so
-/// attestations / aggregations / Status / Goodbye can keep a tighter
-/// ceiling than block-carrying responses. Tracked separately.
+/// TODO: split into per-protocol caps so attestations / aggregations /
+/// Status / Goodbye can keep a tighter ceiling than block-carrying
+/// responses. Tracked separately.
 const MAX_RPC_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Gossip block message size limit.

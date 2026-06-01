@@ -141,7 +141,7 @@ pub fn shouldCatchUpFromPeerStatus(
     return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot) > 0;
 }
 
-/// Pure decider for the "stuck mesh cluster" recovery path (#942 follow-up).
+/// Pure decider for the "stuck mesh cluster" recovery path.
 ///
 /// Fires when ALL of:
 ///   * `best_peer_head_slot` is `wall_head_lag_threshold_slots` or more slots
@@ -153,7 +153,7 @@ pub fn shouldCatchUpFromPeerStatus(
 ///   * `slot - last_force_refresh_slot >= refresh_cooldown_slots` — at least
 ///     one cooldown window has elapsed since the previous force-refresh, so
 ///     we don't burst-refresh every interval if the condition stays continuously
-///     true (and re-create the en-masse RPC-timeout cascade from #926 that
+///     true (and re-create the en-masse RPC-timeout cascade that
 ///     motivated the original status-refresh batching).
 ///   * `best_peer_head_slot < wall_slot` — sanity check; the helper returns
 ///     false if the best peer is already at or past wall-clock (no stuck cluster).
@@ -372,7 +372,7 @@ test "shouldCatchUpFromPeerStatus small gaps use by-root not threshold gate" {
 }
 
 test "shouldForceFullPeerStatusRefresh fires when stuck behind a cluster of stale peers" {
-    // The scenario the helper exists to recover from (#942 follow-up): wall is at
+    // The scenario the helper exists to recover from: wall is at
     // slot 300, best peer head zeam knows about is slot 50, no force-refresh has
     // run yet → stuck-mesh-cluster condition is met.
     try std.testing.expect(shouldForceFullPeerStatusRefresh(50, 300, 300, 0, 16, 16));

@@ -492,11 +492,11 @@ pub const BeamNode = struct {
                     // → ssz.serialize) — it corrupts the upstream `data.*`'s
                     // SignedBlock allocations, which the inbound-gossip worker
                     // thread then deinits, causing a thread-N "Invalid free"
-                    // panic. Same bug + same fix pattern as
-                    // cacheMissingParentRpcChunk (commit 77d21e52); this is the
-                    // gossip-path twin. zeam_9 on devnet image a0faf5b
-                    // (post-77d21e52) showed 2 panics here in 12 min — all in
-                    // onGossip at node.zig:430.
+                    // panic. Same bug and same fix pattern as
+                    // cacheMissingParentRpcChunk; this is the gossip-path twin.
+                    // In one observed incident this path produced repeated
+                    // "Invalid free" panics within minutes, all originating in
+                    // onGossip here.
                     //
                     // The orphan gossip chunk is NOT pre-cached. When the
                     // parent arrives, the chain will re-fetch this block via
@@ -1060,10 +1060,9 @@ pub const BeamNode = struct {
         // Note: do NOT early-return on `children.len == 0` here — the
         // orphan_dependents drain at the tail of this function must run
         // for every parent import, regardless of whether the block cache
-        // happened to have any pre-cached descendants. The #942/#958
-        // orphan refetch path specifically targets blocks that were
-        // dropped (NOT cached) at orphan time; their re-fetch trigger is
-        // exactly this drain.
+        // happened to have any pre-cached descendants. The orphan refetch
+        // path specifically targets blocks that were dropped (NOT cached)
+        // at orphan time; their re-fetch trigger is exactly this drain.
 
         if (children.len > 0) self.logger.debug(
             "Found {d} cached descendant(s) of block 0x{x}",
@@ -1196,7 +1195,7 @@ pub const BeamNode = struct {
             }
         }
 
-        // #942/#958 follow-up: also re-fetch orphan children that we
+        // Also re-fetch orphan children that we
         // recorded in `orphan_dependents` when we could not cache them
         // (the destructive `sszClone` guard in `cacheMissingParentRpcChunk`
         // and the gossip-orphan path in `onGossip`). Now that `parent_root`
@@ -1360,7 +1359,7 @@ pub const BeamNode = struct {
             return;
         }
 
-        // #942 / #958 follow-up: do NOT call `cacheBlockAndFetchParent` here.
+        // Do NOT call `cacheBlockAndFetchParent` here.
         //
         // The full path used to be: cacheBlockAndFetchParent → `types.sszClone`
         // → `ssz.serialize`. `ssz.serialize` is destructive to its input
@@ -1372,14 +1371,13 @@ pub const BeamNode = struct {
         // `defer event.deinit(zigHandler.allocator)` fires, deinit walks the
         // corrupted List state and panics with "Invalid free".
         //
-        // Devnet image ae722ada (commit 7942c299) reproduced this with
-        // SIGSEGV (exit 139) on 6/8 zeam containers within 15 minutes —
-        // 13–22 panics each, every one with `cacheMissingParentRpcChunk` →
-        // `cacheBlockAndFetchParent` in the trace. The race surface
-        // widened after the PR #953 c6cf2241 reqresp-worker move-off
+        // In one observed incident this reproduced with SIGSEGV (exit 139)
+        // on most nodes within minutes — many panics each, every one with
+        // `cacheMissingParentRpcChunk` → `cacheBlockAndFetchParent` in the
+        // trace. The race surface widened after the reqresp-worker move-off
         // (FFI dispatch on a dedicated thread now drives blocks_by_root
         // responses through this path back-to-back at higher rate) and
-        // again after PR #954 added the stuck-mesh-cluster detector
+        // again after the stuck-mesh-cluster detector was added
         // (more peer status refreshes → more `blocks_by_root` fetches).
         //
         // We still ENQUEUE the parent root so chain catch-up makes
@@ -1394,7 +1392,7 @@ pub const BeamNode = struct {
         // or Bitlist allocation, so serialize-style corruption can't
         // affect them.
 
-        // Mirror the pre-finalized check the old `cacheBlockAndFetchParent`
+        // Apply the same pre-finalized check the old `cacheBlockAndFetchParent`
         // path performed before any sszClone, so behaviour for pre-finalized
         // chunks (log + prune descendants) is preserved verbatim.
         const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
@@ -3091,7 +3089,7 @@ pub const BeamNode = struct {
         // status. Overlap is filtered inside `initiateBlocksByRangeCatchUp`.
         if (interval_in_slot == 0) {
             self.maybeInitiateProactiveCatchUp(wall_head_lag_slots);
-            // #942 follow-up: same slot-boundary cadence as proactive catch-up.
+            // Same slot-boundary cadence as proactive catch-up.
             // The detector itself is rate-limited internally so wiring it here
             // doesn't fire every interval; we just need a clock tick to evaluate
             // the predicate against fresh wall_slot / best-peer-head values.
@@ -3200,7 +3198,7 @@ pub const BeamNode = struct {
 
     /// Refresh selector for `refreshSyncFromPeersImpl`. `.batched` walks the
     /// rotating peer-cursor window of `SYNC_STATUS_REFRESH_PEERS_PER_TICK`
-    /// (existing #926 behaviour). `.full_fanout` sends status to every
+    /// (the existing batched behaviour). `.full_fanout` sends status to every
     /// connected peer in one tick — only used by the stuck-mesh-cluster
     /// detector and rate-limited at the caller side by
     /// `SYNC_STATUS_STUCK_CLUSTER_REFRESH_COOLDOWN_SLOTS`.
@@ -3266,13 +3264,13 @@ pub const BeamNode = struct {
                 );
             },
             .full_fanout => self.logger.info(
-                "status refresh full fanout: sent {d}/{d} peers (stuck-mesh-cluster detector #942)",
+                "status refresh full fanout: sent {d}/{d} peers (stuck-mesh-cluster detector)",
                 .{ sent, total },
             ),
         }
     }
 
-    /// #942 follow-up: detect the "stuck mesh cluster" condition (all visible
+    /// Detect the "stuck mesh cluster" condition (all visible
     /// peers report a head_slot far below wall-clock) and trigger a one-shot
     /// full-fanout status refresh to try to discover any peer that has actually
     /// moved. Rate-limited via `last_stuck_cluster_refresh_slot` so a
@@ -3281,11 +3279,11 @@ pub const BeamNode = struct {
     ///
     /// This complements the existing batched refresh: the batch eventually
     /// rotates through every peer over ~`peers / 8` slots, but on a stuck
-    /// devnet that's tens of seconds wasted hammering the same stale-head
+    /// network that's tens of seconds wasted hammering the same stale-head
     /// targets. The full fanout closes that window when the data we have says
-    /// "no visible peer is on the chain tip" — exactly the signal observed
-    /// on the 2026-05-29 devnet where zeam_8's best cached peer head was 45
-    /// while wall-clock was at 298.
+    /// "no visible peer is on the chain tip" — exactly the signal seen in one
+    /// observed incident where a node's best cached peer head was 45 while
+    /// wall-clock was at 298.
     fn maybeForceFullPeerStatusRefresh(self: *Self, slot: types.Slot) void {
         const best = self.findBestCatchUpPeerStatus() orelse return;
         defer self.allocator.free(best.peer_id);
@@ -4103,8 +4101,8 @@ test "Node: processCachedDescendants basic flow" {
     try std.testing.expect(node.chain.forkChoice.hasBlock(block2_root));
 }
 
-test "Node: orphan_dependents recorded then re-enqueued on parent import (#942/#958 refetch)" {
-    // Regression test for the PR #954 review feedback: when a blocks_by_root
+test "Node: orphan_dependents recorded then re-enqueued on parent import (orphan refetch)" {
+    // Regression test: when a blocks_by_root
     // chunk (or gossip block) has a missing parent we can no longer pre-cache
     // it (the old `cacheBlockAndFetchParent` path was a destructive sszClone
     // source-corruption hazard), so we must instead record the (parent, child)
