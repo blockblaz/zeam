@@ -673,6 +673,7 @@ pub const BeamChain = struct {
             .handlers = .{
                 .ctx = self,
                 .on_block = chainWorkerOnBlockThunk,
+                .on_blocks_batch = chainWorkerOnBlocksBatchThunk,
                 .on_gossip_attestation = chainWorkerOnGossipAttestationThunk,
                 .on_gossip_aggregated_attestation = chainWorkerOnGossipAggregatedAttestationThunk,
                 .process_pending_blocks = chainWorkerProcessPendingBlocksThunk,
@@ -1186,6 +1187,102 @@ pub const BeamChain = struct {
             return;
         }
         self.allocator.free(missing_roots);
+    }
+
+    /// Batched-block thunk (PR #966). Called by the chain-worker drain
+    /// loop when it coalesced 2+ `.on_block` messages. Routes the whole
+    /// batch through `chain.onBlocksBatch` so the XMSS aggregated-
+    /// signature verify runs as ONE rayon call across every attestation
+    /// in every block (the `phase2_batch_verify` stage that is 99% of
+    /// `step="verify_signatures"` on a loaded chain). After the batched
+    /// import returns, per-block bookkeeping (onBlockFollowup, replay,
+    /// imported-block backchannel) still runs once per block in order
+    /// — those steps are cheap and not amenable to batching.
+    ///
+    /// TOCTOU rejection paths (MissingPreState / PreFinalizedSlot) that
+    /// the single-block thunk routes to the rejected_block callback are
+    /// NOT exercised from this thunk: `onBlocksBatch` swallows per-block
+    /// failures into `missing_roots = null` so we lose the error tag.
+    /// Acceptable trade-off for the catch-up hot path (where the producer
+    /// just checked `hasBlock(parent)` under a shared lock, so the TOCTOU
+    /// window is narrow); gossip-rate blocks at queue depth ≤ threshold
+    /// still go through `chainWorkerOnBlockThunk` with full TOCTOU.
+    fn chainWorkerOnBlocksBatchThunk(
+        ctx: *anyopaque,
+        items: []const chain_worker.BlockBatchItem,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        // Build per-block input slices for chain.onBlocksBatch. Every
+        // item should have a block_root by construction (gossip / RPC /
+        // local producers all compute it before submitting) — but
+        // recompute if missing to keep this thunk robust against future
+        // producers.
+        const signed_blocks = self.allocator.alloc(types.SignedBlock, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on signed_blocks alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(signed_blocks);
+        const block_roots = self.allocator.alloc(types.Root, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on block_roots alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(block_roots);
+
+        // `prune_forkchoice` is per-item in principle but in practice all
+        // catch-up submitters pass the same value. Use the first item's
+        // value for the batch; if a future submitter mixes per-block
+        // pruning we'll need to split into homogeneous sub-batches.
+        const prune_forkchoice = items[0].prune_forkchoice;
+
+        for (items, 0..) |item, i| {
+            signed_blocks[i] = item.signed_block;
+            if (item.block_root) |r| {
+                block_roots[i] = r;
+            } else {
+                zeam_utils.hashTreeRoot(types.BeamBlock, item.signed_block.block, &block_roots[i], self.allocator) catch |err| {
+                    self.logger.err(
+                        "chain-worker: onBlocksBatch root recompute failed slot={d}: {any}",
+                        .{ item.signed_block.block.slot, err },
+                    );
+                    return;
+                };
+            }
+        }
+
+        const results = self.onBlocksBatch(signed_blocks, block_roots, prune_forkchoice) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch failed K={d}: {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(results);
+
+        // Per-block bookkeeping: followup + replay + imported_block
+        // callback. Mirror the single-block thunk's tail; null result
+        // means that block failed import (already logged inside
+        // onBlocksBatch / its fallback).
+        for (items, results, 0..) |item, result, i| {
+            const block_root = block_roots[i];
+            if (result.missing_roots) |missing_roots| {
+                self.onBlockFollowup(item.prune_forkchoice, &item.signed_block);
+                self.replayPendingAttestations();
+                if (self.imported_block) |cb| {
+                    cb.func(cb.ctx, block_root, missing_roots);
+                } else {
+                    self.allocator.free(missing_roots);
+                }
+            }
+            // Failed blocks: nothing to do — onBlocksBatch already logged
+            // and we have no error tag to drive the rejected_block path.
+        }
     }
 
     fn chainWorkerOnGossipAttestationThunk(

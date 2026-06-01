@@ -330,6 +330,16 @@ const Metrics = struct {
     lean_chain_queue_dropped_total: LeanChainQueueDroppedCounter,
     lean_chain_queue_depth: LeanChainQueueDepthGauge,
     lean_chain_worker_loop_iters_total: LeanChainWorkerLoopItersCounter,
+    /// PR #966: per-dispatch-path counter so dashboards can see how often
+    /// the chain-worker actually managed to batch ≥2 blocks vs falling
+    /// back to the single-block path. `path="single"` increments once
+    /// per `.on_block` Message dispatched through the unbatched code
+    /// path (block queue depth ≤ BLOCK_BATCH_THRESHOLD at drain time);
+    /// `path="batch"` increments once per `Handlers.on_blocks_batch`
+    /// dispatch. Sum the latter with the K from
+    /// `zeam_stf_verify_signatures_batch_size_count` to recover the
+    /// total number of blocks that took the batched path.
+    lean_chain_worker_block_dispatch_total: LeanChainWorkerBlockDispatchCounter,
     /// Tripwire counter (zclawz review on PR #890): bumped from
     /// `chainWorkerProcessPendingBlocksThunk` whenever it returns a
     /// non-empty `missing_roots` slice. The thunk has no production
@@ -554,6 +564,7 @@ const Metrics = struct {
     const LeanChainQueueDroppedCounter = metrics_lib.CounterVec(u64, struct { queue: []const u8 });
     const LeanChainQueueDepthGauge = metrics_lib.GaugeVec(u64, struct { queue: []const u8 });
     const LeanChainWorkerLoopItersCounter = metrics_lib.Counter(u64);
+    const LeanChainWorkerBlockDispatchCounter = metrics_lib.CounterVec(u64, struct { path: []const u8 });
     const LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter = metrics_lib.Counter(u64);
     // Refcount-distribution buckets [1, 2, 4, 8, 16, 32, +Inf]. Typical
     // value is 1 (writer-only); transient 2-4 under reader concurrency;
@@ -1158,6 +1169,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation|replay_pending). The `replay_pending` label is a single nudge that drains the in-process pending-attestation buffers — buffer depth itself is exposed via `lean_pending_attestations_size{kind}`." }, .{}),
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed or explicitly discarded during shutdown, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
+        .lean_chain_worker_block_dispatch_total = try Metrics.LeanChainWorkerBlockDispatchCounter.init(allocator, io, "lean_chain_worker_block_dispatch_total", .{ .help = "Chain-worker block-dispatch path counter. path=\"single\" counts `.on_block` dispatches via the unbatched code path (block queue depth ≤ BLOCK_BATCH_THRESHOLD); path=\"batch\" counts `.on_blocks_batch` dispatches (one per batched call, K blocks each). Combine with zeam_stf_verify_signatures_batch_size_count to recover total blocks taken via the batched path. See PR #966." }, .{}),
         .lean_chain_worker_process_pending_blocks_dropped_missing_roots_total = Metrics.LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter.init("lean_chain_worker_process_pending_blocks_dropped_missing_roots_total", .{ .help = "Tripwire (#890): non-zero only if a future worker producer dispatches `process_pending_blocks` without wiring the missing-roots backchannel. MUST stay 0 in steady state." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.
