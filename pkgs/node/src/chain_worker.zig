@@ -1064,13 +1064,13 @@ pub const ChainWorker = struct {
             );
             return;
         };
-        zeam_metrics.metrics.lean_chain_worker_block_dispatch_total.incr(.{ .path = "batch" }) catch {};
+        zeam_metrics.metrics.zeam_chain_worker_block_dispatch_total.incr(.{ .path = "batch" }) catch {};
         h.on_blocks_batch(h.ctx, items);
     }
 
     fn dispatch(self: *Self, msg: Message) void {
         if (msg == .on_block) {
-            zeam_metrics.metrics.lean_chain_worker_block_dispatch_total.incr(.{ .path = "single" }) catch {};
+            zeam_metrics.metrics.zeam_chain_worker_block_dispatch_total.incr(.{ .path = "single" }) catch {};
         }
         var m = msg;
         defer m.deinit();
