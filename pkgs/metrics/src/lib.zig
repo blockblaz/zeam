@@ -1207,7 +1207,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
 /// is touched at startup only). `MAX_SCRAPE_REFRESHERS` is sized
 /// generously vs. the current ~2 callsites; if a future contributor
 /// needs more, raise the constant rather than adding a parallel slot.
-const MAX_SCRAPE_REFRESHERS: usize = 16;
+/// Raised 16 → 32 to accommodate the growing node-test suite (each
+/// `BeamNode.init` registers a chain-state refcount refresher and the
+/// registry is process-global, so every additional node test consumes a
+/// slot for the test-binary lifetime).
+const MAX_SCRAPE_REFRESHERS: usize = 32;
 
 var g_scrape_refreshers: [MAX_SCRAPE_REFRESHERS]*const fn () void = undefined;
 var g_scrape_refreshers_len: usize = 0;

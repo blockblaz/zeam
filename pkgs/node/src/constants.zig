@@ -128,6 +128,36 @@ pub const SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS: u64 = 4;
 // observed to time out en masse on devnet (#926) and leave catch-up stuck.
 pub const SYNC_STATUS_REFRESH_PEERS_PER_TICK: usize = 8;
 
+// Wall-clock slots the best-known peer head_slot is allowed to lag wall-clock
+// before we treat the entire connected-peer pool as a "stuck mesh cluster"
+// and trigger a one-shot full-fanout status refresh (#942 follow-up).
+//
+// Observed on the 2026-05-29 devnet: zeam_8 was 254 wall slots behind, but
+// every cached `latest_status.head_slot` it knew about topped out at 45 (a
+// peer that was itself stuck behind the broken-snappy gossip ingress at the
+// same network position). `findBestCatchUpPeerStatus` correctly picked the
+// best-of-stale option each slot, fired `blocks_by_root` to it, got a stale
+// response, and made no progress — for 25+ minutes — because the rotating
+// status-refresh batch (`SYNC_STATUS_REFRESH_PEERS_PER_TICK = 8`, full
+// rotation = ~8 slots over a 50-peer mesh) was the only path that could ever
+// learn that some non-batch-current peer might have a fresher head. Sixteen
+// slots = 64 s tolerance: anything below this is normal proactive-catch-up
+// territory; anything above signals "the visible mesh is not on the chain
+// tip."
+pub const SYNC_STATUS_STUCK_CLUSTER_PEER_LAG_THRESHOLD_SLOTS: u64 = 16;
+
+// Minimum slot gap between consecutive full-fanout status refreshes after the
+// "stuck mesh cluster" detector fires (#942 follow-up). Rate-limits the
+// otherwise-unbatched RPC burst so that, in the pathological case where a
+// genuine network-wide pause keeps us stuck, we don't blast every connected
+// peer with status requests every interval and re-create the en-masse RPC
+// timeout cascade that motivated the original batching (#926).
+//
+// 16 slots = 64 s at 4 s/slot lines up with the wall-lag threshold above so
+// at most one force-refresh fires per detection cycle even if the condition
+// stays continuously true.
+pub const SYNC_STATUS_STUCK_CLUSTER_REFRESH_COOLDOWN_SLOTS: u64 = 16;
+
 // When no gossip has been received for this many wall-clock slots, treat
 // ingress as stalled and initiate RPC catch-up from the best known peer
 // head without waiting for a status response (#926).
@@ -150,7 +180,21 @@ pub fn gossipStallThresholdMs() u64 {
 // recursive head-by-root walk. When the peer's head is more than this many slots
 // ahead of ours, we issue a single ranged request to catch up efficiently rather
 // than chasing the parent chain one block at a time.
-pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 64;
+//
+// Lowered 64 → 4 after the 2026-05-29 devnet (#942 follow-up): with the upstream
+// ethlambda encoder bug still emitting broken-snappy block payloads on the wire,
+// ~98 % of inbound block gossip messages were being dropped by `snappy.error.Corrupt`
+// and the entire chain was being assembled via `blocks_by_root` catch-up RPC. Per-
+// node gaps stabilised at 5–59 slots — all below the previous 64-slot threshold —
+// so every catch-up cycle used the single-block-per-round-trip `blocks_by_root`
+// path even though a bulk `blocks_by_range` request would have closed the same
+// gap in one RPC. Lowering the cutoff to 4 means anything from a 5-slot gap up
+// drops into the bulk-fetch path; gaps of 1–4 stay on the cheaper `blocks_by_root`
+// path where its parent-walk semantics are still appropriate. Once the upstream
+// encoder bug is fixed and the gossip block delivery returns to ~100 %, this
+// constant becomes mostly dormant — typical catch-up gaps are sub-second and
+// fall under the threshold either way.
+pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 4;
 
 // Maximum `blocks_by_range` catch-up attempts (peer rotation + fallback) before
 // switching to head-by-root parent walk. Issue #893.
