@@ -3404,7 +3404,11 @@ pub const BeamChain = struct {
             // atomic and the loser frees its handle. The previous
             // mutex around this block was the dominant contributor
             // to the ~78ms mean lock hold reported in #863.
-            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool);
+            // Pass the precomputed block_root so verifySignaturesParallel can
+            // skip its own hashTreeRoot(BeamBlock) call (free win — see PR #963
+            // perf instrumentation: empty blocks were spending most of their
+            // verify_signatures budget in the duplicated hash).
+            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool, &block_root);
 
             step_watch.lap("verify_signatures");
 
