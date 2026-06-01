@@ -336,6 +336,233 @@ pub fn verifySignaturesParallel(
     stage_watch.lap("proposer_xmss_verify");
 }
 
+/// One block's worth of work in a multi-block batched verify. The caller
+/// gathers a slice of these for one rayon Phase-2 call.
+///
+/// `state` is the parent state for this block (its validator set is used
+/// for the pubkey lookup). `precomputed_block_root` MUST be supplied —
+/// the batched path is the catch-up hot path, where chain.onBlock has
+/// already computed the root; re-hashing the block per task would defeat
+/// the point of batching. (The single-block API still accepts `null` for
+/// callers that legitimately don't have it.)
+pub const VerifyMultiBlockTask = struct {
+    state: *const types.BeamState,
+    signed_block: *const types.SignedBlock,
+    precomputed_block_root: *const [32]u8,
+};
+
+/// Multi-block batched signature verification. Targets the
+/// `phase2_batch_verify` cost which is 99% of `verify_signatures` on a
+/// loaded chain (see PR #963 instrumentation): coalescing all attestation
+/// proofs from K blocks into one rayon call amortizes per-call FFI +
+/// scheduling overhead and gives the parallel pool more concurrent work
+/// to schedule across cores.
+///
+/// Phase 1 (serial): for each block, validates indices and warms the
+///                   pubkey_cache, accumulating tasks into a single
+///                   contiguous batch.
+/// Phase 2 (parallel): single rayon call across the accumulated tasks.
+/// Proposer signatures: per-block xmss.verifySsz, serial (one XMSS verify
+///                     each — small enough not to be worth batching).
+///
+/// On any failure the entire function returns an error; the caller is
+/// responsible for the per-block fallback if it needs to identify which
+/// block carried the bad signature.
+///
+/// Single-block callers should keep using `verifySignaturesParallel`;
+/// this function delegates to it for the K=1 case (no batching benefit).
+pub fn verifySignaturesParallelMultiBlock(
+    allocator: Allocator,
+    tasks: []const VerifyMultiBlockTask,
+    pubkey_cache: ?*xmss.PublicKeyCache,
+    thread_pool: anytype,
+) !void {
+    if (tasks.len == 0) return;
+    if (tasks.len == 1) {
+        // K=1 has no batching upside; route through the existing path so
+        // single-block callers (gossip, locally-produced blocks) keep the
+        // same stage-histogram labels and metric semantics.
+        return verifySignaturesParallel(
+            allocator,
+            tasks[0].state,
+            tasks[0].signed_block,
+            pubkey_cache,
+            thread_pool,
+            tasks[0].precomputed_block_root,
+        );
+    }
+
+    // Reuse the same stage-watch shape the single-block path uses so
+    // dashboards can stack the labels and confirm they sum to
+    // `step="verify_signatures_multiblock"` (set at the chain layer).
+    // We record stages under the same `zeam_stf_verify_signatures_stage_duration_seconds`
+    // histogram; the multi-block path simply observes once per batch
+    // (not once per block) — sum is total batch wall-clock, count is
+    // total batches.
+    const VerifyStageWatch = struct {
+        anchor_ns: i128,
+        fn init() @This() {
+            return .{ .anchor_ns = zeam_utils.monotonicTimestampNs() };
+        }
+        fn lap(self: *@This(), comptime stage: []const u8) void {
+            const now_ns = zeam_utils.monotonicTimestampNs();
+            const elapsed_ns: i128 = if (now_ns >= self.anchor_ns) now_ns - self.anchor_ns else 0;
+            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+            zeam_metrics.metrics.zeam_stf_verify_signatures_stage_duration_seconds.observe(
+                .{ .stage = stage },
+                elapsed_s,
+            ) catch {};
+            self.anchor_ns = now_ns;
+        }
+    };
+    var stage_watch = VerifyStageWatch.init();
+
+    // Observe batch size so dashboards can correlate the per-call cost
+    // with how many blocks we managed to coalesce. The histogram is
+    // initialised below in PR #964 (this PR); a separate counter tracks
+    // batch vs single-block dispatch from the chain-worker side.
+    zeam_metrics.zeam_stf_verify_signatures_batch_size.record(
+        @floatFromInt(tasks.len),
+    );
+
+    // Single scratch arena spans all blocks: per-block tasks, public-key
+    // handle arrays, and (when pubkey_cache is absent) pubkey wrappers
+    // all live here and are freed in one shot after Phase 2 returns.
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const scratch_alloc = scratch.allocator();
+
+    // Pubkey wrappers (only used when no cache is provided) carry Rust
+    // handles that need explicit deinit on the way out. List storage
+    // lives in scratch.
+    var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+    defer if (pubkey_cache == null) {
+        for (pubkey_wrappers.items) |*wrapper| wrapper.deinit();
+    };
+
+    // `thread_pool` is already accepted into the K=1 delegate call above.
+    // The K>1 batched path doesn't need it (rayon is invoked directly by
+    // `xmss.verifyAggregatedPayloadBatch`) — same shape as the single-block
+    // function. No further use here.
+
+    // Combined task array across all blocks. We pre-count attestations
+    // so we can allocate once.
+    var total_attestations: usize = 0;
+    for (tasks) |task| {
+        const attestations = task.signed_block.block.body.attestations.constSlice();
+        const signature_proofs = task.signed_block.signature.attestation_signatures.constSlice();
+        if (attestations.len != signature_proofs.len) {
+            return StateTransitionError.InvalidBlockSignatures;
+        }
+        total_attestations += attestations.len;
+    }
+
+    const combined_tasks = try scratch_alloc.alloc(xmss.AggregatedPayloadVerifyBatch, total_attestations);
+
+    // -------- Phase 1: serial pre-warm across all blocks --------
+    var task_idx: usize = 0;
+    for (tasks) |task| {
+        const attestations = task.signed_block.block.body.attestations.constSlice();
+        const signature_proofs = task.signed_block.signature.attestation_signatures.constSlice();
+        const validators = task.state.validators.constSlice();
+
+        for (attestations, signature_proofs) |aggregated_attestation, *signature_proof| {
+            var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
+            defer validator_indices.deinit(allocator);
+
+            var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
+            defer participant_indices.deinit(allocator);
+
+            if (validator_indices.items.len != participant_indices.items.len) {
+                return StateTransitionError.InvalidBlockSignatures;
+            }
+            for (validator_indices.items, participant_indices.items) |att_idx, proof_idx| {
+                if (att_idx != proof_idx) {
+                    return StateTransitionError.InvalidBlockSignatures;
+                }
+            }
+
+            const public_keys = try scratch_alloc.alloc(*const xmss.HashSigPublicKey, validator_indices.items.len);
+
+            for (validator_indices.items, 0..) |validator_index, j| {
+                if (validator_index >= validators.len) {
+                    return StateTransitionError.InvalidValidatorId;
+                }
+                const validator = &validators[validator_index];
+                const pubkey_bytes = validator.getAttestationPubkey();
+
+                if (pubkey_cache) |cache| {
+                    const pk_handle = cache.getOrPut(validator_index, pubkey_bytes) catch {
+                        return StateTransitionError.InvalidBlockSignatures;
+                    };
+                    public_keys[j] = pk_handle;
+                } else {
+                    const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
+                        return StateTransitionError.InvalidBlockSignatures;
+                    };
+                    public_keys[j] = pubkey.handle;
+                    try pubkey_wrappers.append(scratch_alloc, pubkey);
+                }
+            }
+
+            var message_hash: [32]u8 = undefined;
+            try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
+
+            combined_tasks[task_idx] = .{
+                .public_keys = public_keys,
+                .message_hash = message_hash,
+                .epoch = @intCast(aggregated_attestation.data.slot),
+                .agg_sig = &signature_proof.proof_data,
+            };
+            task_idx += 1;
+        }
+    }
+    std.debug.assert(task_idx == total_attestations);
+
+    stage_watch.lap("phase1_prep_multiblock");
+
+    // -------- Phase 2: ONE rayon batch verify across all blocks --------
+    if (combined_tasks.len > 0) {
+        const start_ns = zeam_utils.monotonicTimestampNs();
+        xmss.verifyAggregatedPayloadBatch(scratch_alloc, combined_tasks) catch |err| {
+            const end_ns = zeam_utils.monotonicTimestampNs();
+            const elapsed_s: f32 = @as(f32, @floatFromInt(if (end_ns >= start_ns) end_ns - start_ns else 0)) / std.time.ns_per_s;
+            zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.record(elapsed_s);
+            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
+            return err;
+        };
+        const end_ns = zeam_utils.monotonicTimestampNs();
+        const elapsed_s: f32 = @as(f32, @floatFromInt(if (end_ns >= start_ns) end_ns - start_ns else 0)) / std.time.ns_per_s;
+        const per_task_elapsed_s = elapsed_s / @as(f32, @floatFromInt(combined_tasks.len));
+        for (combined_tasks) |_| {
+            zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.record(per_task_elapsed_s);
+            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
+        }
+    }
+
+    stage_watch.lap("phase2_batch_verify_multiblock");
+
+    // -------- Per-block proposer signatures (serial; one XMSS each) --------
+    for (tasks) |task| {
+        const validators = task.state.validators.constSlice();
+        const proposer_index: usize = @intCast(task.signed_block.block.proposer_index);
+        if (proposer_index >= validators.len) {
+            return StateTransitionError.InvalidValidatorId;
+        }
+        const proposer = &validators[proposer_index];
+        const proposal_pubkey = proposer.getProposalPubkey();
+
+        const block_epoch: u32 = @intCast(task.signed_block.block.slot);
+        try xmss.verifySsz(
+            proposal_pubkey,
+            task.precomputed_block_root,
+            block_epoch,
+            &task.signed_block.signature.proposer_signature,
+        );
+    }
+    stage_watch.lap("proposer_xmss_verify_multiblock");
+}
+
 pub fn verifySingleAttestation(
     allocator: Allocator,
     state: *const types.BeamState,
