@@ -948,7 +948,19 @@ enum RpcWork {
 /// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` blocks per peer per sweep). Drops on
 /// overflow are logged + counted via `INBOUND_RPC_DROPPED_TOTAL` so a
 /// chronically saturated worker is visible without crashing the loop.
-const INBOUND_RPC_CHANNEL_CAPACITY: usize = 256;
+///
+/// Raised 256 → 1024 to unblock lagging fleet members during catch-up.
+/// A single bulk-status round across the ~60-peer devnet emits roughly
+/// `60 peers × (4 chunks + 1 EndOfStream) = 300` messages, which already
+/// exceeded the prior 256 cap before the chain-worker had a chance to
+/// drain even one block — turning every retry into `chunks=0 imported=0`
+/// and stalling sync. 1024 gives ~3× headroom and still bounds worst-case
+/// memory (each enqueued `RpcWork::Response` holds one block payload).
+///
+/// Real root cause is chain-worker throughput on big XMSS-heavy blocks;
+/// this bump is the surgical unstick while #3 (faster chain.onBlock for
+/// catch-up) is worked separately.
+const INBOUND_RPC_CHANNEL_CAPACITY: usize = 1024;
 
 /// Cumulative count of reqresp FFI dispatches dropped because the worker's
 /// channel was full. Read by the diag emitter (and could be exported via
