@@ -948,7 +948,19 @@ enum RpcWork {
 /// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` blocks per peer per sweep). Drops on
 /// overflow are logged + counted via `INBOUND_RPC_DROPPED_TOTAL` so a
 /// chronically saturated worker is visible without crashing the loop.
-const INBOUND_RPC_CHANNEL_CAPACITY: usize = 256;
+///
+/// Raised 256 → 1024 to unblock lagging fleet members during catch-up.
+/// A single bulk-status round across the ~60-peer devnet emits roughly
+/// `60 peers × (4 chunks + 1 EndOfStream) = 300` messages, which already
+/// exceeded the prior 256 cap before the chain-worker had a chance to
+/// drain even one block — turning every retry into `chunks=0 imported=0`
+/// and stalling sync. 1024 gives ~3× headroom and still bounds worst-case
+/// memory (each enqueued `RpcWork::Response` holds one block payload).
+///
+/// Real root cause is chain-worker throughput on big XMSS-heavy blocks;
+/// this bump is the surgical unstick while #3 (faster chain.onBlock for
+/// catch-up) is worked separately.
+const INBOUND_RPC_CHANNEL_CAPACITY: usize = 1024;
 
 /// Cumulative count of reqresp FFI dispatches dropped because the worker's
 /// channel was full. Read by the diag emitter (and could be exported via
@@ -1861,9 +1873,16 @@ unsafe fn send_rpc_response_chunk_inner(
             },
         );
     } else {
-        logger::rustLogger.error(
+        // Benign race, not an error: peer disconnected (ConnectionClosed
+        // handler dropped this channel) between dispatch and the FFI call
+        // landing here. The libp2p stream is already torn down; the chunk
+        // bytes fall on the floor and the requesting peer will retry on
+        // another peer. Heavy on QUIC churn during catch-up (~150-350/min
+        // per node on devnet). Logged at debug so chronic spam doesn't
+        // pollute the error stream.
+        logger::rustLogger.debug(
             network_id,
-            &format!("No response channel found for id {}", channel_id),
+            &format!("No response channel found for id {} (SendRpcResponseChunk; peer likely disconnected mid-response)", channel_id),
         );
     }
 }
@@ -3130,8 +3149,11 @@ impl Network {
                             logger::rustLogger.debug(self.network_id, &format!(
                                 "[reqresp] Sent end-of-stream on channel {} (peer: {})", channel_id, peer_id));
                         } else {
-                            logger::rustLogger.error(self.network_id, &format!(
-                                "No response channel found for id {} (SendRpcEndOfStream)", channel_id));
+                            // Benign race — see send_rpc_response_chunk note. Peer
+                            // disconnected between dispatch and execution; channel
+                            // was removed by ConnectionClosed retain().
+                            logger::rustLogger.debug(self.network_id, &format!(
+                                "No response channel found for id {} (SendRpcEndOfStream; peer likely disconnected mid-response)", channel_id));
                         }
                     }
                     SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
@@ -3150,8 +3172,11 @@ impl Network {
                             logger::rustLogger.info(self.network_id, &format!(
                                 "[reqresp] Sent error response on channel {} (peer: {})", channel_id, peer_id));
                         } else {
-                            logger::rustLogger.error(self.network_id, &format!(
-                                "No response channel found for id {} (SendRpcErrorResponse)", channel_id));
+                            // Benign race — see send_rpc_response_chunk note. Peer
+                            // disconnected between dispatch and execution; channel
+                            // was removed by ConnectionClosed retain().
+                            logger::rustLogger.debug(self.network_id, &format!(
+                                "No response channel found for id {} (SendRpcErrorResponse; peer likely disconnected mid-response)", channel_id));
                         }
                     }
                     SwarmCommand::DialReconnect { peer_id, addr, attempt } => {

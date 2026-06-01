@@ -51,6 +51,16 @@ const Metrics = struct {
     //       `_duration_seconds` so dashboards can sanity-check that the
     //       sub-step buckets sum to roughly the total).
     zeam_chain_onblock_step_duration_seconds: ChainOnblockStepHistogram,
+    // Per-imported-block weight metrics so the existing
+    // `zeam_chain_onblock_*_duration_seconds` histograms can be correlated
+    // with block "heaviness". The catch-up performance issue surfaced on
+    // PR #963 made it clear that `verify_signatures` (84% of onBlock on
+    // catch-up nodes) is the dominant cost — but without these we can't
+    // tell whether a slow block is slow because of many attestations or
+    // because of a per-block constant cost. Recorded once per onBlock
+    // call, alongside the timing histograms.
+    zeam_chain_onblock_num_aggregated_attestations: BlockAggregatedPayloadsHistogram,
+    zeam_chain_onblock_total_participants: BlockTotalParticipantsHistogram,
     // Slot-driver stall watchdog (#863): a dedicated thread samples the
     // libxev tick clock every WATCHDOG_PROBE_MS via `Clock.lastTickMs()`
     // (atomic acquire load); if the value falls more than
@@ -112,6 +122,25 @@ const Metrics = struct {
     /// itself — the two have very different fixes. See #940.
     zeam_xmss_rec_aggregate_phase_seconds: XmssRecAggregatePhaseHistogram,
     lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
+    // Per-stage timing inside `stf.verifySignaturesParallel` so we can
+    // attribute the `step="verify_signatures"` cost. Existing data shows
+    // verify_signatures averages ~520 ms/block but the rayon Phase-2
+    // batch-verify portion (already measured by
+    // lean_pq_sig_aggregated_signatures_verification_time_seconds) is only
+    // ~6 ms — so >99% of verify_signatures is going somewhere else. These
+    // stages split it apart:
+    //   "phase1_prep"           — serial pubkey-cache prep + index check
+    //                             + AttestationData message-hash compute
+    //   "phase2_batch_verify"   — rayon parallel verifyAggregatedPayloadBatch
+    //                             (mirror of the existing pq_sig metric,
+    //                             same wall-clock — kept here so dashboards
+    //                             can stack stages in one chart)
+    //   "proposer_block_root"   — hashTreeRoot(BeamBlock) for proposer-sig
+    //                             input. Currently re-computed inside even
+    //                             when chain.onBlock already has the root.
+    //   "proposer_xmss_verify"  — xmss.verifySsz of the proposer signature.
+    // See PR #963.
+    zeam_stf_verify_signatures_stage_duration_seconds: StfVerifySignaturesStageHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
     // Network peer metrics
@@ -436,6 +465,15 @@ const Metrics = struct {
         ChainOnblockStepLabel,
         &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
     );
+    // Same bucket layout as ChainOnblockStepHistogram so dashboards can
+    // stack the verify-signatures stages under `step="verify_signatures"`
+    // and confirm they sum to roughly the parent step's wall-clock.
+    const StfVerifySignaturesStageLabel = struct { stage: []const u8 };
+    const StfVerifySignaturesStageHistogram = metrics_lib.HistogramVec(
+        f32,
+        StfVerifySignaturesStageLabel,
+        &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
+    );
     // Watchdog counters (#863): wall-clock heartbeats from the slot-driver
     // libxev thread. The watchdog thread bumps `_fired_total` whenever it
     // observes a stall over the configured threshold; the per-bucket
@@ -525,6 +563,11 @@ const Metrics = struct {
     const BlockBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     const BlockPayloadAggregationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
     const BlockAggregatedPayloadsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128 });
+    // Total participant count summed across all aggregated_attestations in
+    // a block. Each attestation can have up to NUM_VALIDATORS participants;
+    // realistic block totals on devnet sit in the low hundreds today and
+    // grow with the validator set. Buckets cover that range with headroom.
+    const BlockTotalParticipantsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 8, 32, 128, 512, 1024, 2048, 4096, 8192 });
     const BlockBuildingSuccessCounter = metrics_lib.Counter(u64);
     const BlockBuildingFailuresCounter = metrics_lib.Counter(u64);
     // Sync status gauge type: 0=idle, 1=syncing, 2=synced
@@ -723,6 +766,18 @@ fn observeBlockPayloadAggregationTime(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeChainOnblockNumAggregatedAttestations(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockAggregatedPayloadsHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainOnblockTotalParticipants(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockTotalParticipantsHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeBlockAggregatedPayloads(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.BlockAggregatedPayloadsHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -824,6 +879,14 @@ fn observePendingBlocksDrainIters(ctx: ?*anyopaque, value: f32) void {
 pub var zeam_chain_onblock_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeChainOnblock,
+};
+pub var zeam_chain_onblock_num_aggregated_attestations: Histogram = .{
+    .context = null,
+    .observe = &observeChainOnblockNumAggregatedAttestations,
+};
+pub var zeam_chain_onblock_total_participants: Histogram = .{
+    .context = null,
+    .observe = &observeChainOnblockTotalParticipants,
 };
 pub var lean_state_transition_time_seconds: Histogram = .{
     .context = null,
@@ -956,6 +1019,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
         .zeam_chain_onblock_step_duration_seconds = try Metrics.ChainOnblockStepHistogram.init(allocator, io, "zeam_chain_onblock_step_duration_seconds", .{ .help = "Per-substep wall-clock duration inside chain.onBlock, labeled by step. See #863 for context. Buckets match zeam_chain_onblock_duration_seconds for stack-aligned dashboarding." }, .{}),
+        .zeam_stf_verify_signatures_stage_duration_seconds = try Metrics.StfVerifySignaturesStageHistogram.init(allocator, io, "zeam_stf_verify_signatures_stage_duration_seconds", .{ .help = "Per-stage wall-clock duration inside stf.verifySignaturesParallel, labeled by stage. Splits the step=\"verify_signatures\" cost recorded by zeam_chain_onblock_step_duration_seconds across phase1_prep / phase2_batch_verify / proposer_block_root / proposer_xmss_verify. See PR #963." }, .{}),
+        .zeam_chain_onblock_num_aggregated_attestations = Metrics.BlockAggregatedPayloadsHistogram.init("zeam_chain_onblock_num_aggregated_attestations", .{ .help = "Number of aggregated_attestations in each block processed by chain.onBlock (block import). Pair with zeam_chain_onblock_step_duration_seconds{step=\"verify_signatures\"} to attribute slow-block timings to block heaviness vs per-block constant cost. See PR #963." }, .{}),
+        .zeam_chain_onblock_total_participants = Metrics.BlockTotalParticipantsHistogram.init("zeam_chain_onblock_total_participants", .{ .help = "Sum of participants across all aggregated_attestations in each block processed by chain.onBlock. Companion to zeam_chain_onblock_num_aggregated_attestations: same block can have few aggregations but many total participants if the aggregator did its job. See PR #963." }, .{}),
         .zeam_slot_driver_stall_fired_total = Metrics.ZeamSlotDriverStallFiredCounter.init("zeam_slot_driver_stall_fired_total", .{ .help = "Total times the watchdog (#863) observed the libxev slot driver stalled past its threshold (default 5s). Each firing also records the stall duration in zeam_slot_driver_stall_seconds and emits an ERROR log." }, .{}),
         .zeam_slot_driver_stall_seconds = Metrics.ZeamSlotDriverStallSecondsHistogram.init("zeam_slot_driver_stall_seconds", .{ .help = "Distribution of slot-driver stall durations observed by the watchdog (#863). Stalls beyond ~1s indicate the libxev loop, libp2p Rust thread, or chain-worker held the main loop hostage; pair with zeam_chain_onblock_step_duration_seconds to attribute." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
@@ -1118,6 +1184,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
     zeam_chain_onblock_duration_seconds.context = @ptrCast(&metrics.zeam_chain_onblock_duration_seconds);
+    zeam_chain_onblock_num_aggregated_attestations.context = @ptrCast(&metrics.zeam_chain_onblock_num_aggregated_attestations);
+    zeam_chain_onblock_total_participants.context = @ptrCast(&metrics.zeam_chain_onblock_total_participants);
     lean_state_transition_time_seconds.context = @ptrCast(&metrics.lean_state_transition_time_seconds);
     lean_state_transition_slots_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_slots_processing_time_seconds);
     lean_state_transition_block_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_block_processing_time_seconds);
