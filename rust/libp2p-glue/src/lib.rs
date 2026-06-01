@@ -3112,7 +3112,7 @@ impl Network {
                         let _ = RESPONSE_CHANNEL_MAP
                             .lock_recover()
                             .update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
-                        logger::rustLogger.info(self.network_id, &format!(
+                        logger::rustLogger.debug(self.network_id, &format!(
                             "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, peer_id));
                     }
                     SwarmCommand::SendRpcEndOfStream { channel_id } => {
@@ -3123,7 +3123,7 @@ impl Network {
                             swarm.behaviour_mut().reqresp.finish_response_stream(
                                 peer_id, channel.connection_id, channel.stream_id,
                             );
-                            logger::rustLogger.info(self.network_id, &format!(
+                            logger::rustLogger.debug(self.network_id, &format!(
                                 "[reqresp] Sent end-of-stream on channel {} (peer: {})", channel_id, peer_id));
                         } else {
                             logger::rustLogger.error(self.network_id, &format!(
