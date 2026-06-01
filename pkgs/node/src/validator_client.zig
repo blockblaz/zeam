@@ -124,7 +124,7 @@ pub const ValidatorClient = struct {
                     // the gossip mesh while still expecting block production.
                     self.logger.info("producing block for slot={d} proposer={d} with no peers (self-import only)", .{ slot, slot_proposer_id });
                 },
-                .behind_peers => |info| {
+                .peers_materially_ahead => |info| {
                     self.chain.logBehindPeersDebug("skipping block production", info);
                     self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
                         slot,
@@ -182,7 +182,7 @@ pub const ValidatorClient = struct {
                 // and they will propagate once peers connect.
                 self.logger.info("attesting for slot={d} with no peers (self-import only)", .{slot});
             },
-            .behind_peers => |info| {
+            .peers_materially_ahead => |info| {
                 self.chain.logBehindPeersDebug("skipping attestation production", info);
                 self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
                     slot,

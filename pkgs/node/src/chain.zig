@@ -2352,7 +2352,7 @@ pub const BeamChain = struct {
         {
             const sync_status = self.getSyncStatus();
             zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "idle" }, if (sync_status == .no_peers or sync_status == .fc_initing) 1 else 0) catch {};
-            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "syncing" }, if (sync_status == .behind_peers) 1 else 0) catch {};
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "syncing" }, if (sync_status == .peers_materially_ahead) 1 else 0) catch {};
             zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "synced" }, if (sync_status == .synced) 1 else 0) catch {};
         }
 
@@ -3120,12 +3120,12 @@ pub const BeamChain = struct {
                 // (`subspecs/sync/service.py::on_gossip_attestation`):
                 // gossip is processed in `SYNCING` and `SYNCED`; only
                 // dropped in `IDLE` (no peers / forkchoice not yet
-                // initialised). The behind_peers state maps to spec
+                // initialised). The peers_materially_ahead state maps to spec
                 // `SYNCING` — accept attestations and let the buffer
                 // catch unknown-block / future-slot ones for replay
                 // after the next gossip block lands.
                 switch (self.getSyncStatus()) {
-                    .synced, .behind_peers => {},
+                    .synced, .peers_materially_ahead => {},
                     .no_peers, .fc_initing => {
                         zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "attestation", .reason = "syncing" }) catch {};
                         return .{};
@@ -3232,7 +3232,7 @@ pub const BeamChain = struct {
                 // Retryable validation failures land in the pending
                 // buffer for replay.
                 switch (self.getSyncStatus()) {
-                    .synced, .behind_peers => {},
+                    .synced, .peers_materially_ahead => {},
                     .no_peers, .fc_initing => {
                         zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "syncing" }) catch {};
                         return .{};
@@ -4505,7 +4505,7 @@ pub const BeamChain = struct {
                 // attestation weight, and aggregates will propagate once peers connect.
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
-            .behind_peers => |info| {
+            .peers_materially_ahead => |info| {
                 self.logBehindPeersDebug("skipping aggregation production", info);
                 self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
                     slot,
@@ -4847,7 +4847,7 @@ pub const BeamChain = struct {
         /// observed a real justified checkpoint via block processing.  Validator duties must
         /// not run until the first onBlock-driven justified update transitions FC to ready.
         fc_initing,
-        behind_peers: BehindPeersInfo,
+        peers_materially_ahead: BehindPeersInfo,
     };
 
     pub const MAX_BEHIND_PEERS_TO_REPORT = 16;
@@ -4887,7 +4887,7 @@ pub const BeamChain = struct {
 
     pub fn logBehindPeersDebug(self: *Self, context: []const u8, info: BehindPeersInfo) void {
         for (info.peers[0..info.peer_count]) |peer| {
-            self.logger.debug("{s}: behind_peers peer {s}{f} finalized_slot={d} max_peer_finalized_slot={d}", .{
+            self.logger.debug("{s}: peers_materially_ahead peer {s}{f} finalized_slot={d} max_peer_finalized_slot={d}", .{
                 context,
                 peer.peerId(),
                 self.node_registry.getNodeNameFromPeerId(peer.peerId()),
@@ -4896,7 +4896,7 @@ pub const BeamChain = struct {
             });
         }
         if (info.peers_truncated) {
-            self.logger.debug("{s}: behind_peers peer list truncated after {d} entries", .{ context, info.peer_count });
+            self.logger.debug("{s}: peers_materially_ahead peer list truncated after {d} entries", .{ context, info.peer_count });
         }
     }
 
@@ -4938,9 +4938,9 @@ pub const BeamChain = struct {
             }
         }
 
-        // `behind_peers` maps to leanSpec **SYNCING** ("deep sync"). It must
+        // `peers_materially_ahead` maps to leanSpec **SYNCING** ("deep sync"). It must
         // ONLY fire on a finalization gap; a 1-slot head delta is normal
-        // gossip latency, not deep sync, and `behind_peers` consumers
+        // gossip latency, not deep sync, and `peers_materially_ahead` consumers
         // (`validator_client.maybeDoProposal` / `mayBeDoAttestation`) skip
         // proposer/attestation duties — gating those on transient head
         // lag would silently disable validators near the head.
@@ -4953,7 +4953,7 @@ pub const BeamChain = struct {
 
         // Check 1/2: our head or finalization is behind peer finalization.
         // Include the exact peers whose finalized slots make this node report
-        // `behind_peers`, so logs can name the source of the decision.
+        // `peers_materially_ahead`, so logs can name the source of the decision.
         const behind_peer_finalization = our_head_slot < max_peer_finalized_slot or our_finalized_slot < max_peer_finalized_slot;
         if (behind_peer_finalization) {
             var info = self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
@@ -4964,7 +4964,7 @@ pub const BeamChain = struct {
                 const peer_info = entry.value_ptr;
                 if (peer_info.latest_status) |status| {
                     if (status.finalized_slot > our_head_slot or status.finalized_slot > our_finalized_slot) {
-                        info.behind_peers.addPeer(peer_info.peer_id, status.finalized_slot);
+                        info.peers_materially_ahead.addPeer(peer_info.peer_id, status.finalized_slot);
                     }
                 }
             }
@@ -4993,7 +4993,7 @@ pub const BeamChain = struct {
         max_peer_finalized_slot: types.Slot,
     ) SyncStatus {
         _ = self;
-        return .{ .behind_peers = .{
+        return .{ .peers_materially_ahead = .{
             .head_slot = head_slot,
             .finalized_slot = finalized_slot,
             .max_peer_finalized_slot = max_peer_finalized_slot,

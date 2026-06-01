@@ -2089,7 +2089,7 @@ pub const BeamNode = struct {
                         };
                         const sync_status = self.chain.getSyncStatus();
                         switch (sync_status) {
-                            .behind_peers => |info| {
+                            .peers_materially_ahead => |info| {
                                 const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
                                 if (self.shouldCatchUpFromPeerStatus(
                                     catch_up_status,
@@ -2182,7 +2182,7 @@ pub const BeamNode = struct {
                         // pending_block_roots so a different peer can
                         // serve them. Without this, a failed request
                         // permanently stalls the parent-chain walk used
-                        // during fc_initing / behind_peers sync.
+                        // during fc_initing / peers_materially_ahead sync.
                         self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
                         return;
                     },
@@ -2213,7 +2213,7 @@ pub const BeamNode = struct {
                 // peer. Without this, a peer that returns EOS without
                 // fulfilling all requested roots (e.g., a mesh helper
                 // with head_slot=0) permanently stalls the parent-chain
-                // walk used during fc_initing / behind_peers sync.
+                // walk used during fc_initing / peers_materially_ahead sync.
                 if (snap.request_kind == .blocks_by_root) {
                     self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
                     return;
