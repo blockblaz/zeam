@@ -3404,7 +3404,11 @@ pub const BeamChain = struct {
             // atomic and the loser frees its handle. The previous
             // mutex around this block was the dominant contributor
             // to the ~78ms mean lock hold reported in #863.
-            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool);
+            // Pass the precomputed block_root so verifySignaturesParallel can
+            // skip its own hashTreeRoot(BeamBlock) call (free win — see PR #963
+            // perf instrumentation: empty blocks were spending most of their
+            // verify_signatures budget in the duplicated hash).
+            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool, &block_root);
 
             step_watch.lap("verify_signatures");
 
@@ -3507,6 +3511,27 @@ pub const BeamChain = struct {
 
             const aggregated_attestations = block.body.attestations.constSlice();
             const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
+
+            // Per-imported-block weight observation (PR #963 follow-up to
+            // option-3(c) instrumentation). Lets dashboards correlate the
+            // existing `zeam_chain_onblock_step_duration_seconds{step=...}`
+            // timings with how heavy the block actually is. `verify_signatures`
+            // is ~84% of onBlock on catch-up nodes; without these we cannot
+            // tell whether a slow block was slow because it carried many
+            // attestations / participants or whether there is a per-block
+            // constant cost worth investigating.
+            zeam_metrics.zeam_chain_onblock_num_aggregated_attestations.record(@floatFromInt(aggregated_attestations.len));
+            {
+                var total_participants: usize = 0;
+                for (aggregated_attestations) |agg_att| {
+                    const bits_len = agg_att.aggregation_bits.len();
+                    var i: usize = 0;
+                    while (i < bits_len) : (i += 1) {
+                        if (agg_att.aggregation_bits.get(i) catch false) total_participants += 1;
+                    }
+                }
+                zeam_metrics.zeam_chain_onblock_total_participants.record(@floatFromInt(total_participants));
+            }
 
             if (aggregated_attestations.len != signature_groups.len) {
                 self.logger.err(

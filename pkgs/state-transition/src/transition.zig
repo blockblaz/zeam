@@ -184,6 +184,7 @@ pub fn verifySignaturesParallel(
     signed_block: *const types.SignedBlock,
     pubkey_cache: ?*xmss.PublicKeyCache,
     thread_pool: anytype,
+    precomputed_block_root: ?*const [32]u8,
 ) !void {
     const attestations = signed_block.block.body.attestations.constSlice();
     const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
@@ -194,6 +195,30 @@ pub fn verifySignaturesParallel(
 
     const validators = state.validators.constSlice();
     _ = thread_pool;
+
+    // Per-stage stopwatch (PR #963). Splits this function's wall clock into
+    // phase1_prep / phase2_batch_verify / proposer_block_root /
+    // proposer_xmss_verify so we can attribute the ~520 ms/block cost that
+    // dashboards see under `step="verify_signatures"`. The rayon batch
+    // verify (phase2) is already known to be small (<6 ms/block on devnet);
+    // the remaining ~98% is what these stages will localise.
+    const VerifyStageWatch = struct {
+        anchor_ns: i128,
+        fn init() @This() {
+            return .{ .anchor_ns = zeam_utils.monotonicTimestampNs() };
+        }
+        fn lap(self: *@This(), comptime stage: []const u8) void {
+            const now_ns = zeam_utils.monotonicTimestampNs();
+            const elapsed_ns: i128 = if (now_ns >= self.anchor_ns) now_ns - self.anchor_ns else 0;
+            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+            zeam_metrics.metrics.zeam_stf_verify_signatures_stage_duration_seconds.observe(
+                .{ .stage = stage },
+                elapsed_s,
+            ) catch {};
+            self.anchor_ns = now_ns;
+        }
+    };
+    var stage_watch = VerifyStageWatch.init();
 
     // All per-task scratch (pubkey handle arrays, pubkey_wrappers when cache is absent)
     // lives in this arena and is freed with one call after the parallel phase returns.
@@ -263,6 +288,8 @@ pub fn verifySignaturesParallel(
         };
     }
 
+    stage_watch.lap("phase1_prep");
+
     // -------- Phase 2: rayon batch verify --------
     const start_ns = zeam_utils.monotonicTimestampNs();
     xmss.verifyAggregatedPayloadBatch(scratch_alloc, tasks) catch |err| {
@@ -280,6 +307,8 @@ pub fn verifySignaturesParallel(
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
     }
 
+    stage_watch.lap("phase2_batch_verify");
+
     // Proposer signature — single verify, do it serially.
     const proposer_index: usize = @intCast(signed_block.block.proposer_index);
     if (proposer_index >= validators.len) {
@@ -288,11 +317,23 @@ pub fn verifySignaturesParallel(
     const proposer = &validators[proposer_index];
     const proposal_pubkey = proposer.getProposalPubkey();
 
-    var block_root: [32]u8 = undefined;
-    try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, allocator);
+    // Reuse the caller-supplied block_root when available — chain.onBlock
+    // already computed hashTreeRoot(BeamBlock) before calling this function
+    // (see `step="block_root_compute"`). Re-hashing here is wasted work on
+    // every block and was previously the prime suspect for the
+    // 520 ms/block verify_signatures cost on empty blocks (no attestations
+    // → Phase 1 + Phase 2 are no-ops, so the cost has to live in this
+    // proposer path). PR #963.
+    var local_block_root: [32]u8 = undefined;
+    const block_root: *const [32]u8 = if (precomputed_block_root) |r| r else blk: {
+        try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &local_block_root, allocator);
+        break :blk &local_block_root;
+    };
+    stage_watch.lap("proposer_block_root");
 
     const block_epoch: u32 = @intCast(signed_block.block.slot);
-    try xmss.verifySsz(proposal_pubkey, &block_root, block_epoch, &signed_block.signature.proposer_signature);
+    try xmss.verifySsz(proposal_pubkey, block_root, block_epoch, &signed_block.signature.proposer_signature);
+    stage_watch.lap("proposer_xmss_verify");
 }
 
 pub fn verifySingleAttestation(
