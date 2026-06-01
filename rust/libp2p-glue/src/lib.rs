@@ -1873,9 +1873,16 @@ unsafe fn send_rpc_response_chunk_inner(
             },
         );
     } else {
-        logger::rustLogger.error(
+        // Benign race, not an error: peer disconnected (ConnectionClosed
+        // handler dropped this channel) between dispatch and the FFI call
+        // landing here. The libp2p stream is already torn down; the chunk
+        // bytes fall on the floor and the requesting peer will retry on
+        // another peer. Heavy on QUIC churn during catch-up (~150-350/min
+        // per node on devnet). Logged at debug so chronic spam doesn't
+        // pollute the error stream.
+        logger::rustLogger.debug(
             network_id,
-            &format!("No response channel found for id {}", channel_id),
+            &format!("No response channel found for id {} (SendRpcResponseChunk; peer likely disconnected mid-response)", channel_id),
         );
     }
 }
@@ -3142,8 +3149,11 @@ impl Network {
                             logger::rustLogger.debug(self.network_id, &format!(
                                 "[reqresp] Sent end-of-stream on channel {} (peer: {})", channel_id, peer_id));
                         } else {
-                            logger::rustLogger.error(self.network_id, &format!(
-                                "No response channel found for id {} (SendRpcEndOfStream)", channel_id));
+                            // Benign race — see send_rpc_response_chunk note. Peer
+                            // disconnected between dispatch and execution; channel
+                            // was removed by ConnectionClosed retain().
+                            logger::rustLogger.debug(self.network_id, &format!(
+                                "No response channel found for id {} (SendRpcEndOfStream; peer likely disconnected mid-response)", channel_id));
                         }
                     }
                     SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
@@ -3162,8 +3172,11 @@ impl Network {
                             logger::rustLogger.info(self.network_id, &format!(
                                 "[reqresp] Sent error response on channel {} (peer: {})", channel_id, peer_id));
                         } else {
-                            logger::rustLogger.error(self.network_id, &format!(
-                                "No response channel found for id {} (SendRpcErrorResponse)", channel_id));
+                            // Benign race — see send_rpc_response_chunk note. Peer
+                            // disconnected between dispatch and execution; channel
+                            // was removed by ConnectionClosed retain().
+                            logger::rustLogger.debug(self.network_id, &format!(
+                                "No response channel found for id {} (SendRpcErrorResponse; peer likely disconnected mid-response)", channel_id));
                         }
                     }
                     SwarmCommand::DialReconnect { peer_id, addr, attempt } => {
