@@ -4481,11 +4481,14 @@ pub const BeamChain = struct {
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
-                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
+                var behind_peers_buf: [1024]u8 = undefined;
+                const behind_peers = info.peerListForLog(&behind_peers_buf);
+                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peers={s})", .{
                     slot,
                     info.head_slot,
                     info.finalized_slot,
                     info.max_peer_finalized_slot,
+                    behind_peers,
                 });
                 zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
                 return;
@@ -4820,11 +4823,75 @@ pub const BeamChain = struct {
         /// observed a real justified checkpoint via block processing.  Validator duties must
         /// not run until the first onBlock-driven justified update transitions FC to ready.
         fc_initing,
-        behind_peers: struct {
-            head_slot: types.Slot,
-            finalized_slot: types.Slot,
-            max_peer_finalized_slot: types.Slot,
-        },
+        behind_peers: BehindPeersInfo,
+    };
+
+    pub const MAX_BEHIND_PEERS_TO_REPORT = 16;
+    pub const MAX_BEHIND_PEER_ID_BYTES = 128;
+
+    pub const BehindPeerInfo = struct {
+        peer_id_buf: [MAX_BEHIND_PEER_ID_BYTES]u8 = undefined,
+        peer_id_len: usize = 0,
+        finalized_slot: types.Slot = 0,
+
+        pub fn peerId(self: *const @This()) []const u8 {
+            return self.peer_id_buf[0..self.peer_id_len];
+        }
+    };
+
+    pub const BehindPeersInfo = struct {
+        head_slot: types.Slot,
+        finalized_slot: types.Slot,
+        max_peer_finalized_slot: types.Slot,
+        peers: [MAX_BEHIND_PEERS_TO_REPORT]BehindPeerInfo = undefined,
+        peer_count: usize = 0,
+        peers_truncated: bool = false,
+
+        pub fn peerListForLog(self: *const @This(), buf: []u8) []const u8 {
+            var pos: usize = 0;
+            appendText(buf, &pos, "[");
+            for (self.peers[0..self.peer_count], 0..) |peer, idx| {
+                if (idx != 0) appendText(buf, &pos, ", ");
+                appendFmt(buf, &pos, "{s}(finalized_slot={d})", .{ peer.peerId(), peer.finalized_slot });
+            }
+            if (self.peers_truncated) {
+                if (self.peer_count != 0) appendText(buf, &pos, ", ");
+                appendText(buf, &pos, "...");
+            }
+            appendText(buf, &pos, "]");
+            return buf[0..pos];
+        }
+
+        fn appendText(buf: []u8, pos: *usize, text: []const u8) void {
+            if (pos.* >= buf.len) return;
+            const copy_len = @min(text.len, buf.len - pos.*);
+            @memcpy(buf[pos.*..][0..copy_len], text[0..copy_len]);
+            pos.* += copy_len;
+        }
+
+        fn appendFmt(buf: []u8, pos: *usize, comptime fmt: []const u8, args: anytype) void {
+            if (pos.* >= buf.len) return;
+            const written = std.fmt.bufPrint(buf[pos.*..], fmt, args) catch |err| switch (err) {
+                error.NoSpaceLeft => {
+                    pos.* = buf.len;
+                    return;
+                },
+            };
+            pos.* += written.len;
+        }
+
+        fn addPeer(self: *@This(), peer_id: []const u8, finalized_slot: types.Slot) void {
+            if (self.peer_count >= self.peers.len) {
+                self.peers_truncated = true;
+                return;
+            }
+            const copy_len = @min(peer_id.len, MAX_BEHIND_PEER_ID_BYTES);
+            var peer = BehindPeerInfo{ .peer_id_len = copy_len, .finalized_slot = finalized_slot };
+            @memcpy(peer.peer_id_buf[0..copy_len], peer_id[0..copy_len]);
+            self.peers[self.peer_count] = peer;
+            self.peer_count += 1;
+            if (copy_len < peer_id.len) self.peers_truncated = true;
+        }
     };
 
     /// Returns detailed sync status information.
@@ -4848,17 +4915,19 @@ pub const BeamChain = struct {
         const our_head_slot = self.forkChoice.getHead().slot;
         const our_finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
-        // Find the maximum finalized slot reported by any peer
+        // Find the maximum finalized slot reported by any peer.
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
 
-        var peer_guard = self.connected_peers.iterateLocked();
-        defer peer_guard.deinit();
-        var peer_iter = peer_guard.iter;
-        while (peer_iter.next()) |entry| {
-            const peer_info = entry.value_ptr;
-            if (peer_info.latest_status) |status| {
-                if (status.finalized_slot > max_peer_finalized_slot) {
-                    max_peer_finalized_slot = status.finalized_slot;
+        {
+            var peer_guard = self.connected_peers.iterateLocked();
+            defer peer_guard.deinit();
+            var peer_iter = peer_guard.iter;
+            while (peer_iter.next()) |entry| {
+                const peer_info = entry.value_ptr;
+                if (peer_info.latest_status) |status| {
+                    if (status.finalized_slot > max_peer_finalized_slot) {
+                        max_peer_finalized_slot = status.finalized_slot;
+                    }
                 }
             }
         }
@@ -4876,14 +4945,24 @@ pub const BeamChain = struct {
         // reports a higher head triggers catch-up without changing the
         // node's high-level sync state.
 
-        // Check 1: our head is behind peer finalization — we don't even have finalized blocks
-        if (our_head_slot < max_peer_finalized_slot) {
-            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
-        }
-
-        // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
-        if (our_finalized_slot < max_peer_finalized_slot) {
-            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
+        // Check 1/2: our head or finalization is behind peer finalization.
+        // Include the exact peers whose finalized slots make this node report
+        // `behind_peers`, so logs can name the source of the decision.
+        const behind_peer_finalization = our_head_slot < max_peer_finalized_slot or our_finalized_slot < max_peer_finalized_slot;
+        if (behind_peer_finalization) {
+            var info = self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
+            var cause_guard = self.connected_peers.iterateLocked();
+            defer cause_guard.deinit();
+            var cause_iter = cause_guard.iter;
+            while (cause_iter.next()) |entry| {
+                const peer_info = entry.value_ptr;
+                if (peer_info.latest_status) |status| {
+                    if (status.finalized_slot > our_head_slot or status.finalized_slot > our_finalized_slot) {
+                        info.behind_peers.addPeer(peer_info.peer_id, status.finalized_slot);
+                    }
+                }
+            }
+            return info;
         }
 
         // Check 3: pre-finalization devnets — wall-clock head lag means we are

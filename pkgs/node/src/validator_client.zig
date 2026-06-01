@@ -125,12 +125,15 @@ pub const ValidatorClient = struct {
                     self.logger.info("producing block for slot={d} proposer={d} with no peers (self-import only)", .{ slot, slot_proposer_id });
                 },
                 .behind_peers => |info| {
-                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
+                    var behind_peers_buf: [1024]u8 = undefined;
+                    const behind_peers = info.peerListForLog(&behind_peers_buf);
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peers={s})", .{
                         slot,
                         slot_proposer_id,
                         info.head_slot,
                         info.finalized_slot,
                         info.max_peer_finalized_slot,
+                        behind_peers,
                     });
                     return null;
                 },
@@ -181,11 +184,14 @@ pub const ValidatorClient = struct {
                 self.logger.info("attesting for slot={d} with no peers (self-import only)", .{slot});
             },
             .behind_peers => |info| {
-                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
+                var behind_peers_buf: [1024]u8 = undefined;
+                const behind_peers = info.peerListForLog(&behind_peers_buf);
+                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peers={s})", .{
                     slot,
                     info.head_slot,
                     info.finalized_slot,
                     info.max_peer_finalized_slot,
+                    behind_peers,
                 });
                 return null;
             },
