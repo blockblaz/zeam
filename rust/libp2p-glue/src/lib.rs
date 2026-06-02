@@ -2742,7 +2742,12 @@ impl Network {
                                 record_mesh_peers(self.network_id, mesh_count);
                             }
 
-                            if let gossipsub::Event::Message { message, .. } = gossipsub_event {
+                            if let gossipsub::Event::Message {
+                                propagation_source,
+                                message,
+                                ..
+                            } = gossipsub_event
+                            {
                                 // #942: do NOT decode here. The full
                                 // snappy-decompress + SSZ-deserialize + chain
                                 // dispatch (`handleMsgFromRustBridge`) used to
@@ -2772,7 +2777,23 @@ impl Network {
                                     }
                                 };
 
-                                let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
+                                // `message.source` is `Some(PeerId)` only when the message
+                                // was signed by its original publisher. zeam runs
+                                // gossipsub with `ValidationMode::Anonymous`, which means
+                                // signed_messages are disabled and `message.source` is
+                                // ALWAYS `None`. Previously we logged the literal string
+                                // "unknown_peer" in that case, which destroyed our
+                                // ability to attribute byte-corrupt arrivals to a
+                                // specific upstream peer (#942 — we couldn't tell
+                                // which client was forwarding the malformed snappy).
+                                // Fall back to `propagation_source` — the peer who
+                                // actually handed us these bytes on this hop — which
+                                // is always populated by libp2p-gossipsub. This is the
+                                // peer we can score, disconnect, or report upstream.
+                                let sender_peer_id_string = message
+                                    .source
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| propagation_source.to_string());
                                 let sender_peer_id = match CString::new(sender_peer_id_string.as_str()) {
                                     Ok(cstring) => cstring,
                                     Err(_) => {
