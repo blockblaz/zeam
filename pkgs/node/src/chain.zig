@@ -4926,7 +4926,7 @@ pub const BeamChain = struct {
     pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_aggregator" }) catch {};
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_aggregator" }) catch {};
             return;
         }
 
@@ -4935,7 +4935,7 @@ pub const BeamChain = struct {
             .synced => {},
             .fc_initing => {
                 self.logger.warn("skipping aggregation production for slot={d}: forkchoice initializing", .{slot});
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
                 return;
             },
             .no_peers => {
@@ -4965,7 +4965,7 @@ pub const BeamChain = struct {
                         info.max_peer_finalized_slot,
                         info.peer_count,
                     });
-                    zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                    zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
                     return;
                 }
             },
@@ -4996,7 +4996,7 @@ pub const BeamChain = struct {
         self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, slot }) catch {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "spawn_failed" }) catch {};
             return;
         };
     }
@@ -5040,12 +5040,14 @@ pub const BeamChain = struct {
         const head_root = chain.forkChoice.getHead().blockRoot;
         var borrow = chain.statesGet(head_root) orelse {
             chain.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "missing_state" }) catch {};
             return;
         };
         defer borrow.deinit();
 
         var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, chain.allocator) catch |err| {
             chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
             return;
         };
         defer validators_owned.deinit();
@@ -5072,6 +5074,7 @@ pub const BeamChain = struct {
             publishOneAggregate,
         ) catch |err| {
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
             return;
         };
         defer chain.allocator.free(aggregations);
