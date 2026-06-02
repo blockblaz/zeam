@@ -4812,14 +4812,28 @@ pub const BeamChain = struct {
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
-                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
-                    slot,
-                    info.head_slot,
-                    info.finalized_slot,
-                    info.max_peer_finalized_slot,
-                });
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
-                return;
+                // Same pre-finalization cold-start exception as
+                // validator_client.mayBeDoAttestation (see its long
+                // comment). Aggregation MUST proceed when both finalized
+                // slots are 0, otherwise we never produce the first
+                // aggregated payload and the chain can't reach a first
+                // justification. Once any finalization exists the gate
+                // returns to its proper deep-sync meaning.
+                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
+                    self.logger.info(
+                        "behind_peers but pre-finalization (finalized_slot=0, max_peer_finalized_slot=0): aggregating for slot={d} on current head_slot={d} to help reach first justification",
+                        .{ slot, info.head_slot },
+                    );
+                } else {
+                    self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
+                        slot,
+                        info.head_slot,
+                        info.finalized_slot,
+                        info.max_peer_finalized_slot,
+                    });
+                    zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                    return;
+                }
             },
         }
 
