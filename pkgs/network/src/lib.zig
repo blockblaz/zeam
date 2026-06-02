@@ -39,6 +39,11 @@ pub const EthLibp2p = ethlibp2pFactory.EthLibp2p;
 const node_registryFactory = @import("./node_registry.zig");
 pub const NodeNameRegistry = node_registryFactory.NodeNameRegistry;
 
+// v2 (pure-Zig, zig-libp2p v0.1.0). See pkgs/network/MIGRATION.md.
+pub const ethlibp2p_v2 = @import("./ethlibp2p_v2.zig");
+pub const EthLibp2pV2 = ethlibp2p_v2.EthLibp2pV2;
+pub const EthLibp2pV2Params = ethlibp2p_v2.EthLibp2pV2Params;
+
 test "get tests" {
     @import("std").testing.refAllDecls(@This());
 }

@@ -326,6 +326,19 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
     zeam_network.addImport("@zeam/metrics", zeam_metrics);
+
+    // zig-libp2p v0.1.0 — opt-in pure-Zig libp2p stack replacing the Rust
+    // glue crate. Wired into the network module so `ethlibp2p_v2.zig` can
+    // `@import("zig_libp2p")` while the legacy `ethlibp2p.zig` continues to
+    // FFI into the Rust crate. Flip embedders over to the Zig stack one
+    // call site at a time; remove the Rust crate when the last consumer
+    // is gone.
+    const zig_libp2p_dep = b.dependency("zig_libp2p", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_network.addImport("zig_libp2p", zig_libp2p_dep.module("zig_libp2p"));
+
     // #942 follow-up: the publish-side forensic log line in `ethlibp2p.zig`
     // includes the build git SHA so receivers across the fleet can correlate
     // broken-byte receipts back to the exact producer binary.
