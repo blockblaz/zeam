@@ -258,10 +258,10 @@ const Metrics = struct {
     /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
     /// plus `publishProducedAggregations` when the aggregator produces gossip aggregates.
     zeam_node_aggregation_interval_tick_seconds: AggregationIntervalTickHistogram,
-    /// Counter for skipped aggregate submissions, labeled by reason.
-    /// Reasons: "not_aggregator", "not_synced", "missing_state", "spawn_failed".
+    /// Standard leanMetrics counter for skipped aggregate submissions, labeled by reason.
+    /// Reasons: "not_aggregator", "not_synced", "missing_state", "spawn_failed", "other".
     /// (In-flight triggers are coalesced via `zeam_aggregate_coalesced_total`.)
-    zeam_aggregate_skip_total: AggregateSkipCounter,
+    lean_aggregator_skipped_total: AggregateSkipCounter,
     /// Slot-driver aggregation triggers coalesced while a worker was in flight.
     /// A single catch-up run is scheduled when the worker finishes.
     zeam_aggregate_coalesced_total: AggregateCoalescedCounter,
@@ -1193,7 +1193,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_libxev_callback_duration_seconds = try Metrics.LibxevCallbackDurationHistogram.init(allocator, io, "zeam_libxev_callback_duration_seconds", .{ .help = "Wall-clock time spent inside individual libxev callbacks, labeled by site (issue #942). Tracks synchronous CPU work blocking the libxev thread between drain passes. Compare against zeam_xev_clock_until_done_drain_seconds and the slow_ge_*ms counters to attribute slow drains to a specific callsite. Sites include onGossip.block.hash_tree_root, onGossip.block.ssz_clone, onGossip.aggregation.ssz_clone, onGossip.attestation.dispatch, onInterval.tick, chain.onGossip.dispatch." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
-        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
+        .lean_aggregator_skipped_total = try Metrics.AggregateSkipCounter.init(allocator, io, "lean_aggregator_skipped_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed, other. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
         .zeam_aggregate_coalesced_total = Metrics.AggregateCoalescedCounter.init("zeam_aggregate_coalesced_total", .{ .help = "Aggregation slot triggers coalesced while a worker was in flight; one catch-up run is scheduled when the worker finishes." }, .{}),
         .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of one aggregate worker run (snapshot through publishProducedAggregations), including all XMSS recursive STARK FFI inside computeAggregatedSignatures. Primary latency signal for aggregator slot budget (issue #907)." }, .{}),
         .zeam_aggregator_publish_aggregations_total = try Metrics.AggregatorPublishAggregationsCounter.init(allocator, io, "zeam_aggregator_publish_aggregations_total", .{ .help = "SignedAggregatedAttestation messages published by the local aggregator worker, labeled by attestation subnet. Distinct from lean_pq_sig_aggregated_signatures_total (block-proposal path only) so cross-client dashboards keep the standard metric's semantics intact." }, .{}),
@@ -1793,6 +1793,36 @@ test "attestation aggregate coverage metrics use leanSpec names" {
     try testing.expect(std.mem.indexOf(u8, body, "subnet=\"subnet_0\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "direction=\"block_only\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "direction=\"timely_only\"") != null);
+}
+
+test "aggregator skipped metric uses leanMetrics name and reasons" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    const reasons = [_][]const u8{
+        "not_aggregator",
+        "not_synced",
+        "missing_state",
+        "spawn_failed",
+        "other",
+    };
+    for (reasons) |reason| {
+        metrics.lean_aggregator_skipped_total.incr(.{ .reason = reason }) catch {};
+    }
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "lean_aggregator_skipped_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_aggregate_skip_total") == null);
+    for (reasons) |reason| {
+        var expected: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&expected, "reason=\"{s}\"", .{reason});
+        try testing.expect(std.mem.indexOf(u8, body, label) != null);
+    }
 }
 
 // Issues #863 / #867: clock-loop xev drain observability must stay in the
