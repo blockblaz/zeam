@@ -3715,7 +3715,7 @@ pub const BeamChain = struct {
             // here would duplicate the work that was the whole reason to
             // batch in the first place. `blockInfo.preVerified` is set
             // ONLY by that controlled caller; bare callers leave it false.
-            if (!blockInfo.skipVerify || !blockInfo.preVerified) {
+            if (!blockInfo.skipVerify or !blockInfo.preVerified) {
                 try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool, &block_root);
             }
 
