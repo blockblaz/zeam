@@ -121,6 +121,17 @@ pub const NodeOptions = struct {
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
     /// issue #907 finding 4.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Percentage of the proposal interval allocated as the build-worker
+    /// deadline budget.
+    proposal_deadline_pct: u32 = node_lib.default_proposal_deadline_pct,
+    /// Cap on the number of child STARK proofs merged with raw signatures
+    /// by the aggregator-worker path. Threaded through to
+    /// `ForkChoice.max_aggregation_children` and applied by
+    /// `prepareAggregateAttData` after greedy + subset-prune. Surfaced as
+    /// `--max-aggregation-children` on the `zeam node` CLI; default is
+    /// `pkgs/types/src/block.zig:default_max_aggregation_children` (0 —
+    /// flat-only worker path). See #940 follow-up.
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -597,7 +608,9 @@ pub const Node = struct {
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
             .min_aggregation_inputs = options.min_aggregation_inputs,
+            .max_aggregation_children = options.max_aggregation_children,
             .aggregate_max_inflight = aggregate_max_inflight,
+            .proposal_deadline_pct = options.proposal_deadline_pct,
         });
         errdefer self.beam_node.deinit();
 
@@ -691,6 +704,12 @@ pub const Node = struct {
         // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
         // command already does network-first; this is the matching swap for
         // the production node path.
+        //
+        // Peer + req-resp handlers are subscribed before the network starts so
+        // the one-shot peer-connect event and early STATUS requests are not
+        // lost to a handler-not-yet-registered race; only gossip mesh subscribe
+        // needs the running channel and stays inside `BeamNode.run()`.
+        try self.beam_node.subscribeNetworkEventHandlers();
         try self.network.run();
         try self.beam_node.run();
 
@@ -1147,8 +1166,7 @@ fn downloadCheckpointState(
     logger.info("successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
 
     // Clone the state to move it out of the arena using the proper cloning function
-    var cloned_state: types.BeamState = undefined;
-    try types.sszClone(allocator, types.BeamState, checkpoint_state, &cloned_state);
+    const cloned_state = try zeam_utils.clone(types.BeamState, &checkpoint_state, allocator);
 
     return cloned_state;
 }
@@ -1335,6 +1353,16 @@ fn downloadAndStoreCheckpointBlock(
     };
     defer batch.deinit();
     batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, ssz_data.items);
+    // Also index the checkpoint block in the finalized slot index so that
+    // blocks_by_range can serve it.  Without this, `onReqRespRequest`'s
+    // finalized-range path (slot <= finalized_slot) finds no entry in
+    // DbFinalizedSlotsNamespace and the unfinalized-range walk is skipped
+    // (its guard is `end_slot_exclusive > finalized_slot + 1`, which is false
+    // when start_slot == finalized_slot == checkpoint_slot).  The result is an
+    // empty blocks_by_range response for the checkpoint slot even though the
+    // block is present in DbBlocksNamespace and is served correctly via
+    // blocks_by_root.
+    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, block.block.slot, expected_root);
     db.commit(&batch) catch |err| {
         logger.warn("checkpoint block fetch: DB commit failed: {}", .{err});
         return;

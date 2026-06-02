@@ -85,6 +85,9 @@ pub fn build(b: *Builder) !void {
     // LTO option (disabled by default for faster builds)
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
 
+    // ThreadSanitizer for the `zeam` cli exe (debug data-race hunting, e.g. node3 sync).
+    const enable_tsan = b.option(bool, "tsan", "Build the zeam cli with ThreadSanitizer") orelse false;
+
     // add ssz
     const ssz = b.dependency("ssz", .{
         .target = target,
@@ -323,6 +326,10 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
     zeam_network.addImport("@zeam/metrics", zeam_metrics);
+    // #942 follow-up: the publish-side forensic log line in `ethlibp2p.zig`
+    // includes the build git SHA so receivers across the fleet can correlate
+    // broken-byte receipts back to the exact producer binary.
+    zeam_network.addImport("build_options", build_options_module);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
@@ -364,6 +371,26 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("snappyz", snappyz);
     zeam_spectests.addImport("snappyframesz", snappyframesz);
 
+    // ThreadSanitizer: instrument the Zig modules involved in the multi-threaded
+    // beam runtime (chain-worker / libxev / rust-bridge thread interplay) so a
+    // data race in the node-3 sync path is reported with both stacks.
+    if (enable_tsan) {
+        for ([_]*std.Build.Module{
+            zeam_utils,
+            zeam_params,
+            zeam_metrics,
+            zeam_types,
+            zeam_configs,
+            zeam_database,
+            zeam_state_transition,
+            zeam_network,
+            zeam_beam_node,
+            zeam_api,
+            zeam_key_manager,
+            zeam_xmss,
+        }) |m| m.sanitize_thread = true;
+    }
+
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
         .name = "zeam",
@@ -371,6 +398,7 @@ pub fn build(b: *Builder) !void {
             .root_source_file = b.path("pkgs/cli/src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = if (enable_tsan) true else null,
         }),
     });
 

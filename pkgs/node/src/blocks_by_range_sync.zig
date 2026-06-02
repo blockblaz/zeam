@@ -60,14 +60,14 @@ pub fn shouldRefreshPeerStatus(
     }
 
     const refresh = switch (sync_status) {
-        .fc_initing, .behind_peers => true,
+        .fc_initing, .peers_materially_ahead => true,
         .synced => wall_head_lag_slots >= wall_head_lag_threshold_slots,
         .no_peers => false,
     };
     return .{ .refresh = refresh, .wall_head_lag_slots = wall_head_lag_slots };
 }
 
-/// True when pre-finalization sync should report `behind_peers` based on
+/// True when pre-finalization sync should report `peers_materially_ahead` based on
 /// wall-clock head lag alone (early devnets with `finalized_slot = 0`).
 pub fn isWallHeadLagSyncing(
     our_finalized_slot: types.Slot,
@@ -141,6 +141,42 @@ pub fn shouldCatchUpFromPeerStatus(
     return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot) > 0;
 }
 
+/// Pure decider for the "stuck mesh cluster" recovery path (#942 follow-up).
+///
+/// Fires when ALL of:
+///   * `best_peer_head_slot` is `wall_head_lag_threshold_slots` or more slots
+///     behind wall — i.e. the best status zeam has cached for any connected
+///     peer reports a head that's itself materially behind wall-clock. This
+///     captures the regime where the entire visible peer pool is stuck and
+///     normal `findBestCatchUpPeerStatus` keeps picking the same stale-head
+///     target every interval.
+///   * `slot - last_force_refresh_slot >= refresh_cooldown_slots` — at least
+///     one cooldown window has elapsed since the previous force-refresh, so
+///     we don't burst-refresh every interval if the condition stays continuously
+///     true (and re-create the en-masse RPC-timeout cascade from #926 that
+///     motivated the original status-refresh batching).
+///   * `best_peer_head_slot < wall_slot` — sanity check; the helper returns
+///     false if the best peer is already at or past wall-clock (no stuck cluster).
+///
+/// Returns `true` when the caller (`maybeForceFullPeerStatusRefresh` in `node.zig`)
+/// should bypass the batch cursor and send a status request to every connected
+/// peer at once, to try to discover a peer with a fresher head_slot.
+pub fn shouldForceFullPeerStatusRefresh(
+    best_peer_head_slot: types.Slot,
+    wall_slot: types.Slot,
+    slot: types.Slot,
+    last_force_refresh_slot: types.Slot,
+    wall_head_lag_threshold_slots: u64,
+    refresh_cooldown_slots: u64,
+) bool {
+    if (best_peer_head_slot >= wall_slot) return false;
+    const peer_lag = wall_slot - best_peer_head_slot;
+    if (peer_lag < wall_head_lag_threshold_slots) return false;
+    if (slot < last_force_refresh_slot) return false; // monotonic guard
+    const since_last = slot - last_force_refresh_slot;
+    return since_last >= refresh_cooldown_slots;
+}
+
 /// Result of a non-blocking attempt to hand a block off to the chain-worker
 /// from an RPC chunk handler (`processBlockByRootChunk` /
 /// `processBlockByRangeChunk`). Distinguishes the four outcomes the libxev
@@ -168,7 +204,7 @@ pub const ImportSubmitOutcome = enum {
     /// Caller falls through to the inline path — that path is the
     /// legitimate import flow when no worker exists.
     worker_disabled,
-    /// `sszClone` or other allocator failure pre-submission. Caller
+    /// `clone` or other allocator failure pre-submission. Caller
     /// falls through to inline as a last-resort best effort.
     failed,
 };
@@ -184,7 +220,7 @@ pub const ChunkImportDisposition = enum {
     /// libxev. The catch-up RPC cycle will refetch on the next status
     /// round.
     drop_backpressure,
-    /// Worker is not available (or sszClone failed). Fall through to
+    /// Worker is not available (or clone failed). Fall through to
     /// the inline `chain.onBlock` path.
     fallback_inline,
 };
@@ -274,7 +310,7 @@ test "shouldRefreshPeerStatus handles cadence sync state and wall lag" {
         synced,
         no_peers,
         fc_initing,
-        behind_peers,
+        peers_materially_ahead,
     };
 
     // Wall-lag arithmetic is shared with cappedSyncGapSlots by treating wall_slot as
@@ -298,7 +334,7 @@ test "shouldRefreshPeerStatus handles cadence sync state and wall lag" {
         .{ .status = .synced, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 103, .threshold_slots = 4, .want_refresh = false, .want_lag = 3 },
         .{ .status = .synced, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 104, .threshold_slots = 4, .want_refresh = true, .want_lag = 4 },
         .{ .status = .fc_initing, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
-        .{ .status = .behind_peers, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
+        .{ .status = .peers_materially_ahead, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
         .{ .status = .no_peers, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 200, .threshold_slots = 4, .want_refresh = false, .want_lag = 100 },
     };
 
@@ -328,9 +364,47 @@ test "shouldCatchUpFromPeerStatus triggers on head gap before finalization" {
 }
 
 test "shouldCatchUpFromPeerStatus small gaps use by-root not threshold gate" {
-    const gap = cappedSyncGapSlots(50, 0, 100);
+    // The threshold gate distinguishes "small gap → by-root parent walk" from
+    // "large gap → bulk by-range fetch" — exercise a gap small enough to stay
+    // on the by-root path under the post-#942-follow-up threshold (4). The
+    // earlier shape of this test used gap=50 against the historic threshold
+    // of 64; the present numbers preserve the intent (gap below threshold,
+    // still triggers catch-up) with the post-fix threshold value.
+    const gap = cappedSyncGapSlots(3, 0, 10);
     try std.testing.expect(gap < constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD);
-    try std.testing.expect(shouldCatchUpFromPeerStatus(50, 0, 0, 0, 100));
+    try std.testing.expect(shouldCatchUpFromPeerStatus(3, 0, 0, 0, 10));
+}
+
+test "shouldForceFullPeerStatusRefresh fires when stuck behind a cluster of stale peers" {
+    // The scenario the helper exists to recover from (#942 follow-up): wall is at
+    // slot 300, best peer head zeam knows about is slot 50, no force-refresh has
+    // run yet → stuck-mesh-cluster condition is met.
+    try std.testing.expect(shouldForceFullPeerStatusRefresh(50, 300, 300, 0, 16, 16));
+}
+
+test "shouldForceFullPeerStatusRefresh is off when best peer is at wall-clock" {
+    // Best peer is at wall — there's no stuck cluster, normal catch-up handles it.
+    try std.testing.expect(!shouldForceFullPeerStatusRefresh(300, 300, 300, 0, 16, 16));
+    try std.testing.expect(!shouldForceFullPeerStatusRefresh(305, 300, 300, 0, 16, 16));
+}
+
+test "shouldForceFullPeerStatusRefresh is off when best peer lag is under threshold" {
+    // Best peer is 10 slots behind wall, threshold is 16 — under threshold, this
+    // is just normal proactive-catch-up territory, not a stuck cluster.
+    try std.testing.expect(!shouldForceFullPeerStatusRefresh(290, 300, 300, 0, 16, 16));
+}
+
+test "shouldForceFullPeerStatusRefresh is rate-limited by cooldown" {
+    // Stuck-cluster condition is met but a force-refresh fired just 4 slots ago —
+    // cooldown is 16 → suppressed. After 16 slots elapse it fires again.
+    try std.testing.expect(!shouldForceFullPeerStatusRefresh(50, 300, 304, 300, 16, 16));
+    try std.testing.expect(shouldForceFullPeerStatusRefresh(50, 300, 316, 300, 16, 16));
+}
+
+test "shouldForceFullPeerStatusRefresh is safe under non-monotonic slot input" {
+    // Defensive: the comparator must not underflow if `slot` somehow arrives
+    // less than `last_force_refresh_slot` (slot driver reset / clock skew).
+    try std.testing.expect(!shouldForceFullPeerStatusRefresh(50, 300, 100, 200, 16, 16));
 }
 
 test "syncEndDecision retry requires alternate peer" {
@@ -465,7 +539,7 @@ test "classifyChunkImport: submitted is handled" {
 test "classifyChunkImport: worker_disabled and failed fall back to inline" {
     // `worker_disabled`: legitimate test / single-thread mode, no
     // worker exists so inline `chain.onBlock` IS the import path.
-    // `failed`: sszClone or allocator failure pre-submission — last-
+    // `failed`: clone or allocator failure pre-submission — last-
     // resort best-effort inline. Both must NOT be confused with
     // `queue_full`, which is the load-shedding case.
     try std.testing.expectEqual(ChunkImportDisposition.fallback_inline, classifyChunkImport(.worker_disabled));
