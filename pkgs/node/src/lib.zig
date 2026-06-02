@@ -9,6 +9,7 @@ pub const BeamNode = nodeFactory.BeamNode;
 
 const chainFactory = @import("./chain.zig");
 pub const BeamChain = chainFactory.BeamChain;
+pub const default_proposal_deadline_pct = chainFactory.default_proposal_deadline_pct;
 
 pub const fcFactory = @import("./forkchoice.zig");
 pub const testing = @import("./testing.zig");

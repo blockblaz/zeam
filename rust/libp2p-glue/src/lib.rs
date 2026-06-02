@@ -198,6 +198,10 @@ fn get_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
 
 fn mark_network_ready(network_id: u32) {
     with_slot_mut(network_id, |slot| slot.ready = true);
+    // Hold NETWORK_READY_LOCK across notify_all so a waiter that has already
+    // observed ready == false but not yet parked (it still holds this lock)
+    // cannot miss the wakeup: we block here until it actually parks.
+    let _g = NETWORK_READY_LOCK.lock_recover();
     NETWORK_READY_CONDVAR.notify_all();
 }
 
@@ -218,6 +222,7 @@ fn clear_network_slot(network_id: u32) {
         let mut slots = NETWORK_SLOTS.lock_recover();
         slots.remove(&network_id);
     }
+    let _g = NETWORK_READY_LOCK.lock_recover();
     NETWORK_READY_CONDVAR.notify_all();
 }
 
@@ -1157,6 +1162,13 @@ lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
     static ref RESPONSE_CHANNEL_MAP: Mutex<HashMapDelay<u64, PendingResponse>> = Mutex::new(HashMapDelay::new(RESPONSE_CHANNEL_IDLE_TIMEOUT));
+    // Sacrificial mutex paired with `NETWORK_READY_CONDVAR`. A `std::sync::Condvar`
+    // permanently binds to the first mutex it is used with and panics
+    // ("attempted to use a condition variable with two mutexes") if a later
+    // wait passes a different mutex. With multiple in-process networks each
+    // calling `wait_for_network_ready`, a per-call dummy mutex would trip this
+    // panic, so all waiters must park on this one shared instance.
+    static ref NETWORK_READY_LOCK: Mutex<()> = Mutex::new(());
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
     // #942 fix (post-bypass A/B verdict): the reconnect-scheduling
     // delay map used to live here as `RECONNECT_QUEUE: HashMapDelay`,
@@ -1327,11 +1339,13 @@ pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64
         let timeout = Duration::from_millis(timeout_ms);
         let deadline = std::time::Instant::now() + timeout;
 
-        // Park on the condvar using a sacrificial mutex; the condition we wake
-        // for is checked against `NETWORK_SLOTS` directly so the slot map can
-        // remain a regular `Mutex<HashMap>` without nesting awaits under it.
-        let dummy = std::sync::Mutex::new(());
-        let mut guard = dummy.lock_recover();
+        // Park on the condvar using the shared NETWORK_READY_LOCK; the condition
+        // we wake for is checked against `NETWORK_SLOTS` directly so the slot map
+        // can remain a regular `Mutex<HashMap>` without nesting awaits under it.
+        // The lock must be shared (not a per-call mutex) — a std Condvar panics
+        // if used with two different mutexes, which is exactly what happens when
+        // multiple in-process networks wait concurrently.
+        let mut guard = NETWORK_READY_LOCK.lock_recover();
         loop {
             if is_network_ready(network_id) {
                 return true;
@@ -3629,6 +3643,75 @@ mod tests {
 
     fn next_test_network_id() -> u32 {
         TEST_NETWORK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Regression for the "attempted to use a condition variable with two
+    /// mutexes" panic: multiple in-process networks waiting concurrently used
+    /// to park on `NETWORK_READY_CONDVAR` with a *per-call* dummy mutex. The
+    /// std `Condvar` binds to the first mutex it sees, so the second waiter
+    /// panicked; the panic was swallowed by `catch_ffi`, returning `false`
+    /// *instantly*, which the caller mis-reported as a 10s init timeout.
+    ///
+    /// With the shared `NETWORK_READY_LOCK`, every concurrent waiter parks on
+    /// the same mutex, so none panic and each one genuinely blocks until its
+    /// timeout (never marked ready here) instead of returning immediately.
+    #[test]
+    fn test_concurrent_waiters_do_not_panic_and_honor_timeout() {
+        let timeout_ms: u64 = 200;
+        // Distinct ids mirroring the n1/n2/n3 in-process layout; none are ever
+        // marked ready, so every waiter must run to its timeout.
+        let ids: Vec<u32> = (0..3).map(|_| next_test_network_id()).collect();
+
+        let handles: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                std::thread::spawn(move || {
+                    let start = std::time::Instant::now();
+                    let ready = unsafe { wait_for_network_ready(id, timeout_ms) };
+                    (ready, start.elapsed())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let (ready, elapsed) = h.join().expect("waiter thread panicked");
+            assert!(!ready, "network was never marked ready, must return false");
+            // A swallowed condvar panic returns in ~0ms. A genuine timeout
+            // blocks ~timeout_ms; require at least half to catch the regression
+            // without being flaky on a loaded scheduler.
+            assert!(
+                elapsed >= Duration::from_millis(timeout_ms / 2),
+                "returned in {elapsed:?}, expected a genuine ~{timeout_ms}ms timeout \
+                 (instant return signals the swallowed two-mutex condvar panic)",
+            );
+        }
+    }
+
+    /// A waiter parked on the condvar is woken by `mark_network_ready` from
+    /// another thread and returns `true` well before its (long) timeout — this
+    /// exercises the notify-under-shared-lock path that closes the lost-wakeup
+    /// window between the predicate check and parking.
+    #[test]
+    fn test_waiter_is_woken_by_mark_network_ready() {
+        let id = next_test_network_id();
+        let timeout_ms: u64 = 10_000;
+
+        let waiter = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let ready = unsafe { wait_for_network_ready(id, timeout_ms) };
+            (ready, start.elapsed())
+        });
+
+        // Give the waiter time to park, then signal readiness.
+        std::thread::sleep(Duration::from_millis(100));
+        mark_network_ready(id);
+
+        let (ready, elapsed) = waiter.join().expect("waiter thread panicked");
+        assert!(ready, "waiter should observe ready == true");
+        assert!(
+            elapsed < Duration::from_millis(timeout_ms),
+            "waiter should be woken by notify, not run to the {timeout_ms}ms timeout",
+        );
     }
 
     #[test]
