@@ -876,13 +876,41 @@ pub const PeerEventHandler = struct {
     }
 
     pub fn subscribe(self: *Self, handler: OnPeerEventCbHandler) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.handlers.append(self.allocator, handler);
-        // Replay peers that connected before this handler subscribed.
-        var it = self.connected.iterator();
-        while (it.next()) |entry| {
-            handler.onPeerConnected(entry.key_ptr.*, entry.value_ptr.*) catch |e| {
+        // A connected-peer entry captured for replay. Owns a dup of the peer-id
+        // key: the snapshot outlives the lock, and a concurrent onPeerDisconnected
+        // could free the original key once we release the mutex.
+        const ReplayEntry = struct { peer_id: []u8, direction: PeerDirection };
+
+        var snapshot: std.ArrayList(ReplayEntry) = .empty;
+        defer {
+            for (snapshot.items) |entry| self.allocator.free(entry.peer_id);
+            snapshot.deinit(self.allocator);
+        }
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            // Snapshot peers that connected before this handler subscribed so the
+            // replay below runs without holding self.mutex (handler callbacks may
+            // re-enter this PeerEventHandler — see onPeerConnected). Build the
+            // snapshot before registering the handler so a dup failure here can't
+            // leave a handler registered but un-replayed.
+            try snapshot.ensureUnusedCapacity(self.allocator, self.connected.count());
+            var it = self.connected.iterator();
+            while (it.next()) |entry| {
+                snapshot.appendAssumeCapacity(.{
+                    .peer_id = try self.allocator.dupe(u8, entry.key_ptr.*),
+                    .direction = entry.value_ptr.*,
+                });
+            }
+            try self.handlers.append(self.allocator, handler);
+        }
+
+        // Replay outside the lock. A peer in the snapshot may have disconnected
+        // in the meantime, yielding a stale onPeerConnected; this is benign as
+        // downstream handlers are idempotent (connected_peers.connect is get-or-put).
+        for (snapshot.items) |entry| {
+            handler.onPeerConnected(entry.peer_id, entry.direction) catch |e| {
                 self.logger.err("network-{d}:: replay onPeerConnected handler error={any}", .{ self.networkId, e });
             };
         }
@@ -890,15 +918,22 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{f} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
-        const gop = try self.connected.getOrPut(peer_id);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, peer_id);
-        }
-        gop.value_ptr.* = direction;
-        for (self.handlers.items) |handler| {
+        // Snapshot the handler list under the lock, then dispatch after releasing
+        // it: handlers may re-enter this PeerEventHandler (or schedule work that
+        // does), and self.mutex is non-recursive — dispatching under it deadlocks.
+        const handlers = handlers: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{f} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
+            const gop = try self.connected.getOrPut(peer_id);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.allocator.dupe(u8, peer_id);
+            }
+            gop.value_ptr.* = direction;
+            break :handlers try self.allocator.dupe(OnPeerEventCbHandler, self.handlers.items);
+        };
+        defer self.allocator.free(handlers);
+        for (handlers) |handler| {
             handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
             };
@@ -907,13 +942,18 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{f} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
-        if (self.connected.fetchRemove(peer_id)) |kv| {
-            self.allocator.free(kv.key);
-        }
-        for (self.handlers.items) |handler| {
+        // Snapshot handlers under the lock, dispatch after release — see onPeerConnected.
+        const handlers = handlers: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{f} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
+            if (self.connected.fetchRemove(peer_id)) |kv| {
+                self.allocator.free(kv.key);
+            }
+            break :handlers try self.allocator.dupe(OnPeerEventCbHandler, self.handlers.items);
+        };
+        defer self.allocator.free(handlers);
+        for (handlers) |handler| {
             handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
             };
@@ -921,10 +961,15 @@ pub const PeerEventHandler = struct {
     }
 
     pub fn onPeerConnectionFailed(self: *Self, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnectionFailed peer_id={s} direction={s} result={s}, handlers={d}", .{ self.networkId, peer_id, @tagName(direction), @tagName(result), self.handlers.items.len });
-        for (self.handlers.items) |handler| {
+        // Snapshot handlers under the lock, dispatch after release — see onPeerConnected.
+        const handlers = handlers: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnectionFailed peer_id={s} direction={s} result={s}, handlers={d}", .{ self.networkId, peer_id, @tagName(direction), @tagName(result), self.handlers.items.len });
+            break :handlers try self.allocator.dupe(OnPeerEventCbHandler, self.handlers.items);
+        };
+        defer self.allocator.free(handlers);
+        for (handlers) |handler| {
             handler.onPeerConnectionFailed(peer_id, direction, result) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnectionFailed handler error={any}", .{ self.networkId, e });
             };

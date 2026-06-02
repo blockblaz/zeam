@@ -137,9 +137,11 @@ pub const ValidatorClient = struct {
             }
 
             self.logger.debug("constructing block for slot={d} proposer={d}", .{ slot, slot_proposer_id });
-            // Spawn the deadline-aware build worker, then block until it
-            // self-truncates and exits. The worker bounds its own runtime
-            // by `chain.proposal_deadline_pct`, so this wait is bounded.
+            // Spawn the deadline-bounded build/aggregation worker and block
+            // (work-stealing) until it self-truncates at
+            // `chain.proposal_deadline_pct` of the interval. We then finalize +
+            // sign within the SAME interval's remaining budget — an
+            // intra-interval build/sign split, not a cross-interval one.
             self.chain.submitBlockBuildOnInterval(slot, slot_proposer_id);
             self.chain.thread_pool.waitAndWork(&self.chain.proposal_build_wg);
 

@@ -84,11 +84,15 @@ pub const ChainOpts = struct {
     /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
     /// further-back slots are wasted work. See `BeamChain.aggregateImpl`.
     aggregate_max_inflight: u32 = 4,
-    /// Percentage of one proposal interval (`SECONDS_PER_INTERVAL_MS`)
-    /// allocated as the deadline budget for the interval-aware proposer
-    /// build worker.
+    /// Share of one proposal interval (`SECONDS_PER_INTERVAL_MS`) budgeted to
+    /// the block build + attestation-aggregation worker. This is an
+    /// INTRA-interval time budget, not a cross-interval split: the worker
+    /// self-truncates at `pct%` of the interval, and the remaining
+    /// `(100-pct)%` of the SAME interval is reserved for the finalize step
+    /// (STF over the harvested partial body + propose-side sign + gossip
+    /// publish), so the signed block is ready before the attestation interval.
     ///
-    /// Default 90: ~720ms compaction budget + ~80ms finalize budget at
+    /// Default 90: ~720ms aggregation budget + ~80ms finalize/sign budget at
     /// the default 800ms interval.
     proposal_deadline_pct: u32 = default_proposal_deadline_pct,
 };
@@ -134,14 +138,18 @@ pub const PartialProposalBody = struct {
     slot: types.Slot,
     proposer_index: types.ValidatorIndex,
     parent_root: types.Root,
+    pre_state: *types.BeamState,
     attestations: types.AggregatedAttestations,
     signatures: types.AttestationSignatures,
+    allocator: Allocator,
 
     pub fn deinit(self: *PartialProposalBody) void {
         for (self.attestations.slice()) |*att| att.deinit();
         self.attestations.deinit();
         for (self.signatures.slice()) |*sig| sig.deinit();
         self.signatures.deinit();
+        self.pre_state.deinit();
+        self.allocator.destroy(self.pre_state);
     }
 };
 
@@ -4660,8 +4668,11 @@ pub const BeamChain = struct {
         self.proposal_partial_slot = null;
     }
 
-    /// Interval-0 entry: spawn the build worker. Boolean inflight gate
-    /// (proposer slots produce at most one block; no coalesce semantics).
+    /// Proposal-interval (interval 0) entry: spawn the deadline-bounded build
+    /// worker. Boolean inflight gate (proposer slots produce at most one block;
+    /// no coalesce semantics). The caller blocks on this worker within the same
+    /// interval (see `proposal_deadline_pct`) — the pool offload buys parallel,
+    /// deadline-bounded aggregation, not a freed event-loop thread.
     pub fn submitBlockBuildOnInterval(
         self: *Self,
         slot: types.Slot,
@@ -4708,9 +4719,10 @@ pub const BeamChain = struct {
             self.allocator.destroy(pre_snapshot);
         };
 
-        // Deadline = pct% of the proposal interval, reserving (100-pct)% for
-        // interval-1 finalize. Clamp to [0, 99] so finalize always has
-        // headroom.
+        // Deadline = pct% of the proposal interval, reserving (100-pct)% of
+        // the SAME interval for the finalize + sign step (an intra-interval
+        // budget, not a cross-interval split). Clamp to [0, 99] so finalize
+        // always has headroom.
         const pct_clamped: i64 = @intCast(@min(self.proposal_deadline_pct, 99));
         const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
         const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
@@ -4730,8 +4742,13 @@ pub const BeamChain = struct {
         pre_snapshot_handed_off = true;
     }
 
-    /// Build-worker body. Owns `pre_snapshot` until exit. Moves the
-    /// compaction result into `chain.proposal_partial_body` atomically.
+    /// Build-worker body. Owns `pre_snapshot` until exit. On the success
+    /// path it transfers `pre_snapshot` ownership into the published
+    /// `PartialProposalBody` so `finalizeProposalIfReady` can reuse it
+    /// as the post-state STF buffer (avoiding a second MB-scale clone
+    /// from the states map and a third clone to seed `post_state`).
+    /// On any failure path before the handoff, the snapshot is freed
+    /// here.
     fn produceBlockWorker(
         chain: *Self,
         slot: types.Slot,
@@ -4741,10 +4758,11 @@ pub const BeamChain = struct {
         deadline_ns: i64,
     ) void {
         defer chain.proposal_build_inflight.store(false, .release);
-        defer {
+        var pre_snapshot_handed_off = false;
+        defer if (!pre_snapshot_handed_off) {
             pre_snapshot.deinit();
             chain.allocator.destroy(pre_snapshot);
-        }
+        };
 
         var result = chain.forkChoice.getProposalAttestations(
             pre_snapshot,
@@ -4775,9 +4793,12 @@ pub const BeamChain = struct {
             .slot = slot,
             .proposer_index = proposer_index,
             .parent_root = parent_root,
+            .pre_state = pre_snapshot,
             .attestations = result.attestations,
             .signatures = result.signatures,
+            .allocator = chain.allocator,
         };
+        pre_snapshot_handed_off = true;
 
         chain.proposal_partial_mutex.lock();
         defer chain.proposal_partial_mutex.unlock();
@@ -4840,39 +4861,22 @@ pub const BeamChain = struct {
             return null;
         }
 
-        // Re-acquire pre-state from the state store (immutable per root).
-        var pre_borrow = self.statesGet(body.parent_root) orelse {
-            self.logger.warn(
-                "finalize failed for slot={d}: missing pre-state for parent_root",
-                .{slot},
-            );
-            return null;
-        };
-        defer pre_borrow.assertReleasedOrPanic();
-        const pre_snapshot = try pre_borrow.cloneAndRelease(self.allocator);
-        defer {
-            pre_snapshot.deinit();
-            self.allocator.destroy(pre_snapshot);
-        }
-
-        const post_state = try self.allocator.create(types.BeamState);
-        var post_state_initialized = false;
-        var post_state_consumed = false;
-        errdefer if (!post_state_consumed) {
-            if (post_state_initialized) post_state.deinit();
-            self.allocator.destroy(post_state);
-        };
-        post_state.* = try zeam_utils.clone(types.BeamState, pre_snapshot, self.allocator);
-        post_state_initialized = true;
-
         // Move out before the body's defer fires. body.deinit MUST NOT run
         // after this — only `allocator.destroy(body)`.
+        const post_state: *types.BeamState = body.pre_state;
         var agg_attestations = body.attestations;
         var attestation_signatures = body.signatures;
         body_owned = false;
         // The body struct itself still needs freeing — its fields point
-        // at memory now owned by `block` / `attestation_signatures`.
+        // at memory now owned by `post_state` / `block` /
+        // `attestation_signatures`.
         defer self.allocator.destroy(body);
+
+        var post_state_consumed = false;
+        errdefer if (!post_state_consumed) {
+            post_state.deinit();
+            self.allocator.destroy(post_state);
+        };
 
         var agg_att_cleanup = true;
         errdefer if (agg_att_cleanup) {

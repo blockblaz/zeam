@@ -2155,7 +2155,7 @@ pub const ForkChoice = struct {
         // `fcStore.latest_justified`. All gossip sigs and child payloads
         // (new + known) registered against the chosen key are still folded
         // into the aggregate; only the choice of key is narrowed.
-        const latest_justified = self.anchorState.latest_justified;
+        const latest_justified = self.fcStore.latest_justified;
         if (selectJustificationAdvancingKey(&snap, att_data_keys, latest_justified)) |data| {
             var maybe_result = try types.computeSingleAggregatedSignature(
                 self.allocator,
