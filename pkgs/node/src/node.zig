@@ -990,6 +990,23 @@ pub const BeamNode = struct {
     /// Safe to call from any thread that reaches the gossip/reqresp
     /// orphan-block paths; the map has its own dedicated lock.
     fn trackOrphanDependent(self: *Self, parent_root: types.Root, child_block_root: types.Root) void {
+        // Slot=13 #942 follow-up: skip the orphan-dependents entry entirely
+        // when `parent_root` has previously failed verify with a
+        // deterministic-failure verdict. The cached parent will never be
+        // importable; tracking the child would just queue a fetch that
+        // chain.onBlock would short-circuit on `KnownInvalidBlock` anyway
+        // (the parent-cascade arm). Cascade-mark the child here so any
+        // future delivery of the SAME child also short-circuits at the
+        // `site="self"` arm. Avoids the 12,676-chunks-per-5-min livelock
+        // observed against ethlambda_0's slot=13 reserve.
+        if (self.chain.isInvalidRoot(parent_root)) {
+            self.chain.markInvalidRoot(child_block_root);
+            self.logger.debug(
+                "skip tracking orphan dependent 0x{x}: parent 0x{x} is known-invalid; cascade-marked child",
+                .{ &child_block_root, &parent_root },
+            );
+            return;
+        }
         self.orphan_dependents_lock.lock();
         defer self.orphan_dependents_lock.unlock();
         const gop = self.orphan_dependents.getOrPut(parent_root) catch |err| {
