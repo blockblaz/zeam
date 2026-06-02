@@ -985,27 +985,21 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
     const ssz_bytes = try response.serialize(ctx.parent.allocator);
     defer ctx.parent.allocator.free(ssz_bytes);
     const now_ms = zl.wall_time.milliTimestamp();
-    // Calls `host.req_resp` directly: zig-libp2p v0.1.0's
-    // `Host.sendResponseChunk` references an `Error` type that lives at
-    // module scope but was annotated as `ReqResp.Error`, which the compiler
-    // rejects. Routing through the embedded runtime sidesteps the broken
-    // wrapper while keeping the behaviour identical. Fix tracked upstream;
-    // once a v0.1.1 ships we can swap back to the Host method.
-    try ctx.parent.host.req_resp.sendResponseChunk(ctx.channel_id, ssz_bytes, now_ms);
+    try ctx.parent.host.sendResponseChunk(ctx.channel_id, ssz_bytes, now_ms);
 }
 
 fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerror!void {
     const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
     if (ctx.finished) return error.StreamFinished;
     _ = code;
-    try ctx.parent.host.req_resp.sendErrorResponse(ctx.channel_id, message);
+    try ctx.parent.host.sendErrorResponse(ctx.channel_id, message);
     ctx.finished = true;
 }
 
 fn serverStreamFinish(ptr: *anyopaque) anyerror!void {
     const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
     if (ctx.finished) return;
-    try ctx.parent.host.req_resp.finishResponseStream(ctx.channel_id);
+    try ctx.parent.host.finishResponseStream(ctx.channel_id);
     ctx.finished = true;
 }
 
