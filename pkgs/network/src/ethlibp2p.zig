@@ -75,10 +75,10 @@ const GOSSIP_PREVIEW_MAX_BYTES: usize = 32;
 /// `2 × GOSSIP_PREVIEW_MAX_BYTES` for the hex pair + (N − 1) single-space
 /// separators between pairs. Lives on the caller's stack; `.slice()`
 /// returns the populated prefix.
-const BytePreview = struct {
+pub const BytePreview = struct {
     buf: [GOSSIP_PREVIEW_MAX_BYTES * 3]u8 = undefined,
     len: usize = 0,
-    fn slice(self: *const BytePreview) []const u8 {
+    pub fn slice(self: *const BytePreview) []const u8 {
         return self.buf[0..self.len];
     }
 };
@@ -87,7 +87,7 @@ const BytePreview = struct {
 /// for #942 gossip-decode-failure logs. Returns an empty slice when `data`
 /// is empty. Pure / stack-only; safe to call from FFI gossip ingress
 /// without heap allocation.
-fn byteHexPreview(data: []const u8, max_bytes: usize) BytePreview {
+pub fn byteHexPreview(data: []const u8, max_bytes: usize) BytePreview {
     var out = BytePreview{};
     const n = @min(@min(data.len, max_bytes), GOSSIP_PREVIEW_MAX_BYTES);
     const hex_digits = "0123456789abcdef";
@@ -137,10 +137,21 @@ const SnappyHeaderValidationError = error{
 /// Successful decode of a snappy block-format header: the declared
 /// uncompressed length and the number of bytes occupied by the varint
 /// header itself.
-const SnappyHeader = struct {
+pub const SnappyHeader = struct {
     value: usize,
     length: usize,
 };
+
+// ── PUBLIC HELPER SURFACE (consumed by `ethlibp2p_v2.zig`) ────────────────
+// These were file-private until the v2 port; they expose the pure-Zig
+// validation + decode logic (#942 protection, snappy frame helpers, hex
+// preview, etc.) so the zig-libp2p-backed v2 path can reuse exactly the
+// same byte-level behaviour without duplicating ~400 LOC of code +
+// fixtures.
+pub const MAX_GOSSIP_BLOCK_SIZE_V2 = MAX_GOSSIP_BLOCK_SIZE;
+pub const MAX_RPC_MESSAGE_SIZE_V2 = MAX_RPC_MESSAGE_SIZE;
+pub const GOSSIP_PREVIEW_MAX_BYTES_V2 = GOSSIP_PREVIEW_MAX_BYTES;
+pub const MESSAGE_DOMAIN_VALID_SNAPPY_V2 = MESSAGE_DOMAIN_VALID_SNAPPY;
 
 const LeanSupportedProtocol = interface.LeanSupportedProtocol;
 
@@ -226,7 +237,7 @@ fn validateRpcSnappyHeader(message_bytes: []const u8) FrameDecodeError!SnappyHea
 /// upstream version regresses on malformed-input handling. The varint
 /// decode is the only piece that overlaps with the upstream decoder; that
 /// overlap is documented in `handleMsgFromRustBridge`'s call site.
-fn validateGossipSnappyHeader(
+pub fn validateGossipSnappyHeader(
     message_bytes: []const u8,
     max_size: usize,
 ) SnappyHeaderValidationError!SnappyHeader {
@@ -502,7 +513,7 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
 
 /// Generic SSZ deserializer for gossip messages. Returns null on failure (with
 /// error logging and debug-file creation), so callers can simply `orelse return`.
-fn deserializeGossipMessage(
+pub fn deserializeGossipMessage(
     comptime T: type,
     comptime label: []const u8,
     data: []const u8,
