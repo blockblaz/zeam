@@ -442,6 +442,26 @@ pub const Handlers = struct {
         prune_forkchoice: bool,
         block_root: ?types.Root,
     ) void,
+    /// Batched block import (PR #966). Called by the drain loop when
+    /// `outstandingDepth > BLOCK_BATCH_THRESHOLD` — coalesces up to
+    /// `BLOCK_BATCH_MAX` `.on_block` messages into one dispatch so the
+    /// XMSS aggregated-signature verify can run as ONE rayon call across
+    /// every attestation in every block (the `phase2_batch_verify` stage
+    /// that is 99% of `step="verify_signatures"` on a loaded chain — see
+    /// PR #963 instrumentation).
+    ///
+    /// `items.len >= 2` by construction (the drain only dispatches the
+    /// batched path when it pulled at least 2 messages); single-block
+    /// pops still route through `on_block` for unchanged latency on
+    /// gossip / locally-produced blocks. The handler is responsible for
+    /// deiniting each item's `signed_block` — the drain loop releases
+    /// the underlying queue slots after the handler returns but does NOT
+    /// call `Message.deinit` for batched items (the slice is built
+    /// outside the queue).
+    on_blocks_batch: *const fn (
+        ctx: *anyopaque,
+        items: []const BlockBatchItem,
+    ) void,
     on_gossip_attestation: *const fn (ctx: *anyopaque, gossip: networks.AttestationGossip) void,
     on_gossip_aggregated_attestation: *const fn (ctx: *anyopaque, agg: types.SignedAggregatedAttestation) void,
     process_pending_blocks: *const fn (ctx: *anyopaque, current_slot: types.Slot) void,
@@ -479,6 +499,32 @@ pub const DEFAULT_AGGREGATED_ATTESTATION_QUEUE_CAPACITY: usize = 512;
 /// iteration instead of one (reduces backlog under devnet bursts).
 pub const AGGREGATED_ATTESTATION_BATCH_THRESHOLD: usize = 16;
 pub const AGGREGATED_ATTESTATION_BATCH_MAX: usize = 32;
+
+/// When outstanding block-queue depth exceeds this, the worker drains
+/// up to `BLOCK_BATCH_MAX` `.on_block` messages and dispatches them
+/// through the batched handler `Handlers.on_blocks_batch`. At depth ≤
+/// threshold the loop falls back to the single-block path so latency
+/// stays bounded for gossip / locally-produced blocks (which are the
+/// dominant case at steady state — head-aligned nodes rarely see
+/// queue depth >1).
+///
+/// Tuned to match `BLOCKS_BY_RANGE_SYNC_THRESHOLD = 4` so a single
+/// catch-up sweep can produce a full batch worth coalescing. Threshold
+/// is 2 (not 1) so a stray solo block doesn't trigger the batched
+/// path; with threshold 2 we batch only when ≥2 blocks are actually
+/// queued.
+pub const BLOCK_BATCH_THRESHOLD: usize = 2;
+pub const BLOCK_BATCH_MAX: usize = 4;
+
+/// One block's payload in a batched `Handlers.on_blocks_batch` call.
+/// Fields mirror the `Message.on_block` variant — see its doc comment
+/// for the ownership contract on `signed_block` (transferred from the
+/// producer; the handler is responsible for deiniting).
+pub const BlockBatchItem = struct {
+    signed_block: types.SignedBlock,
+    prune_forkchoice: bool,
+    block_root: ?types.Root,
+};
 
 /// Owns the chain-worker thread, the bounded queues, and a stop flag.
 ///
@@ -823,7 +869,68 @@ pub const ChainWorker = struct {
 
             // Block queue stays first (highest priority), but each loop also
             // gives raw and aggregated attestations one dispatch opportunity.
-            if (self.block_queue.tryRecv()) |msg| {
+            //
+            // PR #966: when outstanding block depth > BLOCK_BATCH_THRESHOLD,
+            // drain up to BLOCK_BATCH_MAX `.on_block` messages and dispatch
+            // them through the batched handler so the XMSS verify runs as
+            // ONE rayon call across all attestations in all blocks. Below
+            // threshold we keep the single-block path so latency for gossip
+            // / locally-produced blocks (the dominant case at steady state)
+            // is unchanged.
+            //
+            // Mirrors the `aggregated_attestation_queue` batching pattern
+            // a few lines below — same depth-vs-threshold gate, same
+            // bounded drain.
+            const block_depth = self.block_queue.outstandingDepth();
+            const should_batch = block_depth > BLOCK_BATCH_THRESHOLD;
+            if (should_batch) {
+                var batch: [BLOCK_BATCH_MAX]BlockBatchItem = undefined;
+                var batch_len: usize = 0;
+                // Collect up to BLOCK_BATCH_MAX `.on_block` messages.
+                // Other message variants (rare on this queue) drop us out
+                // of batched collection and dispatch single-block to keep
+                // ordering semantics identical to today's loop.
+                while (batch_len < BLOCK_BATCH_MAX) : (batch_len += 1) {
+                    const popped = self.block_queue.tryRecv() orelse break;
+                    switch (popped) {
+                        .on_block => |payload| {
+                            batch[batch_len] = .{
+                                .signed_block = payload.signed_block,
+                                .prune_forkchoice = payload.prune_forkchoice,
+                                .block_root = payload.block_root,
+                            };
+                        },
+                        else => {
+                            // Non-on_block variant. Flush whatever we
+                            // batched so far, then dispatch this one
+                            // single-shot for unchanged semantics.
+                            if (batch_len > 0) {
+                                self.dispatchBlocksBatch(batch[0..batch_len]);
+                                var i: usize = 0;
+                                while (i < batch_len) : (i += 1) {
+                                    self.block_queue.markProcessed();
+                                }
+                                self.recordBlockQueueDepth();
+                                batch_len = 0;
+                            }
+                            self.dispatch(popped);
+                            self.block_queue.markProcessed();
+                            self.recordBlockQueueDepth();
+                            dispatched_any = true;
+                            break;
+                        },
+                    }
+                }
+                if (batch_len > 0) {
+                    self.dispatchBlocksBatch(batch[0..batch_len]);
+                    var i: usize = 0;
+                    while (i < batch_len) : (i += 1) {
+                        self.block_queue.markProcessed();
+                    }
+                    self.recordBlockQueueDepth();
+                    dispatched_any = true;
+                }
+            } else if (self.block_queue.tryRecv()) |msg| {
                 self.dispatch(msg);
                 self.block_queue.markProcessed();
                 self.recordBlockQueueDepth();
@@ -941,7 +1048,30 @@ pub const ChainWorker = struct {
     /// frees any heap-owned payload — the worker remains the sole
     /// owner from `tryRecv` through handler return, regardless of
     /// whether the handler succeeded or threw internally.
+    /// Batched-block dispatch. Releases each item's `signed_block` after
+    /// the handler returns — the handler treats the slice as borrowed
+    /// for the call duration (mirrors `dispatch`'s `defer m.deinit()`
+    /// shape, just lifted across N items).
+    fn dispatchBlocksBatch(self: *Self, items: []const BlockBatchItem) void {
+        defer for (items) |item| {
+            var sb = item.signed_block;
+            sb.deinit();
+        };
+        const h = self.handlers orelse {
+            self.logger.warn(
+                "chain-worker: dropping batched on_blocks_batch ({d} items, no handlers wired)",
+                .{items.len},
+            );
+            return;
+        };
+        zeam_metrics.metrics.zeam_chain_worker_block_dispatch_total.incr(.{ .path = "batch" }) catch {};
+        h.on_blocks_batch(h.ctx, items);
+    }
+
     fn dispatch(self: *Self, msg: Message) void {
+        if (msg == .on_block) {
+            zeam_metrics.metrics.zeam_chain_worker_block_dispatch_total.incr(.{ .path = "single" }) catch {};
+        }
         var m = msg;
         defer m.deinit();
         const h = self.handlers orelse {

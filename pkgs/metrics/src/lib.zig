@@ -141,6 +141,12 @@ const Metrics = struct {
     //   "proposer_xmss_verify"  — xmss.verifySsz of the proposer signature.
     // See PR #963.
     zeam_stf_verify_signatures_stage_duration_seconds: StfVerifySignaturesStageHistogram,
+    // Number of blocks coalesced into one `verifySignaturesParallelMultiBlock`
+    // call. K=1 means we routed through the single-block path; K>1 means
+    // the chain-worker drained ≥2 blocks together. Pair with the
+    // `phase2_batch_verify_multiblock` stage to confirm that batching
+    // actually amortises rayon overhead as K grows.
+    zeam_stf_verify_signatures_batch_size: StfVerifySignaturesBatchSizeHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
     // Network peer metrics
@@ -328,6 +334,16 @@ const Metrics = struct {
     lean_chain_queue_dropped_total: LeanChainQueueDroppedCounter,
     lean_chain_queue_depth: LeanChainQueueDepthGauge,
     lean_chain_worker_loop_iters_total: LeanChainWorkerLoopItersCounter,
+    /// PR #966: per-dispatch-path counter so dashboards can see how often
+    /// the chain-worker actually managed to batch ≥2 blocks vs falling
+    /// back to the single-block path. `path="single"` increments once
+    /// per `.on_block` Message dispatched through the unbatched code
+    /// path (block queue depth ≤ BLOCK_BATCH_THRESHOLD at drain time);
+    /// `path="batch"` increments once per `Handlers.on_blocks_batch`
+    /// dispatch. Sum the latter with the K from
+    /// `zeam_stf_verify_signatures_batch_size_count` to recover the
+    /// total number of blocks that took the batched path.
+    zeam_chain_worker_block_dispatch_total: ZeamChainWorkerBlockDispatchCounter,
     /// Tripwire counter (zclawz review on PR #890): bumped from
     /// `chainWorkerProcessPendingBlocksThunk` whenever it returns a
     /// non-empty `missing_roots` slice. The thunk has no production
@@ -478,6 +494,14 @@ const Metrics = struct {
         StfVerifySignaturesStageLabel,
         &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
     );
+    // Batch sizes 1..16+ cover the practical range:
+    // - K=1: chain-worker drained one block (gossip / locally produced / sparse catch-up)
+    // - K=2..4: typical catch-up sweep (BLOCKS_BY_RANGE_SYNC_THRESHOLD = 4)
+    // - K=8..16: backlog drain after a stall
+    const StfVerifySignaturesBatchSizeHistogram = metrics_lib.Histogram(
+        f32,
+        &[_]f32{ 1, 2, 4, 8, 16, 32 },
+    );
     // Watchdog counters (#863): wall-clock heartbeats from the slot-driver
     // libxev thread. The watchdog thread bumps `_fired_total` whenever it
     // observes a stall over the configured threshold; the per-bucket
@@ -544,6 +568,7 @@ const Metrics = struct {
     const LeanChainQueueDroppedCounter = metrics_lib.CounterVec(u64, struct { queue: []const u8 });
     const LeanChainQueueDepthGauge = metrics_lib.GaugeVec(u64, struct { queue: []const u8 });
     const LeanChainWorkerLoopItersCounter = metrics_lib.Counter(u64);
+    const ZeamChainWorkerBlockDispatchCounter = metrics_lib.CounterVec(u64, struct { path: []const u8 });
     const LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter = metrics_lib.Counter(u64);
     // Refcount-distribution buckets [1, 2, 4, 8, 16, 32, +Inf]. Typical
     // value is 1 (writer-only); transient 2-4 under reader concurrency;
@@ -792,6 +817,12 @@ fn observeBlockAggregatedPayloads(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeStfVerifySignaturesBatchSize(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.StfVerifySignaturesBatchSizeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeGossipBlockSizeBytes(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.GossipBlockSizeBytesHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -901,6 +932,10 @@ pub var zeam_chain_onblock_num_aggregated_attestations: Histogram = .{
 pub var zeam_chain_onblock_total_participants: Histogram = .{
     .context = null,
     .observe = &observeChainOnblockTotalParticipants,
+};
+pub var zeam_stf_verify_signatures_batch_size: Histogram = .{
+    .context = null,
+    .observe = &observeStfVerifySignaturesBatchSize,
 };
 pub var lean_state_transition_time_seconds: Histogram = .{
     .context = null,
@@ -1037,7 +1072,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
         .zeam_chain_onblock_step_duration_seconds = try Metrics.ChainOnblockStepHistogram.init(allocator, io, "zeam_chain_onblock_step_duration_seconds", .{ .help = "Per-substep wall-clock duration inside chain.onBlock, labeled by step. See #863 for context. Buckets match zeam_chain_onblock_duration_seconds for stack-aligned dashboarding." }, .{}),
-        .zeam_stf_verify_signatures_stage_duration_seconds = try Metrics.StfVerifySignaturesStageHistogram.init(allocator, io, "zeam_stf_verify_signatures_stage_duration_seconds", .{ .help = "Per-stage wall-clock duration inside stf.verifySignaturesParallel, labeled by stage. Splits the step=\"verify_signatures\" cost recorded by zeam_chain_onblock_step_duration_seconds across phase1_prep / phase2_batch_verify / proposer_block_root / proposer_xmss_verify. See PR #963." }, .{}),
+        .zeam_stf_verify_signatures_stage_duration_seconds = try Metrics.StfVerifySignaturesStageHistogram.init(allocator, io, "zeam_stf_verify_signatures_stage_duration_seconds", .{ .help = "Per-stage wall-clock duration inside stf.verifySignaturesParallel, labeled by stage. Splits the step=\"verify_signatures\" cost recorded by zeam_chain_onblock_step_duration_seconds across phase1_prep / phase2_batch_verify / proposer_block_root / proposer_xmss_verify. Multi-block path adds _multiblock suffix to the same stages. See PR #963 / #964." }, .{}),
+        .zeam_stf_verify_signatures_batch_size = Metrics.StfVerifySignaturesBatchSizeHistogram.init("zeam_stf_verify_signatures_batch_size", .{ .help = "Number of blocks coalesced into a single stf.verifySignaturesParallelMultiBlock call. K=1 means the single-block path was used; K>1 means the chain-worker batched the drain. Pair with zeam_stf_verify_signatures_stage_duration_seconds{stage=\"phase2_batch_verify_multiblock\"} to measure batching amortisation. See PR #964." }, .{}),
         .zeam_chain_onblock_num_aggregated_attestations = Metrics.BlockAggregatedPayloadsHistogram.init("zeam_chain_onblock_num_aggregated_attestations", .{ .help = "Number of aggregated_attestations in each block processed by chain.onBlock (block import). Pair with zeam_chain_onblock_step_duration_seconds{step=\"verify_signatures\"} to attribute slow-block timings to block heaviness vs per-block constant cost. See PR #963." }, .{}),
         .zeam_chain_onblock_total_participants = Metrics.BlockTotalParticipantsHistogram.init("zeam_chain_onblock_total_participants", .{ .help = "Sum of participants across all aggregated_attestations in each block processed by chain.onBlock. Companion to zeam_chain_onblock_num_aggregated_attestations: same block can have few aggregations but many total participants if the aggregator did its job. See PR #963." }, .{}),
         .zeam_slot_driver_stall_fired_total = Metrics.ZeamSlotDriverStallFiredCounter.init("zeam_slot_driver_stall_fired_total", .{ .help = "Total times the watchdog (#863) observed the libxev slot driver stalled past its threshold (default 5s). Each firing also records the stall duration in zeam_slot_driver_stall_seconds and emits an ERROR log." }, .{}),
@@ -1154,6 +1190,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation|replay_pending). The `replay_pending` label is a single nudge that drains the in-process pending-attestation buffers — buffer depth itself is exposed via `lean_pending_attestations_size{kind}`." }, .{}),
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed or explicitly discarded during shutdown, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
+        .zeam_chain_worker_block_dispatch_total = try Metrics.ZeamChainWorkerBlockDispatchCounter.init(allocator, io, "zeam_chain_worker_block_dispatch_total", .{ .help = "Chain-worker block-dispatch path counter. path=\"single\" counts `.on_block` dispatches via the unbatched code path (block queue depth ≤ BLOCK_BATCH_THRESHOLD); path=\"batch\" counts `.on_blocks_batch` dispatches (one per batched call, K blocks each). Combine with zeam_stf_verify_signatures_batch_size_count to recover total blocks taken via the batched path. See PR #966." }, .{}),
         .lean_chain_worker_process_pending_blocks_dropped_missing_roots_total = Metrics.LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter.init("lean_chain_worker_process_pending_blocks_dropped_missing_roots_total", .{ .help = "Tripwire (#890): non-zero only if a future worker producer dispatches `process_pending_blocks` without wiring the missing-roots backchannel. MUST stay 0 in steady state." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
         // Slice (d)/(e) of #803 — see field doc for label semantics.
@@ -1207,6 +1244,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_chain_onblock_duration_seconds.context = @ptrCast(&metrics.zeam_chain_onblock_duration_seconds);
     zeam_chain_onblock_num_aggregated_attestations.context = @ptrCast(&metrics.zeam_chain_onblock_num_aggregated_attestations);
     zeam_chain_onblock_total_participants.context = @ptrCast(&metrics.zeam_chain_onblock_total_participants);
+    zeam_stf_verify_signatures_batch_size.context = @ptrCast(&metrics.zeam_stf_verify_signatures_batch_size);
     lean_state_transition_time_seconds.context = @ptrCast(&metrics.lean_state_transition_time_seconds);
     lean_state_transition_slots_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_slots_processing_time_seconds);
     lean_state_transition_block_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_block_processing_time_seconds);

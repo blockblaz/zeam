@@ -108,6 +108,16 @@ pub const CachedProcessedBlockInfo = struct {
     // for database persistence and skips re-serializing the live SignedBlock, which
     // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
     sszBytes: ?[]const u8 = null,
+    // Set by `onBlocksBatch` after it has already run
+    // `stf.verifySignaturesParallelMultiBlock` across the full batch.
+    // When true, the `step="verify_signatures"` lap inside `onBlock`
+    // is skipped — re-running it per block would duplicate the work
+    // the caller already did and defeat the point of the batched path.
+    //
+    // Callers OUTSIDE the batched path must leave this false: missing
+    // a real signature verify would silently let bad blocks into fork
+    // choice. See PR #964.
+    preVerified: bool = false,
 };
 
 pub const GossipProcessingResult = struct {
@@ -714,6 +724,7 @@ pub const BeamChain = struct {
             .handlers = .{
                 .ctx = self,
                 .on_block = chainWorkerOnBlockThunk,
+                .on_blocks_batch = chainWorkerOnBlocksBatchThunk,
                 .on_gossip_attestation = chainWorkerOnGossipAttestationThunk,
                 .on_gossip_aggregated_attestation = chainWorkerOnGossipAggregatedAttestationThunk,
                 .process_pending_blocks = chainWorkerProcessPendingBlocksThunk,
@@ -1226,6 +1237,102 @@ pub const BeamChain = struct {
             return;
         }
         self.allocator.free(missing_roots);
+    }
+
+    /// Batched-block thunk (PR #966). Called by the chain-worker drain
+    /// loop when it coalesced 2+ `.on_block` messages. Routes the whole
+    /// batch through `chain.onBlocksBatch` so the XMSS aggregated-
+    /// signature verify runs as ONE rayon call across every attestation
+    /// in every block (the `phase2_batch_verify` stage that is 99% of
+    /// `step="verify_signatures"` on a loaded chain). After the batched
+    /// import returns, per-block bookkeeping (onBlockFollowup, replay,
+    /// imported-block backchannel) still runs once per block in order
+    /// — those steps are cheap and not amenable to batching.
+    ///
+    /// TOCTOU rejection paths (MissingPreState / PreFinalizedSlot) that
+    /// the single-block thunk routes to the rejected_block callback are
+    /// NOT exercised from this thunk: `onBlocksBatch` swallows per-block
+    /// failures into `missing_roots = null` so we lose the error tag.
+    /// Acceptable trade-off for the catch-up hot path (where the producer
+    /// just checked `hasBlock(parent)` under a shared lock, so the TOCTOU
+    /// window is narrow); gossip-rate blocks at queue depth ≤ threshold
+    /// still go through `chainWorkerOnBlockThunk` with full TOCTOU.
+    fn chainWorkerOnBlocksBatchThunk(
+        ctx: *anyopaque,
+        items: []const chain_worker.BlockBatchItem,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        // Build per-block input slices for chain.onBlocksBatch. Every
+        // item should have a block_root by construction (gossip / RPC /
+        // local producers all compute it before submitting) — but
+        // recompute if missing to keep this thunk robust against future
+        // producers.
+        const signed_blocks = self.allocator.alloc(types.SignedBlock, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on signed_blocks alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(signed_blocks);
+        const block_roots = self.allocator.alloc(types.Root, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on block_roots alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(block_roots);
+
+        // `prune_forkchoice` is per-item in principle but in practice all
+        // catch-up submitters pass the same value. Use the first item's
+        // value for the batch; if a future submitter mixes per-block
+        // pruning we'll need to split into homogeneous sub-batches.
+        const prune_forkchoice = items[0].prune_forkchoice;
+
+        for (items, 0..) |item, i| {
+            signed_blocks[i] = item.signed_block;
+            if (item.block_root) |r| {
+                block_roots[i] = r;
+            } else {
+                zeam_utils.hashTreeRoot(types.BeamBlock, item.signed_block.block, &block_roots[i], self.allocator) catch |err| {
+                    self.logger.err(
+                        "chain-worker: onBlocksBatch root recompute failed slot={d}: {any}",
+                        .{ item.signed_block.block.slot, err },
+                    );
+                    return;
+                };
+            }
+        }
+
+        const results = self.onBlocksBatch(signed_blocks, block_roots, prune_forkchoice) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch failed K={d}: {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(results);
+
+        // Per-block bookkeeping: followup + replay + imported_block
+        // callback. Mirror the single-block thunk's tail; null result
+        // means that block failed import (already logged inside
+        // onBlocksBatch / its fallback).
+        for (items, results, 0..) |item, result, i| {
+            const block_root = block_roots[i];
+            if (result.missing_roots) |missing_roots| {
+                self.onBlockFollowup(item.prune_forkchoice, &item.signed_block);
+                self.replayPendingAttestations();
+                if (self.imported_block) |cb| {
+                    cb.func(cb.ctx, block_root, missing_roots);
+                } else {
+                    self.allocator.free(missing_roots);
+                }
+            }
+            // Failed blocks: nothing to do — onBlocksBatch already logged
+            // and we have no error tag to drive the rejected_block path.
+        }
     }
 
     fn chainWorkerOnGossipAttestationThunk(
@@ -3463,7 +3570,15 @@ pub const BeamChain = struct {
             // skip its own hashTreeRoot(BeamBlock) call (free win — see PR #963
             // perf instrumentation: empty blocks were spending most of their
             // verify_signatures budget in the duplicated hash).
-            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool, &block_root);
+            //
+            // Skip when the caller already batch-verified across multiple
+            // blocks (`onBlocksBatch` path, PR #964): rerunning the verify
+            // here would duplicate the work that was the whole reason to
+            // batch in the first place. `blockInfo.preVerified` is set
+            // ONLY by that controlled caller; bare callers leave it false.
+            if (!blockInfo.preVerified) {
+                try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool, &block_root);
+            }
 
             step_watch.lap("verify_signatures");
 
@@ -3786,6 +3901,142 @@ pub const BeamChain = struct {
             blockInfo.postState == null,
         });
         return missing_roots.toOwnedSlice(self.allocator);
+    }
+
+    /// Per-block result of `onBlocksBatch`. `missing_roots` is `null`
+    /// when that block failed import (caller does not need to free).
+    /// Non-null entries are owned by the caller and must be freed with
+    /// `chain.allocator.free(missing_roots)` — same contract as the
+    /// return value of single-block `onBlock`.
+    pub const BatchBlockResult = struct {
+        missing_roots: ?[]types.Root,
+    };
+
+    /// Batched block import. Coalesces the XMSS aggregated-signature
+    /// verify across all blocks in `signedBlocks` into ONE rayon call
+    /// (the previously-instrumented `phase2_batch_verify` stage that is
+    /// 99% of `step="verify_signatures"` on a loaded chain — see PR
+    /// #963 data), then runs STF per block sequentially with
+    /// `preVerified=true` so the per-block `onBlock` does NOT redo the
+    /// verify. Targets the catch-up hot path where the chain-worker has
+    /// drained K blocks at once.
+    ///
+    /// Inputs:
+    ///   signedBlocks  — K SignedBlock values, slot-ascending (caller's
+    ///                   responsibility; STF below depends on parent
+    ///                   states being importable in iteration order).
+    ///   block_roots   — pre-computed hashTreeRoot of each block, in
+    ///                   the same order. Required (multi-block path
+    ///                   skips the duplicate hashTreeRoot inside
+    ///                   `verifySignaturesParallel`).
+    ///   pruneForkchoice — passed through to per-block onBlock.
+    ///
+    /// Returns: K-length slice of BatchBlockResult, owned by caller (free
+    /// the outer slice; for each non-null `missing_roots` also free it).
+    ///
+    /// K=0: returns empty slice. K=1: routes through `onBlock` for
+    /// identical semantics with non-batched paths (no batching upside).
+    ///
+    /// On a multi-block batch-verify failure, falls back to per-block
+    /// `onBlock(.{ preVerified = false })` so a single bad signature
+    /// in the batch doesn't drop the whole sweep — valid blocks still
+    /// import; the bad one(s) get marked with `missing_roots = null`.
+    pub fn onBlocksBatch(
+        self: *Self,
+        signedBlocks: []const types.SignedBlock,
+        block_roots: []const types.Root,
+        pruneForkchoice: bool,
+    ) ![]BatchBlockResult {
+        std.debug.assert(signedBlocks.len == block_roots.len);
+        if (signedBlocks.len == 0) return self.allocator.alloc(BatchBlockResult, 0);
+
+        const results = try self.allocator.alloc(BatchBlockResult, signedBlocks.len);
+        errdefer self.allocator.free(results);
+
+        if (signedBlocks.len == 1) {
+            // K=1: no batching upside. Use the regular path so metrics +
+            // semantics match other single-block callers exactly.
+            const missing = self.onBlock(signedBlocks[0], .{
+                .blockRoot = block_roots[0],
+                .pruneForkchoice = pruneForkchoice,
+            }) catch |err| {
+                results[0] = .{ .missing_roots = null };
+                return err;
+            };
+            results[0] = .{ .missing_roots = missing };
+            return results;
+        }
+
+        // For verify, all blocks need a state to look up validator
+        // pubkeys. In lean consensus the validator set is fixed at
+        // genesis (no dynamic registration), so pubkeys are identical
+        // across every block's parent state. Using the first block's
+        // parent state for all K verify tasks is sound and avoids
+        // having to STF blocks 1..N-1 just to compute their parent
+        // states for the verify pass. The actual STF below still does
+        // a per-block parent-state lookup and full state transition.
+        var parent_borrow = self.statesGet(signedBlocks[0].block.parent_root) orelse {
+            self.allocator.free(results);
+            return BlockProcessingError.MissingPreState;
+        };
+        defer parent_borrow.assertReleasedOrPanic();
+        const shared_pre_snapshot = try parent_borrow.cloneAndRelease(self.allocator);
+        defer {
+            shared_pre_snapshot.deinit();
+            self.allocator.destroy(shared_pre_snapshot);
+        }
+
+        // Build the multi-block task slice. `block_roots` must outlive
+        // this scope; the caller's slice does (it owns the storage).
+        const tasks = try self.allocator.alloc(stf.VerifyMultiBlockTask, signedBlocks.len);
+        defer self.allocator.free(tasks);
+        for (signedBlocks, block_roots, 0..) |*sb, *root, i| {
+            tasks[i] = .{
+                .state = shared_pre_snapshot,
+                .signed_block = sb,
+                .precomputed_block_root = root,
+            };
+        }
+
+        // The one rayon call across every attestation in every block.
+        const batch_verify_ok = blk: {
+            stf.verifySignaturesParallelMultiBlock(
+                self.allocator,
+                tasks,
+                &self.public_key_cache,
+                self.thread_pool,
+            ) catch |err| {
+                self.logger.warn(
+                    "multi-block batch verify failed (K={d}): {any}; falling back to per-block import",
+                    .{ signedBlocks.len, err },
+                );
+                break :blk false;
+            };
+            break :blk true;
+        };
+
+        // Per-block STF. When the batch verify succeeded we pass
+        // `preVerified = true` so `onBlock` skips its own verify call;
+        // on fallback we run the regular path so a bad signature
+        // gets isolated to its specific block via the normal error
+        // return rather than failing the whole sweep.
+        for (signedBlocks, block_roots, 0..) |sb, root, i| {
+            const missing = self.onBlock(sb, .{
+                .blockRoot = root,
+                .pruneForkchoice = pruneForkchoice,
+                .preVerified = batch_verify_ok,
+            }) catch |err| {
+                self.logger.warn(
+                    "onBlocksBatch: block 0x{x} slot={d} failed import: {any}",
+                    .{ &root, sb.block.slot, err },
+                );
+                results[i] = .{ .missing_roots = null };
+                continue;
+            };
+            results[i] = .{ .missing_roots = missing };
+        }
+
+        return results;
     }
 
     pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlock) void {
@@ -4561,14 +4812,28 @@ pub const BeamChain = struct {
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .behind_peers => |info| {
-                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
-                    slot,
-                    info.head_slot,
-                    info.finalized_slot,
-                    info.max_peer_finalized_slot,
-                });
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
-                return;
+                // Same pre-finalization cold-start exception as
+                // validator_client.mayBeDoAttestation (see its long
+                // comment). Aggregation MUST proceed when both finalized
+                // slots are 0, otherwise we never produce the first
+                // aggregated payload and the chain can't reach a first
+                // justification. Once any finalization exists the gate
+                // returns to its proper deep-sync meaning.
+                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
+                    self.logger.info(
+                        "behind_peers but pre-finalization (finalized_slot=0, max_peer_finalized_slot=0): aggregating for slot={d} on current head_slot={d} to help reach first justification",
+                        .{ slot, info.head_slot },
+                    );
+                } else {
+                    self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
+                        slot,
+                        info.head_slot,
+                        info.finalized_slot,
+                        info.max_peer_finalized_slot,
+                    });
+                    zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                    return;
+                }
             },
         }
 
