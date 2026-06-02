@@ -418,7 +418,7 @@ const Metrics = struct {
     //   * `kind` — `attestation` (raw gossip att) or `aggregation`
     //     (aggregated payload).
     //   * `reason`:
-    //     - `syncing` — chain.getSyncStatus() is `behind_peers` /
+    //     - `syncing` — chain.getSyncStatus() is `peers_materially_ahead` /
     //       `fc_initing` / `no_peers`; suppress validation work and the
     //       follow-up `BlocksByRoot` fetch enqueue (the death-spiral fix).
     //       Recovery comes from `BlocksByRange` / gossip block import.
