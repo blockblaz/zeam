@@ -568,11 +568,6 @@ pub const Network = struct {
             }
             return err;
         };
-        // Cache took the inner SignedBlock value (struct copy). Free the
-        // outer heap pointer; the inner allocations are now owned by the
-        // cache and will be freed via `removeFetchedBlock` /
-        // `BlockCache.deinit`.
-        self.allocator.destroy(block_ptr);
     }
 
     /// Returns the pre-serialized SSZ bytes for a cached block, if stored.

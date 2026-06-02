@@ -84,7 +84,21 @@ pub const ChainOpts = struct {
     /// PR #900 the slot filter is `{slot-1, slot}`, so aggregations for
     /// further-back slots are wasted work. See `BeamChain.aggregateImpl`.
     aggregate_max_inflight: u32 = 4,
+    /// Share of one proposal interval (`SECONDS_PER_INTERVAL_MS`) budgeted to
+    /// the block build + attestation-aggregation worker. This is an
+    /// INTRA-interval time budget, not a cross-interval split: the worker
+    /// self-truncates at `pct%` of the interval, and the remaining
+    /// `(100-pct)%` of the SAME interval is reserved for the finalize step
+    /// (STF over the harvested partial body + propose-side sign + gossip
+    /// publish), so the signed block is ready before the attestation interval.
+    ///
+    /// Default 90: ~720ms aggregation budget + ~80ms finalize/sign budget at
+    /// the default 800ms interval.
+    proposal_deadline_pct: u32 = default_proposal_deadline_pct,
 };
+
+/// Default value for `ChainOpts.proposal_deadline_pct`
+pub const default_proposal_deadline_pct: u32 = 90;
 
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
@@ -94,6 +108,16 @@ pub const CachedProcessedBlockInfo = struct {
     // for database persistence and skips re-serializing the live SignedBlock, which
     // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
     sszBytes: ?[]const u8 = null,
+    // Set by `onBlocksBatch` after it has already run
+    // `stf.verifySignaturesParallelMultiBlock` across the full batch.
+    // When true, the `step="verify_signatures"` lap inside `onBlock`
+    // is skipped — re-running it per block would duplicate the work
+    // the caller already did and defeat the point of the batched path.
+    //
+    // Callers OUTSIDE the batched path must leave this false: missing
+    // a real signature verify would silently let bad blocks into fork
+    // choice. See PR #964.
+    preVerified: bool = false,
 };
 
 pub const GossipProcessingResult = struct {
@@ -114,6 +138,28 @@ pub const ProducedBlock = struct {
             sig_group.deinit();
         }
         self.attestation_signatures.deinit();
+    }
+};
+
+/// Worker-produced body. Worker moves its `compactAttestations` result
+/// here; `finalizeProposalIfReady` takes ownership and finishes the
+/// proposal (STF + sign + broadcast).
+pub const PartialProposalBody = struct {
+    slot: types.Slot,
+    proposer_index: types.ValidatorIndex,
+    parent_root: types.Root,
+    pre_state: *types.BeamState,
+    attestations: types.AggregatedAttestations,
+    signatures: types.AttestationSignatures,
+    allocator: Allocator,
+
+    pub fn deinit(self: *PartialProposalBody) void {
+        for (self.attestations.slice()) |*att| att.deinit();
+        self.attestations.deinit();
+        for (self.signatures.slice()) |*sig| sig.deinit();
+        self.signatures.deinit();
+        self.pre_state.deinit();
+        self.allocator.destroy(self.pre_state);
     }
 };
 
@@ -420,6 +466,15 @@ pub const BeamChain = struct {
     /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
     aggregate_max_inflight: u32,
 
+    /// See `ChainOpts.proposal_deadline_pct`.
+    proposal_deadline_pct: u32,
+
+    proposal_partial_mutex: zeam_utils.SyncMutex = .{},
+    proposal_partial_slot: ?types.Slot = null,
+    proposal_partial_body: ?*PartialProposalBody = null,
+    proposal_build_inflight: std.atomic.Value(bool) = .init(false),
+    proposal_build_wg: WaitGroup = .{},
+
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -606,6 +661,12 @@ pub const BeamChain = struct {
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
+            .proposal_deadline_pct = opts.proposal_deadline_pct,
+            .proposal_partial_mutex = .{},
+            .proposal_partial_slot = null,
+            .proposal_partial_body = null,
+            .proposal_build_inflight = .init(false),
+            .proposal_build_wg = .{},
             // leanSpec _pending_attestations / _pending_aggregated_attestations
             // buffers — empty at init; FIFO-bounded by
             // constants.MAX_PENDING_ATTESTATIONS in the enqueue helpers.
@@ -663,6 +724,7 @@ pub const BeamChain = struct {
             .handlers = .{
                 .ctx = self,
                 .on_block = chainWorkerOnBlockThunk,
+                .on_blocks_batch = chainWorkerOnBlocksBatchThunk,
                 .on_gossip_attestation = chainWorkerOnGossipAttestationThunk,
                 .on_gossip_aggregated_attestation = chainWorkerOnGossipAggregatedAttestationThunk,
                 .process_pending_blocks = chainWorkerProcessPendingBlocksThunk,
@@ -1026,15 +1088,14 @@ pub const BeamChain = struct {
             &gossip.message.signature,
         );
 
-        // Role-gated storage — leanSpec: `if is_aggregator: ...`.
-        // zeam's analog of `attestation_signatures` is the per-validator
-        // attestation tracker maintained by `forkChoice.onSignedAttestation`,
-        // which in turn feeds head selection. Skipping it for non-
-        // aggregators matches the spec's "Non-aggregator nodes validate
-        // and drop — they never store gossip signatures" contract.
-        if (is_aggregator_role) {
-            try self.forkChoice.onSignedAttestation(gossip.message);
-        }
+        // Fork-choice vote tracking runs for ALL nodes so head selection and
+        // `safeTarget` converge across aggregators and non-aggregators —
+        // gating it (as this path used to) left non-aggregators voting a
+        // divergent attestation target, which wedged justification at
+        // genesis. Only the `attestation_signatures` aggregation buffer is
+        // role-gated (leanSpec "non-aggregators validate and drop the raw
+        // signature"); that gate now lives inside `onSignedAttestation`.
+        try self.forkChoice.onSignedAttestation(gossip.message, is_aggregator_role);
     }
 
     // ------------------------------------------------------------------
@@ -1176,6 +1237,102 @@ pub const BeamChain = struct {
             return;
         }
         self.allocator.free(missing_roots);
+    }
+
+    /// Batched-block thunk (PR #966). Called by the chain-worker drain
+    /// loop when it coalesced 2+ `.on_block` messages. Routes the whole
+    /// batch through `chain.onBlocksBatch` so the XMSS aggregated-
+    /// signature verify runs as ONE rayon call across every attestation
+    /// in every block (the `phase2_batch_verify` stage that is 99% of
+    /// `step="verify_signatures"` on a loaded chain). After the batched
+    /// import returns, per-block bookkeeping (onBlockFollowup, replay,
+    /// imported-block backchannel) still runs once per block in order
+    /// — those steps are cheap and not amenable to batching.
+    ///
+    /// TOCTOU rejection paths (MissingPreState / PreFinalizedSlot) that
+    /// the single-block thunk routes to the rejected_block callback are
+    /// NOT exercised from this thunk: `onBlocksBatch` swallows per-block
+    /// failures into `missing_roots = null` so we lose the error tag.
+    /// Acceptable trade-off for the catch-up hot path (where the producer
+    /// just checked `hasBlock(parent)` under a shared lock, so the TOCTOU
+    /// window is narrow); gossip-rate blocks at queue depth ≤ threshold
+    /// still go through `chainWorkerOnBlockThunk` with full TOCTOU.
+    fn chainWorkerOnBlocksBatchThunk(
+        ctx: *anyopaque,
+        items: []const chain_worker.BlockBatchItem,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        // Build per-block input slices for chain.onBlocksBatch. Every
+        // item should have a block_root by construction (gossip / RPC /
+        // local producers all compute it before submitting) — but
+        // recompute if missing to keep this thunk robust against future
+        // producers.
+        const signed_blocks = self.allocator.alloc(types.SignedBlock, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on signed_blocks alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(signed_blocks);
+        const block_roots = self.allocator.alloc(types.Root, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on block_roots alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(block_roots);
+
+        // `prune_forkchoice` is per-item in principle but in practice all
+        // catch-up submitters pass the same value. Use the first item's
+        // value for the batch; if a future submitter mixes per-block
+        // pruning we'll need to split into homogeneous sub-batches.
+        const prune_forkchoice = items[0].prune_forkchoice;
+
+        for (items, 0..) |item, i| {
+            signed_blocks[i] = item.signed_block;
+            if (item.block_root) |r| {
+                block_roots[i] = r;
+            } else {
+                zeam_utils.hashTreeRoot(types.BeamBlock, item.signed_block.block, &block_roots[i], self.allocator) catch |err| {
+                    self.logger.err(
+                        "chain-worker: onBlocksBatch root recompute failed slot={d}: {any}",
+                        .{ item.signed_block.block.slot, err },
+                    );
+                    return;
+                };
+            }
+        }
+
+        const results = self.onBlocksBatch(signed_blocks, block_roots, prune_forkchoice) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch failed K={d}: {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(results);
+
+        // Per-block bookkeeping: followup + replay + imported_block
+        // callback. Mirror the single-block thunk's tail; null result
+        // means that block failed import (already logged inside
+        // onBlocksBatch / its fallback).
+        for (items, results, 0..) |item, result, i| {
+            const block_root = block_roots[i];
+            if (result.missing_roots) |missing_roots| {
+                self.onBlockFollowup(item.prune_forkchoice, &item.signed_block);
+                self.replayPendingAttestations();
+                if (self.imported_block) |cb| {
+                    cb.func(cb.ctx, block_root, missing_roots);
+                } else {
+                    self.allocator.free(missing_roots);
+                }
+            }
+            // Failed blocks: nothing to do — onBlocksBatch already logged
+            // and we have no error tag to drive the rejected_block path.
+        }
     }
 
     fn chainWorkerOnGossipAttestationThunk(
@@ -1525,6 +1682,11 @@ pub const BeamChain = struct {
         // Issue #907: join any in-flight aggregate workers before
         // tearing down chain state they reference.
         self.thread_pool.waitAndWork(&self.aggregate_wg);
+
+        // Join proposer build worker before tearing down chain state it
+        // references (pre_snapshot, forkChoice, partial body slot).
+        self.thread_pool.waitAndWork(&self.proposal_build_wg);
+        self.freeProposalPartialUnderLock();
 
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
@@ -2516,7 +2678,7 @@ pub const BeamChain = struct {
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         // FFI call against the owned snapshot — no lock held during this
         // window.
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root);
+        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, null);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -3408,7 +3570,15 @@ pub const BeamChain = struct {
             // skip its own hashTreeRoot(BeamBlock) call (free win — see PR #963
             // perf instrumentation: empty blocks were spending most of their
             // verify_signatures budget in the duplicated hash).
-            try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool, &block_root);
+            //
+            // Skip when the caller already batch-verified across multiple
+            // blocks (`onBlocksBatch` path, PR #964): rerunning the verify
+            // here would duplicate the work that was the whole reason to
+            // batch in the first place. `blockInfo.preVerified` is set
+            // ONLY by that controlled caller; bare callers leave it false.
+            if (!blockInfo.preVerified) {
+                try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, self.thread_pool, &block_root);
+            }
 
             step_watch.lap("verify_signatures");
 
@@ -3731,6 +3901,142 @@ pub const BeamChain = struct {
             blockInfo.postState == null,
         });
         return missing_roots.toOwnedSlice(self.allocator);
+    }
+
+    /// Per-block result of `onBlocksBatch`. `missing_roots` is `null`
+    /// when that block failed import (caller does not need to free).
+    /// Non-null entries are owned by the caller and must be freed with
+    /// `chain.allocator.free(missing_roots)` — same contract as the
+    /// return value of single-block `onBlock`.
+    pub const BatchBlockResult = struct {
+        missing_roots: ?[]types.Root,
+    };
+
+    /// Batched block import. Coalesces the XMSS aggregated-signature
+    /// verify across all blocks in `signedBlocks` into ONE rayon call
+    /// (the previously-instrumented `phase2_batch_verify` stage that is
+    /// 99% of `step="verify_signatures"` on a loaded chain — see PR
+    /// #963 data), then runs STF per block sequentially with
+    /// `preVerified=true` so the per-block `onBlock` does NOT redo the
+    /// verify. Targets the catch-up hot path where the chain-worker has
+    /// drained K blocks at once.
+    ///
+    /// Inputs:
+    ///   signedBlocks  — K SignedBlock values, slot-ascending (caller's
+    ///                   responsibility; STF below depends on parent
+    ///                   states being importable in iteration order).
+    ///   block_roots   — pre-computed hashTreeRoot of each block, in
+    ///                   the same order. Required (multi-block path
+    ///                   skips the duplicate hashTreeRoot inside
+    ///                   `verifySignaturesParallel`).
+    ///   pruneForkchoice — passed through to per-block onBlock.
+    ///
+    /// Returns: K-length slice of BatchBlockResult, owned by caller (free
+    /// the outer slice; for each non-null `missing_roots` also free it).
+    ///
+    /// K=0: returns empty slice. K=1: routes through `onBlock` for
+    /// identical semantics with non-batched paths (no batching upside).
+    ///
+    /// On a multi-block batch-verify failure, falls back to per-block
+    /// `onBlock(.{ preVerified = false })` so a single bad signature
+    /// in the batch doesn't drop the whole sweep — valid blocks still
+    /// import; the bad one(s) get marked with `missing_roots = null`.
+    pub fn onBlocksBatch(
+        self: *Self,
+        signedBlocks: []const types.SignedBlock,
+        block_roots: []const types.Root,
+        pruneForkchoice: bool,
+    ) ![]BatchBlockResult {
+        std.debug.assert(signedBlocks.len == block_roots.len);
+        if (signedBlocks.len == 0) return self.allocator.alloc(BatchBlockResult, 0);
+
+        const results = try self.allocator.alloc(BatchBlockResult, signedBlocks.len);
+        errdefer self.allocator.free(results);
+
+        if (signedBlocks.len == 1) {
+            // K=1: no batching upside. Use the regular path so metrics +
+            // semantics match other single-block callers exactly.
+            const missing = self.onBlock(signedBlocks[0], .{
+                .blockRoot = block_roots[0],
+                .pruneForkchoice = pruneForkchoice,
+            }) catch |err| {
+                results[0] = .{ .missing_roots = null };
+                return err;
+            };
+            results[0] = .{ .missing_roots = missing };
+            return results;
+        }
+
+        // For verify, all blocks need a state to look up validator
+        // pubkeys. In lean consensus the validator set is fixed at
+        // genesis (no dynamic registration), so pubkeys are identical
+        // across every block's parent state. Using the first block's
+        // parent state for all K verify tasks is sound and avoids
+        // having to STF blocks 1..N-1 just to compute their parent
+        // states for the verify pass. The actual STF below still does
+        // a per-block parent-state lookup and full state transition.
+        var parent_borrow = self.statesGet(signedBlocks[0].block.parent_root) orelse {
+            self.allocator.free(results);
+            return BlockProcessingError.MissingPreState;
+        };
+        defer parent_borrow.assertReleasedOrPanic();
+        const shared_pre_snapshot = try parent_borrow.cloneAndRelease(self.allocator);
+        defer {
+            shared_pre_snapshot.deinit();
+            self.allocator.destroy(shared_pre_snapshot);
+        }
+
+        // Build the multi-block task slice. `block_roots` must outlive
+        // this scope; the caller's slice does (it owns the storage).
+        const tasks = try self.allocator.alloc(stf.VerifyMultiBlockTask, signedBlocks.len);
+        defer self.allocator.free(tasks);
+        for (signedBlocks, block_roots, 0..) |*sb, *root, i| {
+            tasks[i] = .{
+                .state = shared_pre_snapshot,
+                .signed_block = sb,
+                .precomputed_block_root = root,
+            };
+        }
+
+        // The one rayon call across every attestation in every block.
+        const batch_verify_ok = blk: {
+            stf.verifySignaturesParallelMultiBlock(
+                self.allocator,
+                tasks,
+                &self.public_key_cache,
+                self.thread_pool,
+            ) catch |err| {
+                self.logger.warn(
+                    "multi-block batch verify failed (K={d}): {any}; falling back to per-block import",
+                    .{ signedBlocks.len, err },
+                );
+                break :blk false;
+            };
+            break :blk true;
+        };
+
+        // Per-block STF. When the batch verify succeeded we pass
+        // `preVerified = true` so `onBlock` skips its own verify call;
+        // on fallback we run the regular path so a bad signature
+        // gets isolated to its specific block via the normal error
+        // return rather than failing the whole sweep.
+        for (signedBlocks, block_roots, 0..) |sb, root, i| {
+            const missing = self.onBlock(sb, .{
+                .blockRoot = root,
+                .pruneForkchoice = pruneForkchoice,
+                .preVerified = batch_verify_ok,
+            }) catch |err| {
+                self.logger.warn(
+                    "onBlocksBatch: block 0x{x} slot={d} failed import: {any}",
+                    .{ &root, sb.block.slot, err },
+                );
+                results[i] = .{ .missing_roots = null };
+                continue;
+            };
+            results[i] = .{ .missing_roots = missing };
+        }
+
+        return results;
     }
 
     pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlock) void {
@@ -4365,7 +4671,7 @@ pub const BeamChain = struct {
             &signedAttestation.message.signature,
         );
 
-        return self.forkChoice.onSignedAttestation(signedAttestation.message);
+        return self.forkChoice.onSignedAttestation(signedAttestation.message, self.isAggregator());
     }
 
     /// Update fork-choice attestation trackers for an aggregated proof.
@@ -4506,16 +4812,30 @@ pub const BeamChain = struct {
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .peers_materially_ahead => |info| {
-                self.logBehindPeersDebug("skipping aggregation production", info);
-                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
-                    slot,
-                    info.head_slot,
-                    info.finalized_slot,
-                    info.max_peer_finalized_slot,
-                    info.peer_count,
-                });
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
-                return;
+                // Same pre-finalization cold-start exception as
+                // validator_client.mayBeDoAttestation (see its long
+                // comment). Aggregation MUST proceed when both finalized
+                // slots are 0, otherwise we never produce the first
+                // aggregated payload and the chain can't reach a first
+                // justification. Once any finalization exists the gate
+                // returns to its proper deep-sync meaning.
+                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
+                    self.logger.info(
+                        "peers_materially_ahead but pre-finalization (finalized_slot=0, max_peer_finalized_slot=0): aggregating for slot={d} on current head_slot={d} to help reach first justification",
+                        .{ slot, info.head_slot },
+                    );
+                } else {
+                    self.logBehindPeersDebug("skipping aggregation production", info);
+                    self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
+                        slot,
+                        info.head_slot,
+                        info.finalized_slot,
+                        info.max_peer_finalized_slot,
+                        info.peer_count,
+                    });
+                    zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                    return;
+                }
             },
         }
 
@@ -4628,6 +4948,299 @@ pub const BeamChain = struct {
             node.publishProducedAggregations(aggregations);
         }
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
+    }
+
+    /// Caller must hold `proposal_partial_mutex` or be in `deinit`.
+    fn freeProposalPartialUnderLock(self: *Self) void {
+        if (self.proposal_partial_body) |body| {
+            body.deinit();
+            self.allocator.destroy(body);
+            self.proposal_partial_body = null;
+        }
+        self.proposal_partial_slot = null;
+    }
+
+    /// Proposal-interval (interval 0) entry: spawn the deadline-bounded build
+    /// worker. Boolean inflight gate (proposer slots produce at most one block;
+    /// no coalesce semantics). The caller blocks on this worker within the same
+    /// interval (see `proposal_deadline_pct`) — the pool offload buys parallel,
+    /// deadline-bounded aggregation, not a freed event-loop thread.
+    pub fn submitBlockBuildOnInterval(
+        self: *Self,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+    ) void {
+        if (self.proposal_build_inflight.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) {
+            self.logger.info(
+                "skipping block build for slot={d}: previous build still in flight",
+                .{slot},
+            );
+            return;
+        }
+
+        var inflight_owned = true;
+        defer if (inflight_owned) self.proposal_build_inflight.store(false, .release);
+
+        const proposal_head = self.forkChoice.getProposalHead(slot) catch |err| {
+            self.logger.warn(
+                "failed to get proposal head for slot={d}: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+        const parent_root = proposal_head.root;
+
+        var pre_borrow = self.statesGet(parent_root) orelse {
+            self.logger.warn(
+                "skipping block build for slot={d}: missing pre-state for parent_root",
+                .{slot},
+            );
+            return;
+        };
+        defer pre_borrow.assertReleasedOrPanic();
+        const pre_snapshot = pre_borrow.cloneAndRelease(self.allocator) catch |err| {
+            self.logger.warn(
+                "failed to clone pre-state for slot={d}: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+        var pre_snapshot_handed_off = false;
+        defer if (!pre_snapshot_handed_off) {
+            pre_snapshot.deinit();
+            self.allocator.destroy(pre_snapshot);
+        };
+
+        // Deadline = pct% of the proposal interval, reserving (100-pct)% of
+        // the SAME interval for the finalize + sign step (an intra-interval
+        // budget, not a cross-interval split). Clamp to [0, 99] so finalize
+        // always has headroom.
+        const pct_clamped: i64 = @intCast(@min(self.proposal_deadline_pct, 99));
+        const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
+        const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
+
+        self.thread_pool.spawnWg(
+            &self.proposal_build_wg,
+            produceBlockWorker,
+            .{ self, slot, proposer_index, parent_root, pre_snapshot, deadline_ns },
+        ) catch {
+            self.logger.warn(
+                "failed to spawn block build worker for slot={d}",
+                .{slot},
+            );
+            return;
+        };
+        inflight_owned = false;
+        pre_snapshot_handed_off = true;
+    }
+
+    /// Build-worker body. Owns `pre_snapshot` until exit. On the success
+    /// path it transfers `pre_snapshot` ownership into the published
+    /// `PartialProposalBody` so `finalizeProposalIfReady` can reuse it
+    /// as the post-state STF buffer (avoiding a second MB-scale clone
+    /// from the states map and a third clone to seed `post_state`).
+    /// On any failure path before the handoff, the snapshot is freed
+    /// here.
+    fn produceBlockWorker(
+        chain: *Self,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+        parent_root: types.Root,
+        pre_snapshot: *types.BeamState,
+        deadline_ns: i64,
+    ) void {
+        defer chain.proposal_build_inflight.store(false, .release);
+        var pre_snapshot_handed_off = false;
+        defer if (!pre_snapshot_handed_off) {
+            pre_snapshot.deinit();
+            chain.allocator.destroy(pre_snapshot);
+        };
+
+        var result = chain.forkChoice.getProposalAttestations(
+            pre_snapshot,
+            slot,
+            proposer_index,
+            parent_root,
+            deadline_ns,
+        ) catch |err| {
+            chain.logger.warn(
+                "proposal build worker for slot={d} failed: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+
+        const body = chain.allocator.create(PartialProposalBody) catch |err| {
+            for (result.attestations.slice()) |*att| att.deinit();
+            result.attestations.deinit();
+            for (result.signatures.slice()) |*sig| sig.deinit();
+            result.signatures.deinit();
+            chain.logger.warn(
+                "proposal build worker for slot={d} body alloc failed: {any}",
+                .{ slot, err },
+            );
+            return;
+        };
+        body.* = .{
+            .slot = slot,
+            .proposer_index = proposer_index,
+            .parent_root = parent_root,
+            .pre_state = pre_snapshot,
+            .attestations = result.attestations,
+            .signatures = result.signatures,
+            .allocator = chain.allocator,
+        };
+        pre_snapshot_handed_off = true;
+
+        chain.proposal_partial_mutex.lock();
+        defer chain.proposal_partial_mutex.unlock();
+        if (chain.proposal_partial_body) |old| {
+            old.deinit();
+            chain.allocator.destroy(old);
+        }
+        chain.proposal_partial_slot = slot;
+        chain.proposal_partial_body = body;
+    }
+
+    /// Take the latest published partial, run STF, register, return for
+    /// signing. Mirrors `produceBlock`'s tail; null if no partial ready.
+    pub fn finalizeProposalIfReady(
+        self: *Self,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+    ) !?ProducedBlock {
+        var body_ptr: ?*PartialProposalBody = null;
+        {
+            self.proposal_partial_mutex.lock();
+            defer self.proposal_partial_mutex.unlock();
+
+            if (self.proposal_partial_slot) |partial_slot| {
+                if (partial_slot < slot and self.proposal_partial_body != null) {
+                    // Reap stale partial from prior slot.
+                    self.freeProposalPartialUnderLock();
+                    zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+                    return null;
+                }
+                if (partial_slot != slot) {
+                    zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+                    return null;
+                }
+            } else {
+                zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+                return null;
+            }
+
+            body_ptr = self.proposal_partial_body;
+            self.proposal_partial_slot = null;
+            self.proposal_partial_body = null;
+        }
+
+        var body = body_ptr orelse {
+            zeam_metrics.metrics.zeam_proposal_skipped_empty_total.incr();
+            return null;
+        };
+        var body_owned = true;
+        defer if (body_owned) {
+            body.deinit();
+            self.allocator.destroy(body);
+        };
+
+        if (body.proposer_index != proposer_index) {
+            self.logger.warn(
+                "proposal partial proposer mismatch: slot={d} expected={d} got={d}",
+                .{ slot, proposer_index, body.proposer_index },
+            );
+            return null;
+        }
+
+        // Move out before the body's defer fires. body.deinit MUST NOT run
+        // after this — only `allocator.destroy(body)`.
+        const post_state: *types.BeamState = body.pre_state;
+        var agg_attestations = body.attestations;
+        var attestation_signatures = body.signatures;
+        body_owned = false;
+        // The body struct itself still needs freeing — its fields point
+        // at memory now owned by `post_state` / `block` /
+        // `attestation_signatures`.
+        defer self.allocator.destroy(body);
+
+        var post_state_consumed = false;
+        errdefer if (!post_state_consumed) {
+            post_state.deinit();
+            self.allocator.destroy(post_state);
+        };
+
+        var agg_att_cleanup = true;
+        errdefer if (agg_att_cleanup) {
+            for (agg_attestations.slice()) |*att| att.deinit();
+            agg_attestations.deinit();
+        };
+
+        var agg_sig_cleanup = true;
+        errdefer if (agg_sig_cleanup) {
+            for (attestation_signatures.slice()) |*sig| sig.deinit();
+            attestation_signatures.deinit();
+        };
+
+        var block = types.BeamBlock{
+            .slot = slot,
+            .proposer_index = proposer_index,
+            .parent_root = body.parent_root,
+            .state_root = undefined,
+            .body = types.BeamBlockBody{
+                .attestations = agg_attestations,
+            },
+        };
+        agg_att_cleanup = false; // ownership moved into block.body.attestations
+        errdefer block.deinit();
+
+        agg_sig_cleanup = false; // ownership moved into the returned ProducedBlock
+        errdefer {
+            for (attestation_signatures.slice()) |*sig| sig.deinit();
+            attestation_signatures.deinit();
+        }
+
+        {
+            var t_rts = LockTimer.start("root_to_slot", "finalizeProposalIfReady.stf");
+            locking.assertNoTier5SiblingHeld("finalizeProposalIfReady.stf");
+            self.root_to_slot_lock.lock();
+            locking.enterTier5();
+            t_rts.acquired();
+            defer {
+                self.root_to_slot_lock.unlock();
+                locking.leaveTier5();
+                t_rts.released();
+            }
+            try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
+        }
+
+        var block_root: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+
+        const post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_consumed);
+        try self.statesPutExclusive("finalizeProposalIfReady.commit", block_root, post_state_rc);
+
+        var forkchoice_added = false;
+        errdefer if (!forkchoice_added) {
+            if (self.statesFetchRemoveExclusivePtr("finalizeProposalIfReady.errdefer", block_root)) |rc_ptr| {
+                rc_ptr.release();
+            }
+        };
+
+        _ = try self.forkChoice.onBlock(block, post_state, .{
+            .currentSlot = block.slot,
+            .blockDelayMs = 0,
+            .blockRoot = block_root,
+            .confirmed = false,
+        });
+        forkchoice_added = true;
+        _ = try self.forkChoice.updateHead();
+
+        return .{
+            .block = block,
+            .blockRoot = block_root,
+            .attestation_signatures = attestation_signatures,
+        };
     }
 
     /// Find the subnet of the first set participant in `participants`.
@@ -6267,7 +6880,13 @@ test "attestation processing - valid block attestation" {
     const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
+    // is_aggregator = true: this test asserts the raw signature is recorded
+    // into `attestation_signatures` (the aggregation buffer). Per leanSpec,
+    // only aggregators store gossip signatures for re-aggregation; a
+    // non-aggregator validates and drops them (it still updates the
+    // fork-choice vote tracker). Make the chain an aggregator so the
+    // "recorded for aggregation" assertion below exercises the right role.
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool, .is_aggregator = true }, connected_peers);
     defer beam_chain.deinit();
 
     // Add blocks to chain

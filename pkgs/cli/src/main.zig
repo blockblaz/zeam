@@ -99,6 +99,10 @@ pub const NodeCommand = struct {
     /// Higher values trade slot latency for fewer sub-threshold aggregates
     /// on chatty subnets. See issue #907 finding 4.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
+    /// Intra-interval block-build/aggregation deadline budget (see
+    /// `ChainOpts.proposal_deadline_pct`): build self-truncates at this percent
+    /// of the proposal interval; the remainder of the same interval signs.
+    @"proposal-deadline-pct": u32 = node_lib.default_proposal_deadline_pct,
 
     /// Cap on the number of child STARK proofs the aggregator worker merges
     /// with raw signatures via `rec_xmss_aggregate` (#940 follow-up).
@@ -138,6 +142,7 @@ pub const NodeCommand = struct {
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
         .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to pre-#908 behavior. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
+        .@"proposal-deadline-pct" = "Percentage of one proposal interval (SECONDS_PER_INTERVAL_MS, default 800ms) budgeted to the block-build/aggregation worker. This is an intra-interval split: the worker self-truncates at this percentage and the remaining (100-pct)% of the SAME interval is reserved for the finalize step (STF on the harvested partial body + propose-side sign + gossip publish), so the signed block is ready before the attestation interval. Default 90 (~720ms aggregation + ~80ms finalize/sign at the default 800ms interval). Lower this on slow validator hardware to widen the finalize/sign window; raise toward 99 to maximise aggregation throughput. Clamped to [0, 99] inside the consumer.",
         .@"max-aggregation-children" = "Cap on the number of child STARK proofs the aggregator worker merges with raw signatures via rec_xmss_aggregate. Default 0 keeps per-call latency bounded by flat-prove cost (~0.5 s/call on devnet aggregator hardware) by never taking the recursive code path; peer-published aggregates for the same att_data remain in latest_known_aggregated_payloads for the block proposer to compact at proposal time. Set 1 to allow at most one peer child to be merged (~1.5 s/call). Higher values reintroduce the multi-second tail (#940 devnet snapshot: num_children=3-4 averaged ~4.8 s).",
         .help = "Show help information for the node command",
     };
@@ -761,24 +766,32 @@ fn mainInner(init: std.process.Init) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.started) return;
 
-                    // Wait until finalization has advanced beyond genesis on the reference node
-                    const finalized_slot = self.reference_node.chain.forkChoice.fcStore.latest_finalized.slot;
+                    // Wait until finalization has advanced beyond genesis on the
+                    // reference node. Read through the shared-locked accessor:
+                    // `fcStore.latest_finalized` is a multi-field Checkpoint
+                    // written under the fork-choice mutex by the reference
+                    // node's chain-worker thread, so a raw field read from this
+                    // clock-callback thread is a data race (observed as a torn
+                    // garbage slot under a non-serializing allocator).
+                    const finalized_slot = self.reference_node.chain.forkChoice.getLatestFinalized().slot;
                     if (finalized_slot == 0) return;
 
                     std.debug.print("\n=== STARTING NODE 3 (delayed sync node) at interval {d} ===\n", .{interval});
                     std.debug.print("=== Finalization reached slot {d} on reference node — starting node 3 ===\n", .{finalized_slot});
                     std.debug.print("=== Node 3 will sync from genesis using parent block syncing ===\n\n", .{});
 
-                    // Start BeamNode first so it registers selective gossip
-                    // topic handlers; EthLibp2p.run() then derives the
-                    // gossipsub subscribe set from those handlers (instead of
-                    // joining every attestation subnet). See
-                    // pkgs/network/src/ethlibp2p.zig run() for the rationale.
-                    try self.beam_node.run();
+                    // Register peer + req-resp handlers before the network
+                    // starts (same race-fix as nodes 1/2): otherwise node 3's
+                    // inbound STATUS handling and peer registration can be lost,
+                    // leaving it unable to sync. Gossip subscribe still happens
+                    // inside `beam_node.run()` after `net.run()`.
+                    try self.beam_node.subscribeNetworkEventHandlers();
 
                     if (self.network) |net| {
                         try net.run();
                     }
+
+                    try self.beam_node.run();
                     self.started = true;
 
                     std.debug.print("=== NODE 3 STARTED - will now sync via STATUS and parent block requests ===\n\n", .{});
@@ -795,6 +808,15 @@ fn mainInner(init: std.process.Init) !void {
                 .ptr = &delayed_runner,
                 .onIntervalCb = DelayedNodeRunner.onInterval,
             };
+
+            // Subscribe peer + req-resp handlers BEFORE the networks start
+            // accepting connections, so the one-shot peer-connect event (and
+            // early STATUS requests) are never lost to a handler-not-yet-
+            // registered race. These only append to in-process handler lists;
+            // gossip mesh subscribe still happens later in `BeamNode.run()`
+            // because it needs the running swarm command channel.
+            try beam_node_1.subscribeNetworkEventHandlers();
+            try beam_node_2.subscribeNetworkEventHandlers();
 
             // Start the rust libp2p networks BEFORE the beam nodes:
             // `BeamNode.run()` calls `gossip.subscribe(...)`, which now
@@ -882,6 +904,7 @@ fn mainInner(init: std.process.Init) !void {
                 .db_backend = leancmd.@"db-backend",
                 .rayon_threads = leancmd.@"rayon-threads",
                 .min_aggregation_inputs = leancmd.@"min-aggregation-inputs",
+                .proposal_deadline_pct = leancmd.@"proposal-deadline-pct",
                 .max_aggregation_children = leancmd.@"max-aggregation-children",
             };
 
