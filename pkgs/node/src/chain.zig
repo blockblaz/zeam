@@ -31,6 +31,16 @@ const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
 const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
+const invalid_block_cache = @import("./invalid_block_cache.zig");
+const InvalidBlockSet = invalid_block_cache.InvalidBlockSet;
+
+/// Bound on the in-memory invalid-block-roots cache (see
+/// `BeamChain.invalid_block_roots`). 10 000 32-byte roots ≈ 320 KB plus
+/// hashmap overhead — comfortably small. Sized large enough to cover a
+/// sustained burst of malformed blocks (e.g. the slot=13 ethlambda
+/// AggregatedXMSS deserialize failure observed on devnet 2a4b7197) without
+/// FIFO-evicting still-arriving repeats.
+const INVALID_BLOCK_CACHE_MAX_ENTRIES: usize = 10_000;
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -296,6 +306,21 @@ pub const BeamChain = struct {
     public_key_cache: xmss.PublicKeyCache,
     // Cache for root to slot mapping to optimize block processing performance.
     root_to_slot_cache: types.RootToSlotCache,
+
+    /// Bounded set of block roots that failed verification with a
+    /// deterministic-failure error (signature deserialize/verify fail,
+    /// structural mismatch, proposer-sig fail). Reads from
+    /// `chainWorkerOnBlockThunk`'s catch arm (write) and `onBlock`'s entry
+    /// guard (read), plus the orphan-tracking path in `node.zig`.
+    ///
+    /// See `invalid_block_cache.zig` for the spec-safety rationale and the
+    /// exhaustive list of which errors are deterministic enough to insert.
+    /// Without this, a peer that keeps gossiping a malformed block (or a
+    /// later block whose parent_root chains back to one) wedges the
+    /// orphan-dependents loop into a refetch-and-fail livelock — the slot=13
+    /// `AggregatedXMSS` deserialize failure observed on devnet image
+    /// 2a4b7197 chewed ~6 MB/s of catch-up bandwidth per node.
+    invalid_block_roots: InvalidBlockSet,
     /// Optional worker pool for parallelizing CPU-bound steps (currently:
     /// attestation signature verification and `compactAttestations`). Owned
     /// by the caller (e.g. the CLI's main), not by the chain.
@@ -635,6 +660,7 @@ pub const BeamChain = struct {
             // CAS protocol and validator-set-growth caveats.
             .public_key_cache = try xmss.PublicKeyCache.init(allocator, @intCast(opts.config.genesis.numValidators())),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
+            .invalid_block_roots = InvalidBlockSet.init(allocator, INVALID_BLOCK_CACHE_MAX_ENTRIES),
             .thread_pool = opts.thread_pool,
             // pending_blocks is the future-slot queue (issue #788). It's an
             // unmanaged ArrayList, so default-init to `.empty`; the lock
@@ -1189,6 +1215,58 @@ pub const BeamChain = struct {
                 // matches the pre-#890 chain-worker behaviour;
                 // production wires the callback in `BeamNode.init`.
             }
+
+            // Deterministic-failure classifier (slot=13 #942 follow-up).
+            // For any error category that is purely a function of the
+            // block bytes — signature deserialize/verify fail, structural
+            // mismatch, proposer-sig fail — insert the root into
+            // `invalid_block_roots` so the orphan-dependents refetch loop
+            // and any future gossip redelivery short-circuit at
+            // `onBlock`'s entry guard without re-running STF / XMSS
+            // verify.
+            //
+            // State-dependent errors (InvalidPostState, MissingPreState,
+            // PreFinalizedSlot, UnknownParentBlock, FutureSlot) are
+            // intentionally EXCLUDED — a re-org through a different
+            // ancestor could legitimately re-enable such blocks, and the
+            // pre-existing `rejected_block` callback (above) already
+            // handles the TOCTOU-shaped MissingPreState / PreFinalizedSlot
+            // cases. KnownInvalidBlock is also excluded so we don't
+            // double-count the cache hit.
+            const is_deterministic_invalid = switch (err) {
+                xmss.AggregationError.InvalidAggregateSignature,
+                types.StateTransitionError.InvalidBlockSignatures,
+                types.StateTransitionError.InvalidValidatorId,
+                BlockProcessingError.InvalidSignatureGroups,
+                BlockProcessingError.DuplicateAttestationData,
+                BlockProcessingError.TooManyAttestationData,
+                xmss.HashSigError.InvalidSignature,
+                xmss.HashSigError.VerificationFailed,
+                xmss.HashSigError.DeserializationFailed,
+                xmss.HashSigError.InvalidMessageLength,
+                => true,
+                else => false,
+            };
+            if (is_deterministic_invalid) {
+                const r_root: types.Root = block_root orelse blk: {
+                    var rr: types.Root = undefined;
+                    zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &rr, self.allocator) catch |hash_err| {
+                        self.logger.err(
+                            "chain-worker: invalid-block-mark skipped, root recompute failed slot={d} err={any}: {any}",
+                            .{ signed_block.block.slot, err, hash_err },
+                        );
+                        break :blk std.mem.zeroes(types.Root);
+                    };
+                    break :blk rr;
+                };
+                if (!std.mem.eql(u8, &r_root, &std.mem.zeroes(types.Root))) {
+                    self.markInvalidRoot(r_root);
+                    self.logger.warn(
+                        "chain-worker: marking root=0x{x} slot={d} as permanently invalid (err={any})",
+                        .{ &r_root, signed_block.block.slot, err },
+                    );
+                }
+            }
             self.logger.err("chain-worker: onBlock failed slot={d}: {any}", .{
                 signed_block.block.slot,
                 err,
@@ -1731,6 +1809,11 @@ pub const BeamChain = struct {
 
         // Clean up root to slot cache
         self.root_to_slot_cache.deinit();
+
+        // Drop the invalid-block-roots cache. The mutex inside is unused
+        // after chain_worker.stop() above (sole writer) and no remaining
+        // libxev path reads after deinit, so a plain deinit is safe.
+        self.invalid_block_roots.deinit();
         // Clean up any blocks that were queued waiting for the forkchoice clock
         // (each entry wraps the SignedBlock + its precomputed root).
         for (self.pending_blocks.items) |*entry| {
@@ -1758,6 +1841,26 @@ pub const BeamChain = struct {
     /// Returns the current aggregator role flag.
     pub fn isAggregator(self: *const Self) bool {
         return self.is_aggregator_enabled.load(.acquire);
+    }
+
+    /// True if `root` is the hash of a block that previously failed
+    /// verification with a deterministic-failure error. Safe to call from
+    /// any thread (libxev gossip path, chain-worker, RPC handlers). See
+    /// `invalid_block_roots` field doc + `invalid_block_cache.zig` for the
+    /// spec-safety argument.
+    pub fn isInvalidRoot(self: *Self, root: types.Root) bool {
+        return self.invalid_block_roots.contains(root);
+    }
+
+    /// Mark `root` as permanently invalid. Callers MUST restrict this to
+    /// deterministic-failure errors — see the enumeration in
+    /// `invalid_block_cache.zig`. State-dependent errors (InvalidPostState,
+    /// MissingPreState) MUST NOT call this: a future re-org through a
+    /// different ancestor could legitimately re-enable the block.
+    pub fn markInvalidRoot(self: *Self, root: types.Root) void {
+        const inserted = self.invalid_block_roots.mark(root);
+        // Plain Counter (no labels) — incr() doesn't fail, no `try`/`catch`.
+        if (inserted) zeam_metrics.metrics.zeam_chain_invalid_block_root_marked_total.incr();
     }
 
     /// Atomically flips the aggregator role and returns the previous value.
@@ -3529,6 +3632,35 @@ pub const BeamChain = struct {
                     );
                 }
             }
+        }
+
+        // Invalid-block-roots short-circuit. Cheap O(1) HashMap lookup
+        // against the bounded cache populated by `chainWorkerOnBlockThunk`
+        // when verify returned a deterministic-failure verdict. Two
+        // separate checks:
+        //
+        //   (a) this block's own root → already proven invalid; redelivery
+        //       (gossip echo, blocks_by_root refetch from a peer still
+        //       serving it) should not pay the STF/XMSS cost a second time.
+        //   (b) the parent's root → descendant-of-invalid is itself
+        //       invalid per spec (a chain rooted at an invalid block
+        //       cannot be canonical). Mark the child too so future
+        //       deliveries short-circuit on (a).
+        //
+        // Both raise `KnownInvalidBlock` so `chainWorkerOnBlockThunk`'s
+        // existing classifier sees a distinct error tag and does NOT
+        // re-mark — avoiding a metric double-count.
+        if (self.invalid_block_roots.contains(block_root)) {
+            zeam_metrics.metrics.zeam_chain_invalid_block_root_hit_total.incr(.{ .site = "self" }) catch {};
+            return BlockProcessingError.KnownInvalidBlock;
+        }
+        if (self.invalid_block_roots.contains(block.parent_root)) {
+            // Cascade. Don't goto `markInvalidRoot` (extra metric
+            // increment); inline the insert so the cascade hit is
+            // bucketed under `site="parent"` instead.
+            _ = self.invalid_block_roots.mark(block_root);
+            zeam_metrics.metrics.zeam_chain_invalid_block_root_hit_total.incr(.{ .site = "parent" }) catch {};
+            return BlockProcessingError.KnownInvalidBlock;
         }
 
         const post_state_owned = blockInfo.postState == null;
@@ -5623,6 +5755,13 @@ pub const BlockProcessingError = error{
     InvalidSignatureGroups,
     DuplicateAttestationData,
     TooManyAttestationData,
+    /// Block's hash-tree-root, or its `parent_root`, is already in the
+    /// `invalid_block_roots` cache from a prior deterministic-failure
+    /// verdict. Surfaced from `onBlock`'s entry guard so callers can
+    /// distinguish "we already proved this invalid" from a fresh verify
+    /// failure (which would itself populate the cache). Cheap-drop: STF /
+    /// XMSS verify never run on this code path.
+    KnownInvalidBlock,
 };
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{

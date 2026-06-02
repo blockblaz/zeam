@@ -42,5 +42,6 @@ test "get tests" {
     _ = @import("./chain_worker.zig");
     _ = @import("./rc_beam_state.zig");
     _ = @import("./slot_driver_watchdog.zig");
+    _ = @import("./invalid_block_cache.zig");
     @import("std").testing.refAllDecls(@This());
 }
