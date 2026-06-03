@@ -963,9 +963,9 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
             "zeam-glue", "--no-default-features", "--features",     "hashsig,multisig,openvm",
         }),
         .all => b.addSystemCommand(&.{
-            "rustup",                "run",        "nightly",                              "cargo",
-            "-C",                    path,         "-Z",                                   "unstable-options",
-            "build",                 "--release",  "-p",                                   "zeam-glue",
+            "rustup",                "run",        "nightly",                       "cargo",
+            "-C",                    path,         "-Z",                            "unstable-options",
+            "build",                 "--release",  "-p",                            "zeam-glue",
             "--no-default-features", "--features", "hashsig,multisig,risc0,openvm",
         }),
     };
