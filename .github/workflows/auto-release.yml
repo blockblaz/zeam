@@ -248,6 +248,7 @@ jobs:
     outputs:
       shadow_status: ${{ steps.rebase.outputs.shadow_status }}
       shadow_sha: ${{ steps.rebase.outputs.shadow_sha }}
+      shadow_failed: ${{ steps.rebase.outputs.shadow_failed }}
 
     steps:
     - name: Checkout code
@@ -275,21 +276,23 @@ jobs:
             NEW_SHA=$(git rev-parse --short HEAD)
             echo "shadow_status=✅ rebased to $NEW_SHA" >> $GITHUB_OUTPUT
             echo "shadow_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+            echo "shadow_failed=false" >> $GITHUB_OUTPUT
             echo "✅ Shadow rebase succeeded: $NEW_SHA"
           else
             git rebase --abort || true
             echo "shadow_status=❌ rebase conflict — manual fix needed" >> $GITHUB_OUTPUT
             echo "shadow_sha=" >> $GITHUB_OUTPUT
-            echo "❌ Shadow rebase failed"
-            exit 1
+            echo "shadow_failed=true" >> $GITHUB_OUTPUT
+            echo "❌ Shadow rebase failed; release will continue after notifying Telegram"
           fi
         else
           echo "shadow_status=⚠️ shadow branch not found" >> $GITHUB_OUTPUT
           echo "shadow_sha=" >> $GITHUB_OUTPUT
+          echo "shadow_failed=false" >> $GITHUB_OUTPUT
         fi
 
     - name: Send Telegram shadow rebase failure notification
-      if: failure()
+      if: ${{ steps.rebase.outputs.shadow_failed == 'true' }}
       run: |
         VERSION="${{ needs.create-tags.outputs.version }}"
         REPO_URL="${{ github.server_url }}/${{ github.repository }}"
@@ -300,7 +303,7 @@ jobs:
         PAYLOAD=$(jq -n \
           --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
           --arg text "$MESSAGE" \
-          '{chat_id: $chat_id, text: $text, disable_web_page_preview: true}')
+          '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", disable_web_page_preview: true}')
 
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -H "Content-Type: application/json" \
@@ -309,7 +312,7 @@ jobs:
   create-github-release:
     needs: [ create-tags, build-and-push, create-manifest, rebase-shadow ]
     runs-on: ubuntu-latest
-    if: ${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
+    if: ${{ always() && needs.create-tags.outputs.has_devnet_tag == 'true' && needs.build-and-push.result == 'success' && needs.create-manifest.result == 'success' }}
 
     steps:
     - name: Checkout code
@@ -459,25 +462,31 @@ jobs:
         IMAGE_NAME="${{ env.IMAGE_NAME }}"
         SHADOW_STATUS="${{ needs.rebase-shadow.outputs.shadow_status }}"
 
-        MESSAGE=$(printf 'Zeam %s Release SUCCESS
+        MESSAGE="🚀 *Zeam $GITHUB_TAG Release SUCCESS*
 
-Release Details:
-  Version: %s
-  Network: %s
+        *Release Details:*
+        • Version: `$VERSION`
+        • Network: `$GITHUB_TAG`
+        • Repository: [${{ github.repository }}]($REPO_URL)
 
-Docker Images Available:
-  Multi-arch: %s/%s:%s
-  AMD64: %s/%s:%s-amd64
-  ARM64: %s/%s:%s-arm64
+        *🐋 Docker Images Available:*
+        • Multi-arch: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG`
+        • AMD64: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-amd64`
+        • ARM64: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-arm64`
 
-GitHub Release: %s/releases/tag/%s
-Deployment: code pushed to %s branch
-Shadow Branch: %s'           "$GITHUB_TAG" "$VERSION" "$GITHUB_TAG"           "$REGISTRY" "$IMAGE_NAME" "$DOCKER_TAG"           "$REGISTRY" "$IMAGE_NAME" "$DOCKER_TAG"           "$REGISTRY" "$IMAGE_NAME" "$DOCKER_TAG"           "$REPO_URL" "$GITHUB_TAG" "$DOCKER_TAG" "$SHADOW_STATUS")
+        *🔗 Quick Links:*
+        • [GitHub Release]($REPO_URL/releases/tag/$GITHUB_TAG)
+
+        *🌿 Deployment:*
+        • Code pushed to `$DOCKER_TAG` branch
+        • Shadow branch: $SHADOW_STATUS
+
+        _🤖 Automated release notification_"
 
         PAYLOAD=$(jq -n \
           --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
           --arg text "$MESSAGE" \
-          '{chat_id: $chat_id, text: $text, disable_web_page_preview: true}')
+          '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", disable_web_page_preview: true}')
 
         # Send to Telegram
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
