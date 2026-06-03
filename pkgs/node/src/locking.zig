@@ -552,9 +552,9 @@ pub const BlockCache = struct {
     ///
     /// All allocations happen INSIDE the critical section so the cloned
     /// data has no aliasing back into cache-owned memory once the lock
-    /// is released. The block clone uses `types.sszClone` (round-trip
-    /// serialize/deserialize) so every interior heap field is freshly
-    /// allocated under `allocator`. The ssz clone uses `allocator.dupe`.
+    /// is released. The block clone uses `zeam_utils.clone` so every
+    /// interior heap field is freshly allocated under `allocator`. The
+    /// ssz clone uses `allocator.dupe`.
     ///
     /// Use this for any caller that needs (block, ssz) to remain valid
     /// across cache mutations or long-running work (e.g. `chain.onBlock`
@@ -572,12 +572,11 @@ pub const BlockCache = struct {
 
         const block_ptr = self.blocks.getPtr(root) orelse return null;
 
-        // Deep-clone the SignedBlock under the cache lock. `sszClone`
-        // round-trips through ssz bytes so the result has no aliasing
-        // back into cache-owned storage. If this fails (OOM mid-clone),
-        // we have not allocated anything else yet — just propagate.
-        var cloned_block: types.SignedBlock = undefined;
-        try types.sszClone(allocator, types.SignedBlock, block_ptr.*, &cloned_block);
+        // Deep-clone the SignedBlock under the cache lock so the result
+        // has no aliasing back into cache-owned storage. If this fails
+        // (OOM mid-clone), we have not allocated anything else yet —
+        // just propagate.
+        var cloned_block = try zeam_utils.clone(types.SignedBlock, block_ptr, allocator);
         errdefer cloned_block.deinit();
 
         // Dupe the ssz bytes (if any). Done AFTER the block clone so the
@@ -1181,7 +1180,7 @@ pub const BorrowedState = struct {
         errdefer self.deinit();
         const owned = try allocator.create(types.BeamState);
         errdefer allocator.destroy(owned);
-        try types.sszClone(allocator, types.BeamState, self.state.*, owned);
+        owned.* = try zeam_utils.clone(types.BeamState, self.state, allocator);
         // Past the last `try`: success path. Drop the borrow explicitly.
         self.deinit();
         return owned;
