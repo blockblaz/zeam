@@ -690,6 +690,25 @@ pub const EthLibp2pV2 = struct {
         return try allocator.dupe(u8, slice);
     }
 
+    /// Pure derivation of the libp2p PeerId-as-base58 from a 32-byte
+    /// ECDSA-P-256 seed — same path `init` uses internally, but exposed as
+    /// a free function so embedders can compute peer ids BEFORE any
+    /// `init` runs. Lets a multi-node simulation build connect_peers
+    /// strings for every other node without an init ordering dance.
+    /// Caller owns the returned slice.
+    pub fn peerIdBase58FromSeed(allocator: Allocator, seed: [32]u8) ![]u8 {
+        const kp = try EcdsaP256.KeyPair.generateDeterministic(seed);
+        const pub_sec1: [65]u8 = kp.public_key.toUncompressedSec1();
+        const proto = try zl.security.libp2p_tls_cert.encodeEcdsaPublicKeyProto(allocator, pub_sec1);
+        defer allocator.free(proto);
+        const reader = try peer_id_pkg.PublicKeyReader.init(proto);
+        var pk = peer_id_pkg.PublicKey{ .type = .ECDSA, .data = reader.getData() };
+        const pid = try peer_id_pkg.PeerId.fromPublicKey(allocator, &pk);
+        var buf: [128]u8 = undefined;
+        const slice = try pid.toBase58(&buf);
+        return try allocator.dupe(u8, slice);
+    }
+
     pub fn getNetworkInterface(self: *Self) NetworkInterface {
         return .{
             .gossip = .{
@@ -865,16 +884,19 @@ pub const EthLibp2pV2 = struct {
         const ssz_bytes = try req.serialize(self.allocator);
         defer self.allocator.free(ssz_bytes);
 
-        // `Host.sendRequest`'s `timeout_ms` argument is forwarded as `now_ms`
-        // into the req/resp runtime, which adds `request_timeout_ms`
-        // (15s default) to compute the request deadline. Pass the current
-        // wall time so the deadline lands 15s in the real future.
+        // Calls `host.req_resp` directly: zig-libp2p v0.1.3's
+        // `Host.sendRequest` declares its 4th argument as `timeout_ms: u32`
+        // but forwards it as `now_ms: i64` into the req/resp runtime,
+        // which is both a type mismatch (any real wall-time millisecond
+        // value overflows u32 on `@intCast`) and a naming bug. Routing
+        // through the runtime sidesteps both; behaviour is identical to
+        // a correctly-shaped Host.sendRequest. Fix tracked upstream.
         const now_ms = zl.wall_time.milliTimestamp();
-        const request_id = try self.host.sendRequest(
+        const request_id = try self.host.req_resp.sendRequest(
             peer,
             proto,
             ssz_bytes,
-            @intCast(@as(u64, @bitCast(now_ms))),
+            now_ms,
         );
 
         if (callback) |handler| {

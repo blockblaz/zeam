@@ -537,12 +537,14 @@ fn mainInner(init: std.process.Init) !void {
             var listen_str1: ?[]u8 = null;
             var listen_str2: ?[]u8 = null;
             var listen_str3: ?[]u8 = null;
+            var connect_str1: ?[]u8 = null;
             var connect_str2: ?[]u8 = null;
             var connect_str3: ?[]u8 = null;
             defer {
                 if (listen_str1) |s| allocator.free(s);
                 if (listen_str2) |s| allocator.free(s);
                 if (listen_str3) |s| allocator.free(s);
+                if (connect_str1) |s| allocator.free(s);
                 if (connect_str2) |s| allocator.free(s);
                 if (connect_str3) |s| allocator.free(s);
             }
@@ -587,6 +589,36 @@ fn mainInner(init: std.process.Init) !void {
                 listen_str2 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9002/quic-v1");
                 listen_str3 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9003/quic-v1");
 
+                // Derive every node's peer id upfront so we can build the
+                // full all-to-all connect mesh before any network is
+                // init'd. QuicRuntime in zig-libp2p v0.1.3 only routes
+                // outbound sends through connections it has dialed —
+                // inbound-only peers can't be the target of `sendRequest`
+                // — so making every node dial every other node is the
+                // cheapest fix at this layer.
+                const peer1_b58 = try networks.EthLibp2pV2.peerIdBase58FromSeed(allocator, seed1);
+                defer allocator.free(peer1_b58);
+                const peer2_b58 = try networks.EthLibp2pV2.peerIdBase58FromSeed(allocator, seed2);
+                defer allocator.free(peer2_b58);
+                const peer3_b58 = try networks.EthLibp2pV2.peerIdBase58FromSeed(allocator, seed3);
+                defer allocator.free(peer3_b58);
+
+                connect_str1 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9002/quic-v1/p2p/{s},/ip4/127.0.0.1/udp/9003/quic-v1/p2p/{s}",
+                    .{ peer2_b58, peer3_b58 },
+                );
+                connect_str2 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s},/ip4/127.0.0.1/udp/9003/quic-v1/p2p/{s}",
+                    .{ peer1_b58, peer3_b58 },
+                );
+                connect_str3 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s},/ip4/127.0.0.1/udp/9002/quic-v1/p2p/{s}",
+                    .{ peer1_b58, peer2_b58 },
+                );
+
                 // ── Network 1 ───────────────────────────────────────────
                 // `EthLibp2pV2.init` returns a heap-allocated `*Self`; we
                 // do NOT need a separate `allocator.create` like the
@@ -602,27 +634,11 @@ fn mainInner(init: std.process.Init) !void {
                     .networkId = 0,
                     .fork_digest = fork_digest1,
                     .listen_addresses = listen_str1.?,
-                    .connect_peers = "",
+                    .connect_peers = connect_str1.?,
                     .node_registry = test_registry1,
                     .host_identity_seed = seed1,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
-
-                // Build connect strings to network1 now that we know its
-                // peer id (deterministic from `seed1`, but we read it off
-                // the struct so the encoding stays one source of truth).
-                const peer1_b58 = try network1.localPeerIdBase58(allocator);
-                defer allocator.free(peer1_b58);
-                connect_str2 = try std.fmt.allocPrint(
-                    allocator,
-                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s}",
-                    .{peer1_b58},
-                );
-                connect_str3 = try std.fmt.allocPrint(
-                    allocator,
-                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s}",
-                    .{peer1_b58},
-                );
 
                 // ── Network 2 ───────────────────────────────────────────
                 const fork_digest2 = try allocator.dupe(u8, chain_config.spec.fork_digest);

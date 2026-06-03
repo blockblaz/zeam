@@ -56,8 +56,23 @@ fn getZeamExecutable() ![]const u8 {
 fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
     const io = std.testing.io;
 
-    // Set up process with beam command and mock network
-    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
+    // Routes the simulation through `EthLibp2pV2` (zig-libp2p QuicRuntime
+    // over real UDP loopback on 127.0.0.1:9001-9003), so the test
+    // exercises the on-wire libp2p path — block + attestation gossip,
+    // status req/resp, peer connection establishment — instead of the
+    // in-process `networks.Mock` shortcut. `--mockNetwork` defaults to
+    // `false` in the BeamCmd spec; we omit the flag entirely because
+    // `simargs` treats `--mockNetwork value` as the bool flag being set
+    // (to true) plus a positional `value`.
+    //
+    // Wipe the default `./data` dir before launch — a stale RocksDB
+    // MANIFEST from a crashed previous run otherwise surfaces as
+    // `Corruption: IO error: ... 000NNN.sst: No such file or directory`
+    // during node init and aborts the binary before any libp2p
+    // bring-up. (The CLI's `--data-dir` flag is currently a no-op for
+    // beam-sim mode; tracked separately.)
+    std.Io.Dir.deleteTree(.cwd(), std.testing.io, "./data") catch {};
+    const args = [_][]const u8{ exe_path, "beam", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
 
     // Start the process
