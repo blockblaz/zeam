@@ -110,15 +110,6 @@ pub const EthLibp2pV2Params = struct {
     /// `std.posix.getrandom` (ephemeral identity per run — matches the
     /// random-PeerId behaviour of the legacy path).
     host_identity_seed: ?[32]u8 = null,
-    /// Directory where the libp2p TLS cert + key PEM files are written so
-    /// the QUIC runtime can load them. Must be a path that's writable in
-    /// the container or test sandbox. We can't use `/tmp` because zeam's
-    /// runtime image is `FROM scratch` — there's no `/tmp` to write into,
-    /// just whatever paths get COPY'd or VOLUME-mounted. The devnet
-    /// container always mounts `--data-dir`, so the cert + key live
-    /// alongside the chain DB. Defaults to `"."` for tests / in-process
-    /// callers that don't care.
-    cert_dir: []const u8 = ".",
 };
 
 /// Heap-allocated host signer state that captures the ECDSA-P-256 keypair
@@ -141,21 +132,6 @@ const EcdsaHostSigner = struct {
         if (der.len > out_sig.len) return error.NoSpaceLeft;
         @memcpy(out_sig[0..der.len], der);
         out_sig_len.* = der.len;
-    }
-};
-
-/// On-disk PEM bundle used to wire `QuicRuntime`. Lives on `EthLibp2pV2` so
-/// the temp files can be cleaned up at `deinit` time.
-const HostCertBundle = struct {
-    cert_path: [:0]u8,
-    key_path: [:0]u8,
-
-    fn deinit(self: *HostCertBundle, allocator: Allocator) void {
-        _ = std.c.unlink(self.cert_path.ptr);
-        _ = std.c.unlink(self.key_path.ptr);
-        allocator.free(self.cert_path);
-        allocator.free(self.key_path);
-        self.* = undefined;
     }
 };
 
@@ -182,25 +158,6 @@ fn fillRandomBytes(out: []u8) !void {
             }
         },
     }
-}
-
-/// Write `data` to `path` (an absolute path). Uses the std.Io vtable so the
-/// underlying open/write errors propagate as proper Zig errors instead of
-/// the opaque `error.OpenFailed` we used to return from a raw `std.c.open`
-/// call — the legacy path never wrote to disk, so getting the *real* errno
-/// here is the difference between "fix the cert dir" and "guess".
-fn writeFileSync(path: []const u8, data: []const u8) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var w = file.writer(io, &buf);
-    try w.interface.writeAll(data);
-    // `file.close` does NOT flush the buffered writer. Without an explicit
-    // flush we'd zero-length the cert / key file on disk, and zquic's
-    // `loadCertDer` would then fail with `error.NoCertificate` because the
-    // PEM begin-marker scan returns null. Learned the hard way.
-    try w.interface.flush();
 }
 
 /// Per-topic registered handler. The validator hook fans every accepted
@@ -251,10 +208,6 @@ pub const EthLibp2pV2 = struct {
     /// Heap-allocated so the pointer handed to
     /// `libp2p_tls_cert.HostIdentityKey.ecdsa_p256.sign_ctx` stays valid.
     host_signer: *EcdsaHostSigner,
-
-    /// On-disk PEM bundle for the QUIC transport. `null` if
-    /// `params.listen_addresses` was empty (in-process / unit-test mode).
-    cert_bundle: ?HostCertBundle = null,
 
     /// `null` until `run` brings up a QUIC listener; `null` forever if the
     /// embedder left `listen_addresses` empty.
@@ -416,14 +369,6 @@ pub const EthLibp2pV2 = struct {
             self.rpc_callbacks.deinit(self.allocator);
         }
 
-        if (self.cert_bundle) |*b| {
-            // `*b` deinit takes self by pointer and zeroes it; copy out then
-            // write back so the optional still owns a sentinel-free struct
-            // through the duration of the call.
-            var bundle = b.*;
-            bundle.deinit(self.allocator);
-            self.cert_bundle = null;
-        }
         self.allocator.destroy(self.host_signer);
 
         self.gossip_handler.deinit();
@@ -463,10 +408,12 @@ pub const EthLibp2pV2 = struct {
         self.drain_thread = try Thread.spawn(.{}, drainEventsTrampoline, .{self});
     }
 
-    /// Mints a fresh libp2p TLS cert from this node's ECDSA host identity,
-    /// writes the cert + key PEMs to per-network temp files, and starts a
-    /// `QuicRuntime` on `params.listen_addresses`. The PEM files live for
-    /// the lifetime of the runtime and are deleted at `deinit`.
+    /// Mints a fresh libp2p TLS cert from this node's ECDSA host identity
+    /// and starts a `QuicRuntime` on `params.listen_addresses`. The cert +
+    /// key PEMs are handed to zquic in-memory via zig-libp2p v0.1.5's
+    /// `TlsPemSource.pem_bytes` (which routes through zquic v1.6.6's new
+    /// `cert_pem` / `key_pem` config fields — see ch4r10t33r/zquic#129).
+    /// Nothing is written to disk.
     fn startQuicTransport(self: *Self) !void {
         const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
         const host_pub_sec1: [65]u8 = self.host_signer.kp.public_key.toUncompressedSec1();
@@ -488,48 +435,19 @@ pub const EthLibp2pV2 = struct {
         });
         defer gen.deinit(self.allocator);
 
+        // The cert + key PEMs are borrowed by `QuicRuntime` for the
+        // duration of `create`; zquic parses them into DER + a
+        // `tls_vendor.config.PrivateKey` and stores those instead, so the
+        // PEM buffers can be freed as soon as `create` returns.
         const cert_pem = try zl.security.libp2p_tls_cert.certDerToPem(self.allocator, gen.cert_der);
         defer self.allocator.free(cert_pem);
         const key_pem = try zl.security.libp2p_tls_cert.ecdsaP256SeedToPem(self.allocator, gen.cert_key_seed);
         defer self.allocator.free(key_pem);
 
-        const cert_path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/zeam_v2_net_{d}_cert.pem",
-            .{ self.params.cert_dir, self.params.networkId },
-            0,
-        );
-        errdefer self.allocator.free(cert_path);
-        const key_path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/zeam_v2_net_{d}_key.pem",
-            .{ self.params.cert_dir, self.params.networkId },
-            0,
-        );
-        errdefer self.allocator.free(key_path);
-
-        writeFileSync(cert_path, cert_pem) catch |e| {
-            self.logger.err(
-                "network-{d}:: failed to write libp2p TLS cert to {s}: {any}",
-                .{ self.params.networkId, cert_path, e },
-            );
-            return e;
-        };
-        writeFileSync(key_path, key_pem) catch |e| {
-            self.logger.err(
-                "network-{d}:: failed to write libp2p TLS key to {s}: {any}",
-                .{ self.params.networkId, key_path, e },
-            );
-            return e;
-        };
-
-        self.cert_bundle = .{ .cert_path = cert_path, .key_path = key_path };
-
         const rt = zl.transport.quic_runtime.QuicRuntime.create(.{
             .allocator = self.allocator,
             .host = self.host,
-            .cert_path = std.mem.span(@as([*:0]const u8, cert_path.ptr)),
-            .key_path = std.mem.span(@as([*:0]const u8, key_path.ptr)),
+            .tls_pem = .{ .pem_bytes = .{ .cert_pem = cert_pem, .key_pem = key_pem } },
             .listen_multiaddr = self.params.listen_addresses,
         }) catch |e| {
             self.logger.err(
@@ -1501,10 +1419,10 @@ test "EthLibp2pV2 brings up QuicRuntime when listen_addresses is set" {
     // The runtime is up; it owns a bound UDP socket on a kernel-assigned
     // port. We don't open an outbound dial here — the QuicRuntime loopback
     // test in zig-libp2p already gates that path. This test asserts the
-    // glue (cert mint + temp file write + start) lands without panicking
-    // or leaking, which is exactly what would block embedders today.
+    // glue (in-memory cert mint + zero-copy PEM hand-off + start) lands
+    // without panicking or leaking, which is exactly what would block
+    // embedders today.
     try testing.expect(net.quic_runtime != null);
-    try testing.expect(net.cert_bundle != null);
     try testing.expect(net.quic_runtime.?.boundUdpPortIpv4() != null);
     try testing.expect(net.quic_runtime.?.boundUdpPortIpv4().? != 0);
 }
