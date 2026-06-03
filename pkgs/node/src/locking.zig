@@ -1001,26 +1001,21 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             var candidates: std.ArrayList([]const u8) = .empty;
             defer candidates.deinit(allocator);
 
-            var effective_min_slot: ?u64 = min_slot;
-            while (true) {
-                var it = self.map.iterator();
-                while (it.next()) |entry| {
-                    if (exclude) |ex| {
-                        if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
-                    }
-                    if (comptime @hasField(PeerInfo, "latest_status")) {
-                        if (effective_min_slot) |ms| {
-                            const peer_head_slot = if (entry.value_ptr.latest_status) |status| status.head_slot else 0;
-                            if (ms > peer_head_slot) continue;
-                        }
-                    }
-                    if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
-                        if (entry.value_ptr.blocks_by_range_unavailable) continue;
-                    }
-                    try candidates.append(allocator, entry.value_ptr.peer_id);
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                if (exclude) |ex| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
                 }
-                if (candidates.items.len > 0 or effective_min_slot == null) break;
-                effective_min_slot = null;
+                if (comptime @hasField(PeerInfo, "latest_status")) {
+                    if (min_slot) |ms| {
+                        const peer_head_slot = if (entry.value_ptr.latest_status) |status| status.head_slot else 0;
+                        if (ms > peer_head_slot) continue;
+                    }
+                }
+                if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
+                    if (entry.value_ptr.blocks_by_range_unavailable) continue;
+                }
+                try candidates.append(allocator, entry.value_ptr.peer_id);
             }
 
             if (candidates.items.len == 0) return null;

@@ -437,8 +437,8 @@ pub const Network = struct {
         return self.connected_peers.selectPeerExcluding(self.allocator, exclude, false, min_slot);
     }
 
-    pub fn selectPeerForRangeSyncExcluding(self: *Self, exclude: ?[]const u8) !?[]u8 {
-        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, true, null);
+    pub fn selectPeerForRangeSyncExcluding(self: *Self, exclude: ?[]const u8, min_slot: ?u64) !?[]u8 {
+        return self.connected_peers.selectPeerExcluding(self.allocator, exclude, true, min_slot);
     }
 
     pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
