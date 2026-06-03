@@ -188,7 +188,10 @@ pub unsafe extern "C" fn xmss_aggregate(
         log_inv_rate,
     ) {
         Ok(result) => result,
-        Err(_) => return std::ptr::null(),
+        Err(err) => {
+            eprintln!("xmss_aggregate failed: {err}");
+            return std::ptr::null();
+        }
     };
 
     let t_stark_done = Instant::now();
