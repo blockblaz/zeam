@@ -607,8 +607,11 @@ pub const EthLibp2pV2 = struct {
         defer ssz_buf.deinit(self.allocator);
         switch (data.*) {
             .block => |sb| try ssz.serialize(types.SignedBlock, sb, &ssz_buf, self.allocator),
-            .attestation => |att| try ssz.serialize(types.SignedAttestation, att, &ssz_buf, self.allocator),
-            .aggregation => |agg| try ssz.serialize(types.AggregatedAttestation, agg, &ssz_buf, self.allocator),
+            // For attestations the gossip payload is the SignedAttestation
+            // inside the wrapper; the subnet_id is encoded in the topic
+            // string, not the SSZ payload (same as the legacy Rust path).
+            .attestation => |att| try ssz.serialize(types.SignedAttestation, att.message, &ssz_buf, self.allocator),
+            .aggregation => |agg| try ssz.serialize(types.SignedAggregatedAttestation, agg, &ssz_buf, self.allocator),
         }
         if (ssz_buf.items.len > MAX_GOSSIP_BLOCK_SIZE) return error.PayloadTooLarge;
 
@@ -676,25 +679,77 @@ pub const EthLibp2pV2 = struct {
         try self.peer_event_handler.subscribe(handler);
     }
 
+    /// Base58 multihash encoding of this node's libp2p PeerId — the form
+    /// used in `/p2p/<id>` multiaddr suffixes and the canonical form peers
+    /// see after the TLS handshake. Embedders use this to build the
+    /// `connect_peers` strings for OTHER nodes pointing at this one.
+    /// Caller owns the returned slice.
+    pub fn localPeerIdBase58(self: *Self, allocator: Allocator) ![]u8 {
+        var buf: [128]u8 = undefined;
+        const slice = try self.local_peer.toBase58(&buf);
+        return try allocator.dupe(u8, slice);
+    }
+
     pub fn getNetworkInterface(self: *Self) NetworkInterface {
         return .{
-            .ptr = self,
-            .gossipsub = .{
+            .gossip = .{
                 .ptr = self,
                 .publishFn = publish,
                 .subscribeFn = subscribe,
+                .onGossipFn = onGossipFanOut,
+                .refreshMeshFn = refreshGossipMeshSubscriptions,
+                .meshPeerCountFn = gossipMeshPeerCount,
             },
             .reqresp = .{
                 .ptr = self,
-                .subscribeFn = subscribeReqResp,
                 .sendRequestFn = sendRPCRequest,
+                .onReqRespRequestFn = onReqRespRequestFanOut,
+                .subscribeFn = subscribeReqResp,
                 .cancelInflightRequestFn = cancelInflightRpcCallbackFn,
             },
-            .peer_events = .{
+            .peers = .{
                 .ptr = self,
                 .subscribeFn = subscribePeerEvents,
             },
         };
+    }
+
+    /// Fan-out wrapper used by the `NetworkInterface.gossip.onGossipFn`
+    /// vtable: forwards an inbound `GossipMessage` to the in-process
+    /// gossip-handler (which dispatches to whichever per-topic
+    /// `OnGossipCbHandler`s `subscribe` registered).
+    fn onGossipFanOut(
+        ptr: *anyopaque,
+        data: *interface.GossipMessage,
+        sender_peer_id: []const u8,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.gossip_handler.onGossip(data, sender_peer_id);
+    }
+
+    /// Fan-out wrapper used by the `NetworkInterface.reqresp.onReqRespRequestFn`
+    /// vtable: forwards an inbound `ReqRespRequest` + stream pair to the
+    /// in-process req/resp handler.
+    fn onReqRespRequestFanOut(
+        ptr: *anyopaque,
+        data: *interface.ReqRespRequest,
+        stream: interface.ReqRespServerStream,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.reqresp_handler.onReqRespRequest(data, stream);
+    }
+
+    /// No-op for v2 — the gossipsub mesh in zig-libp2p re-subscribes
+    /// automatically. The legacy Rust path needed manual re-subscribes
+    /// because of an FFI race that doesn't apply here.
+    fn refreshGossipMeshSubscriptions(_: *anyopaque) void {}
+
+    /// Total mesh peer count across all subscribed topics, read from the
+    /// per-instance metrics registry (same source as the
+    /// `lean_gossip_mesh_peers` scrape).
+    fn gossipMeshPeerCount(ptr: *anyopaque) u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.host.gossipsub.meshPeers();
     }
 
     // ── Topic-validator hook (gossipsub local-delivery) ───────────────────

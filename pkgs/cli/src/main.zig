@@ -527,26 +527,24 @@ fn mainInner(init: std.process.Init) !void {
 
             // These are owned by the network implementations and will be freed in their deinit functions
             // We will run network1, network2, and network3 after the nodes are running to avoid race conditions
-            var network1: *networks.EthLibp2p = undefined;
-            var network2: *networks.EthLibp2p = undefined;
-            var network3: *networks.EthLibp2p = undefined;
-            // Initialize to empty slices to avoid undefined behavior in defer when mock_network=true
-            var listen_addresses1: []Multiaddr = &.{};
-            var listen_addresses2: []Multiaddr = &.{};
-            var listen_addresses3: []Multiaddr = &.{};
-            var connect_peers: []Multiaddr = &.{};
-            var connect_peers3: []Multiaddr = &.{};
+            var network1: *networks.EthLibp2pV2 = undefined;
+            var network2: *networks.EthLibp2pV2 = undefined;
+            var network3: *networks.EthLibp2pV2 = undefined;
+            // v2 takes string-shaped listen/connect multiaddrs (one or
+            // comma-separated). We allocate them after we know each network's
+            // peer id (so connect strings can carry `/p2p/<peer>`), keep them
+            // alive through the simulation, and free them at scope exit.
+            var listen_str1: ?[]u8 = null;
+            var listen_str2: ?[]u8 = null;
+            var listen_str3: ?[]u8 = null;
+            var connect_str2: ?[]u8 = null;
+            var connect_str3: ?[]u8 = null;
             defer {
-                for (listen_addresses1) |addr| addr.deinit();
-                if (listen_addresses1.len > 0) allocator.free(listen_addresses1);
-                for (listen_addresses2) |addr| addr.deinit();
-                if (listen_addresses2.len > 0) allocator.free(listen_addresses2);
-                for (listen_addresses3) |addr| addr.deinit();
-                if (listen_addresses3.len > 0) allocator.free(listen_addresses3);
-                for (connect_peers) |addr| addr.deinit();
-                if (connect_peers.len > 0) allocator.free(connect_peers);
-                for (connect_peers3) |addr| addr.deinit();
-                if (connect_peers3.len > 0) allocator.free(connect_peers3);
+                if (listen_str1) |s| allocator.free(s);
+                if (listen_str2) |s| allocator.free(s);
+                if (listen_str3) |s| allocator.free(s);
+                if (connect_str2) |s| allocator.free(s);
+                if (connect_str3) |s| allocator.free(s);
             }
 
             // Create shared registry for beam simulation with validator ID mappings
@@ -572,58 +570,79 @@ fn mainInner(init: std.process.Init) !void {
                 backend3 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {f}", .{backend1.gossip});
             } else {
-                network1 = try allocator.create(networks.EthLibp2p);
-                const key_pair1 = enr_lib.KeyPair.generate();
-                const priv_key1 = key_pair1.v4.toString();
-                listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
+                // Pure-Zig libp2p (v2) backed by zig-libp2p v0.1.3:
+                //   - Each network has a deterministic ECDSA-P-256 host
+                //     identity (so peer ids are stable across runs and we
+                //     can build connect strings between nodes BEFORE all
+                //     networks are init'd).
+                //   - Listen multiaddrs are UDP / quic-v1 (was TCP under
+                //     the Rust glue). QuicRuntime only does QUIC.
+                //   - connect_peers strings carry the `/p2p/<peer>` suffix
+                //     so the TLS handshake verifies the expected peer id.
+                const seed1 = [_]u8{0x01} ** 32;
+                const seed2 = [_]u8{0x02} ** 32;
+                const seed3 = [_]u8{0x03} ** 32;
+
+                listen_str1 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9001/quic-v1");
+                listen_str2 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9002/quic-v1");
+                listen_str3 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9003/quic-v1");
+
+                // ── Network 1 ───────────────────────────────────────────
+                // `EthLibp2pV2.init` returns a heap-allocated `*Self`; we
+                // do NOT need a separate `allocator.create` like the
+                // legacy `EthLibp2p` flow.
                 const fork_digest1 = try allocator.dupe(u8, chain_config.spec.fork_digest);
                 errdefer allocator.free(fork_digest1);
-                // Create empty registry for test network
                 const test_registry1 = try allocator.create(node_lib.NodeNameRegistry);
                 errdefer allocator.destroy(test_registry1);
                 test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry1.deinit();
 
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network1 = try networks.EthLibp2pV2.init(allocator, loop, .{
                     .networkId = 0,
                     .fork_digest = fork_digest1,
-                    .local_private_key = &priv_key1,
-                    .listen_addresses = listen_addresses1,
-                    .connect_peers = null,
+                    .listen_addresses = listen_str1.?,
+                    .connect_peers = "",
                     .node_registry = test_registry1,
+                    .host_identity_seed = seed1,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
-                // init a new lib2p network here to connect with network1
-                network2 = try allocator.create(networks.EthLibp2p);
-                const key_pair2 = enr_lib.KeyPair.generate();
-                const priv_key2 = key_pair2.v4.toString();
-                listen_addresses2 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")});
-                connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
+                // Build connect strings to network1 now that we know its
+                // peer id (deterministic from `seed1`, but we read it off
+                // the struct so the encoding stays one source of truth).
+                const peer1_b58 = try network1.localPeerIdBase58(allocator);
+                defer allocator.free(peer1_b58);
+                connect_str2 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s}",
+                    .{peer1_b58},
+                );
+                connect_str3 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s}",
+                    .{peer1_b58},
+                );
+
+                // ── Network 2 ───────────────────────────────────────────
                 const fork_digest2 = try allocator.dupe(u8, chain_config.spec.fork_digest);
                 errdefer allocator.free(fork_digest2);
-                // Create empty registry for test network
                 const test_registry2 = try allocator.create(node_lib.NodeNameRegistry);
                 errdefer allocator.destroy(test_registry2);
                 test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry2.deinit();
 
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network2 = try networks.EthLibp2pV2.init(allocator, loop, .{
                     .networkId = 1,
                     .fork_digest = fork_digest2,
-                    .local_private_key = &priv_key2,
-                    .listen_addresses = listen_addresses2,
-                    .connect_peers = connect_peers,
+                    .listen_addresses = listen_str2.?,
+                    .connect_peers = connect_str2.?,
                     .node_registry = test_registry2,
+                    .host_identity_seed = seed2,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
-                // init network3 for node 3 (delayed sync node)
-                network3 = try allocator.create(networks.EthLibp2p);
-                const key_pair3 = enr_lib.KeyPair.generate();
-                const priv_key3 = key_pair3.v4.toString();
-                listen_addresses3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9003")});
-                connect_peers3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
+                // ── Network 3 (delayed sync node) ───────────────────────
                 const fork_digest3 = try allocator.dupe(u8, chain_config.spec.fork_digest);
                 errdefer allocator.free(fork_digest3);
                 const test_registry3 = try allocator.create(node_lib.NodeNameRegistry);
@@ -631,16 +650,16 @@ fn mainInner(init: std.process.Init) !void {
                 test_registry3.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry3.deinit();
 
-                network3.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network3 = try networks.EthLibp2pV2.init(allocator, loop, .{
                     .networkId = 2,
                     .fork_digest = fork_digest3,
-                    .local_private_key = &priv_key3,
-                    .listen_addresses = listen_addresses3,
-                    .connect_peers = connect_peers3,
+                    .listen_addresses = listen_str3.?,
+                    .connect_peers = connect_str3.?,
                     .node_registry = test_registry3,
+                    .host_identity_seed = seed3,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
-                logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- v2 ethlibp2p gossip {f}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
@@ -759,7 +778,7 @@ fn mainInner(init: std.process.Init) !void {
                 beam_node: *BeamNode,
                 /// Reference node whose finalization status determines when node 3 starts
                 reference_node: *BeamNode,
-                network: ?*networks.EthLibp2p = null,
+                network: ?*networks.EthLibp2pV2 = null,
                 started: bool = false,
 
                 pub fn onInterval(ptr: *anyopaque, interval: isize) !void {
