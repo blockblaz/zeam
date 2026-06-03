@@ -175,20 +175,18 @@ fn fillRandomBytes(out: []u8) !void {
     }
 }
 
-fn writeFileSync(path: [:0]const u8, data: []const u8) !void {
-    var o: std.c.O = .{};
-    o.ACCMODE = .WRONLY;
-    o.CREAT = true;
-    o.TRUNC = true;
-    const fd = std.c.open(path.ptr, o, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
-    var off: usize = 0;
-    while (off < data.len) {
-        const n = std.c.write(fd, data[off..].ptr, data.len - off);
-        if (n <= 0) return error.WriteShort;
-        off += @intCast(n);
-    }
+/// Write `data` to `path` (an absolute path). Uses the std.Io vtable so the
+/// underlying open/write errors propagate as proper Zig errors instead of
+/// the opaque `error.OpenFailed` we used to return from a raw `std.c.open`
+/// call — the legacy path never wrote to disk, so getting the *real* errno
+/// here is the difference between "fix the cert dir" and "guess".
+fn writeFileSync(path: []const u8, data: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.writeAll(data);
 }
 
 /// Per-topic registered handler. The validator hook fans every accepted
@@ -496,20 +494,44 @@ pub const EthLibp2pV2 = struct {
         );
         errdefer self.allocator.free(key_path);
 
-        try writeFileSync(cert_path, cert_pem);
-        try writeFileSync(key_path, key_pem);
+        writeFileSync(cert_path, cert_pem) catch |e| {
+            self.logger.err(
+                "network-{d}:: failed to write libp2p TLS cert to {s}: {any}",
+                .{ self.params.networkId, cert_path, e },
+            );
+            return e;
+        };
+        writeFileSync(key_path, key_pem) catch |e| {
+            self.logger.err(
+                "network-{d}:: failed to write libp2p TLS key to {s}: {any}",
+                .{ self.params.networkId, key_path, e },
+            );
+            return e;
+        };
 
         self.cert_bundle = .{ .cert_path = cert_path, .key_path = key_path };
 
-        const rt = try zl.transport.quic_runtime.QuicRuntime.create(.{
+        const rt = zl.transport.quic_runtime.QuicRuntime.create(.{
             .allocator = self.allocator,
             .host = self.host,
             .cert_path = std.mem.span(@as([*:0]const u8, cert_path.ptr)),
             .key_path = std.mem.span(@as([*:0]const u8, key_path.ptr)),
             .listen_multiaddr = self.params.listen_addresses,
-        });
+        }) catch |e| {
+            self.logger.err(
+                "network-{d}:: QuicRuntime.create failed for listen={s}: {any}",
+                .{ self.params.networkId, self.params.listen_addresses, e },
+            );
+            return e;
+        };
         errdefer rt.destroy();
-        try rt.start();
+        rt.start() catch |e| {
+            self.logger.err(
+                "network-{d}:: QuicRuntime.start failed for listen={s}: {any}",
+                .{ self.params.networkId, self.params.listen_addresses, e },
+            );
+            return e;
+        };
         self.quic_runtime = rt;
 
         self.logger.info(
