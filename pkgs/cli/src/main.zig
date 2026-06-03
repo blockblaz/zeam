@@ -922,6 +922,7 @@ fn mainInner(init: std.process.Init) !void {
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.@"network-id",
                 .node_key = leancmd.@"node-id",
+                .host_identity_key_path = leancmd.@"node-key",
                 .validator_config = leancmd.@"validator-config",
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.@"metrics-enable",

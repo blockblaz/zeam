@@ -72,6 +72,14 @@ pub const NodeOptions = struct {
     network_id: u32,
     node_key: []const u8,
     node_key_index: usize,
+    /// Path to the lean-quickstart `<node>.key` file holding a 64-hex-char
+    /// ASCII representation of the 32-byte ECDSA-P-256 host-identity seed.
+    /// Threaded through to `EthLibp2pV2Params.host_identity_key_path` so the
+    /// libp2p PeerId derives from the SAME seed `eth-beacon-genesis` used to
+    /// populate `nodes.yaml`. Without this, every outbound dial fails
+    /// `PeerIdMismatch` against the dial-multiaddr's expected peer id.
+    /// `null` only when the legacy code path (no real networking) is in use.
+    host_identity_key_path: ?[]const u8 = null,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
     // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and annotated_validators.yaml
@@ -405,6 +413,7 @@ pub const Node = struct {
             .listen_addresses = self.listen_addresses_str,
             .connect_peers = self.connect_peers_str,
             .node_registry = options.node_registry,
+            .host_identity_key_path = options.host_identity_key_path,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.logger_config);

@@ -106,10 +106,23 @@ pub const EthLibp2pV2Params = struct {
     node_registry: *const NodeNameRegistry,
     /// 32-byte seed for this node's ECDSA-P-256 host identity. The libp2p
     /// PeerId derives from this seed, so persisting it across restarts gives
-    /// a stable peer id. When `null`, a fresh seed is drawn from
-    /// `std.posix.getrandom` (ephemeral identity per run — matches the
-    /// random-PeerId behaviour of the legacy path).
+    /// a stable peer id. When `null` AND `host_identity_key_path` is also
+    /// `null`, a fresh seed is drawn from `std.posix.getrandom` (ephemeral
+    /// identity per run — matches the random-PeerId behaviour of the legacy
+    /// path). Takes precedence over `host_identity_key_path` when both are
+    /// set (used by unit tests that want a fixed in-process identity).
     host_identity_seed: ?[32]u8 = null,
+    /// Optional path to a file containing a 64-hex-char ASCII representation
+    /// of the 32-byte ECDSA-P-256 host-identity seed (lean-quickstart's
+    /// `--node-key /config/<node>.key` format: 64 hex chars + trailing
+    /// newline). When set and `host_identity_seed` is `null`, init() reads,
+    /// strips whitespace, hex-decodes and uses the resulting 32 bytes as the
+    /// seed — giving a stable PeerId across restarts that MATCHES the
+    /// `/p2p/...` peer id the bootnode list pre-computed from the same key
+    /// file. Without this, the host identity is random per startup and every
+    /// dial fails `PeerIdMismatch` against the expected peer id from the
+    /// dial multiaddr.
+    host_identity_key_path: ?[]const u8 = null,
 };
 
 /// Heap-allocated host signer state that captures the ECDSA-P-256 keypair
@@ -158,6 +171,35 @@ fn fillRandomBytes(out: []u8) !void {
             }
         },
     }
+}
+
+/// Read a lean-quickstart `<node>.key` file (64 hex chars + optional
+/// whitespace, e.g. trailing newline) and hex-decode to a 32-byte
+/// ECDSA-P-256 host-identity seed.
+///
+/// lean-quickstart's `spin-node.sh` generates these files via PK's
+/// `eth-beacon-genesis` tool and pre-computes the matching `/p2p/...` peer
+/// ids into `nodes.yaml`. Reading the SAME seed here is what makes our
+/// derived PeerId match the dial-target peer id in the bootnode multiaddrs
+/// — otherwise every outbound dial fails `PeerIdMismatch` because our cert
+/// encodes a random pubkey that doesn't agree with what the dialer expected.
+fn readHostIdentitySeedFromHexFile(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256));
+    defer allocator.free(bytes);
+    // Strip ASCII whitespace (lean-quickstart writes "<64hex>\n").
+    var hex_buf: [64]u8 = undefined;
+    var hex_len: usize = 0;
+    for (bytes) |c| {
+        if (c == '\n' or c == '\r' or c == ' ' or c == '\t') continue;
+        if (hex_len >= 64) return error.HostKeyFileTooLong;
+        hex_buf[hex_len] = c;
+        hex_len += 1;
+    }
+    if (hex_len != 64) return error.HostKeyFileShouldBe64Hex;
+    var seed: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, hex_buf[0..hex_len]);
+    return seed;
 }
 
 /// Per-topic registered handler. The validator hook fans every accepted
@@ -236,10 +278,22 @@ pub const EthLibp2pV2 = struct {
         // across restarts the peer id is stable. When the embedder leaves
         // the seed `null`, we draw a fresh one from `getrandom` — matching
         // the random-PeerId behaviour of the legacy path.
-        var host_seed: [32]u8 = if (params.host_identity_seed) |s| s else seed: {
+        var host_seed: [32]u8 = blk: {
+            if (params.host_identity_seed) |s| break :blk s;
+            if (params.host_identity_key_path) |p| {
+                break :blk readHostIdentitySeedFromHexFile(allocator, p) catch |e| {
+                    logger.err(
+                        "network-{d}:: failed to read host identity seed from {s}: {any} — falling back to ephemeral random seed (PeerId will not match the bootnode list and every dial will fail PeerIdMismatch)",
+                        .{ params.networkId, p, e },
+                    );
+                    var buf: [32]u8 = undefined;
+                    try fillRandomBytes(&buf);
+                    break :blk buf;
+                };
+            }
             var buf: [32]u8 = undefined;
             try fillRandomBytes(&buf);
-            break :seed buf;
+            break :blk buf;
         };
         const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
 
