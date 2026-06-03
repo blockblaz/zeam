@@ -60,14 +60,14 @@ pub fn shouldRefreshPeerStatus(
     }
 
     const refresh = switch (sync_status) {
-        .fc_initing, .behind_peers => true,
+        .fc_initing, .peers_materially_ahead => true,
         .synced => wall_head_lag_slots >= wall_head_lag_threshold_slots,
         .no_peers => false,
     };
     return .{ .refresh = refresh, .wall_head_lag_slots = wall_head_lag_slots };
 }
 
-/// True when pre-finalization sync should report `behind_peers` based on
+/// True when pre-finalization sync should report `peers_materially_ahead` based on
 /// wall-clock head lag alone (early network with `finalized_slot = 0`).
 pub fn isWallHeadLagSyncing(
     our_finalized_slot: types.Slot,
@@ -309,7 +309,7 @@ test "shouldRefreshPeerStatus handles cadence sync state and wall lag" {
         synced,
         no_peers,
         fc_initing,
-        behind_peers,
+        peers_materially_ahead,
     };
 
     // Wall-lag arithmetic is shared with cappedSyncGapSlots by treating wall_slot as
@@ -333,7 +333,7 @@ test "shouldRefreshPeerStatus handles cadence sync state and wall lag" {
         .{ .status = .synced, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 103, .threshold_slots = 4, .want_refresh = false, .want_lag = 3 },
         .{ .status = .synced, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 104, .threshold_slots = 4, .want_refresh = true, .want_lag = 4 },
         .{ .status = .fc_initing, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
-        .{ .status = .behind_peers, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
+        .{ .status = .peers_materially_ahead, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 100, .threshold_slots = 4, .want_refresh = true, .want_lag = 0 },
         .{ .status = .no_peers, .interval_in_slot = 0, .slot = 104, .our_head_slot = 100, .wall_slot = 200, .threshold_slots = 4, .want_refresh = false, .want_lag = 100 },
     };
 

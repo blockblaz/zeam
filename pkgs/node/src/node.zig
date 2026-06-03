@@ -67,6 +67,8 @@ const NodeOpts = struct {
     max_aggregation_children: u32 = types.default_max_aggregation_children,
     /// Soft cap on concurrent aggregate workers (`BeamChain.aggregate_inflight`).
     aggregate_max_inflight: u32 = 4,
+    /// See `chainFactory.ChainOpts.proposal_deadline_pct`.
+    proposal_deadline_pct: u32 = chainFactory.default_proposal_deadline_pct,
 };
 
 /// blocks_by_root retry backoff (interop storm fix). A requested block root that no peer can
@@ -226,6 +228,7 @@ pub const BeamNode = struct {
                 .min_aggregation_inputs = opts.min_aggregation_inputs,
                 .max_aggregation_children = opts.max_aggregation_children,
                 .aggregate_max_inflight = opts.aggregate_max_inflight,
+                .proposal_deadline_pct = opts.proposal_deadline_pct,
             },
             network.connected_peers,
         ) catch |init_err| {
@@ -1015,6 +1018,23 @@ pub const BeamNode = struct {
     /// Safe to call from any thread that reaches the gossip/reqresp
     /// orphan-block paths; the map has its own dedicated lock.
     fn trackOrphanDependent(self: *Self, parent_root: types.Root, child_block_root: types.Root) void {
+        // Slot=13 #942 follow-up: skip the orphan-dependents entry entirely
+        // when `parent_root` has previously failed verify with a
+        // deterministic-failure verdict. The cached parent will never be
+        // importable; tracking the child would just queue a fetch that
+        // chain.onBlock would short-circuit on `KnownInvalidBlock` anyway
+        // (the parent-cascade arm). Cascade-mark the child here so any
+        // future delivery of the SAME child also short-circuits at the
+        // `site="self"` arm. Avoids the 12,676-chunks-per-5-min livelock
+        // observed against ethlambda_0's slot=13 reserve.
+        if (self.chain.isInvalidRoot(parent_root)) {
+            self.chain.markInvalidRoot(child_block_root);
+            self.logger.debug(
+                "skip tracking orphan dependent 0x{x}: parent 0x{x} is known-invalid; cascade-marked child",
+                .{ &child_block_root, &parent_root },
+            );
+            return;
+        }
         self.orphan_dependents_lock.lock();
         defer self.orphan_dependents_lock.unlock();
         const gop = self.orphan_dependents.getOrPut(parent_root) catch |err| {
@@ -2126,7 +2146,7 @@ pub const BeamNode = struct {
                         };
                         const sync_status = self.chain.getSyncStatus();
                         switch (sync_status) {
-                            .behind_peers => |info| {
+                            .peers_materially_ahead => |info| {
                                 const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
                                 if (self.shouldCatchUpFromPeerStatus(
                                     catch_up_status,
@@ -2219,7 +2239,7 @@ pub const BeamNode = struct {
                         // pending_block_roots so a different peer can
                         // serve them. Without this, a failed request
                         // permanently stalls the parent-chain walk used
-                        // during fc_initing / behind_peers sync.
+                        // during fc_initing / peers_materially_ahead sync.
                         self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
                         return;
                     },
@@ -2250,7 +2270,7 @@ pub const BeamNode = struct {
                 // peer. Without this, a peer that returns EOS without
                 // fulfilling all requested roots (e.g., a mesh helper
                 // with head_slot=0) permanently stalls the parent-chain
-                // walk used during fc_initing / behind_peers sync.
+                // walk used during fc_initing / peers_materially_ahead sync.
                 if (snap.request_kind == .blocks_by_root) {
                     self.retryUnservedBlockRoots(request_id, snap.requested_roots_copy, peer_id);
                     return;
@@ -3784,14 +3804,32 @@ pub const BeamNode = struct {
 
         try self.network.backend.gossip.subscribe(topics_slice, handler);
 
+        // Peer + req-resp handlers are subscribed earlier via
+        // `subscribeNetworkEventHandlers` (called before `EthLibp2p.run()`),
+        // so an inbound connection or RPC request that arrives the instant the
+        // listener comes up is never dispatched to zero handlers. Only gossip
+        // mesh subscribe must stay here — it enqueues a swarm command that
+        // requires the running network.
+
+        const chainOnSlot = try self.getOnIntervalCbWrapper();
+        try self.clock.subscribeOnSlot(chainOnSlot);
+    }
+
+    /// Register the peer-event and req-resp request handlers on the network
+    /// backend. These only append to in-process handler lists (no swarm
+    /// command channel needed), so they MUST be called BEFORE `EthLibp2p.run()`
+    /// starts the rust bridge listener. Doing so closes the startup race where
+    /// the bridge accepts an inbound connection (or receives a STATUS request)
+    /// before `BeamNode.run()` would have subscribed — which otherwise left
+    /// `connected_peers` empty (sync status stuck at `.no_peers`, gossip
+    /// attestations dropped, no finalization) and surfaced
+    /// `error.NoHandlerSubscribed` for early RPC requests.
+    pub fn subscribeNetworkEventHandlers(self: *Self) !void {
         const peer_handler = self.getPeerEventHandler();
         try self.network.backend.peers.subscribe(peer_handler);
 
         const req_handler = self.getOnReqRespRequestCbHandler();
         try self.network.backend.reqresp.subscribe(req_handler);
-
-        const chainOnSlot = try self.getOnIntervalCbWrapper();
-        try self.clock.subscribeOnSlot(chainOnSlot);
     }
 };
 
@@ -3878,6 +3916,11 @@ test "Node peer tracking on connect/disconnect" {
     });
     defer node.deinit();
 
+    // Peer/req-resp handler registration moved out of `run()` into
+    // `subscribeNetworkEventHandlers` (called before the network starts in
+    // production); the test drives the mock peer handler directly, so register
+    // here to wire the node's onPeerConnected/onPeerDisconnected callbacks.
+    try node.subscribeNetworkEventHandlers();
     try node.run();
 
     // Verify initial state: 0 peers

@@ -79,12 +79,26 @@ COPY .git/HEAD .git/HEAD
 COPY .git/refs .git/refs
 
 # Get git commit hash and build the project with optimizations
-# Use cache mount for Zig build cache as well
+# Use cache mounts for both the Zig and Cargo build caches.
+#
+# Without the three `/root/.cargo/{registry,git}` and `/app/rust/target`
+# mounts, every Docker build (even for a 1-line Rust change) re-downloads
+# the full Cargo crate graph and re-compiles the ~200 transitive deps
+# (libp2p, gossipsub, quinn, tokio, ...) from scratch. On Mac/Docker
+# Desktop that's 5-15 minutes of pure Cargo compile time burned per
+# build. With these mounts: ~10s incremental rebuilds for typical changes.
+#
+# `rust/target` is where `cargo -C rust build` writes artifacts (see
+# build.zig: `cargo_build = b.addSystemCommand({..., "-C", "rust", ...})`).
+#
 # CPU targeting per architecture:
 #   amd64: x86-64-v3 (AVX2, no AVX512) — portable across modern x86_64 servers
 #   arm64: generic CPU — QEMU-compatible when cross-building
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/zig \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/rust/target \
     EXTRA_ZIG_FLAGS="" && \
     if [ "$TARGETARCH" = "amd64" ]; then \
         EXTRA_ZIG_FLAGS="-Dcpu=x86_64_v3 -Drust-target-cpu=x86-64-v3"; \
@@ -98,14 +112,20 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build --seed 0 -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS
+    zig build --seed 0 -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS && \
+    REC_AGG_DIR=$(find /root/.cargo/git/checkouts -path "*/rec_aggregation" -type d | head -1) && \
+    cp -r "$REC_AGG_DIR" /tmp/rec_aggregation_src && \
+    echo "$REC_AGG_DIR" > /tmp/rec_aggregation_path
 
-# rec_aggregation's compilation.rs reads .py source files at runtime to verify
-# a bytecode fingerprint (via env!("CARGO_MANIFEST_DIR") baked at compile time).
-# Stage the crate source so we can recreate the path in the runtime image.
-RUN REC_AGG_DIR=$(find /root/.cargo/git/checkouts -path "*/rec_aggregation" -type d | head -1) \
-    && cp -r "$REC_AGG_DIR" /tmp/rec_aggregation_src \
-    && echo "$REC_AGG_DIR" > /tmp/rec_aggregation_path
+# Note: rec_aggregation extraction is folded into the build RUN above
+# (not a separate RUN) because we cache-mount /root/.cargo/git on that
+# RUN — cache mounts are ephemeral per-RUN, so a subsequent layer cannot
+# see /root/.cargo/git/checkouts at all. /tmp/rec_aggregation_src lands
+# on the real image layer and is picked up by the runtime-prep stage.
+# rec_aggregation's compilation.rs reads .py source files at runtime to
+# verify a bytecode fingerprint (via env!("CARGO_MANIFEST_DIR") baked at
+# compile time), so the crate source has to be present at the same path
+# in the runtime image.
 
 # Intermediate stage to prepare runtime libraries
 FROM ubuntu:24.04 AS runtime-prep

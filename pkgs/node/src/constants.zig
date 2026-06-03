@@ -104,7 +104,7 @@ pub const MAX_FC_CHAIN_PRINT_DEPTH = 5;
 pub const RPC_REQUEST_TIMEOUT_SECONDS: i64 = 8;
 
 // How often to re-send status requests to connected peers when sync may need
-// recovery: always while fc_initing/behind_peers, and while synced only after
+// recovery: always while fc_initing/peers_materially_ahead, and while synced only after
 // the local head has fallen behind wall-clock slots. Ensures that already-
 // connected peers are probed again after a restart and that an early network
 // with finalized_slot=0 can recover from a gossip-ingress stall via status-driven

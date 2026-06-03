@@ -117,6 +117,9 @@ pub const NodeOptions = struct {
     /// free of this filtering). Surfaced as `--min-aggregation-inputs` on the
     /// `zeam node` CLI; default is `default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Percentage of the proposal interval allocated as the build-worker
+    /// deadline budget.
+    proposal_deadline_pct: u32 = node_lib.default_proposal_deadline_pct,
     /// Cap on the number of child STARK proofs merged with raw signatures
     /// by the aggregator-worker path. Threaded through to
     /// `ForkChoice.max_aggregation_children` and applied by
@@ -603,6 +606,7 @@ pub const Node = struct {
             .min_aggregation_inputs = options.min_aggregation_inputs,
             .max_aggregation_children = options.max_aggregation_children,
             .aggregate_max_inflight = aggregate_max_inflight,
+            .proposal_deadline_pct = options.proposal_deadline_pct,
         });
         errdefer self.beam_node.deinit();
 
@@ -696,6 +700,12 @@ pub const Node = struct {
         // with `error.GossipMeshSubscribeFailed`. The dev `beam`
         // command already does network-first; this is the matching swap for
         // the production node path.
+        //
+        // Peer + req-resp handlers are subscribed before the network starts so
+        // the one-shot peer-connect event and early STATUS requests are not
+        // lost to a handler-not-yet-registered race; only gossip mesh subscribe
+        // needs the running channel and stays inside `BeamNode.run()`.
+        try self.beam_node.subscribeNetworkEventHandlers();
         try self.network.run();
         try self.beam_node.run();
 

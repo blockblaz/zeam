@@ -36,6 +36,16 @@ const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
 const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
+const invalid_block_cache = @import("./invalid_block_cache.zig");
+const InvalidBlockSet = invalid_block_cache.InvalidBlockSet;
+
+/// Bound on the in-memory invalid-block-roots cache (see
+/// `BeamChain.invalid_block_roots`). 10 000 32-byte roots ≈ 320 KB plus
+/// hashmap overhead — comfortably small. Sized large enough to cover a
+/// sustained burst of malformed blocks (e.g. the slot=13 ethlambda
+/// AggregatedXMSS deserialize failure observed on devnet 2a4b7197) without
+/// FIFO-evicting still-arriving repeats.
+const INVALID_BLOCK_CACHE_MAX_ENTRIES: usize = 10_000;
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -88,7 +98,21 @@ pub const ChainOpts = struct {
     /// slot filter is `{slot-1, slot}`, so aggregations for further-back slots
     /// are wasted work. See `BeamChain.aggregateImpl`.
     aggregate_max_inflight: u32 = 4,
+    /// Share of one proposal interval (`SECONDS_PER_INTERVAL_MS`) budgeted to
+    /// the block build + attestation-aggregation worker. This is an
+    /// INTRA-interval time budget, not a cross-interval split: the worker
+    /// self-truncates at `pct%` of the interval, and the remaining
+    /// `(100-pct)%` of the SAME interval is reserved for the finalize step
+    /// (STF over the harvested partial body + propose-side sign + gossip
+    /// publish), so the signed block is ready before the attestation interval.
+    ///
+    /// Default 90: ~720ms aggregation budget + ~80ms finalize/sign budget at
+    /// the default 800ms interval.
+    proposal_deadline_pct: u32 = default_proposal_deadline_pct,
 };
+
+/// Default value for `ChainOpts.proposal_deadline_pct`
+pub const default_proposal_deadline_pct: u32 = 90;
 
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
@@ -98,6 +122,16 @@ pub const CachedProcessedBlockInfo = struct {
     // for database persistence and skips re-serializing the live SignedBlock, which
     // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
     sszBytes: ?[]const u8 = null,
+    // Set by `onBlocksBatch` after it has already run
+    // `stf.verifySignaturesParallelMultiBlock` across the full batch.
+    // When true, the `step="verify_signatures"` lap inside `onBlock`
+    // is skipped — re-running it per block would duplicate the work
+    // the caller already did and defeat the point of the batched path.
+    //
+    // Callers OUTSIDE the batched path must leave this false: missing
+    // a real signature verify would silently let bad blocks into fork
+    // choice. See PR #964.
+    preVerified: bool = false,
 };
 
 pub const GossipProcessingResult = struct {
@@ -249,6 +283,21 @@ pub const BeamChain = struct {
     public_key_cache: xmss.PublicKeyCache,
     // Cache for root to slot mapping to optimize block processing performance.
     root_to_slot_cache: types.RootToSlotCache,
+
+    /// Bounded set of block roots that failed verification with a
+    /// deterministic-failure error (signature deserialize/verify fail,
+    /// structural mismatch, proposer-sig fail). Reads from
+    /// `chainWorkerOnBlockThunk`'s catch arm (write) and `onBlock`'s entry
+    /// guard (read), plus the orphan-tracking path in `node.zig`.
+    ///
+    /// See `invalid_block_cache.zig` for the spec-safety rationale and the
+    /// exhaustive list of which errors are deterministic enough to insert.
+    /// Without this, a peer that keeps gossiping a malformed block (or a
+    /// later block whose parent_root chains back to one) wedges the
+    /// orphan-dependents loop into a refetch-and-fail livelock — the slot=13
+    /// `AggregatedXMSS` deserialize failure observed on devnet image
+    /// 2a4b7197 chewed ~6 MB/s of catch-up bandwidth per node.
+    invalid_block_roots: InvalidBlockSet,
     /// Optional worker pool for parallelizing CPU-bound steps (currently:
     /// attestation signature verification and `compactAttestations`). Owned
     /// by the caller (e.g. the CLI's main), not by the chain.
@@ -260,7 +309,7 @@ pub const BeamChain = struct {
     ///      whose `alloc`/`free` are internally serialized; an `ArenaAllocator`
     ///      or any custom non-thread-safe allocator would race. If a future
     ///      change swaps the allocator, audit every consumer of `thread_pool`
-    ///      (`stf.verifySignaturesParallel`, `types.compactAttestations`).
+    ///      (`stf.verifySignaturesParallelMultiBlock`, `types.compactAttestations`).
     ///   2. The XMSS prover/verifier bytecode must be set up before the pool's
     ///      first verify. The CLI calls `xmss.setupXmssAggregation()` on the
     ///      main thread *before* constructing the thread pool, so workers
@@ -432,7 +481,12 @@ pub const BeamChain = struct {
     /// never `fcmutex -> prove_gate` — so there is no lock cycle.
     prove_gate: zeam_utils.SyncMutex = .{},
 
-    /// Optional chain-worker thread.
+    /// See `ChainOpts.proposal_deadline_pct`. Surfaced as a config knob
+    /// (CLI `--proposal-deadline-pct`) and stored here; devnet5's off-loop
+    /// `proposeImpl` is the active proposal path.
+    proposal_deadline_pct: u32,
+
+    /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
     /// worker thread serialises the actual chain mutations.
@@ -589,6 +643,7 @@ pub const BeamChain = struct {
             // and validator-set-growth caveats.
             .public_key_cache = try xmss.PublicKeyCache.init(allocator, @intCast(opts.config.genesis.numValidators())),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
+            .invalid_block_roots = InvalidBlockSet.init(allocator, INVALID_BLOCK_CACHE_MAX_ENTRIES),
             .thread_pool = opts.thread_pool,
             // pending_blocks is the future-slot queue. It's an
             // unmanaged ArrayList, so default-init to `.empty`; the lock
@@ -614,6 +669,7 @@ pub const BeamChain = struct {
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
+            .proposal_deadline_pct = opts.proposal_deadline_pct,
             // Pending attestation / aggregated-attestation buffers — empty
             // at init; FIFO-bounded by constants.MAX_PENDING_ATTESTATIONS in
             // the enqueue helpers.
@@ -671,6 +727,7 @@ pub const BeamChain = struct {
             .handlers = .{
                 .ctx = self,
                 .on_block = chainWorkerOnBlockThunk,
+                .on_blocks_batch = chainWorkerOnBlocksBatchThunk,
                 .on_gossip_attestation = chainWorkerOnGossipAttestationThunk,
                 .on_gossip_aggregated_attestation = chainWorkerOnGossipAggregatedAttestationThunk,
                 .process_pending_blocks = chainWorkerProcessPendingBlocksThunk,
@@ -1026,14 +1083,14 @@ pub const BeamChain = struct {
             &gossip.message.signature,
         );
 
-        // Role-gated storage: only aggregators store. The analog of
-        // `attestation_signatures` is the per-validator attestation
-        // tracker maintained by `forkChoice.onSignedAttestation`, which
-        // in turn feeds head selection. Non-aggregators validate and
-        // drop — they never store gossip signatures.
-        if (is_aggregator_role) {
-            try self.forkChoice.onSignedAttestation(gossip.message);
-        }
+        // Fork-choice vote tracking runs for ALL nodes so head selection and
+        // `safeTarget` converge across aggregators and non-aggregators —
+        // gating it (as this path used to) left non-aggregators voting a
+        // divergent attestation target, which wedged justification at
+        // genesis. Only the `attestation_signatures` aggregation buffer is
+        // role-gated (leanSpec "non-aggregators validate and drop the raw
+        // signature"); that gate now lives inside `onSignedAttestation`.
+        try self.forkChoice.onSignedAttestation(gossip.message, is_aggregator_role);
     }
 
     // ------------------------------------------------------------------
@@ -1123,6 +1180,59 @@ pub const BeamChain = struct {
                 // through to the "log and drop" path. Production wires
                 // the callback in `BeamNode.init`.
             }
+
+            // Deterministic-failure classifier (slot=13 #942 follow-up).
+            // For any error category that is purely a function of the
+            // block bytes — signature deserialize/verify fail, structural
+            // mismatch, proposer-sig fail — insert the root into
+            // `invalid_block_roots` so the orphan-dependents refetch loop
+            // and any future gossip redelivery short-circuit at
+            // `onBlock`'s entry guard without re-running STF / XMSS
+            // verify.
+            //
+            // State-dependent errors (InvalidPostState, MissingPreState,
+            // PreFinalizedSlot, UnknownParentBlock, FutureSlot) are
+            // intentionally EXCLUDED — a re-org through a different
+            // ancestor could legitimately re-enable such blocks, and the
+            // pre-existing `rejected_block` callback (above) already
+            // handles the TOCTOU-shaped MissingPreState / PreFinalizedSlot
+            // cases. KnownInvalidBlock is also excluded so we don't
+            // double-count the cache hit.
+            const is_deterministic_invalid = switch (err) {
+                xmss.AggregationError.Type1VerifyFailed,
+                xmss.AggregationError.Type2VerifyFailed,
+                types.StateTransitionError.InvalidBlockSignatures,
+                types.StateTransitionError.InvalidValidatorId,
+                BlockProcessingError.InvalidSignatureGroups,
+                BlockProcessingError.DuplicateAttestationData,
+                BlockProcessingError.TooManyAttestationData,
+                xmss.HashSigError.InvalidSignature,
+                xmss.HashSigError.VerificationFailed,
+                xmss.HashSigError.DeserializationFailed,
+                xmss.HashSigError.InvalidMessageLength,
+                => true,
+                else => false,
+            };
+            if (is_deterministic_invalid) {
+                const r_root: types.Root = block_root orelse blk: {
+                    var rr: types.Root = undefined;
+                    zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &rr, self.allocator) catch |hash_err| {
+                        self.logger.err(
+                            "chain-worker: invalid-block-mark skipped, root recompute failed slot={d} err={any}: {any}",
+                            .{ signed_block.block.slot, err, hash_err },
+                        );
+                        break :blk std.mem.zeroes(types.Root);
+                    };
+                    break :blk rr;
+                };
+                if (!std.mem.eql(u8, &r_root, &std.mem.zeroes(types.Root))) {
+                    self.markInvalidRoot(r_root);
+                    self.logger.warn(
+                        "chain-worker: marking root=0x{x} slot={d} as permanently invalid (err={any})",
+                        .{ &r_root, signed_block.block.slot, err },
+                    );
+                }
+            }
             self.logger.err("chain-worker: onBlock failed slot={d}: {any}", .{
                 signed_block.block.slot,
                 err,
@@ -1169,6 +1279,102 @@ pub const BeamChain = struct {
             return;
         }
         self.allocator.free(missing_roots);
+    }
+
+    /// Batched-block thunk (PR #966). Called by the chain-worker drain
+    /// loop when it coalesced 2+ `.on_block` messages. Routes the whole
+    /// batch through `chain.onBlocksBatch` so the XMSS aggregated-
+    /// signature verify runs as ONE rayon call across every attestation
+    /// in every block (the `phase2_batch_verify` stage that is 99% of
+    /// `step="verify_signatures"` on a loaded chain). After the batched
+    /// import returns, per-block bookkeeping (onBlockFollowup, replay,
+    /// imported-block backchannel) still runs once per block in order
+    /// — those steps are cheap and not amenable to batching.
+    ///
+    /// TOCTOU rejection paths (MissingPreState / PreFinalizedSlot) that
+    /// the single-block thunk routes to the rejected_block callback are
+    /// NOT exercised from this thunk: `onBlocksBatch` swallows per-block
+    /// failures into `missing_roots = null` so we lose the error tag.
+    /// Acceptable trade-off for the catch-up hot path (where the producer
+    /// just checked `hasBlock(parent)` under a shared lock, so the TOCTOU
+    /// window is narrow); gossip-rate blocks at queue depth ≤ threshold
+    /// still go through `chainWorkerOnBlockThunk` with full TOCTOU.
+    fn chainWorkerOnBlocksBatchThunk(
+        ctx: *anyopaque,
+        items: []const chain_worker.BlockBatchItem,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        // Build per-block input slices for chain.onBlocksBatch. Every
+        // item should have a block_root by construction (gossip / RPC /
+        // local producers all compute it before submitting) — but
+        // recompute if missing to keep this thunk robust against future
+        // producers.
+        const signed_blocks = self.allocator.alloc(types.SignedBlock, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on signed_blocks alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(signed_blocks);
+        const block_roots = self.allocator.alloc(types.Root, items.len) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch thunk OOM on block_roots alloc ({d} items): {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(block_roots);
+
+        // `prune_forkchoice` is per-item in principle but in practice all
+        // catch-up submitters pass the same value. Use the first item's
+        // value for the batch; if a future submitter mixes per-block
+        // pruning we'll need to split into homogeneous sub-batches.
+        const prune_forkchoice = items[0].prune_forkchoice;
+
+        for (items, 0..) |item, i| {
+            signed_blocks[i] = item.signed_block;
+            if (item.block_root) |r| {
+                block_roots[i] = r;
+            } else {
+                zeam_utils.hashTreeRoot(types.BeamBlock, item.signed_block.block, &block_roots[i], self.allocator) catch |err| {
+                    self.logger.err(
+                        "chain-worker: onBlocksBatch root recompute failed slot={d}: {any}",
+                        .{ item.signed_block.block.slot, err },
+                    );
+                    return;
+                };
+            }
+        }
+
+        const results = self.onBlocksBatch(signed_blocks, block_roots, prune_forkchoice) catch |err| {
+            self.logger.err(
+                "chain-worker: onBlocksBatch failed K={d}: {any}",
+                .{ items.len, err },
+            );
+            return;
+        };
+        defer self.allocator.free(results);
+
+        // Per-block bookkeeping: followup + replay + imported_block
+        // callback. Mirror the single-block thunk's tail; null result
+        // means that block failed import (already logged inside
+        // onBlocksBatch / its fallback).
+        for (items, results, 0..) |item, result, i| {
+            const block_root = block_roots[i];
+            if (result.missing_roots) |missing_roots| {
+                self.onBlockFollowup(item.prune_forkchoice, &item.signed_block);
+                self.replayPendingAttestations();
+                if (self.imported_block) |cb| {
+                    cb.func(cb.ctx, block_root, missing_roots);
+                } else {
+                    self.allocator.free(missing_roots);
+                }
+            }
+            // Failed blocks: nothing to do — onBlocksBatch already logged
+            // and we have no error tag to drive the rejected_block path.
+        }
     }
 
     fn chainWorkerOnGossipAttestationThunk(
@@ -1558,6 +1764,11 @@ pub const BeamChain = struct {
 
         // Clean up root to slot cache
         self.root_to_slot_cache.deinit();
+
+        // Drop the invalid-block-roots cache. The mutex inside is unused
+        // after chain_worker.stop() above (sole writer) and no remaining
+        // libxev path reads after deinit, so a plain deinit is safe.
+        self.invalid_block_roots.deinit();
         // Clean up any blocks that were queued waiting for the forkchoice clock
         // (each entry wraps the SignedBlock + its precomputed root).
         for (self.pending_blocks.items) |*entry| {
@@ -1585,6 +1796,26 @@ pub const BeamChain = struct {
     /// Returns the current aggregator role flag.
     pub fn isAggregator(self: *const Self) bool {
         return self.is_aggregator_enabled.load(.acquire);
+    }
+
+    /// True if `root` is the hash of a block that previously failed
+    /// verification with a deterministic-failure error. Safe to call from
+    /// any thread (libxev gossip path, chain-worker, RPC handlers). See
+    /// `invalid_block_roots` field doc + `invalid_block_cache.zig` for the
+    /// spec-safety argument.
+    pub fn isInvalidRoot(self: *Self, root: types.Root) bool {
+        return self.invalid_block_roots.contains(root);
+    }
+
+    /// Mark `root` as permanently invalid. Callers MUST restrict this to
+    /// deterministic-failure errors — see the enumeration in
+    /// `invalid_block_cache.zig`. State-dependent errors (InvalidPostState,
+    /// MissingPreState) MUST NOT call this: a future re-org through a
+    /// different ancestor could legitimately re-enable the block.
+    pub fn markInvalidRoot(self: *Self, root: types.Root) void {
+        const inserted = self.invalid_block_roots.mark(root);
+        // Plain Counter (no labels) — incr() doesn't fail, no `try`/`catch`.
+        if (inserted) zeam_metrics.metrics.zeam_chain_invalid_block_root_marked_total.incr();
     }
 
     /// Atomically flips the aggregator role and returns the previous value.
@@ -2330,7 +2561,7 @@ pub const BeamChain = struct {
         {
             const sync_status = self.getSyncStatus();
             zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "idle" }, if (sync_status == .no_peers or sync_status == .fc_initing) 1 else 0) catch {};
-            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "syncing" }, if (sync_status == .behind_peers) 1 else 0) catch {};
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "syncing" }, if (sync_status == .peers_materially_ahead) 1 else 0) catch {};
             zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "synced" }, if (sync_status == .synced) 1 else 0) catch {};
         }
 
@@ -2494,7 +2725,7 @@ pub const BeamChain = struct {
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         // FFI call against the owned snapshot — no lock held during this
         // window.
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root);
+        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, null);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -3135,12 +3366,12 @@ pub const BeamChain = struct {
 
                 // Sync-state gating: gossip is processed when synced or
                 // syncing; only dropped when idle (no peers / forkchoice
-                // not yet initialised). When behind peers we accept
-                // attestations and let the buffer catch unknown-block /
-                // future-slot ones for replay after the next gossip
+                // not yet initialised). When peers are materially ahead we
+                // accept attestations and let the buffer catch unknown-block
+                // / future-slot ones for replay after the next gossip
                 // block lands.
                 switch (self.getSyncStatus()) {
-                    .synced, .behind_peers => {},
+                    .synced, .peers_materially_ahead => {},
                     .no_peers, .fc_initing => {
                         zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "attestation", .reason = "syncing" }) catch {};
                         return .{};
@@ -3244,7 +3475,7 @@ pub const BeamChain = struct {
                 // peers / fc not initialised). Retryable validation
                 // failures land in the pending buffer for replay.
                 switch (self.getSyncStatus()) {
-                    .synced, .behind_peers => {},
+                    .synced, .peers_materially_ahead => {},
                     .no_peers, .fc_initing => {
                         zeam_metrics.metrics.zeam_gossip_atts_dropped_total.incr(.{ .kind = "aggregation", .reason = "syncing" }) catch {};
                         return .{};
@@ -3381,6 +3612,35 @@ pub const BeamChain = struct {
             }
         }
 
+        // Invalid-block-roots short-circuit. Cheap O(1) HashMap lookup
+        // against the bounded cache populated by `chainWorkerOnBlockThunk`
+        // when verify returned a deterministic-failure verdict. Two
+        // separate checks:
+        //
+        //   (a) this block's own root → already proven invalid; redelivery
+        //       (gossip echo, blocks_by_root refetch from a peer still
+        //       serving it) should not pay the STF/XMSS cost a second time.
+        //   (b) the parent's root → descendant-of-invalid is itself
+        //       invalid per spec (a chain rooted at an invalid block
+        //       cannot be canonical). Mark the child too so future
+        //       deliveries short-circuit on (a).
+        //
+        // Both raise `KnownInvalidBlock` so `chainWorkerOnBlockThunk`'s
+        // existing classifier sees a distinct error tag and does NOT
+        // re-mark — avoiding a metric double-count.
+        if (self.invalid_block_roots.contains(block_root)) {
+            zeam_metrics.metrics.zeam_chain_invalid_block_root_hit_total.incr(.{ .site = "self" }) catch {};
+            return BlockProcessingError.KnownInvalidBlock;
+        }
+        if (self.invalid_block_roots.contains(block.parent_root)) {
+            // Cascade. Don't goto `markInvalidRoot` (extra metric
+            // increment); inline the insert so the cascade hit is
+            // bucketed under `site="parent"` instead.
+            _ = self.invalid_block_roots.mark(block_root);
+            zeam_metrics.metrics.zeam_chain_invalid_block_root_hit_total.incr(.{ .site = "parent" }) catch {};
+            return BlockProcessingError.KnownInvalidBlock;
+        }
+
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. Snapshot parent state under `states_lock.shared`, then
@@ -3416,7 +3676,15 @@ pub const BeamChain = struct {
             // the dominant contributor to a ~78ms mean lock hold.
             // A block carries one merged Type-2 proof, so verification is a single
             // container.verify (no per-attestation parallel batch). thread_pool no longer needed here.
-            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
+            //
+            // Skip when the caller already batch-verified across multiple
+            // blocks (`onBlocksBatch` path): rerunning the verify here would
+            // duplicate the work that was the whole reason to batch in the
+            // first place. `blockInfo.preVerified` is set ONLY by that
+            // controlled caller; bare callers leave it false.
+            if (!blockInfo.preVerified) {
+                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
+            }
 
             step_watch.lap("verify_signatures");
 
@@ -3760,6 +4028,143 @@ pub const BeamChain = struct {
             blockInfo.postState == null,
         });
         return missing_roots.toOwnedSlice(self.allocator);
+    }
+
+    /// Per-block result of `onBlocksBatch`. `missing_roots` is `null`
+    /// when that block failed import (caller does not need to free).
+    /// Non-null entries are owned by the caller and must be freed with
+    /// `chain.allocator.free(missing_roots)` — same contract as the
+    /// return value of single-block `onBlock`.
+    pub const BatchBlockResult = struct {
+        missing_roots: ?[]types.Root,
+    };
+
+    /// Batched block import. Coalesces the XMSS aggregated-signature
+    /// verify across all blocks in `signedBlocks` into ONE rayon call
+    /// (the previously-instrumented `phase2_batch_verify` stage that is
+    /// 99% of `step="verify_signatures"` on a loaded chain — see PR
+    /// #963 data), then runs STF per block sequentially with
+    /// `preVerified=true` so the per-block `onBlock` does NOT redo the
+    /// verify. Targets the catch-up hot path where the chain-worker has
+    /// drained K blocks at once.
+    ///
+    /// Inputs:
+    ///   signedBlocks  — K SignedBlock values, slot-ascending (caller's
+    ///                   responsibility; STF below depends on parent
+    ///                   states being importable in iteration order).
+    ///   block_roots   — pre-computed hashTreeRoot of each block, in
+    ///                   the same order. Required (multi-block path
+    ///                   skips the duplicate hashTreeRoot inside
+    ///                   `verifySignatures`).
+    ///   pruneForkchoice — passed through to per-block onBlock.
+    ///
+    /// Returns: K-length slice of BatchBlockResult, owned by caller (free
+    /// the outer slice; for each non-null `missing_roots` also free it).
+    ///
+    /// K=0: returns empty slice. K=1: routes through `onBlock` for
+    /// identical semantics with non-batched paths (no batching upside).
+    ///
+    /// On a multi-block batch-verify failure, falls back to per-block
+    /// `onBlock(.{ preVerified = false })` so a single bad signature
+    /// in the batch doesn't drop the whole sweep — valid blocks still
+    /// import; the bad one(s) get marked with `missing_roots = null`.
+    pub fn onBlocksBatch(
+        self: *Self,
+        signedBlocks: []const types.SignedBlock,
+        block_roots: []const types.Root,
+        pruneForkchoice: bool,
+    ) ![]BatchBlockResult {
+        std.debug.assert(signedBlocks.len == block_roots.len);
+        if (signedBlocks.len == 0) return self.allocator.alloc(BatchBlockResult, 0);
+
+        const results = try self.allocator.alloc(BatchBlockResult, signedBlocks.len);
+        errdefer self.allocator.free(results);
+
+        if (signedBlocks.len == 1) {
+            // K=1: no batching upside. Use the regular path so metrics +
+            // semantics match other single-block callers exactly.
+            const missing = self.onBlock(signedBlocks[0], .{
+                .blockRoot = block_roots[0],
+                .pruneForkchoice = pruneForkchoice,
+            }) catch |err| {
+                results[0] = .{ .missing_roots = null };
+                return err;
+            };
+            results[0] = .{ .missing_roots = missing };
+            return results;
+        }
+
+        // For verify, all blocks need a state to look up validator
+        // pubkeys. In lean consensus the validator set is fixed at
+        // genesis (no dynamic registration), so pubkeys are identical
+        // across every block's parent state. Using the first block's
+        // parent state for all K verify tasks is sound and avoids
+        // having to STF blocks 1..N-1 just to compute their parent
+        // states for the verify pass. The actual STF below still does
+        // a per-block parent-state lookup and full state transition.
+        var parent_borrow = self.statesGet(signedBlocks[0].block.parent_root) orelse {
+            // `results` is released by the errdefer above; freeing it here too
+            // would double-free on this error return.
+            return BlockProcessingError.MissingPreState;
+        };
+        defer parent_borrow.assertReleasedOrPanic();
+        const shared_pre_snapshot = try parent_borrow.cloneAndRelease(self.allocator);
+        defer {
+            shared_pre_snapshot.deinit();
+            self.allocator.destroy(shared_pre_snapshot);
+        }
+
+        // Build the multi-block task slice. `block_roots` must outlive
+        // this scope; the caller's slice does (it owns the storage).
+        const tasks = try self.allocator.alloc(stf.VerifyMultiBlockTask, signedBlocks.len);
+        defer self.allocator.free(tasks);
+        for (signedBlocks, block_roots, 0..) |*sb, *root, i| {
+            tasks[i] = .{
+                .state = shared_pre_snapshot,
+                .signed_block = sb,
+                .precomputed_block_root = root,
+            };
+        }
+
+        // The one rayon call across every attestation in every block.
+        const batch_verify_ok = blk: {
+            stf.verifySignaturesParallelMultiBlock(
+                self.allocator,
+                tasks,
+                &self.public_key_cache,
+                self.thread_pool,
+            ) catch |err| {
+                self.logger.warn(
+                    "multi-block batch verify failed (K={d}): {any}; falling back to per-block import",
+                    .{ signedBlocks.len, err },
+                );
+                break :blk false;
+            };
+            break :blk true;
+        };
+
+        // Per-block STF. When the batch verify succeeded we pass
+        // `preVerified = true` so `onBlock` skips its own verify call;
+        // on fallback we run the regular path so a bad signature
+        // gets isolated to its specific block via the normal error
+        // return rather than failing the whole sweep.
+        for (signedBlocks, block_roots, 0..) |sb, root, i| {
+            const missing = self.onBlock(sb, .{
+                .blockRoot = root,
+                .pruneForkchoice = pruneForkchoice,
+                .preVerified = batch_verify_ok,
+            }) catch |err| {
+                self.logger.warn(
+                    "onBlocksBatch: block 0x{x} slot={d} failed import: {any}",
+                    .{ &root, sb.block.slot, err },
+                );
+                results[i] = .{ .missing_roots = null };
+                continue;
+            };
+            results[i] = .{ .missing_roots = missing };
+        }
+
+        return results;
     }
 
     pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlock) void {
@@ -4390,7 +4795,7 @@ pub const BeamChain = struct {
             &signedAttestation.message.signature,
         );
 
-        return self.forkChoice.onSignedAttestation(signedAttestation.message);
+        return self.forkChoice.onSignedAttestation(signedAttestation.message, self.isAggregator());
     }
 
     /// Update fork-choice attestation trackers for an aggregated proof.
@@ -4512,7 +4917,7 @@ pub const BeamChain = struct {
     pub fn submitAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_aggregator" }) catch {};
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_aggregator" }) catch {};
             return;
         }
 
@@ -4521,7 +4926,7 @@ pub const BeamChain = struct {
             .synced => {},
             .fc_initing => {
                 self.logger.warn("skipping aggregation production for slot={d}: forkchoice initializing", .{slot});
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
+                zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
                 return;
             },
             .no_peers => {
@@ -4529,15 +4934,31 @@ pub const BeamChain = struct {
                 // attestation weight, and aggregates will propagate once peers connect.
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
-            .behind_peers => |info| {
-                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
-                    slot,
-                    info.head_slot,
-                    info.finalized_slot,
-                    info.max_peer_finalized_slot,
-                });
-                zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "not_synced" }) catch {};
-                return;
+            .peers_materially_ahead => |info| {
+                // Same pre-finalization cold-start exception as
+                // validator_client.mayBeDoAttestation (see its long
+                // comment). Aggregation MUST proceed when both finalized
+                // slots are 0, otherwise we never produce the first
+                // aggregated payload and the chain can't reach a first
+                // justification. Once any finalization exists the gate
+                // returns to its proper deep-sync meaning.
+                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
+                    self.logger.info(
+                        "peers_materially_ahead but pre-finalization (finalized_slot=0, max_peer_finalized_slot=0): aggregating for slot={d} on current head_slot={d} to help reach first justification",
+                        .{ slot, info.head_slot },
+                    );
+                } else {
+                    self.logBehindPeersDebug("skipping aggregation production", info);
+                    self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
+                        slot,
+                        info.head_slot,
+                        info.finalized_slot,
+                        info.max_peer_finalized_slot,
+                        info.peer_count,
+                    });
+                    zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
+                    return;
+                }
             },
         }
 
@@ -4566,7 +4987,7 @@ pub const BeamChain = struct {
         self.thread_pool.spawnWg(&self.aggregate_wg, aggregateImpl, .{ self, node, slot }) catch {
             _ = self.aggregate_inflight.fetchSub(1, .acq_rel);
             self.logger.warn("failed to enqueue aggregation for slot={d}; skipping", .{slot});
-            zeam_metrics.metrics.zeam_aggregate_skip_total.incr(.{ .reason = "spawn_failed" }) catch {};
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "spawn_failed" }) catch {};
             return;
         };
     }
@@ -4610,12 +5031,14 @@ pub const BeamChain = struct {
         const head_root = chain.forkChoice.getHead().blockRoot;
         var borrow = chain.statesGet(head_root) orelse {
             chain.logger.warn("skipping aggregation for slot={d}: missing state for head root", .{slot});
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "missing_state" }) catch {};
             return;
         };
         defer borrow.deinit();
 
         var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, chain.allocator) catch |err| {
             chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
             return;
         };
         defer validators_owned.deinit();
@@ -4648,6 +5071,7 @@ pub const BeamChain = struct {
         ) catch |err| {
             chain.prove_gate.unlock();
             chain.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
             return;
         };
         chain.prove_gate.unlock();
@@ -4683,9 +5107,22 @@ pub const BeamChain = struct {
                 self.logger.info("skipping block production for slot={d} proposer={d}: forkchoice still initing", .{ slot, proposer_id });
                 return;
             },
-            .behind_peers => |info| {
-                self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{ slot, proposer_id, info.head_slot, info.finalized_slot, info.max_peer_finalized_slot });
-                return;
+            .peers_materially_ahead => |info| {
+                // Same pre-finalization cold-start exception as
+                // submitAggregateOnInterval / mayBeDoAttestation: when both
+                // finalized slots are 0 we must still propose, otherwise the
+                // chain can never reach a first justification. Once any
+                // finalization exists the gate returns to its deep-sync meaning.
+                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
+                    self.logger.info(
+                        "peers_materially_ahead but pre-finalization (finalized_slot=0, max_peer_finalized_slot=0): producing block for slot={d} proposer={d} on current head_slot={d} to help reach first justification",
+                        .{ slot, proposer_id, info.head_slot },
+                    );
+                } else {
+                    self.logBehindPeersDebug("skipping block production", info);
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{ slot, proposer_id, info.head_slot, info.finalized_slot, info.max_peer_finalized_slot, info.peer_count });
+                    return;
+                }
             },
         }
 
@@ -4972,12 +5409,58 @@ pub const BeamChain = struct {
         /// observed a real justified checkpoint via block processing.  Validator duties must
         /// not run until the first onBlock-driven justified update transitions FC to ready.
         fc_initing,
-        behind_peers: struct {
-            head_slot: types.Slot,
-            finalized_slot: types.Slot,
-            max_peer_finalized_slot: types.Slot,
-        },
+        peers_materially_ahead: BehindPeersInfo,
     };
+
+    pub const MAX_BEHIND_PEERS_TO_REPORT = 16;
+    pub const MAX_BEHIND_PEER_ID_BYTES = 128;
+
+    pub const BehindPeerInfo = struct {
+        peer_id_buf: [MAX_BEHIND_PEER_ID_BYTES]u8 = undefined,
+        peer_id_len: usize = 0,
+        finalized_slot: types.Slot = 0,
+
+        pub fn peerId(self: *const @This()) []const u8 {
+            return self.peer_id_buf[0..self.peer_id_len];
+        }
+    };
+
+    pub const BehindPeersInfo = struct {
+        head_slot: types.Slot,
+        finalized_slot: types.Slot,
+        max_peer_finalized_slot: types.Slot,
+        peers: [MAX_BEHIND_PEERS_TO_REPORT]BehindPeerInfo = undefined,
+        peer_count: usize = 0,
+        peers_truncated: bool = false,
+
+        fn addPeer(self: *@This(), peer_id: []const u8, finalized_slot: types.Slot) void {
+            if (self.peer_count >= self.peers.len) {
+                self.peers_truncated = true;
+                return;
+            }
+            const copy_len = @min(peer_id.len, MAX_BEHIND_PEER_ID_BYTES);
+            var peer = BehindPeerInfo{ .peer_id_len = copy_len, .finalized_slot = finalized_slot };
+            @memcpy(peer.peer_id_buf[0..copy_len], peer_id[0..copy_len]);
+            self.peers[self.peer_count] = peer;
+            self.peer_count += 1;
+            if (copy_len < peer_id.len) self.peers_truncated = true;
+        }
+    };
+
+    pub fn logBehindPeersDebug(self: *Self, context: []const u8, info: BehindPeersInfo) void {
+        for (info.peers[0..info.peer_count]) |peer| {
+            self.logger.debug("{s}: peers_materially_ahead peer {s}{f} finalized_slot={d} max_peer_finalized_slot={d}", .{
+                context,
+                peer.peerId(),
+                self.node_registry.getNodeNameFromPeerId(peer.peerId()),
+                peer.finalized_slot,
+                info.max_peer_finalized_slot,
+            });
+        }
+        if (info.peers_truncated) {
+            self.logger.debug("{s}: peers_materially_ahead peer list truncated after {d} entries", .{ context, info.peer_count });
+        }
+    }
 
     /// Returns detailed sync status information.
     pub fn getSyncStatus(self: *Self) SyncStatus {
@@ -5003,24 +5486,26 @@ pub const BeamChain = struct {
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
         var max_peer_head_slot: types.Slot = our_head_slot;
 
-        var peer_guard = self.connected_peers.iterateLocked();
-        defer peer_guard.deinit();
-        var peer_iter = peer_guard.iter;
-        while (peer_iter.next()) |entry| {
-            const peer_info = entry.value_ptr;
-            if (peer_info.latest_status) |status| {
-                if (status.finalized_slot > max_peer_finalized_slot) {
-                    max_peer_finalized_slot = status.finalized_slot;
-                }
-                if (status.head_slot > max_peer_head_slot) {
-                    max_peer_head_slot = status.head_slot;
+        {
+            var peer_guard = self.connected_peers.iterateLocked();
+            defer peer_guard.deinit();
+            var peer_iter = peer_guard.iter;
+            while (peer_iter.next()) |entry| {
+                const peer_info = entry.value_ptr;
+                if (peer_info.latest_status) |status| {
+                    if (status.finalized_slot > max_peer_finalized_slot) {
+                        max_peer_finalized_slot = status.finalized_slot;
+                    }
+                    if (status.head_slot > max_peer_head_slot) {
+                        max_peer_head_slot = status.head_slot;
+                    }
                 }
             }
         }
 
-        // `behind_peers` is the "deep sync" state. It must
+        // `peers_materially_ahead` is the "deep sync" state. It must
         // only fire on a finalization gap; a 1-slot head delta is normal
-        // gossip latency, not deep sync, and `behind_peers` consumers
+        // gossip latency, not deep sync, and `peers_materially_ahead` consumers
         // (`validator_client.maybeDoProposal` / `mayBeDoAttestation`) skip
         // proposer/attestation duties — gating those on transient head
         // lag would silently disable validators near the head.
@@ -5031,14 +5516,24 @@ pub const BeamChain = struct {
         // reports a higher head triggers catch-up without changing the
         // node's high-level sync state.
 
-        // Check 1: our head is behind peer finalization — we don't even have finalized blocks
-        if (our_head_slot < max_peer_finalized_slot) {
-            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
-        }
-
-        // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
-        if (our_finalized_slot < max_peer_finalized_slot) {
-            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
+        // Check 1/2: our head or finalization is behind peer finalization.
+        // Include the exact peers whose finalized slots make this node report
+        // `peers_materially_ahead`, so logs can name the source of the decision.
+        const behind_peer_finalization = our_head_slot < max_peer_finalized_slot or our_finalized_slot < max_peer_finalized_slot;
+        if (behind_peer_finalization) {
+            var info = self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
+            var cause_guard = self.connected_peers.iterateLocked();
+            defer cause_guard.deinit();
+            var cause_iter = cause_guard.iter;
+            while (cause_iter.next()) |entry| {
+                const peer_info = entry.value_ptr;
+                if (peer_info.latest_status) |status| {
+                    if (status.finalized_slot > our_head_slot or status.finalized_slot > our_finalized_slot) {
+                        info.peers_materially_ahead.addPeer(peer_info.peer_id, status.finalized_slot);
+                    }
+                }
+            }
+            return info;
         }
 
         // Check 3: pre-finalization networks — wall-clock head lag means we are
@@ -5071,7 +5566,7 @@ pub const BeamChain = struct {
         max_peer_finalized_slot: types.Slot,
     ) SyncStatus {
         _ = self;
-        return .{ .behind_peers = .{
+        return .{ .peers_materially_ahead = .{
             .head_slot = head_slot,
             .finalized_slot = finalized_slot,
             .max_peer_finalized_slot = max_peer_finalized_slot,
@@ -5088,6 +5583,13 @@ pub const BlockProcessingError = error{
     InvalidSignatureGroups,
     DuplicateAttestationData,
     TooManyAttestationData,
+    /// Block's hash-tree-root, or its `parent_root`, is already in the
+    /// `invalid_block_roots` cache from a prior deterministic-failure
+    /// verdict. Surfaced from `onBlock`'s entry guard so callers can
+    /// distinguish "we already proved this invalid" from a fresh verify
+    /// failure (which would itself populate the cache). Cheap-drop: STF /
+    /// XMSS verify never run on this code path.
+    KnownInvalidBlock,
 };
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
@@ -6343,7 +6845,13 @@ test "attestation processing - valid block attestation" {
     const thread_pool = try setupTestPrimitives();
     defer thread_pool.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool }, connected_peers);
+    // is_aggregator = true: this test asserts the raw signature is recorded
+    // into `attestation_signatures` (the aggregation buffer). Per leanSpec,
+    // only aggregators store gossip signatures for re-aggregation; a
+    // non-aggregator validates and drops them (it still updates the
+    // fork-choice vote tracker). Make the chain an aggregator so the
+    // "recorded for aggregation" assertion below exercises the right role.
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry, .thread_pool = thread_pool, .is_aggregator = true }, connected_peers);
     defer beam_chain.deinit();
 
     // Add blocks to chain

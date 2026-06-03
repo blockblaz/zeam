@@ -1471,6 +1471,9 @@ const AggregateAttDataSlot = struct {
 const CompactGroupSlot = struct {
     result: ?CompactGroupResult = null,
     err: ?anyerror = null,
+    /// Task observed the deadline already elapsed at dispatch time and
+    /// returned without running the FFI. Empty result, no error.
+    skipped: bool = false,
 };
 
 /// Per-entry preparation built serially before any worker thread runs.
@@ -1571,12 +1574,17 @@ fn runCompactGroupPrep(
     );
 }
 
+/// `deadline_ns` is an optional monotonic-ns cutoff. `null` = unbounded
+/// (legacy synchronous produceBlock). When set, parallel workers self-skip
+/// at dispatch if the deadline has elapsed; results are harvested as the
+/// longest contiguous prefix of completed slots.
 pub fn compactAttestations(
     allocator: Allocator,
     attestations: *AggregatedAttestations,
     signatures: *Type1ProofList,
     validators: *const Validators,
     thread_pool: anytype,
+    deadline_ns: ?i64,
 ) !struct { attestations: AggregatedAttestations, signatures: Type1ProofList } {
     const att_slice = attestations.constSlice();
     const sig_slice = signatures.constSlice();
@@ -1722,6 +1730,12 @@ pub fn compactAttestations(
     // Parallel path: per-AttestationData aggregation across the shared
     // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
     // touch FFI deserialization themselves.
+    //
+    // Each worker checks `deadline_ns` at dispatch and self-skips if
+    // already past — bounding the total work without needing to cancel the
+    // FFI (uncancellable run-to-completion). Tasks already mid-FFI when
+    // the deadline elapses run to completion; that's the soft upper bound.
+    // Callers that want unbounded compaction pass `std.math.maxInt(i128)`.
     const slots = try allocator.alloc(CompactGroupSlot, preps.len);
     defer allocator.free(slots);
     for (slots) |*slot| slot.* = .{};
@@ -1734,6 +1748,9 @@ pub fn compactAttestations(
         }
     }
 
+    // `deadline_ns` is i64 to avoid i128 in the scope.spawn args tuple
+    // (breaks ThreadPool's @fieldParentPtr alignment). The compare against
+    // `monotonicTimestampNs()` (i128) widens once inside the worker.
     const Runner = struct {
         fn runScope(
             scope: anytype,
@@ -1742,9 +1759,10 @@ pub fn compactAttestations(
             alloc: Allocator,
             out_slots: []CompactGroupSlot,
             any_err: *std.atomic.Value(bool),
+            deadline: ?i64,
         ) Allocator.Error!void {
             for (preps_in, 0..) |prep, i| {
-                try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err });
+                try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err, deadline });
             }
         }
 
@@ -1754,8 +1772,15 @@ pub fn compactAttestations(
             sigs: []const aggregation.AggregatedSignatureProof,
             out_slot: *CompactGroupSlot,
             any_err: *std.atomic.Value(bool),
+            deadline: ?i64,
         ) void {
             if (any_err.load(.acquire)) return;
+            if (deadline) |d| {
+                if (zeam_utils.monotonicTimestampNs() >= @as(i128, d)) {
+                    out_slot.skipped = true;
+                    return;
+                }
+            }
             const result = runCompactGroupPrep(alloc, prep, sigs) catch |err| {
                 out_slot.err = err;
                 any_err.store(true, .release);
@@ -1772,14 +1797,25 @@ pub fn compactAttestations(
         allocator,
         slots,
         &any_err,
+        deadline_ns,
     });
 
     for (slots) |*slot| {
         if (slot.err) |err| return err;
     }
 
+    // Strict-prefix harvest: take the longest contiguous run of completed
+    // slots starting at index 0, stop at the first skipped/incomplete one.
+    // Late completions past a gap are discarded so the block always contains
+    // the deterministic top-N (e.g. {ad1, ad2} when ad1+ad2 finish; never
+    // {ad3} alone when ad1+ad2 didn't).
+    var truncated = false;
     for (slots) |*slot| {
-        var result = slot.result orelse continue;
+        if (slot.skipped or slot.result == null) {
+            truncated = true;
+            break;
+        }
+        var result = slot.result.?;
         slot.result = null;
 
         var att_moved = false;
@@ -1793,6 +1829,21 @@ pub fn compactAttestations(
         att_moved = true;
         try out_sigs.append(result.signature);
         sig_moved = true;
+    }
+
+    // Free results past the prefix gap so the errdefer-cleanup of `slots`
+    // doesn't see them — we own them now, drop them.
+    for (slots) |*slot| {
+        if (slot.result) |*r| {
+            r.attestation.deinit();
+            r.signature.deinit();
+            slot.result = null;
+        }
+    }
+
+    if (truncated) {
+        zeam_metrics.metrics.zeam_proposal_deadline_hits_total.incr();
+        zeam_metrics.zeam_proposal_partial_prefix_size.record(@floatFromInt(out_atts.constSlice().len));
     }
 
     // Free old input entries
@@ -2259,4 +2310,69 @@ test "computeSingleAggregatedSignature: single-child passthrough survives prep d
     defer cloned.deinit();
 
     try std.testing.expect(cloned.participants.len() > 0);
+}
+
+// Two entries sharing one AttestationData force `needs_compaction = true`
+// so we enter the parallel path. Empty validators short-circuits the XMSS
+// pre-phase. With deadline in the past, every dispatched worker sees the
+// elapsed deadline at task start and self-skips → strict-prefix harvest
+// returns an empty result.
+test "compactAttestations: elapsed deadline returns empty prefix" {
+    const allocator = std.testing.allocator;
+
+    const thread_pool = try setupTestPrimitives(allocator);
+    defer thread_pool.deinit();
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var attestations = try AggregatedAttestations.init(allocator);
+    var attestations_consumed = false;
+    defer if (!attestations_consumed) {
+        for (attestations.slice()) |*att| att.deinit();
+        attestations.deinit();
+    };
+
+    var signatures = try Type1ProofList.init(allocator);
+    var signatures_consumed = false;
+    defer if (!signatures_consumed) {
+        for (signatures.slice()) |*sig| sig.deinit();
+        signatures.deinit();
+    };
+
+    const att_data = attestation.AttestationData{
+        .slot = 1,
+        .head = .{ .root = ZERO_HASH, .slot = 0 },
+        .target = .{ .root = ZERO_HASH, .slot = 0 },
+        .source = .{ .root = ZERO_HASH, .slot = 0 },
+    };
+
+    inline for ([_]u32{ 0, 1 }) |_| {
+        const bits = try attestation.AggregationBits.init(allocator);
+        try attestations.append(.{ .aggregation_bits = bits, .data = att_data });
+
+        const proof = try aggregation.AggregatedSignatureProof.init(allocator);
+        try signatures.append(proof);
+    }
+
+    var result = try compactAttestations(
+        allocator,
+        &attestations,
+        &signatures,
+        &validators,
+        thread_pool,
+        0,
+    );
+    // inputs consumed by compactAttestations; cancel double-free defers.
+    attestations_consumed = true;
+    signatures_consumed = true;
+    defer {
+        for (result.attestations.slice()) |*att| att.deinit();
+        result.attestations.deinit();
+        for (result.signatures.slice()) |*sig| sig.deinit();
+        result.signatures.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), result.attestations.constSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), result.signatures.constSlice().len);
 }
