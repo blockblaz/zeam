@@ -12,14 +12,14 @@ edition = "2021"
 #               same hardware class as the devnet aggregator hosts.
 #   - 5fbd5bf: Plonky3 PR #1600 NEON dot-product regression coverage
 #   - e5c2183: leanSig dep flipped to `main` (devnet4 merged into main)
-#   - 5eba3b1: rec_aggregation BenchmarkReport (API-additive, source of
+#   - f66d4a9: rec_aggregation BenchmarkReport (API-additive, source of
 #               the per-node breakdown that lean-bench / op tooling read)
 # Devnet operators reported ~16 sig/s on 2eb4b9d (Apr 17) vs ~37 sig/s on
-# leanMultisig benchmarks against 5eba3b1 — the 939a767 inline removal is
+# leanMultisig benchmarks against f66d4a9 — the 939a767 inline removal is
 # the dominant contributor on the prod hardware.
-rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa" }
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa" }
-backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa" }
+rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "f66d4a974eced803574eb0ea43d812e523c8d7ad" }
+leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "f66d4a974eced803574eb0ea43d812e523c8d7ad" }
+backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "f66d4a974eced803574eb0ea43d812e523c8d7ad" }
 rayon = "1"
 
 [lib]
