@@ -17,8 +17,13 @@
 // The openvm/risc0 zkVM backends ship their own #[global_allocator]
 // (e.g. openvm_stark_backend), and only one is allowed per binary — so jemalloc
 // is installed only when neither zkVM prover is built. The multisig (devnet5)
-// and default builds, which carry the heavy prover, always get it.
-#[cfg(not(any(feature = "openvm", feature = "risc0")))]
+// and default builds, which carry the heavy prover, get it by default.
+//
+// The `jemalloc` feature lets build.zig omit the allocator for `-Dno-jemalloc`:
+// the Shadow simulator's shim re-enters malloc during its own first-syscall
+// init, which deadlocks jemalloc's non-recursive init lock (shadow/shadow#3763).
+// That build drops this feature and falls back to the system allocator.
+#[cfg(all(feature = "jemalloc", not(any(feature = "openvm", feature = "risc0"))))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

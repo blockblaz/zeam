@@ -79,7 +79,13 @@ pub fn build(b: *Builder) !void {
     const prover_option = b.option([]const u8, "prover", "Choose prover: dummy, risc0, openvm, or all (default: dummy)") orelse "dummy";
     const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .dummy;
 
-    const build_rust_lib_steps = build_rust_project(b, "rust", prover);
+    // Drop the jemalloc global allocator and use the system allocator. Needed
+    // for the Shadow network simulator: its preload shim re-enters malloc during
+    // its own first-syscall init while jemalloc holds its non-recursive init
+    // lock, which self-deadlocks (shadow/shadow#3763).
+    const no_jemalloc = b.option(bool, "no-jemalloc", "Disable the jemalloc global allocator (use the system allocator). Required under the Shadow simulator, whose shim deadlocks with jemalloc's init.") orelse false;
+
+    const build_rust_lib_steps = build_rust_project(b, "rust", prover, no_jemalloc);
 
     // LTO option (disabled by default for faster builds)
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
@@ -891,7 +897,7 @@ fn setSpectestArgsAndEnv(
     }
 }
 
-fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
+fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice, no_jemalloc: bool) *Builder.Step.Run {
     // Every Rust glue crate is routed through the `zeam-glue` staticlib shim;
     // feature flags control which per-prover rlibs get linked in. See the
     // comment on `addRustGlueLib`.
@@ -910,12 +916,17 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Local-dev requirement: rustup must be installed. Standalone
     // Cargo (e.g. Homebrew-only) won't satisfy `rustup run nightly`
     // any more than it satisfied the previous `cargo +nightly` shape.
+    // jemalloc is the global allocator only for the multisig/default build (the
+    // lib.rs cfg excludes the zkVM provers, which ship their own). Enable its
+    // cargo feature here, unless -Dno-jemalloc was passed (e.g. for the Shadow
+    // simulator, where jemalloc deadlocks the shim — system allocator instead).
+    const multisig_features = if (no_jemalloc) "libp2p,hashsig,multisig" else "libp2p,hashsig,multisig,jemalloc";
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
             "rustup",    "run",                   "nightly",          "cargo",
             "-C",        path,                    "-Z",               "unstable-options",
             "build",     "--profile",             "multisig-release", "-p",
-            "zeam-glue", "--no-default-features", "--features",       "libp2p,hashsig,multisig",
+            "zeam-glue", "--no-default-features", "--features",       multisig_features,
         }),
         .risc0 => b.addSystemCommand(&.{
             "rustup",    "run",                   "nightly",       "cargo",
