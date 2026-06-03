@@ -169,7 +169,14 @@ pub const NodeOptions = struct {
 /// It manages the event loop, network interface, clock, and beam node.
 pub const Node = struct {
     loop: xev.Loop,
-    network: networks.EthLibp2p,
+    /// `EthLibp2pV2.init` returns a heap-allocated `*Self`, so this is a
+    /// pointer (was a value field under the legacy `EthLibp2p` flow).
+    network: *networks.EthLibp2pV2,
+    /// String-form listen + connect multiaddrs handed to v2. Owned by
+    /// `Node`; freed at `deinit` so v2 (which stores slice refs, not
+    /// dupes) is safe across its lifetime.
+    listen_addresses_str: []u8,
+    connect_peers_str: []u8,
     beam_node: BeamNode,
     clock: Clock,
     enr: ENR,
@@ -372,14 +379,31 @@ pub const Node = struct {
         // behavior of this further needs to be investigated but for now we will share the same loop
         self.loop = try xev.Loop.init(.{});
 
+        // v2 wants strings (one listen multiaddr; comma-separated connect
+        // multiaddrs). The legacy ENR plumbing returns `[]Multiaddr`; we
+        // convert here and own the resulting strings on `Node` so v2
+        // (which stores slice references, not dupes) is safe across its
+        // lifetime.
         const addresses = try self.constructMultiaddrs();
+        defer {
+            for (addresses.listen_addresses) |addr| addr.deinit();
+            allocator.free(addresses.listen_addresses);
+            for (addresses.connect_peers) |addr| addr.deinit();
+            allocator.free(addresses.connect_peers);
+        }
+        self.listen_addresses_str = if (addresses.listen_addresses.len > 0)
+            try addresses.listen_addresses[0].toString(allocator)
+        else
+            try allocator.dupe(u8, "");
+        errdefer allocator.free(self.listen_addresses_str);
+        self.connect_peers_str = try joinMultiaddrsCsv(allocator, addresses.connect_peers);
+        errdefer allocator.free(self.connect_peers_str);
 
-        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
+        self.network = try networks.EthLibp2pV2.init(allocator, &self.loop, .{
             .networkId = options.network_id,
             .fork_digest = chain_config.spec.fork_digest,
-            .listen_addresses = addresses.listen_addresses,
-            .connect_peers = addresses.connect_peers,
-            .local_private_key = options.local_priv_key,
+            .listen_addresses = self.listen_addresses_str,
+            .connect_peers = self.connect_peers_str,
             .node_registry = options.node_registry,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
@@ -685,6 +709,8 @@ pub const Node = struct {
         self.clock.deinit(self.allocator);
         self.beam_node.deinit();
         self.thread_pool.deinit();
+        self.allocator.free(self.listen_addresses_str);
+        self.allocator.free(self.connect_peers_str);
         self.key_manager.deinit();
         self.network.deinit();
         self.enr.deinit();
@@ -944,6 +970,21 @@ pub const Node = struct {
 
 /// Reads ATTESTATION_COMMITTEE_COUNT from a parsed config.yaml Yaml document.
 /// Returns null if the field is absent or cannot be parsed.
+/// Comma-separated multiaddr string for `EthLibp2pV2Params.connect_peers`.
+/// Returns an allocator-owned slice (empty string for the no-bootnodes case).
+fn joinMultiaddrsCsv(allocator: std.mem.Allocator, addrs: []const Multiaddr) ![]u8 {
+    if (addrs.len == 0) return try allocator.dupe(u8, "");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (addrs, 0..) |addr, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        const s = try addr.toString(allocator);
+        defer allocator.free(s);
+        try buf.appendSlice(allocator, s);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
 fn attestationCommitteeCountFromYAML(config: Yaml) ?u64 {
     if (config.docs.items.len == 0) return null;
     const root = config.docs.items[0];

@@ -9,9 +9,6 @@
 //!
 //! See blockblaz/zeam#773 for the motivation.
 
-#[cfg(feature = "libp2p")]
-extern crate libp2p_glue;
-
 #[cfg(feature = "hashsig")]
 extern crate hashsig_glue;
 

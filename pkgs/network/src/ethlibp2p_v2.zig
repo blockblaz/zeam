@@ -80,16 +80,16 @@ const peer_id_pkg = zl.peer_id;
 
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
-// Re-use the legacy file's #942-hardened helpers. Duplicating the logic
-// would be 400+ LOC; the helpers are `pub` so `validateGossipSnappyHeader`,
-// `deserializeGossipMessage`, `byteHexPreview`, the snappy domain constant,
-// and the size caps stay the single source of truth.
-const v1 = @import("./ethlibp2p.zig");
+// Shared snappy + SSZ codec helpers; previously lived inside the legacy
+// `ethlibp2p.zig` and were `pub`'d for v2 reuse. After the Rust-glue
+// teardown those helpers live in their own module so the codec sticks
+// around once the legacy file is deleted.
+const v1 = @import("./gossip_codec.zig");
 
-const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = v1.MESSAGE_DOMAIN_VALID_SNAPPY_V2;
-const MAX_GOSSIP_BLOCK_SIZE: usize = v1.MAX_GOSSIP_BLOCK_SIZE_V2;
-const MAX_RPC_MESSAGE_SIZE: usize = v1.MAX_RPC_MESSAGE_SIZE_V2;
-const GOSSIP_PREVIEW_MAX_BYTES: usize = v1.GOSSIP_PREVIEW_MAX_BYTES_V2;
+const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = v1.MESSAGE_DOMAIN_VALID_SNAPPY;
+const MAX_GOSSIP_BLOCK_SIZE: usize = v1.MAX_GOSSIP_BLOCK_SIZE;
+const MAX_RPC_MESSAGE_SIZE: usize = v1.MAX_RPC_MESSAGE_SIZE;
+const GOSSIP_PREVIEW_MAX_BYTES: usize = v1.GOSSIP_PREVIEW_MAX_BYTES;
 
 /// Default per-request response wait used by the legacy path (the Rust glue
 /// embeds a 15s timeout in its req/resp protocol handler). zig-libp2p's
