@@ -637,6 +637,7 @@ fn mainInner(init: std.process.Init) !void {
                     .connect_peers = connect_str1.?,
                     .node_registry = test_registry1,
                     .host_identity_seed = seed1,
+                    .cert_dir = beamcmd.@"data-dir",
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
@@ -655,6 +656,7 @@ fn mainInner(init: std.process.Init) !void {
                     .connect_peers = connect_str2.?,
                     .node_registry = test_registry2,
                     .host_identity_seed = seed2,
+                    .cert_dir = beamcmd.@"data-dir",
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
@@ -673,6 +675,7 @@ fn mainInner(init: std.process.Init) !void {
                     .connect_peers = connect_str3.?,
                     .node_registry = test_registry3,
                     .host_identity_seed = seed3,
+                    .cert_dir = beamcmd.@"data-dir",
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
                 logger1_config.logger(null).debug("--- v2 ethlibp2p gossip {f}", .{backend1.gossip});

@@ -110,6 +110,15 @@ pub const EthLibp2pV2Params = struct {
     /// `std.posix.getrandom` (ephemeral identity per run — matches the
     /// random-PeerId behaviour of the legacy path).
     host_identity_seed: ?[32]u8 = null,
+    /// Directory where the libp2p TLS cert + key PEM files are written so
+    /// the QUIC runtime can load them. Must be a path that's writable in
+    /// the container or test sandbox. We can't use `/tmp` because zeam's
+    /// runtime image is `FROM scratch` — there's no `/tmp` to write into,
+    /// just whatever paths get COPY'd or VOLUME-mounted. The devnet
+    /// container always mounts `--data-dir`, so the cert + key live
+    /// alongside the chain DB. Defaults to `"."` for tests / in-process
+    /// callers that don't care.
+    cert_dir: []const u8 = ".",
 };
 
 /// Heap-allocated host signer state that captures the ECDSA-P-256 keypair
@@ -481,15 +490,15 @@ pub const EthLibp2pV2 = struct {
 
         const cert_path = try std.fmt.allocPrintSentinel(
             self.allocator,
-            "/tmp/zeam_v2_net_{d}_cert.pem",
-            .{self.params.networkId},
+            "{s}/zeam_v2_net_{d}_cert.pem",
+            .{ self.params.cert_dir, self.params.networkId },
             0,
         );
         errdefer self.allocator.free(cert_path);
         const key_path = try std.fmt.allocPrintSentinel(
             self.allocator,
-            "/tmp/zeam_v2_net_{d}_key.pem",
-            .{self.params.networkId},
+            "{s}/zeam_v2_net_{d}_key.pem",
+            .{ self.params.cert_dir, self.params.networkId },
             0,
         );
         errdefer self.allocator.free(key_path);

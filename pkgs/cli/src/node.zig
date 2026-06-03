@@ -405,6 +405,10 @@ pub const Node = struct {
             .listen_addresses = self.listen_addresses_str,
             .connect_peers = self.connect_peers_str,
             .node_registry = options.node_registry,
+            // Write the libp2p TLS cert/key PEMs into the data dir — the
+            // zeam runtime image is `FROM scratch` and has no `/tmp`, but
+            // `/data` is always present (the operator mounts `--data-dir`).
+            .cert_dir = options.database_path,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.logger_config);
