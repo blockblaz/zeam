@@ -213,6 +213,16 @@ pub const EthLibp2pV2 = struct {
     /// embedder left `listen_addresses` empty.
     quic_runtime: ?*zl.transport.quic_runtime.QuicRuntime = null,
 
+    /// PEM-encoded TLS cert + key, owned by this v2 instance and BORROWED by
+    /// `QuicRuntime` (which forwards the slices straight into zquic v1.6.6's
+    /// `ServerConfig.cert_pem` / `ClientConfig.client_cert_pem`). The server
+    /// config parses them once during `QuicRuntime.create`, but the client
+    /// config re-parses them on EVERY `dial`, so these buffers must live as
+    /// long as `quic_runtime` — freeing them after `create` returns turns
+    /// every outbound dial into `error.NoCertificate`.
+    tls_cert_pem: ?[]u8 = null,
+    tls_key_pem: ?[]u8 = null,
+
     const Self = @This();
 
     pub fn init(
@@ -349,6 +359,16 @@ pub const EthLibp2pV2 = struct {
             rt.destroy();
             self.quic_runtime = null;
         }
+        // Free the borrowed-by-runtime PEM buffers AFTER `rt.destroy()` —
+        // QuicRuntime holds the slices live until destroy returns.
+        if (self.tls_cert_pem) |pem| {
+            self.allocator.free(pem);
+            self.tls_cert_pem = null;
+        }
+        if (self.tls_key_pem) |pem| {
+            self.allocator.free(pem);
+            self.tls_key_pem = null;
+        }
         self.host.shutdown();
         if (self.drain_thread) |t| {
             t.join();
@@ -435,14 +455,18 @@ pub const EthLibp2pV2 = struct {
         });
         defer gen.deinit(self.allocator);
 
-        // The cert + key PEMs are borrowed by `QuicRuntime` for the
-        // duration of `create`; zquic parses them into DER + a
-        // `tls_vendor.config.PrivateKey` and stores those instead, so the
-        // PEM buffers can be freed as soon as `create` returns.
+        // The cert + key PEMs are BORROWED by `QuicRuntime` and threaded
+        // into zquic v1.6.6's `ServerConfig.cert_pem` /
+        // `ClientConfig.client_cert_pem`. Server parses once at
+        // `QuicRuntime.create`, but the CLIENT config re-parses on every
+        // `dial` — so these buffers must outlive the runtime. Store them
+        // on `self`; `deinit` frees them after the runtime is torn down.
         const cert_pem = try zl.security.libp2p_tls_cert.certDerToPem(self.allocator, gen.cert_der);
-        defer self.allocator.free(cert_pem);
+        errdefer self.allocator.free(cert_pem);
         const key_pem = try zl.security.libp2p_tls_cert.ecdsaP256SeedToPem(self.allocator, gen.cert_key_seed);
-        defer self.allocator.free(key_pem);
+        errdefer self.allocator.free(key_pem);
+        self.tls_cert_pem = cert_pem;
+        self.tls_key_pem = key_pem;
 
         const rt = zl.transport.quic_runtime.QuicRuntime.create(.{
             .allocator = self.allocator,
