@@ -61,8 +61,8 @@
             .hash = "thread_pool-0.1.0-m6B8f9j4AAAWx5c9ytLrH_NlntTMxSg049v76xVsgoSw",
         },
         .zig_libp2p = .{
-            .url = "git+https://github.com/ch4r10t33r/zig-libp2p.git?ref=v0.1.1#a7c63e3beacfc794f821a3eb515163b4256a6d6e",
-            .hash = "zig_libp2p-0.1.1-lil2hMHYCgBVqUElhvo0_ReMOGVN7ZFu2dYp02_ngcV8",
+            .url = "git+https://github.com/ch4r10t33r/zig-libp2p.git?ref=v0.1.2#fc75a73413265867f8f8ed05259078e92801d550",
+            .hash = "zig_libp2p-0.1.2-lil2hOlVDAAHkXIa_tpSYOLF8BQiA4_cT_SIjIUB5ad-",
         },
     },
     .paths = .{""},

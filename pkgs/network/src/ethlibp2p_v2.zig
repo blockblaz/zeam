@@ -76,6 +76,9 @@ const NodeNameRegistry = @import("./node_registry.zig").NodeNameRegistry;
 
 const zl = @import("zig_libp2p");
 const Multiaddr = @import("multiaddr").Multiaddr;
+const peer_id_pkg = zl.peer_id;
+
+const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 // Re-use the legacy file's #942-hardened helpers. Duplicating the logic
 // would be 400+ LOC; the helpers are `pub` so `validateGossipSnappyHeader`,
@@ -101,7 +104,92 @@ pub const EthLibp2pV2Params = struct {
     listen_addresses: []const u8 = "",
     connect_peers: []const u8 = "",
     node_registry: *const NodeNameRegistry,
+    /// 32-byte seed for this node's ECDSA-P-256 host identity. The libp2p
+    /// PeerId derives from this seed, so persisting it across restarts gives
+    /// a stable peer id. When `null`, a fresh seed is drawn from
+    /// `std.posix.getrandom` (ephemeral identity per run — matches the
+    /// random-PeerId behaviour of the legacy path).
+    host_identity_seed: ?[32]u8 = null,
 };
+
+/// Heap-allocated host signer state that captures the ECDSA-P-256 keypair
+/// for the libp2p TLS cert's `SignedKey` DER ECDSA signature. Stored on
+/// `EthLibp2pV2` so the pointer in `HostIdentityKey.ecdsa_p256.sign_ctx`
+/// stays valid for the lifetime of any cert minted from it.
+const EcdsaHostSigner = struct {
+    kp: EcdsaP256.KeyPair,
+
+    fn sign(
+        ctx: ?*anyopaque,
+        message: []const u8,
+        out_sig: []u8,
+        out_sig_len: *usize,
+    ) anyerror!void {
+        const self: *EcdsaHostSigner = @ptrCast(@alignCast(ctx.?));
+        const sig = try self.kp.sign(message, null);
+        var der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
+        const der = sig.toDer(&der_buf);
+        if (der.len > out_sig.len) return error.NoSpaceLeft;
+        @memcpy(out_sig[0..der.len], der);
+        out_sig_len.* = der.len;
+    }
+};
+
+/// On-disk PEM bundle used to wire `QuicRuntime`. Lives on `EthLibp2pV2` so
+/// the temp files can be cleaned up at `deinit` time.
+const HostCertBundle = struct {
+    cert_path: [:0]u8,
+    key_path: [:0]u8,
+
+    fn deinit(self: *HostCertBundle, allocator: Allocator) void {
+        _ = std.c.unlink(self.cert_path.ptr);
+        _ = std.c.unlink(self.key_path.ptr);
+        allocator.free(self.cert_path);
+        allocator.free(self.key_path);
+        self.* = undefined;
+    }
+};
+
+/// Zig 0.16 moved secure randomness to `std.Io.randomSecure`, which requires
+/// an `Io` instance the v2 module doesn't otherwise need. Same fallback shape
+/// as zig-libp2p's gossipsub seed routine: prefer the Linux `getrandom`
+/// syscall, else `arc4random_buf` on libc platforms.
+fn fillRandomBytes(out: []u8) !void {
+    const builtin = @import("builtin");
+    switch (builtin.os.tag) {
+        .linux => {
+            var off: usize = 0;
+            while (off < out.len) {
+                const n = std.os.linux.getrandom(out.ptr + off, out.len - off, 0);
+                if (n == 0) return error.GetRandomFailed;
+                off += n;
+            }
+        },
+        else => {
+            if (@TypeOf(std.c.arc4random_buf) != void) {
+                std.c.arc4random_buf(out.ptr, out.len);
+            } else {
+                return error.NoSecureRandomSource;
+            }
+        },
+    }
+}
+
+fn writeFileSync(path: [:0]const u8, data: []const u8) !void {
+    var o: std.c.O = .{};
+    o.ACCMODE = .WRONLY;
+    o.CREAT = true;
+    o.TRUNC = true;
+    const fd = std.c.open(path.ptr, o, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = std.c.write(fd, data[off..].ptr, data.len - off);
+        if (n <= 0) return error.WriteShort;
+        off += @intCast(n);
+    }
+}
 
 /// Per-topic registered handler. The validator hook fans every accepted
 /// inbound gossip message out to every handler subscribed to its topic.
@@ -148,6 +236,18 @@ pub const EthLibp2pV2 = struct {
     drain_thread: ?Thread = null,
     shutdown_flag: std.atomic.Value(bool) = .init(false),
 
+    /// Heap-allocated so the pointer handed to
+    /// `libp2p_tls_cert.HostIdentityKey.ecdsa_p256.sign_ctx` stays valid.
+    host_signer: *EcdsaHostSigner,
+
+    /// On-disk PEM bundle for the QUIC transport. `null` if
+    /// `params.listen_addresses` was empty (in-process / unit-test mode).
+    cert_bundle: ?HostCertBundle = null,
+
+    /// `null` until `run` brings up a QUIC listener; `null` forever if the
+    /// embedder left `listen_addresses` empty.
+    quic_runtime: ?*zl.transport.quic_runtime.QuicRuntime = null,
+
     const Self = @This();
 
     pub fn init(
@@ -156,7 +256,41 @@ pub const EthLibp2pV2 = struct {
         params: EthLibp2pV2Params,
         logger: zeam_utils.ModuleLogger,
     ) !*Self {
-        const me = try zl.identity.PeerId.random();
+        // Build an ECDSA-P-256 host identity. The libp2p PeerId derives from
+        // its public key, so when an embedder persists `host_identity_seed`
+        // across restarts the peer id is stable. When the embedder leaves
+        // the seed `null`, we draw a fresh one from `getrandom` — matching
+        // the random-PeerId behaviour of the legacy path.
+        var host_seed: [32]u8 = if (params.host_identity_seed) |s| s else seed: {
+            var buf: [32]u8 = undefined;
+            try fillRandomBytes(&buf);
+            break :seed buf;
+        };
+        const host_kp = try EcdsaP256.KeyPair.generateDeterministic(host_seed);
+
+        const host_signer = try allocator.create(EcdsaHostSigner);
+        errdefer allocator.destroy(host_signer);
+        host_signer.* = .{ .kp = host_kp };
+
+        // Derive the matching libp2p PeerId from the ECDSA host public key.
+        // The libp2p TLS spec stores PKIX SubjectPublicKeyInfo (NOT raw
+        // SEC1) as the protobuf `Data` field for ECDSA hosts — that wire
+        // shape is what `libp2p_tls.verifiedPeerIdFromQuicLeafCertificate`
+        // reads on the receiving side, so the peer id we publish here and
+        // the one peers see after the TLS handshake match. The encoder is
+        // in `libp2p_tls_cert` to keep the SPKI shape in one place.
+        const host_pub_sec1: [65]u8 = host_kp.public_key.toUncompressedSec1();
+        const host_pub_proto = try zl.security.libp2p_tls_cert.encodeEcdsaPublicKeyProto(
+            allocator,
+            host_pub_sec1,
+        );
+        defer allocator.free(host_pub_proto);
+        const pk_reader = try peer_id_pkg.PublicKeyReader.init(host_pub_proto);
+        var host_pk = peer_id_pkg.PublicKey{
+            .type = .ECDSA,
+            .data = pk_reader.getData(),
+        };
+        const me = try peer_id_pkg.PeerId.fromPublicKey(allocator, &host_pk);
 
         const metrics_registry = try allocator.create(zl.metrics.Metrics);
         errdefer allocator.destroy(metrics_registry);
@@ -214,13 +348,18 @@ pub const EthLibp2pV2 = struct {
                 .listen_addresses = params.listen_addresses,
                 .connect_peers = params.connect_peers,
                 .node_registry = params.node_registry,
+                .host_identity_seed = host_seed,
             },
             .logger = logger,
             .local_peer = me,
             .gossip_handler = gossip_handler,
             .peer_event_handler = peer_event_handler,
             .reqresp_handler = reqresp_handler,
+            .host_signer = host_signer,
         };
+        // Wipe the seed off the stack now that it's in our struct (and the
+        // KeyPair is the only thing that needed the raw bytes).
+        @memset(&host_seed, 0);
 
         // Wire the gossipsub local-delivery hook now that `self` is stable.
         // Gossipsub runs this for every accepted-by-dedup inbound message
@@ -236,9 +375,15 @@ pub const EthLibp2pV2 = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Shutdown order mirrors EthLibp2p: signal first, join the drain
+        // Shutdown order mirrors EthLibp2p: signal first, stop the QUIC
+        // transport so no new commands land mid-deinit, then join the drain
         // thread, then tear down Host + handlers.
         self.shutdown_flag.store(true, .release);
+        if (self.quic_runtime) |rt| {
+            rt.stop();
+            rt.destroy();
+            self.quic_runtime = null;
+        }
         self.host.shutdown();
         if (self.drain_thread) |t| {
             t.join();
@@ -259,6 +404,16 @@ pub const EthLibp2pV2 = struct {
             self.rpc_callbacks.deinit(self.allocator);
         }
 
+        if (self.cert_bundle) |*b| {
+            // `*b` deinit takes self by pointer and zeroes it; copy out then
+            // write back so the optional still owns a sentinel-free struct
+            // through the duration of the call.
+            var bundle = b.*;
+            bundle.deinit(self.allocator);
+            self.cert_bundle = null;
+        }
+        self.allocator.destroy(self.host_signer);
+
         self.gossip_handler.deinit();
         self.peer_event_handler.deinit();
         self.reqresp_handler.deinit();
@@ -272,9 +427,18 @@ pub const EthLibp2pV2 = struct {
         try self.host.startBackground();
         if (!self.host.waitUntilReady(5_000)) return error.HostNotReady;
 
-        // Register bootnodes now that the host is running. Without a real
-        // transport (deferred) every dial will fail-stub, but the
-        // connection-manager scheduling + back-off semantics are exercised.
+        // Bring up the QUIC transport (real on-the-wire path) BEFORE
+        // bootnodes are registered, so dial commands have something to
+        // route through when the connection manager ticks. Skipped when
+        // `listen_addresses` is empty — that's the in-process / unit-test
+        // mode where the gossipsub validator hook is the only delivery
+        // channel.
+        if (self.params.listen_addresses.len > 0) {
+            try self.startQuicTransport();
+        }
+
+        // Register bootnodes now that the host (and, if configured, the
+        // transport) is running.
         if (self.params.connect_peers.len > 0) {
             self.registerBootnodes() catch |e| {
                 self.logger.err(
@@ -285,6 +449,73 @@ pub const EthLibp2pV2 = struct {
         }
 
         self.drain_thread = try Thread.spawn(.{}, drainEventsTrampoline, .{self});
+    }
+
+    /// Mints a fresh libp2p TLS cert from this node's ECDSA host identity,
+    /// writes the cert + key PEMs to per-network temp files, and starts a
+    /// `QuicRuntime` on `params.listen_addresses`. The PEM files live for
+    /// the lifetime of the runtime and are deleted at `deinit`.
+    fn startQuicTransport(self: *Self) !void {
+        const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
+        const host_pub_sec1: [65]u8 = self.host_signer.kp.public_key.toUncompressedSec1();
+
+        var cert_seed: [32]u8 = undefined;
+        try fillRandomBytes(&cert_seed);
+
+        var gen = try zl.security.libp2p_tls_cert.generate(self.allocator, .{
+            .host_identity = .{
+                .ecdsa_p256 = .{
+                    .public_key_sec1_uncompressed = host_pub_sec1,
+                    .sign = EcdsaHostSigner.sign,
+                    .sign_ctx = self.host_signer,
+                },
+            },
+            .not_before_sec = now_sec - 3600,
+            .not_after_sec = now_sec + 365 * 24 * 3600,
+            .cert_key_seed = cert_seed,
+        });
+        defer gen.deinit(self.allocator);
+
+        const cert_pem = try zl.security.libp2p_tls_cert.certDerToPem(self.allocator, gen.cert_der);
+        defer self.allocator.free(cert_pem);
+        const key_pem = try zl.security.libp2p_tls_cert.ecdsaP256SeedToPem(self.allocator, gen.cert_key_seed);
+        defer self.allocator.free(key_pem);
+
+        const cert_path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "/tmp/zeam_v2_net_{d}_cert.pem",
+            .{self.params.networkId},
+            0,
+        );
+        errdefer self.allocator.free(cert_path);
+        const key_path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "/tmp/zeam_v2_net_{d}_key.pem",
+            .{self.params.networkId},
+            0,
+        );
+        errdefer self.allocator.free(key_path);
+
+        try writeFileSync(cert_path, cert_pem);
+        try writeFileSync(key_path, key_pem);
+
+        self.cert_bundle = .{ .cert_path = cert_path, .key_path = key_path };
+
+        const rt = try zl.transport.quic_runtime.QuicRuntime.create(.{
+            .allocator = self.allocator,
+            .host = self.host,
+            .cert_path = std.mem.span(@as([*:0]const u8, cert_path.ptr)),
+            .key_path = std.mem.span(@as([*:0]const u8, key_path.ptr)),
+            .listen_multiaddr = self.params.listen_addresses,
+        });
+        errdefer rt.destroy();
+        try rt.start();
+        self.quic_runtime = rt;
+
+        self.logger.info(
+            "network-{d}:: v2 QUIC transport up on {s}",
+            .{ self.params.networkId, self.params.listen_addresses },
+        );
     }
 
     fn registerBootnodes(self: *Self) !void {
@@ -1124,6 +1355,45 @@ test "EthLibp2pV2 peer-event dispatch fires registered handler" {
     try testing.expectEqual(@as(u32, 1), Counter.instance.connected);
     try testing.expectEqual(@as(u32, 1), Counter.instance.disconnected);
     try testing.expectEqual(@as(u32, 1), Counter.instance.failed);
+}
+
+test "EthLibp2pV2 brings up QuicRuntime when listen_addresses is set" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var registry = NodeNameRegistry.init(a);
+    defer registry.deinit();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+
+    // Deterministic host identity so we can assert this never relies on a
+    // particular peer id — only that bring-up succeeds end-to-end.
+    var net = try EthLibp2pV2.init(a, &loop, .{
+        .networkId = 0,
+        .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
+        .listen_addresses = "/ip4/127.0.0.1/udp/0/quic-v1",
+        .node_registry = &registry,
+        .host_identity_seed = [_]u8{0xAB} ** 32,
+    }, logger);
+    defer net.deinit();
+
+    try net.run();
+    try testing.expect(net.host.isReady());
+
+    // The runtime is up; it owns a bound UDP socket on a kernel-assigned
+    // port. We don't open an outbound dial here — the QuicRuntime loopback
+    // test in zig-libp2p already gates that path. This test asserts the
+    // glue (cert mint + temp file write + start) lands without panicking
+    // or leaking, which is exactly what would block embedders today.
+    try testing.expect(net.quic_runtime != null);
+    try testing.expect(net.cert_bundle != null);
+    try testing.expect(net.quic_runtime.?.boundUdpPortIpv4() != null);
+    try testing.expect(net.quic_runtime.?.boundUdpPortIpv4().? != 0);
 }
 
 test "EthLibp2pV2 bootnode multiaddr parsing tolerates whitespace + empty entries" {
