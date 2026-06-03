@@ -162,7 +162,7 @@ pub unsafe extern "C" fn xmss_aggregate(
                 return std::ptr::null();
             }
             let proof_bytes = slice::from_raw_parts(proof_ptrs[i], proof_lens[i]);
-            let proof = match AggregatedXMSS::deserialize(proof_bytes) {
+            let proof = match AggregatedXMSS::decompress(proof_bytes) {
                 Some(p) => p,
                 None => return std::ptr::null(),
             };
@@ -180,13 +180,19 @@ pub unsafe extern "C" fn xmss_aggregate(
     let t_marshal_done = Instant::now();
 
     // Call rec_aggregation
-    let (_pub_keys, agg_sig) = rec_xmss_aggregate(
+    let (_pub_keys, agg_sig) = match rec_xmss_aggregate(
         &children_with_keys,
         raw_xmss,
         message_hash,
         slot,
         log_inv_rate,
-    );
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("xmss_aggregate failed: {err}");
+            return std::ptr::null();
+        }
+    };
 
     let t_stark_done = Instant::now();
 
@@ -235,7 +241,7 @@ pub unsafe extern "C" fn xmss_verify_aggregated(
 
     // Deserialize aggregate signature
     let bytes = slice::from_raw_parts(agg_sig_bytes, agg_sig_len);
-    let agg_sig = match AggregatedXMSS::deserialize(bytes) {
+    let agg_sig = match AggregatedXMSS::decompress(bytes) {
         Some(sig) => sig,
         None => return false,
     };
@@ -339,7 +345,7 @@ pub unsafe extern "C" fn xmss_verify_aggregated_batch(
 
     tasks.par_iter().all(|task| {
         let sig_bytes = slice::from_raw_parts(task.sig_ptr as *const u8, task.sig_len);
-        let agg_sig = match AggregatedXMSS::deserialize(sig_bytes) {
+        let agg_sig = match AggregatedXMSS::decompress(sig_bytes) {
             Some(sig) => sig,
             None => return false,
         };
@@ -374,7 +380,7 @@ pub unsafe extern "C" fn xmss_aggregate_signature_to_bytes(
     }
 
     let agg_sig_ref = &*agg_sig;
-    let serialized = agg_sig_ref.serialize();
+    let serialized = agg_sig_ref.compress();
 
     if serialized.len() > buffer_len {
         return 0;
@@ -403,7 +409,7 @@ pub unsafe extern "C" fn xmss_aggregate_signature_from_bytes(
 
     let input_slice = slice::from_raw_parts(bytes, bytes_len);
 
-    match AggregatedXMSS::deserialize(input_slice) {
+    match AggregatedXMSS::decompress(input_slice) {
         Some(agg_sig) => Box::into_raw(Box::new(agg_sig)),
         None => std::ptr::null_mut(),
     }
