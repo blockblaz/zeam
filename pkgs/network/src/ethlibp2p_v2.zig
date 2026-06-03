@@ -196,6 +196,11 @@ fn writeFileSync(path: []const u8, data: []const u8) !void {
     var buf: [4096]u8 = undefined;
     var w = file.writer(io, &buf);
     try w.interface.writeAll(data);
+    // `file.close` does NOT flush the buffered writer. Without an explicit
+    // flush we'd zero-length the cert / key file on disk, and zquic's
+    // `loadCertDer` would then fail with `error.NoCertificate` because the
+    // PEM begin-marker scan returns null. Learned the hard way.
+    try w.interface.flush();
 }
 
 /// Per-topic registered handler. The validator hook fans every accepted
