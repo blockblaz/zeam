@@ -284,6 +284,7 @@ jobs:
             echo "shadow_sha=" >> $GITHUB_OUTPUT
             echo "shadow_failed=true" >> $GITHUB_OUTPUT
             echo "❌ Shadow rebase failed; release will continue after notifying Telegram"
+            exit 1 
           fi
         else
           echo "shadow_status=⚠️ shadow branch not found" >> $GITHUB_OUTPUT
@@ -312,7 +313,12 @@ jobs:
   create-github-release:
     needs: [ create-tags, build-and-push, create-manifest, rebase-shadow ]
     runs-on: ubuntu-latest
-    if: ${{ always() && needs.create-tags.outputs.has_devnet_tag == 'true' && needs.build-and-push.result == 'success' && needs.create-manifest.result == 'success' }}
+    if: |
+      always() &&
+      needs.create-tags.result == 'success' &&
+      needs.build-and-push.result == 'success' &&
+      needs.create-manifest.result == 'success' &&
+      needs.create-tags.outputs.has_devnet_tag == 'true'
 
     steps:
     - name: Checkout code
@@ -340,7 +346,13 @@ jobs:
       run: |
         DEVNET_TAG="${{ needs.create-tags.outputs.github_tag }}"
         VERSION="${{ needs.create-tags.outputs.version }}"
-        PREVIOUS_TAG=$(git tag -l | grep -iE "^[Dd]evnet[0-9]+" | sort -V -r | grep -v "^$DEVNET_TAG$" | head -1)
+        PREVIOUS_TAG=$(git tag -l \
+          | grep -iE "^[Dd]evnet[0-9]+$" \
+          | awk '{ print tolower($0), $0 }' \
+          | sort -V -r -k1,1 \
+          | awk '{ print $2 }' \
+          | grep -iv "^$DEVNET_TAG$" \
+          | head -1)
 
         if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$DEVNET_TAG" ]; then
           echo "✅ Found previous tag: $PREVIOUS_TAG"
@@ -461,6 +473,7 @@ jobs:
         REGISTRY="${{ env.REGISTRY }}"
         IMAGE_NAME="${{ env.IMAGE_NAME }}"
         SHADOW_STATUS="${{ needs.rebase-shadow.outputs.shadow_status }}"
+        SHADOW_STATUS="${SHADOW_STATUS:-⚠️ skipped}"
 
         MESSAGE="🚀 *Zeam $GITHUB_TAG Release SUCCESS*
 

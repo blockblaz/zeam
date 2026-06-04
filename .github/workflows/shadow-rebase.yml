@@ -2,8 +2,9 @@ name: Shadow Branch Auto-Rebase
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
+
 
 permissions:
   contents: write
@@ -39,12 +40,18 @@ jobs:
         fi
         echo "🔄 Rebasing origin/shadow onto origin/main..."
         git checkout shadow
-        git rebase origin/main
-        echo "rebase_status=success" >> $GITHUB_OUTPUT
-        echo "✅ Rebase succeeded"
+        if git rebase origin/main; then
+          echo "rebase_status=success" >> $GITHUB_OUTPUT
+          echo "✅ Rebase succeeded"
+        else
+          git rebase --abort || true
+          echo "rebase_status=failed" >> $GITHUB_OUTPUT
+          echo "❌ Rebase failed"
+          exit 1
+        fi
 
     - name: Push rebased shadow branch
-      if: steps.rebase.outputs.rebase_status == 'success'
+      if: ${{ steps.rebase.outputs.rebase_status == 'success' }}
       run: |
         git push origin shadow --force-with-lease
         echo "✅ Pushed rebased shadow branch"
@@ -53,7 +60,7 @@ jobs:
       if: failure()
       run: |
         MAIN_SHA="${{ github.sha }}"
-        COMMIT_MSG="${{ github.event.head_commit.message }}"
+        COMMIT_MSG="${{ github.event.head_commit.message || 'manual trigger' }}"
         REPO_URL="${{ github.server_url }}/${{ github.repository }}"
         RUN_URL="$REPO_URL/actions/runs/${{ github.run_id }}"
 
