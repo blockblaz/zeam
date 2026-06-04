@@ -426,7 +426,7 @@ fn cacheChurnWorker(ctx: *StressCtx, thread_id: usize) void {
     while (!ctx.shouldStop()) {
         // Randomly insert or remove. Use synthetic non-aliasing roots
         // (high u32 in first 4 bytes) so we don't collide with real
-        // chain roots. Each insertion is a fresh sszClone of the
+        // chain roots. Each insertion is a fresh clone of the
         // template + serialized ssz buffer.
         const op = rand.uintAtMost(u8, 99);
         if (op < 50) {
@@ -435,40 +435,32 @@ fn cacheChurnWorker(ctx: *StressCtx, thread_id: usize) void {
             std.mem.writeInt(u32, root[0..4], key, .little);
             insert_counter +%= 1;
 
-            const block_ptr = allocator.create(types.SignedBlock) catch {
-                _ = ctx.cache_ops.fetchAdd(1, .monotonic);
-                continue;
-            };
-            types.sszClone(allocator, types.SignedBlock, ctx.template_block, block_ptr) catch {
-                allocator.destroy(block_ptr);
+            var block = zeam_utils.clone(types.SignedBlock, &ctx.template_block, allocator) catch {
                 _ = ctx.cache_ops.fetchAdd(1, .monotonic);
                 continue;
             };
 
             var ssz_buf: std.ArrayList(u8) = .empty;
             ssz.serialize(types.SignedBlock, ctx.template_block, &ssz_buf, allocator) catch {
-                block_ptr.deinit();
-                allocator.destroy(block_ptr);
+                block.deinit();
                 ssz_buf.deinit(allocator);
                 _ = ctx.cache_ops.fetchAdd(1, .monotonic);
                 continue;
             };
             const ssz_bytes = ssz_buf.toOwnedSlice(allocator) catch {
-                block_ptr.deinit();
-                allocator.destroy(block_ptr);
+                block.deinit();
                 ssz_buf.deinit(allocator);
                 _ = ctx.cache_ops.fetchAdd(1, .monotonic);
                 continue;
             };
 
-            ctx.cache.insertBlockPtr(root, block_ptr, ctx.template_parent, ssz_bytes) catch {
-                block_ptr.deinit();
-                allocator.destroy(block_ptr);
+            ctx.cache.insertBlockPtr(root, &block, ctx.template_parent, ssz_bytes) catch {
+                block.deinit();
                 allocator.free(ssz_bytes);
                 _ = ctx.cache_ops.fetchAdd(1, .monotonic);
                 continue;
             };
-            allocator.destroy(block_ptr);
+            block.deinit();
         } else {
             // Try to remove a recently-inserted root.
             var root: types.Root = std.mem.zeroes(types.Root);
@@ -565,8 +557,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, allocator);
     defer beam_state.deinit();
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
@@ -594,7 +585,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try @import("./testing.zig").initTestThreadPool(allocator);
+    const thread_pool = try @import("./testing.zig").setupTestPrimitives(allocator);
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{
@@ -890,8 +881,7 @@ fn saturationBlockProducerWorker(ctx: *SaturationCtx, thread_id: usize) void {
         // successful send (the worker calls Message.deinit after
         // dispatch). On QueueFull / QueueClosed / ChainWorkerDisabled,
         // the producer retains ownership and MUST deinit the clone.
-        var cloned: types.SignedBlock = undefined;
-        types.sszClone(allocator, types.SignedBlock, template, &cloned) catch {
+        var cloned = zeam_utils.clone(types.SignedBlock, &template, allocator) catch {
             _ = ctx.block_attempts.fetchAdd(1, .monotonic);
             _ = ctx.block_other_err.fetchAdd(1, .monotonic);
             continue;
@@ -1072,8 +1062,7 @@ fn runStressSaturation(allocator: Allocator, cfg: SaturationConfig) !SaturationS
         },
     };
 
-    var beam_state: types.BeamState = undefined;
-    try types.sszClone(allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    var beam_state = try zeam_utils.clone(types.BeamState, &mock_chain.genesis_state, allocator);
     defer beam_state.deinit();
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
@@ -1099,7 +1088,7 @@ fn runStressSaturation(allocator: Allocator, cfg: SaturationConfig) !SaturationS
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    const thread_pool = try @import("./testing.zig").initTestThreadPool(allocator);
+    const thread_pool = try @import("./testing.zig").setupTestPrimitives(allocator);
     defer thread_pool.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{

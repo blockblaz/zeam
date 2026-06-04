@@ -282,7 +282,7 @@ fn runCase(
     var logger_config = zeam_utils.getTestLoggerConfig();
     defer logger_config.deinit();
 
-    var test_thread_pool = @import("@zeam/node").testing.initTestThreadPool(allocator) catch |err| {
+    var test_thread_pool = @import("@zeam/node").testing.setupTestPrimitives(allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}: thread pool init failed ({s})\n",
             .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
@@ -710,12 +710,14 @@ fn processBlockStep(
     const target_intervals = slotToIntervals(block.slot);
     try advanceForkchoiceIntervals(ctx, target_intervals, true);
 
+    // Heap-allocate so the pointer we store in `state_map`/`allocated_states`
+    // outlives this function. A stack var would leave dangling pointers
+    // for cleanup defer at the end of runCase.
     const new_state_ptr = try ctx.allocator.create(types.BeamState);
-    errdefer {
-        new_state_ptr.deinit();
-        ctx.allocator.destroy(new_state_ptr);
-    }
-    try types.sszClone(ctx.allocator, types.BeamState, parent_state_ptr.*, new_state_ptr);
+    var new_state_tracked = false;
+    errdefer if (!new_state_tracked) ctx.allocator.destroy(new_state_ptr);
+    new_state_ptr.* = try zeam_utils.clone(types.BeamState, parent_state_ptr, ctx.allocator);
+    errdefer if (!new_state_tracked) new_state_ptr.deinit();
 
     state_transition.apply_transition(ctx.allocator, new_state_ptr, block, .{ .logger = ctx.fork_logger, .validateResult = false }) catch |err| {
         std.debug.print(
@@ -770,6 +772,7 @@ fn processBlockStep(
         );
         return FixtureError.InvalidFixture;
     };
+    new_state_tracked = true;
 
     // Store block body attestations as known aggregated payloads (spec-aligned).
     for (aggregated_attestations) |aggregated_attestation| {
@@ -791,8 +794,7 @@ fn processBlockStep(
         };
         defer proof_template.deinit();
 
-        var cloned_bits: types.AggregationBits = undefined;
-        types.sszClone(ctx.allocator, types.AggregationBits, aggregated_attestation.aggregation_bits, &cloned_bits) catch |err| {
+        const cloned_bits = zeam_utils.clone(types.AggregationBits, &aggregated_attestation.aggregation_bits, ctx.allocator) catch |err| {
             std.debug.print(
                 "fixture {s} case {s}{f}: failed to clone aggregation bits ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -1054,8 +1056,7 @@ fn processGossipAggregatedAttestationStep(
     defer proof.deinit();
 
     // Clone participant bits into proof.
-    var cloned_bits: types.AggregationBits = undefined;
-    types.sszClone(ctx.allocator, types.AggregationBits, aggregation_bits, &cloned_bits) catch |err| {
+    const cloned_bits = zeam_utils.clone(types.AggregationBits, &aggregation_bits, ctx.allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: failed to clone aggregation bits ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },

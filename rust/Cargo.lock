@@ -633,17 +633,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-recursion"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -684,11 +673,12 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attohttpc"
-version = "0.24.1"
+version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d9a9bf8b79a749ee0b911b91b671cc2b6c670bdbc7e3dfd537576ddc94bb2a2"
+checksum = "16e2cdb6d5ed835199484bb92bb8b3edd526effe995c61732580439c1a67e2e9"
 dependencies = [
- "http 0.2.12",
+ "base64",
+ "http",
  "log",
  "url",
 ]
@@ -713,7 +703,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "backend"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
@@ -2481,7 +2471,7 @@ dependencies = [
  "fnv",
  "futures-core",
  "futures-sink",
- "http 1.4.0",
+ "http",
  "indexmap 2.14.0",
  "slab",
  "tokio",
@@ -2719,11 +2709,10 @@ checksum = "b07f60793ff0a4d9cef0f18e63b5357e06209987153a64648c972c1e5aff336f"
 
 [[package]]
 name = "hickory-proto"
-version = "0.25.0-alpha.5"
+version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d00147af6310f4392a31680db52a3ed45a2e0f68eb18e8c3fe5537ecc96d9e2"
+checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
 dependencies = [
- "async-recursion",
  "async-trait",
  "cfg-if",
  "data-encoding",
@@ -2735,6 +2724,7 @@ dependencies = [
  "ipnet",
  "once_cell",
  "rand 0.9.4",
+ "ring",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tinyvec",
@@ -2745,9 +2735,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.25.0-alpha.5"
+version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5762f69ebdbd4ddb2e975cd24690bf21fe6b2604039189c26acddbc427f12887"
+checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -2784,17 +2774,6 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "601cbb57e577e2f5ef5be8e7b83f0f63994f25aa94d673e54a92d5c516d101f1"
-dependencies = [
- "bytes",
- "fnv",
- "itoa",
-]
-
-[[package]]
-name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
@@ -2810,7 +2789,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1efedce1fb8e6913f23e0c92de8e62cd5b772a67e7b3946df930a62566c93184"
 dependencies = [
  "bytes",
- "http 1.4.0",
+ "http",
 ]
 
 [[package]]
@@ -2821,7 +2800,7 @@ checksum = "b021d93e26becf5dc7e1b75b1bed1fd93124b374ceb73f43d4d4eafec896a64a"
 dependencies = [
  "bytes",
  "futures-core",
- "http 1.4.0",
+ "http",
  "http-body",
  "pin-project-lite",
 ]
@@ -2852,7 +2831,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "h2",
- "http 1.4.0",
+ "http",
  "http-body",
  "httparse",
  "itoa",
@@ -2868,7 +2847,7 @@ version = "0.27.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2b52f86d1d4bc0d6b4e6826d960b1b333217e07d36b882dca570a5e1c48895b"
 dependencies = [
- "http 1.4.0",
+ "http",
  "hyper",
  "hyper-util",
  "rustls",
@@ -2888,7 +2867,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-util",
- "http 1.4.0",
+ "http",
  "http-body",
  "hyper",
  "ipnet",
@@ -3075,20 +3054,20 @@ dependencies = [
 
 [[package]]
 name = "igd-next"
-version = "0.15.1"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76b0d7d4541def58a37bf8efc559683f21edce7c82f0d866c93ac21f7e098f93"
+checksum = "516893339c97f6011282d5825ac94fc1c7aad5cad26bdc2d0cee068c0bf97f97"
 dependencies = [
  "async-trait",
  "attohttpc",
  "bytes",
  "futures",
- "http 1.4.0",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "log",
- "rand 0.8.5",
+ "rand 0.9.4",
  "tokio",
  "url",
  "xmltree",
@@ -3119,6 +3098,25 @@ name = "include_bytes_aligned"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee796ad498c8d9a1d68e477df8f754ed784ef875de1414ebdaf169f70a6a784"
+
+[[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
 
 [[package]]
 name = "indenter"
@@ -3330,9 +3328,10 @@ dependencies = [
 [[package]]
 name = "lean_compiler"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "backend",
+ "include_dir",
  "lean_vm",
  "pest",
  "pest_derive",
@@ -3345,7 +3344,7 @@ dependencies = [
 [[package]]
 name = "lean_prover"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3354,6 +3353,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "rand 0.10.1",
+ "serde",
  "sub_protocols",
  "tracing",
  "utils",
@@ -3362,7 +3362,7 @@ dependencies = [
 [[package]]
 name = "lean_vm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3438,7 +3438,7 @@ dependencies = [
 [[package]]
 name = "leansig_wrapper"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "backend",
  "ethereum_ssz",
@@ -3468,9 +3468,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libp2p"
-version = "0.55.0"
+version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b72dc443ddd0254cb49a794ed6b6728400ee446a0f7ab4a07d0209ee98de20e9"
+checksum = "ce71348bf5838e46449ae240631117b487073d5f347c06d434caddcb91dceb5a"
 dependencies = [
  "bytes",
  "either",
@@ -3502,9 +3502,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-allow-block-list"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38944b7cb981cc93f2f0fb411ff82d0e983bd226fbcc8d559639a3a73236568b"
+checksum = "d16ccf824ee859ca83df301e1c0205270206223fd4b1f2e512a693e1912a8f4a"
 dependencies = [
  "libp2p-core",
  "libp2p-identity",
@@ -3513,9 +3513,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-connection-limits"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efe9323175a17caa8a2ed4feaf8a548eeef5e0b72d03840a0eab4bcb0210ce1c"
+checksum = "a18b8b607cf3bfa2f8c57db9c7d8569a315d5cc0a282e6bfd5ebfc0a9840b2a0"
 dependencies = [
  "libp2p-core",
  "libp2p-identity",
@@ -3549,9 +3549,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-dns"
-version = "0.43.0"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b780a1150214155b0ed1cdf09fbd2e1b0442604f9146a431d1b21d23eef7bd7"
+checksum = "0b770c1c8476736ca98c578cba4b505104ff8e842c2876b528925f9766379f9a"
 dependencies = [
  "async-trait",
  "futures",
@@ -3574,7 +3574,6 @@ dependencies = [
  "hex",
  "lazy_static",
  "libp2p",
- "libp2p-mplex",
  "sha2 0.9.9",
  "snap",
  "thiserror 2.0.18",
@@ -3587,9 +3586,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-gossipsub"
-version = "0.48.0"
+version = "0.49.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d558548fa3b5a8e9b66392f785921e363c57c05dcadfda4db0d41ae82d313e4a"
+checksum = "a538e571cd38f504f761c61b8f79127489ea7a7d6f05c41ca15d31ffb5726326"
 dependencies = [
  "async-channel",
  "asynchronous-codec",
@@ -3606,7 +3605,6 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-swarm",
- "prometheus-client",
  "quick-protobuf",
  "quick-protobuf-codec",
  "rand 0.8.5",
@@ -3618,9 +3616,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-identify"
-version = "0.46.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8c06862544f02d05d62780ff590cc25a75f5c2b9df38ec7a370dcae8bb873cf"
+checksum = "8ab792a8b68fdef443a62155b01970c81c3aadab5e659621b063ef252a8e65e8"
 dependencies = [
  "asynchronous-codec",
  "either",
@@ -3661,9 +3659,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-mdns"
-version = "0.47.0"
+version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d0ba095e1175d797540e16b62e7576846b883cb5046d4159086837b36846cc"
+checksum = "c66872d0f1ffcded2788683f76931be1c52e27f343edb93bc6d0bcd8887be443"
 dependencies = [
  "futures",
  "hickory-proto",
@@ -3680,9 +3678,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-metrics"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ce58c64292e87af624fcb86465e7dd8342e46a388d71e8fec0ab37ee789630a"
+checksum = "805a555148522cb3414493a5153451910cb1a146c53ffbf4385708349baf62b7"
 dependencies = [
  "futures",
  "libp2p-core",
@@ -3694,25 +3692,6 @@ dependencies = [
  "pin-project",
  "prometheus-client",
  "web-time",
-]
-
-[[package]]
-name = "libp2p-mplex"
-version = "0.43.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a4019ba30c4e42b776113e9778071691fe3f34bf23b6b3bf0dfcf29d801f3d"
-dependencies = [
- "asynchronous-codec",
- "bytes",
- "futures",
- "libp2p-core",
- "libp2p-identity",
- "nohash-hasher",
- "parking_lot",
- "rand 0.8.5",
- "smallvec",
- "tracing",
- "unsigned-varint 0.8.0",
 ]
 
 [[package]]
@@ -3740,9 +3719,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-ping"
-version = "0.46.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2529993ff22deb2504c0130a58b60fb77f036be555053922db1a0490b5798b"
+checksum = "74bb7fcdfd9fead4144a3859da0b49576f171a8c8c7c0bfc7c541921d25e60d3"
 dependencies = [
  "futures",
  "futures-timer",
@@ -3772,9 +3751,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-quic"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41432a159b00424a0abaa2c80d786cddff81055ac24aa127e0cf375f7858d880"
+checksum = "8dc448b2de9f4745784e3751fe8bc6c473d01b8317edd5ababcb0dec803d843f"
 dependencies = [
  "futures",
  "futures-timer",
@@ -3794,20 +3773,19 @@ dependencies = [
 
 [[package]]
 name = "libp2p-swarm"
-version = "0.46.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "803399b4b6f68adb85e63ab573ac568154b193e9a640f03e0f2890eabbcb37f8"
+checksum = "ce88c6c4bf746c8482480345ea3edfd08301f49e026889d1cbccfa1808a9ed9e"
 dependencies = [
  "either",
  "fnv",
  "futures",
  "futures-timer",
+ "hashlink 0.10.0",
  "libp2p-core",
  "libp2p-identity",
  "libp2p-swarm-derive",
- "lru",
  "multistream-select",
- "once_cell",
  "rand 0.8.5",
  "smallvec",
  "tokio",
@@ -3817,28 +3795,27 @@ dependencies = [
 
 [[package]]
 name = "libp2p-swarm-derive"
-version = "0.35.0"
+version = "0.35.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "206e0aa0ebe004d778d79fb0966aa0de996c19894e2c0605ba2f8524dd4443d8"
+checksum = "dd297cf53f0cb3dee4d2620bb319ae47ef27c702684309f682bdb7e55a18ae9c"
 dependencies = [
  "heck",
- "proc-macro2",
  "quote",
  "syn 2.0.117",
 ]
 
 [[package]]
 name = "libp2p-tcp"
-version = "0.43.0"
+version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65346fb4d36035b23fec4e7be4c320436ba53537ce9b6be1d1db1f70c905cad0"
+checksum = "fb6585b9309699f58704ec9ab0bb102eca7a3777170fa91a8678d73ca9cafa93"
 dependencies = [
  "futures",
  "futures-timer",
  "if-watch",
  "libc",
  "libp2p-core",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tracing",
 ]
@@ -3864,9 +3841,9 @@ dependencies = [
 
 [[package]]
 name = "libp2p-upnp"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d457b9ecceb66e7199f049926fad447f1f17f040e8d29d690c086b4cab8ed14a"
+checksum = "4757e65fe69399c1a243bbb90ec1ae5a2114b907467bf09f3575e899815bb8d3"
 dependencies = [
  "futures",
  "futures-timer",
@@ -4129,7 +4106,7 @@ dependencies = [
 [[package]]
 name = "mt-air"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "mt-field",
  "mt-poly",
@@ -4138,7 +4115,7 @@ dependencies = [
 [[package]]
 name = "mt-fiat-shamir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
@@ -4146,12 +4123,13 @@ dependencies = [
  "mt-utils",
  "rayon",
  "serde",
+ "tracing",
 ]
 
 [[package]]
 name = "mt-field"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "itertools 0.14.0",
  "mt-utils",
@@ -4166,7 +4144,7 @@ dependencies = [
 [[package]]
 name = "mt-koala-bear"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
@@ -4182,7 +4160,7 @@ dependencies = [
 [[package]]
 name = "mt-poly"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
@@ -4190,12 +4168,13 @@ dependencies = [
  "rand 0.10.1",
  "rayon",
  "serde",
+ "system-info",
 ]
 
 [[package]]
 name = "mt-sumcheck"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
@@ -4208,7 +4187,7 @@ dependencies = [
 [[package]]
 name = "mt-symetric"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
@@ -4218,7 +4197,7 @@ dependencies = [
 [[package]]
 name = "mt-utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "serde",
 ]
@@ -4226,7 +4205,7 @@ dependencies = [
 [[package]]
 name = "mt-whir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "itertools 0.14.0",
  "mt-fiat-shamir",
@@ -4238,6 +4217,7 @@ dependencies = [
  "mt-utils",
  "rand 0.10.1",
  "rayon",
+ "system-info",
  "tracing",
 ]
 
@@ -4561,6 +4541,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags 2.11.1",
+ "objc2",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4583,6 +4588,10 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+dependencies = [
+ "critical-section",
+ "portable-atomic",
+]
 
 [[package]]
 name = "once_cell_polyfill"
@@ -5518,7 +5527,7 @@ dependencies = [
 [[package]]
 name = "p3-baby-bear"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "p3-challenger 0.5.1",
  "p3-field 0.5.1",
@@ -5570,7 +5579,7 @@ dependencies = [
 [[package]]
 name = "p3-challenger"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "p3-field 0.5.1",
  "p3-maybe-rayon 0.5.1",
@@ -5610,7 +5619,7 @@ dependencies = [
 [[package]]
 name = "p3-dft"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.5.1",
@@ -5641,7 +5650,7 @@ dependencies = [
 [[package]]
 name = "p3-field"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "itertools 0.14.0",
  "num-bigint 0.4.6",
@@ -5743,7 +5752,7 @@ dependencies = [
 [[package]]
 name = "p3-koala-bear"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "p3-challenger 0.5.1",
  "p3-field 0.5.1",
@@ -5773,7 +5782,7 @@ dependencies = [
 [[package]]
 name = "p3-matrix"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.5.1",
@@ -5795,7 +5804,7 @@ dependencies = [
 [[package]]
 name = "p3-maybe-rayon"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 
 [[package]]
 name = "p3-mds"
@@ -5814,7 +5823,7 @@ dependencies = [
 [[package]]
 name = "p3-mds"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "p3-dft 0.5.1",
  "p3-field 0.5.1",
@@ -5864,7 +5873,7 @@ dependencies = [
 [[package]]
 name = "p3-monty-31"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "itertools 0.14.0",
  "num-bigint 0.4.6",
@@ -5898,7 +5907,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon1"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "p3-field 0.5.1",
  "p3-mds 0.5.1",
@@ -5921,7 +5930,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon2"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "p3-field 0.5.1",
  "p3-mds 0.5.1",
@@ -5959,7 +5968,7 @@ dependencies = [
 [[package]]
 name = "p3-symmetric"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "itertools 0.14.0",
  "p3-field 0.5.1",
@@ -5996,7 +6005,7 @@ dependencies = [
 [[package]]
 name = "p3-util"
 version = "0.5.1"
-source = "git+https://github.com/Plonky3/Plonky3.git#82cfad73cd734d37a0d51953094f970c531817ec"
+source = "git+https://github.com/Plonky3/Plonky3.git#5ef05b2a75aab9024ea4e77bfdcdda75da20beec"
 dependencies = [
  "serde",
  "transpose",
@@ -6392,9 +6401,9 @@ dependencies = [
 
 [[package]]
 name = "prometheus-client"
-version = "0.22.3"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "504ee9ff529add891127c4827eb481bd69dc0ebc72e9a682e187db4caa60c3ca"
+checksum = "cf41c1a7c32ed72abe5082fb19505b969095c12da9f5732a4bc9878757fd087c"
 dependencies = [
  "dtoa",
  "itoa",
@@ -6732,14 +6741,17 @@ dependencies = [
 [[package]]
 name = "rec_aggregation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "backend",
+ "include_dir",
  "lean_compiler",
  "lean_prover",
  "lean_vm",
  "leansig_wrapper",
  "lz4_flex",
+ "objc2",
+ "objc2-foundation",
  "postcard",
  "rand 0.10.1",
  "serde",
@@ -6747,6 +6759,7 @@ dependencies = [
  "sub_protocols",
  "tracing",
  "utils",
+ "zk-alloc",
 ]
 
 [[package]]
@@ -6829,7 +6842,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "http 1.4.0",
+ "http",
  "http-body",
  "http-body-util",
  "hyper",
@@ -7806,7 +7819,7 @@ dependencies = [
 [[package]]
 name = "sub_protocols"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "backend",
  "lean_vm",
@@ -7881,6 +7894,15 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "system-info"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+dependencies = [
+ "libc",
+ "rayon",
 ]
 
 [[package]]
@@ -8200,7 +8222,7 @@ dependencies = [
  "bitflags 2.11.1",
  "bytes",
  "futures-util",
- "http 1.4.0",
+ "http",
  "http-body",
  "iri-string",
  "pin-project-lite",
@@ -8423,10 +8445,6 @@ name = "unsigned-varint"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
-dependencies = [
- "asynchronous-codec",
- "bytes",
-]
 
 [[package]]
 name = "untrusted"
@@ -8461,7 +8479,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa#5eba3b141455349d7cdbf0f5d3ccfb2e640b02aa"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
 dependencies = [
  "backend",
  "tracing",
@@ -9312,6 +9330,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zk-alloc"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=f66d4a974eced803574eb0ea43d812e523c8d7ad#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+dependencies = [
+ "libc",
+ "system-info",
 ]
 
 [[package]]

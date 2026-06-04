@@ -18,16 +18,35 @@ const snappyz = @import("snappyz");
 const snappyframesz = @import("snappyframesz");
 const node_registry = @import("./node_registry.zig");
 const NodeNameRegistry = node_registry.NodeNameRegistry;
+// #942 follow-up: publish-side forensic logging includes the build git SHA so
+// receivers across the fleet can correlate broken-byte receipts back to the
+// exact producer binary.
+const build_options = @import("build_options");
+
+// Gossipsub spec message-id domain (matches Rust libp2p-glue / leanSpec).
+const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = .{ 0x01, 0x00, 0x00, 0x00 };
 
 const ServerStreamError = error{
     StreamAlreadyFinished,
     InvalidResponseVariant,
 };
 
-/// General RPC message size limit (4 MB). Used for req/resp protocol messages
-/// (BlocksByRoot, Status, etc.) and as a baseline gossip limit for small messages
-/// such as attestations and aggregations.
-const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+/// General RPC message size limit. Used for req/resp protocol messages
+/// (BlocksByRoot, BlocksByRange, Status, etc.) and as a baseline gossip limit
+/// for small messages such as attestations and aggregations.
+///
+/// Sized to match `MAX_GOSSIP_BLOCK_SIZE`: `blocks_by_range` and
+/// `blocks_by_root` carry the same XMSS-heavy blocks as the gossip block
+/// topic, so the RPC cap must accommodate the same per-block payload. A
+/// lower RPC cap (was 4 MB before #960) caused `error.PayloadTooLarge`
+/// during `buildResponseFrame` for every legitimately-sized block that
+/// fit in gossip but not in the RPC frame check, breaking blocks_by_range
+/// catch-up across all peer clients and preventing finalisation.
+///
+/// TODO(#855 review #9 follow-up): split into per-protocol caps so
+/// attestations / aggregations / Status / Goodbye can keep a tighter
+/// ceiling than block-carrying responses. Tracked separately.
+const MAX_RPC_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Gossip block message size limit.
 ///
@@ -44,6 +63,47 @@ const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// Track in a follow-up issue once the spec lands and we can lower this.
 const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
+
+/// Maximum number of leading bytes inlined into gossip-decode-failure log
+/// lines for the #942 diagnostic preview. 32 bytes is enough to cover any
+/// reasonable framing-magic prefix (snappy-frames magic is 10 bytes; common
+/// snappy-block varint headers are 1–3 bytes plus body tags) while keeping
+/// the log line readable and bounded.
+const GOSSIP_PREVIEW_MAX_BYTES: usize = 32;
+
+/// Fixed-capacity hex preview buffer returned by `byteHexPreview`.
+/// `2 × GOSSIP_PREVIEW_MAX_BYTES` for the hex pair + (N − 1) single-space
+/// separators between pairs. Lives on the caller's stack; `.slice()`
+/// returns the populated prefix.
+const BytePreview = struct {
+    buf: [GOSSIP_PREVIEW_MAX_BYTES * 3]u8 = undefined,
+    len: usize = 0,
+    fn slice(self: *const BytePreview) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Build a `"aa bb cc ..."` hex preview of the first `max_bytes` of `data`
+/// for #942 gossip-decode-failure logs. Returns an empty slice when `data`
+/// is empty. Pure / stack-only; safe to call from FFI gossip ingress
+/// without heap allocation.
+fn byteHexPreview(data: []const u8, max_bytes: usize) BytePreview {
+    var out = BytePreview{};
+    const n = @min(@min(data.len, max_bytes), GOSSIP_PREVIEW_MAX_BYTES);
+    const hex_digits = "0123456789abcdef";
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (i != 0) {
+            out.buf[out.len] = ' ';
+            out.len += 1;
+        }
+        const b = data[i];
+        out.buf[out.len] = hex_digits[(b >> 4) & 0x0f];
+        out.buf[out.len + 1] = hex_digits[b & 0x0f];
+        out.len += 2;
+    }
+    return out;
+}
 
 const FrameDecodeError = error{
     EmptyFrame,
@@ -376,8 +436,14 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
 /// disk with one debug file per message (PR #855 review #5). We only persist
 /// `1` of every `MALFORMED_DUMP_SAMPLE_RATE` rejections; the rest are logged
 /// inline. The counter is process-local and racy across threads, which is
-/// fine — the goal is *not* exact 1:1024 sampling, just bounded disk pressure.
-const MALFORMED_DUMP_SAMPLE_RATE: usize = 1024;
+/// fine — the goal is *not* exact 1:N sampling, just bounded disk pressure.
+///
+/// Lowered 1024 → 32 for the #942 in-transit-corruption investigation
+/// (2026-05-29 devnet). Worst-case observed failure rate was ~30 dumps/min
+/// on a single node, at <300 KB per dump → ~9 MB/min on disk, bounded by
+/// the rolling `deserialization_dumps/` cleanup in the ops playbook.
+/// Restore to 1024 once the libp2p-layer corruption is fixed (issue #942).
+const MALFORMED_DUMP_SAMPLE_RATE: usize = 32;
 var malformed_dump_counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
 /// Returns true iff the caller should persist this malformed message to disk.
@@ -463,6 +529,7 @@ fn deserializeGossipMessage(
 fn rejectMalformedGossip(
     zigHandler: *EthLibp2p,
     err: SnappyHeaderValidationError,
+    topic_kind: []const u8,
     topic_slice: []const u8,
     sender_peer_id_slice: []const u8,
     message_bytes: []const u8,
@@ -480,10 +547,17 @@ fn rejectMalformedGossip(
         error.HeaderWithoutBody => "snappy_truncated",
     };
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
+    // #942: include the first 32 bytes hex inline so operators can diagnose
+    // framing-format mismatches (e.g. snappy-frames magic `ff 06 00 00 73 4e
+    // 61 50 70 59`) from logs without needing the sample-rate-gated dump file.
+    const preview = byteHexPreview(message_bytes, 32);
     zigHandler.logger.err(
-        "Rejecting gossip message: {s} (topic={s}, len={d}, peer={s}{f})",
-        .{ reason, topic_slice, message_bytes.len, sender_peer_id_slice, node_name },
+        "Rejecting gossip message: {s} (topic={s}, len={d}, peer={s}{f}, first32={s})",
+        .{ reason, topic_slice, message_bytes.len, sender_peer_id_slice, node_name, preview.slice() },
     );
+    // #942: dashboard-visible counter so a stuck zeam fleet shows up via
+    // metrics before head_slot drifts off wall-clock.
+    zeam_metrics.incrGossipDecodeFailure(topic_kind, dump_label);
     if (shouldPersistMalformedDump()) {
         if (!writeFailedBytes(message_bytes, dump_label, zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("Failed to persist malformed gossip dump ({s})", .{dump_label});
@@ -501,13 +575,15 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     const sender_peer_id_slice = std.mem.span(sender_peer_id);
     const topic_slice = std.mem.span(topic_str);
 
-    // Block gossip messages carry XMSS/post-quantum aggregated signatures and can be
-    // substantially larger than the 4 MB RPC limit (devnet4 saw ~9.37 MB — issue #723).
-    // Use the larger MAX_GOSSIP_BLOCK_SIZE for block topics; keep the tighter limit for
-    // small messages (attestations, aggregations) to bound memory use.
+    // Block gossip messages carry XMSS/post-quantum aggregated signatures and
+    // can reach tens of MB (devnet4 saw ~9.37 MB — issue #723). Use
+    // MAX_GOSSIP_BLOCK_SIZE for block topics and MAX_RPC_MESSAGE_SIZE for the
+    // smaller-message topics; both are 50 MB today (see #960), so this
+    // distinction is currently a no-op but kept for the per-kind tightening
+    // TODO below.
     //
     // TODO(#855 review #9): attestations/aggregations rarely approach
-    // MAX_RPC_MESSAGE_SIZE (4 MB). Tighter per-kind ceilings would let us
+    // MAX_RPC_MESSAGE_SIZE. Tighter per-kind ceilings would let us
     // reject earlier and reduce attacker amplification. Track separately.
     const decode_limit: usize = switch (topic.gossip_topic.kind) {
         .block => MAX_GOSSIP_BLOCK_SIZE,
@@ -526,8 +602,14 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     // size-limit comparison (strict `>`, see `SnappyHeaderValidationError`).
     // If the upstream contract ever changes (e.g. to `>=`), the boundary tests
     // pinned in the test block below will go red.
+    const topic_kind_label: []const u8 = switch (topic.gossip_topic.kind) {
+        .block => "block",
+        .attestation => "attestation",
+        .aggregation => "aggregation",
+    };
+
     _ = validateGossipSnappyHeader(message_bytes, decode_limit) catch |e| {
-        rejectMalformedGossip(zigHandler, e, topic_slice, sender_peer_id_slice, message_bytes);
+        rejectMalformedGossip(zigHandler, e, topic_kind_label, topic_slice, sender_peer_id_slice, message_bytes);
         // TODO(#855 review #4): apply a libp2p gossipsub score penalty here
         // so a peer spamming malformed gossip is ejected by the protocol
         // instead of getting unlimited free retries. Out of scope for the
@@ -536,10 +618,27 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 
     const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
+        // #942: inline first-bytes preview + per-failure counter so a stalled
+        // zeam fleet shows up on dashboards (`zeam_gossip_decode_failures_total`)
+        // and the framing format on the wire is diagnosable from logs alone.
+        //
+        // #942 producer attribution: sha256(compressed) of the inbound bytes
+        // is the byte-exact fingerprint to look up against the publish-side
+        // `[#942 publish]` log line's `sha256_compressed`. Length alone has
+        // been observed to collide (devnet 2026-05-29 dump showed length
+        // 284553 match between ethlambda publish and zeam_8 inbound, but
+        // sha256 differed — proving in-transit byte mutation rather than
+        // codec interop bug). Adding the hash lets correlation become a
+        // single fleet-wide grep.
+        const preview = byteHexPreview(message_bytes, GOSSIP_PREVIEW_MAX_BYTES);
+        const preview_bytes = @min(message_bytes.len, GOSSIP_PREVIEW_MAX_BYTES);
+        var inbound_sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(message_bytes, &inbound_sha256, .{});
         zigHandler.logger.err(
-            "Error in snappyz decoding the message for topic={s} from peer={s}: {any}",
-            .{ topic_slice, sender_peer_id_slice, e },
+            "Error in snappyz decoding the message for topic={s} (len={d}) sha256_inbound={x} from peer={s}: {any}; first{d}={s}",
+            .{ topic_slice, message_bytes.len, &inbound_sha256, sender_peer_id_slice, e, preview_bytes, preview.slice() },
         );
+        zeam_metrics.incrGossipDecodeFailure(topic_kind_label, "snappy_decode");
         if (shouldPersistMalformedDump()) {
             if (!writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) {
                 zigHandler.logger.err("Snappyz decode failed - could not create debug file", .{});
@@ -825,28 +924,34 @@ export fn handleRPCResponseFromRustBridge(
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
 
-    const callback_ptr = zigHandler.rpcCallbacks.getPtr(request_id) orelse {
+    var callback_snap = zigHandler.snapshotRpcCallbackForDelivery(request_id) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to snapshot RPC callback for request_id={d} protocol={s} from peer={s}{f}: {any}",
+            .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name, err },
+        );
+        return;
+    } orelse {
         zigHandler.logger.warn(
             "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name },
         );
         return;
     };
-    // Use peer_id from callback if available, otherwise use the one passed from Rust
-    // (They should match, but callback takes precedence for consistency)
-    const callback_peer_id = callback_ptr.peer_id;
+    defer callback_snap.deinit(zigHandler.allocator);
+    const callback_peer_id = callback_snap.peer_id;
     const callback_node_name = zigHandler.node_registry.getNodeNameFromPeerId(callback_peer_id);
+    const method = callback_snap.method;
+    const handler = callback_snap.handler;
     const protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
         zigHandler.notifyRpcErrorFmt(
             request_id,
-            callback_ptr.method,
+            method,
             2,
             "Unsupported RPC protocol in response: {s}",
             .{protocol_slice},
         );
         return;
     };
-    const method = callback_ptr.method;
     if (protocol != method) {
         zigHandler.logger.warn(
             "network-{d}:: RPC protocol/method mismatch for request_id={d}: protocol={s} method={s} from peer={s}{f}",
@@ -938,7 +1043,7 @@ export fn handleRPCResponseFromRustBridge(
         .{ zigHandler.params.networkId, request_id, protocol.protocolId(), response_bytes.len, callback_peer_id, callback_node_name },
     );
 
-    callback_ptr.notify(&event) catch |notify_err| {
+    handler.onReqRespResponse(&event) catch |notify_err| {
         zigHandler.logger.err(
             "network-{d}:: Failed to notify RPC success callback for request_id={d} from peer={s}{f}: {any}",
             .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, notify_err },
@@ -957,10 +1062,10 @@ export fn handleRPCEndOfStreamFromRustBridge(
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
 
-    if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
-        var callback = entry.value;
-        const method = callback.method;
-        const callback_peer_id = callback.peer_id;
+    if (zigHandler.takeRpcCallback(request_id)) |callback| {
+        var owned_callback = callback;
+        const method = owned_callback.method;
+        const callback_peer_id = owned_callback.peer_id;
         const callback_node_name = zigHandler.node_registry.getNodeNameFromPeerId(callback_peer_id);
 
         var event = interface.ReqRespResponseEvent.initCompleted(request_id, method);
@@ -971,13 +1076,13 @@ export fn handleRPCEndOfStreamFromRustBridge(
             .{ zigHandler.params.networkId, request_id, protocol_str, callback_peer_id, callback_node_name },
         );
 
-        callback.notify(&event) catch |notify_err| {
+        owned_callback.notify(&event) catch |notify_err| {
             zigHandler.logger.err(
                 "network-{d}:: Failed to notify RPC completion for request_id={d}: {any}",
                 .{ zigHandler.params.networkId, request_id, notify_err },
             );
         };
-        callback.deinit();
+        owned_callback.deinit();
     } else {
         zigHandler.logger.warn(
             "network-{d}:: Received RPC end-of-stream for unknown request_id={d} protocol={s} from peer={s}{f}",
@@ -997,10 +1102,10 @@ export fn handleRPCErrorFromRustBridge(
     const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
     const message_slice = std.mem.span(message_ptr);
 
-    if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
-        var callback = entry.value;
-        const method = callback.method;
-        const peer_id = callback.peer_id;
+    if (zigHandler.takeRpcCallback(request_id)) |callback| {
+        var owned_callback = callback;
+        const method = owned_callback.method;
+        const peer_id = owned_callback.peer_id;
         const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id);
 
         const owned_message = zigHandler.allocator.dupe(u8, message_slice) catch |alloc_err| {
@@ -1008,7 +1113,7 @@ export fn handleRPCErrorFromRustBridge(
                 "network-{d}:: Failed to duplicate RPC error message for request_id={d} from peer={s}{f}: {any}",
                 .{ zigHandler.params.networkId, request_id, peer_id, node_name, alloc_err },
             );
-            callback.deinit();
+            owned_callback.deinit();
             return;
         };
 
@@ -1023,13 +1128,13 @@ export fn handleRPCErrorFromRustBridge(
             .{ zigHandler.params.networkId, request_id, protocol_str, code, peer_id, node_name },
         );
 
-        callback.notify(&event) catch |notify_err| {
+        owned_callback.notify(&event) catch |notify_err| {
             zigHandler.logger.err(
                 "network-{d}:: Failed to notify RPC error for request_id={d} from peer={s}{f}: {any}",
                 .{ zigHandler.params.networkId, request_id, peer_id, node_name, notify_err },
             );
         };
-        callback.deinit();
+        owned_callback.deinit();
     } else {
         zigHandler.logger.warn(
             "network-{d}:: Dropping RPC error for unknown request_id={d} protocol={s} code={d}",
@@ -1327,10 +1432,96 @@ pub const EthLibp2p = struct {
     params: EthLibp2pParams,
     rustBridgeThread: ?Thread = null,
     rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
+    /// Guards `rpcCallbacks` against concurrent mutation from the libxev
+    /// thread (status refresh, block fetch dispatch) and the rust-bridge
+    /// thread (response / EOS / error delivery). Unsynchronized access
+    /// corrupts callback entries and has produced GPEs in onReqRespResponse
+    /// during status RPC bursts (#933).
+    rpc_callbacks_lock: zeam_utils.SyncMutex = .{},
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
+    /// Topics successfully joined on the Rust gossipsub mesh at startup.
+    subscribed_gossip_topics: std.ArrayListUnmanaged(interface.GossipTopic) = .empty,
+    subscribed_gossip_topics_lock: zeam_utils.SyncMutex = .{},
 
     const Self = @This();
+
+    /// Snapshot of an in-flight RPC callback for response delivery while the
+    /// entry remains registered (streaming success chunks). `peer_id` is owned
+    /// by this snapshot; do not use map pointers after releasing the lock.
+    ///
+    /// `handler.ptr` references the node (`BeamNode` via
+    /// `getReqRespResponseHandler`), not memory owned by `ReqRespRequestCallback`.
+    /// `ReqRespRequestCallback.deinit` only frees `peer_id`, so concurrent
+    /// `cancelInflightRpcCallback` cannot invalidate the handler target.
+    const RpcCallbackDeliverySnapshot = struct {
+        handler: interface.OnReqRespResponseCbHandler,
+        method: interface.LeanSupportedProtocol,
+        peer_id: []const u8,
+
+        fn deinit(self: *RpcCallbackDeliverySnapshot, allocator: Allocator) void {
+            allocator.free(self.peer_id);
+        }
+    };
+
+    fn takeRpcCallback(self: *Self, request_id: u64) ?interface.ReqRespRequestCallback {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        if (self.rpcCallbacks.fetchRemove(request_id)) |entry| {
+            return entry.value;
+        }
+        return null;
+    }
+
+    fn snapshotRpcCallbackForDelivery(self: *Self, request_id: u64) !?RpcCallbackDeliverySnapshot {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
+        const handler = callback_ptr.handler orelse return null;
+        const peer_id = try self.allocator.dupe(u8, callback_ptr.peer_id);
+        return .{
+            .handler = handler,
+            .method = callback_ptr.method,
+            .peer_id = peer_id,
+        };
+    }
+
+    fn getRpcCallbackMethod(self: *Self, request_id: u64) ?interface.LeanSupportedProtocol {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
+        return callback_ptr.method;
+    }
+
+    fn dupeRpcCallbackPeerId(self: *Self, request_id: u64) !?[]const u8 {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
+        return try self.allocator.dupe(u8, callback_ptr.peer_id);
+    }
+
+    fn putRpcCallback(self: *Self, request_id: u64, callback_entry: interface.ReqRespRequestCallback) !void {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        try self.rpcCallbacks.put(self.allocator, request_id, callback_entry);
+    }
+
+    fn cancelInflightRpcCallback(self: *Self, request_id: u64) void {
+        if (self.takeRpcCallback(request_id)) |callback| {
+            var owned_callback = callback;
+            owned_callback.deinit();
+        }
+    }
+
+    fn deinitAllRpcCallbacks(self: *Self) void {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        var it = self.rpcCallbacks.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.rpcCallbacks.deinit(self.allocator);
+    }
 
     pub fn init(
         allocator: Allocator,
@@ -1405,6 +1596,10 @@ pub const EthLibp2p = struct {
         self.gossipHandler.deinit();
         self.peerEventHandler.deinit();
 
+        self.subscribed_gossip_topics_lock.lock();
+        self.subscribed_gossip_topics.deinit(self.allocator);
+        self.subscribed_gossip_topics_lock.unlock();
+
         for (self.params.listen_addresses) |addr| addr.deinit();
         self.allocator.free(self.params.listen_addresses);
 
@@ -1415,11 +1610,7 @@ pub const EthLibp2p = struct {
 
         self.allocator.free(self.params.fork_digest);
 
-        var it = self.rpcCallbacks.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        self.rpcCallbacks.deinit(self.allocator);
+        self.deinitAllRpcCallbacks();
     }
 
     pub fn run(self: *Self) !void {
@@ -1477,8 +1668,105 @@ pub const EthLibp2p = struct {
 
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
+
+        // #942 publish-side forensic log. If a peer reports
+        // `snappy.error.Corrupt` on bytes whose sha256 matches the
+        // `sha256_compressed` field below, the producer of those bytes is the
+        // node that emitted this line (identified by `git_sha`). Conversely,
+        // if no producer log matches the broken hash, the corruption
+        // originated downstream (forwarder re-encode or wire-level damage).
+        self.emitPublishForensicLog(data, topic_str, message, compressed_message);
+
         self.logger.debug("network-{d}:: publishing to rust bridge data={f} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
         return publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
+    }
+
+    /// Emit a single structured log line capturing the pre-snappy and
+    /// post-snappy hashes of an outbound gossip message plus the spec
+    /// message-id. Intended for cross-fleet log correlation under #942.
+    /// Failures here are swallowed: instrumentation must not block publish.
+    fn emitPublishForensicLog(
+        self: *Self,
+        data: *const interface.GossipMessage,
+        topic_str: [:0]u8,
+        ssz_bytes: []const u8,
+        compressed: []const u8,
+    ) void {
+        // Pre/post-snappy content hashes.
+        var ssz_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(ssz_bytes, &ssz_hash, .{});
+        var compressed_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(compressed, &compressed_hash, .{});
+
+        // Spec gossipsub message_id:
+        //   SHA256(MESSAGE_DOMAIN_VALID_SNAPPY || u64_le(topic_len) || topic || ssz_bytes)[:20]
+        // Mirrors the formula in `rust/libp2p-glue/src/lib.rs` so a producer's
+        // message_id matches what any receiver computes from the same payload.
+        var msg_id_20: [20]u8 = undefined;
+        {
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(&MESSAGE_DOMAIN_VALID_SNAPPY);
+            var topic_len_le: [8]u8 = undefined;
+            const topic_slice: []const u8 = topic_str[0..topic_str.len];
+            std.mem.writeInt(u64, &topic_len_le, @as(u64, topic_slice.len), .little);
+            hasher.update(&topic_len_le);
+            hasher.update(topic_slice);
+            hasher.update(ssz_bytes);
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            @memcpy(&msg_id_20, digest[0..20]);
+        }
+
+        // Self-decode roundtrip: a `false` here means the local snappyz
+        // encoder produced a payload its own decoder rejects — strong signal
+        // that the producer (this binary) is the source of broken-snappy.
+        const self_decoded = snappyz.decodeWithMax(self.allocator, compressed, MAX_GOSSIP_BLOCK_SIZE) catch null;
+        defer if (self_decoded) |d| self.allocator.free(d);
+        const self_decode_ok: bool = if (self_decoded) |d| std.mem.eql(u8, d, ssz_bytes) else false;
+
+        // Per-kind fields. Block root is only meaningful for the block kind;
+        // attestation/aggregation leave it zeroed.
+        var slot: u64 = 0;
+        var proposer: u64 = 0;
+        var block_root: [32]u8 = std.mem.zeroes([32]u8);
+        const kind_label: []const u8 = switch (data.*) {
+            .block => |sb| blk: {
+                slot = sb.block.slot;
+                proposer = sb.block.proposer_index;
+                zeam_utils.hashTreeRoot(types.BeamBlock, sb.block, &block_root, self.allocator) catch {};
+                break :blk "block";
+            },
+            .aggregation => |agg| blk: {
+                slot = agg.data.slot;
+                break :blk "aggregation";
+            },
+            .attestation => |att| blk: {
+                slot = att.message.message.slot;
+                break :blk "attestation";
+            },
+        };
+
+        // Periodic publish-side forensic. Kept at debug now that the
+        // upstream snappy / cross-copy investigation is closed (commits
+        // 71f24084 + c6cf2241 verified on devnet 2026-05-30). Switch
+        // the network log scope to debug to revive these for triage.
+        self.logger.debug(
+            "[#942 publish] net={d} kind={s} topic={s} slot={d} proposer={d} block_root={x} sha256_ssz={x} sha256_compressed={x} compressed_len={d} self_decode_ok={any} msg_id={x} git_sha={s} snappy_lib=zig-snappy-0.0.5",
+            .{
+                self.params.networkId,
+                kind_label,
+                topic_str,
+                slot,
+                proposer,
+                &block_root,
+                &ssz_hash,
+                &compressed_hash,
+                compressed.len,
+                self_decode_ok,
+                &msg_id_20,
+                build_options.version,
+            },
+        );
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -1491,19 +1779,61 @@ pub const EthLibp2p = struct {
         // bridge thread; `run()`'s `wait_for_network_ready` ensures the swarm
         // command channel exists by the time `run()` returns.
         for (topics) |gossip_topic| {
-            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
-            defer topic.deinit();
-            const topic_str = try topic.encodeZ();
-            defer self.allocator.free(topic_str);
-            if (!subscribe_gossip_topic_to_rust_bridge(self.params.networkId, topic_str.ptr)) {
+            if (!self.sendGossipMeshSubscribe(gossip_topic)) {
                 self.logger.err(
                     "network-{d}:: gossip mesh subscribe dropped for topic={f} (network not ready or swarm command channel full — see rust-bridge logs)",
                     .{ self.params.networkId, gossip_topic },
                 );
                 return error.GossipMeshSubscribeFailed;
             }
+            try self.recordSubscribedGossipTopic(gossip_topic);
         }
         try self.gossipHandler.subscribe(topics, handler);
+    }
+
+    fn sendGossipMeshSubscribe(self: *Self, gossip_topic: interface.GossipTopic) bool {
+        var topic = interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest) catch return false;
+        defer topic.deinit();
+        const topic_str = topic.encodeZ() catch return false;
+        defer self.allocator.free(topic_str);
+        return subscribe_gossip_topic_to_rust_bridge(self.params.networkId, topic_str.ptr);
+    }
+
+    fn recordSubscribedGossipTopic(self: *Self, gossip_topic: interface.GossipTopic) !void {
+        self.subscribed_gossip_topics_lock.lock();
+        defer self.subscribed_gossip_topics_lock.unlock();
+        for (self.subscribed_gossip_topics.items) |existing| {
+            if (std.meta.eql(existing, gossip_topic)) return;
+        }
+        try self.subscribed_gossip_topics.append(self.allocator, gossip_topic);
+    }
+
+    fn refreshGossipMeshSubscriptions(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        var topics_copy: std.ArrayListUnmanaged(interface.GossipTopic) = .empty;
+        defer topics_copy.deinit(self.allocator);
+        self.subscribed_gossip_topics_lock.lock();
+        topics_copy.appendSlice(self.allocator, self.subscribed_gossip_topics.items) catch {
+            self.subscribed_gossip_topics_lock.unlock();
+            return;
+        };
+        self.subscribed_gossip_topics_lock.unlock();
+
+        var resubscribed: usize = 0;
+        for (topics_copy.items) |gossip_topic| {
+            if (self.sendGossipMeshSubscribe(gossip_topic)) resubscribed += 1;
+        }
+        if (resubscribed > 0) {
+            self.logger.info(
+                "network-{d}:: re-sent gossipsub mesh subscriptions for {d} topic(s)",
+                .{ self.params.networkId, resubscribed },
+            );
+        }
+    }
+
+    fn gossipMeshPeerCount(ptr: *anyopaque) u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return get_mesh_peers_total(self.params.networkId);
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
@@ -1582,7 +1912,7 @@ pub const EthLibp2p = struct {
             var callback_entry = interface.ReqRespRequestCallback.init(method, self.allocator, handler, peer_id_copy);
             errdefer callback_entry.deinit();
 
-            self.rpcCallbacks.put(self.allocator, request_id, callback_entry) catch |err| {
+            self.putRpcCallback(request_id, callback_entry) catch |err| {
                 self.allocator.free(peer_id_copy);
                 self.logger.err(
                     "network-{d}:: Failed to register RPC callback for request_id={d} peer={s}{f}: {any}",
@@ -1593,6 +1923,11 @@ pub const EthLibp2p = struct {
         }
 
         return request_id;
+    }
+
+    pub fn cancelInflightRpcCallbackFn(ptr: *anyopaque, request_id: u64) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.cancelInflightRpcCallback(request_id);
     }
 
     fn notifyRpcErrorWithOwnedMessage(
@@ -1608,17 +1943,17 @@ pub const EthLibp2p = struct {
         });
         defer event.deinit(self.allocator);
 
-        if (self.rpcCallbacks.fetchRemove(request_id)) |entry| {
-            var callback = entry.value;
-            const peer_id = callback.peer_id;
+        if (self.takeRpcCallback(request_id)) |callback| {
+            var owned_callback = callback;
+            const peer_id = owned_callback.peer_id;
             const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-            callback.notify(&event) catch |notify_err| {
+            owned_callback.notify(&event) catch |notify_err| {
                 self.logger.err(
                     "network-{d}:: Failed to deliver RPC error callback for request_id={d} from peer={s}{f}: {any}",
                     .{ self.params.networkId, request_id, peer_id, node_name, notify_err },
                 );
             };
-            callback.deinit();
+            owned_callback.deinit();
         } else {
             self.logger.warn(
                 "network-{d}:: Dropping RPC error for unknown request_id={d}",
@@ -1635,13 +1970,25 @@ pub const EthLibp2p = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        const callback_ptr = self.rpcCallbacks.getPtr(request_id);
-        const peer_id = if (callback_ptr) |cb| cb.peer_id else "unknown";
-        const node_name = if (callback_ptr) |cb| self.node_registry.getNodeNameFromPeerId(cb.peer_id) else zeam_utils.OptionalNode.init(null);
         const owned_message = std.fmt.allocPrint(self.allocator, fmt, args) catch |alloc_err| {
+            const peer_id_copy = self.dupeRpcCallbackPeerId(request_id) catch |dup_err| {
+                self.logger.err(
+                    "network-{d}:: Failed to duplicate peer id for RPC error log request_id={d}: {any}",
+                    .{ self.params.networkId, request_id, dup_err },
+                );
+                return;
+            } orelse {
+                self.logger.err(
+                    "network-{d}:: Failed to allocate RPC error message for request_id={d}: {any}",
+                    .{ self.params.networkId, request_id, alloc_err },
+                );
+                return;
+            };
+            defer self.allocator.free(peer_id_copy);
+            const node_name = self.node_registry.getNodeNameFromPeerId(peer_id_copy);
             self.logger.err(
                 "network-{d}:: Failed to allocate RPC error message for request_id={d} from peer={s}{f}: {any}",
-                .{ self.params.networkId, request_id, peer_id, node_name, alloc_err },
+                .{ self.params.networkId, request_id, peer_id_copy, node_name, alloc_err },
             );
             return;
         };
@@ -1664,10 +2011,14 @@ pub const EthLibp2p = struct {
         var matching: std.ArrayList(u64) = .empty;
         defer matching.deinit(self.allocator);
 
-        var it = self.rpcCallbacks.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
-                try matching.append(self.allocator, entry.key_ptr.*);
+        {
+            self.rpc_callbacks_lock.lock();
+            defer self.rpc_callbacks_lock.unlock();
+            var it = self.rpcCallbacks.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
+                    try matching.append(self.allocator, entry.key_ptr.*);
+                }
             }
         }
 
@@ -1677,11 +2028,10 @@ pub const EthLibp2p = struct {
         const PEER_DISCONNECTED_CODE: u32 = 499;
 
         for (matching.items) |request_id| {
-            const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse continue;
-            const method = callback_ptr.method;
+            const callback_method = self.getRpcCallbackMethod(request_id) orelse continue;
             self.notifyRpcErrorFmt(
                 request_id,
-                method,
+                callback_method,
                 PEER_DISCONNECTED_CODE,
                 "peer disconnected before responding (peer={s})",
                 .{peer_id},
@@ -1711,12 +2061,15 @@ pub const EthLibp2p = struct {
                 .publishFn = publish,
                 .subscribeFn = subscribe,
                 .onGossipFn = onGossip,
+                .refreshMeshFn = refreshGossipMeshSubscriptions,
+                .meshPeerCountFn = gossipMeshPeerCount,
             },
             .reqresp = .{
                 .ptr = self,
                 .sendRequestFn = sendRPCRequest,
                 .onReqRespRequestFn = onRPCRequest,
                 .subscribeFn = subscribeReqResp,
+                .cancelInflightRequestFn = cancelInflightRpcCallbackFn,
             },
             .peers = .{
                 .ptr = self,
@@ -1857,6 +2210,32 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
     try std.testing.expectEqual(@as(usize, MAX_GOSSIP_BLOCK_SIZE), at_limit_ok.value);
 }
 
+test "issue_942 inbound corruption: real on-the-wire bytes captured from devnet must surface as error.Corrupt" {
+    // Captured 2026-05-29 from zeam_8 (root@77.42.121.211) during devnet run
+    // with PR #953 deployed. The byte stream arrived at zeam_8's gossipsub
+    // ingress with `compressed_len=284553` (matching ethlambda_8's slot-1
+    // block publish at 18:18:19.929 UTC, length 284553) but with a DIFFERENT
+    // sha256 than ethlambda's published `compressed_sha256=0c83964d…`.
+    //
+    // sha256(this file) = c8700b167c3550add606cdef67ab385d061165c141fd76718bc2a35ff13a496e
+    //
+    // Cross-checked locally: `rust-snap 1.1.1` (the exact same crate version
+    // ethlambda, ream, and grandine all use) also fails to decode these
+    // bytes with `Offset { offset: 2265232849, dst_pos: 98776 }`. That rules
+    // out a zig-snappy ↔ rust-snap interop bug and pins the corruption to
+    // somewhere between ethlambda's publish and zeam_8's receive — almost
+    // certainly inside the libp2p framing / muxer layer (echoes #39 +
+    // ruled out by #37 for mplex specifically).
+    //
+    // Locking the symptom in as a test means any future "fix" to snappyz
+    // that starts accepting these mangled bytes goes through a deliberate
+    // code review rather than silently masking the upstream transport bug.
+    const corrupt = @embedFile("testdata_issue_942_inbound_corrupt.bin");
+    try std.testing.expectEqual(@as(usize, 284553), corrupt.len);
+    const result = snappyz.decodeWithMax(std.testing.allocator, corrupt, MAX_GOSSIP_BLOCK_SIZE);
+    try std.testing.expectError(error.Corrupt, result);
+}
+
 test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic" {
     // REGRESSION CANARY (PR #855 review #11): if this test ever panics the
     // whole test binary instead of returning `error.Corrupt`, the upstream
@@ -1871,4 +2250,130 @@ test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic
     const garbage = [_]u8{0xef} ** 1024;
     const result = snappyz.decodeWithMax(std.testing.allocator, &garbage, MAX_GOSSIP_BLOCK_SIZE);
     try std.testing.expectError(error.Corrupt, result);
+}
+
+test "byteHexPreview: formats bytes with single-space separator" {
+    // #942 diagnostic: gossip-decode failure logs include the leading bytes
+    // hex so operators can spot framing-format mismatches (snappy-frames
+    // magic `ff 06 00 00 73 4e 61 50 70 59` vs snappy-block leading varint)
+    // directly from the log line, without needing the sample-rate-gated
+    // dump file. Pinning the format here so a future refactor that switches
+    // separators or capitalisation goes through a deliberate test update.
+    const data = [_]u8{ 0xff, 0x06, 0x00, 0x00, 0x73, 0x4e, 0x61, 0x50 };
+    const p = byteHexPreview(&data, 8);
+    try std.testing.expectEqualSlices(u8, "ff 06 00 00 73 4e 61 50", p.slice());
+}
+
+test "byteHexPreview: truncates to max_bytes" {
+    const data = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    const p = byteHexPreview(&data, 3);
+    try std.testing.expectEqualSlices(u8, "aa bb cc", p.slice());
+}
+
+test "byteHexPreview: empty input returns empty slice" {
+    const empty: []const u8 = &.{};
+    const p = byteHexPreview(empty, 32);
+    try std.testing.expectEqual(@as(usize, 0), p.slice().len);
+}
+
+test "byteHexPreview: hard cap at GOSSIP_PREVIEW_MAX_BYTES even if caller asks more" {
+    // The buffer is sized for 32 bytes; if a caller passes max_bytes > 32
+    // (a future code-path bug), we must silently cap to keep stack usage
+    // bounded and not overrun the buffer.
+    const data = [_]u8{0xab} ** 64;
+    const p = byteHexPreview(&data, 100);
+    try std.testing.expectEqual(GOSSIP_PREVIEW_MAX_BYTES, p.slice().len / 3 + 1);
+}
+
+test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
+    // Reproduce the #942 gossip-decode-failure pattern in a unit test.
+    //
+    // Observation from the live devnet under PR #945 instrumentation:
+    // - Both Zig `snappyz.decodeWithMax` AND Rust `snap::raw::Decoder` reject
+    //   the same gossip payloads with `error.Corrupt` / `Offset { offset:
+    //   62376420, dst_pos: 65866 }`.
+    // - The byte-preview at the FFI boundary matches Rust ↔ Zig (no FFI bug).
+    // - Failures cluster around block / aggregation payloads of ~200-300 KB
+    //   with `dst_pos` errors near 64 KB / 128 KB / power-of-two boundaries.
+    // - The only client family that publishes via `snappyz.encode` is zeam;
+    //   every other client uses Rust `snap::raw::Encoder` which round-trips
+    //   the same payload classes fine. Working hypothesis: `snappyz.encode`
+    //   produces non-standard snappy output for inputs that combine
+    //   high-entropy content with the chunking boundary at
+    //   `maxBlockSize = 65536` (snappy.zig:17).
+    //
+    // The existing snappyz "encode larger than maxBlockSize" test uses a
+    // sequential `b.* = i & 0xff` pattern which is highly compressible and
+    // unlikely to expose the bug. This test uses a fixed-seed PRNG so the
+    // input has STARK-proof-like entropy (≈1.0 byte/byte) at sizes that
+    // straddle the 64 KB chunk boundary multiple times.
+    //
+    // If this test FAILS, we have local reproduction of #942 and can debug
+    // `encodeBlock` (snappy.zig:400) without devnet round-trips. If it
+    // PASSES, the wire-side corruption originates elsewhere (peer encoder
+    // outside zeam, or a gossipsub-layer mutation) and we need to capture
+    // a real payload from the wire to drill further.
+    const allocator = std.testing.allocator;
+
+    // 280 KB: crosses the 65536-byte maxBlockSize boundary 4 times, in the
+    // size range of the failing devnet payloads (`data_len=287149` was a
+    // recurring victim in PR #945's live capture).
+    const input_size: usize = 280 * 1024;
+    const input = try allocator.alloc(u8, input_size);
+    defer allocator.free(input);
+
+    // Fixed seed so the failure (if any) is reproducible across runs and CI.
+    var prng = std.Random.DefaultPrng.init(0x0942_5141_5252_4754);
+    prng.random().bytes(input);
+
+    const encoded = try snappyz.encode(allocator, input);
+    defer allocator.free(encoded);
+
+    const decoded = snappyz.decodeWithMax(allocator, encoded, MAX_GOSSIP_BLOCK_SIZE) catch |err| {
+        std.debug.print(
+            "\nsnappyz roundtrip FAILED on {d}KB high-entropy input: {any}\n" ++
+                "  encoded size: {d} bytes\n" ++
+                "  first 16 encoded bytes: {x}\n",
+            .{ input_size / 1024, err, encoded.len, encoded[0..@min(16, encoded.len)] },
+        );
+        return err;
+    };
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualSlices(u8, input, decoded);
+}
+
+test "snappyz roundtrip: high-entropy 64KB-boundary spans (#942)" {
+    // Targeted variant of the test above: try several input sizes just below,
+    // exactly at, and just above `maxBlockSize = 65536` (and 2× / 3× that)
+    // so a failure modes that's specific to a single boundary crossing
+    // shows up as one of the sub-cases.
+    const allocator = std.testing.allocator;
+    const sizes_to_try = [_]usize{
+        65535, // last byte that fits in one chunk
+        65536, // exactly maxBlockSize
+        65537, // first byte spilling into a second chunk
+        131071,
+        131072, // 2 × maxBlockSize
+        131073,
+        196608, // 3 × maxBlockSize
+        196609,
+    };
+    for (sizes_to_try) |sz| {
+        const input = try allocator.alloc(u8, sz);
+        defer allocator.free(input);
+        var prng = std.Random.DefaultPrng.init(0xDEADBEEF_CAFEBABE);
+        prng.random().bytes(input);
+
+        const encoded = try snappyz.encode(allocator, input);
+        defer allocator.free(encoded);
+
+        const decoded = snappyz.decodeWithMax(allocator, encoded, MAX_GOSSIP_BLOCK_SIZE) catch |err| {
+            std.debug.print("\nFAILED at size={d}: {any}\n", .{ sz, err });
+            return err;
+        };
+        defer allocator.free(decoded);
+
+        try std.testing.expectEqualSlices(u8, input, decoded);
+    }
 }

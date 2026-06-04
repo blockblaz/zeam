@@ -6,14 +6,13 @@ pub const MAX_AGGREGATE_SIGNATURE_SIZE = aggregate.MAX_AGGREGATE_SIGNATURE_SIZE;
 pub const ByteListMiB = aggregate.ByteListMiB;
 pub const AggregationError = aggregate.AggregationError;
 pub const setRayonThreads = aggregate.setRayonThreads;
-pub const setupProver = aggregate.setupProver;
-pub const ensureProverReady = aggregate.ensureProverReady;
-pub const setupVerifier = aggregate.setupVerifier;
+pub const setupXmssAggregation = aggregate.setupXmssAggregation;
 pub const aggregateSignatures = aggregate.aggregateSignatures;
 pub const verifyAggregatedPayload = aggregate.verifyAggregatedPayload;
 pub const verifyAggregatedPayloadBatch = aggregate.verifyAggregatedPayloadBatch;
 pub const AggregatedPayloadVerifyBatch = aggregate.AggregatedPayloadVerifyBatch;
 pub const aggregate_module = aggregate;
+pub const shadow_cost = aggregate.shadow_cost;
 
 const hashsig = @import("hashsig.zig");
 pub const KeyPair = hashsig.KeyPair;

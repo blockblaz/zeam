@@ -121,6 +121,17 @@ pub const NodeOptions = struct {
     /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
     /// issue #907 finding 4.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Percentage of the proposal interval allocated as the build-worker
+    /// deadline budget.
+    proposal_deadline_pct: u32 = node_lib.default_proposal_deadline_pct,
+    /// Cap on the number of child STARK proofs merged with raw signatures
+    /// by the aggregator-worker path. Threaded through to
+    /// `ForkChoice.max_aggregation_children` and applied by
+    /// `prepareAggregateAttData` after greedy + subset-prune. Surfaced as
+    /// `--max-aggregation-children` on the `zeam node` CLI; default is
+    /// `pkgs/types/src/block.zig:default_max_aggregation_children` (0 —
+    /// flat-only worker path). See #940 follow-up.
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -494,12 +505,6 @@ pub const Node = struct {
             const zig_worker_budget = @max(@as(usize, 1), (desired_workers + 1) / 2);
             break :blk @min(zig_worker_budget, @as(usize, ThreadPool.max_thread_count));
         };
-        self.thread_pool = try ThreadPool.init(.{
-            .allocator = allocator,
-            .io = std.Io.Threaded.global_single_threaded.io(),
-            .thread_count = @intCast(worker_count),
-        });
-        errdefer self.thread_pool.deinit();
 
         // Coordinate the Zig worker pool and the rayon pool used by the XMSS
         // aggregate prover from the same post-system-thread budget so they do
@@ -515,7 +520,7 @@ pub const Node = struct {
         // aggregator that bottleneck is the produce path instead, so giving
         // rayon more cores measurably shortens the per-pass build time.
         //
-        // Must be called before setupProver/setupVerifier since rayon’s global
+        // Must be called before setupXmssAggregation since rayon’s global
         // pool is initialized lazily on first use.
         const rayon_threads = if (options.rayon_threads) |override| blk: {
             const requested = @max(@as(usize, 1), @as(usize, override));
@@ -561,11 +566,15 @@ pub const Node = struct {
         }
         xmss.setRayonThreads(rayon_threads);
 
-        if (options.is_aggregator) {
-            xmss.ensureProverReady() catch |err| {
-                self.logger.warn("xmss prover init failed: {any}; aggregation may be unavailable", .{err});
-            };
-        }
+        // Single XMSS aggregation setup for both prover and verifier paths
+        try xmss.setupXmssAggregation();
+
+        self.thread_pool = try ThreadPool.init(.{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .thread_count = @intCast(worker_count),
+        });
+        errdefer self.thread_pool.deinit();
 
         // Log the aggregator threshold on startup so operators can see
         // exactly how `--min-aggregation-inputs` was resolved (default vs
@@ -583,16 +592,6 @@ pub const Node = struct {
             },
         );
 
-        // Pre-warm the XMSS verifier on the main thread before any worker can
-        // call `verifyAggregatedPayload`. The Rust-side verifier setup is
-        // documented as idempotent but is not hardened against first-time-init
-        // races between concurrent callers; doing it once here removes that
-        // race regardless of the Rust implementation.
-        xmss.setupVerifier() catch |err| {
-            // Do not call `thread_pool.deinit()` here — `errdefer` below already tears it down.
-            return err;
-        };
-
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -609,7 +608,9 @@ pub const Node = struct {
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
             .min_aggregation_inputs = options.min_aggregation_inputs,
+            .max_aggregation_children = options.max_aggregation_children,
             .aggregate_max_inflight = aggregate_max_inflight,
+            .proposal_deadline_pct = options.proposal_deadline_pct,
         });
         errdefer self.beam_node.deinit();
 
@@ -703,6 +704,12 @@ pub const Node = struct {
         // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
         // command already does network-first; this is the matching swap for
         // the production node path.
+        //
+        // Peer + req-resp handlers are subscribed before the network starts so
+        // the one-shot peer-connect event and early STATUS requests are not
+        // lost to a handler-not-yet-registered race; only gossip mesh subscribe
+        // needs the running channel and stays inside `BeamNode.run()`.
+        try self.beam_node.subscribeNetworkEventHandlers();
         try self.network.run();
         try self.beam_node.run();
 
@@ -1159,8 +1166,7 @@ fn downloadCheckpointState(
     logger.info("successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
 
     // Clone the state to move it out of the arena using the proper cloning function
-    var cloned_state: types.BeamState = undefined;
-    try types.sszClone(allocator, types.BeamState, checkpoint_state, &cloned_state);
+    const cloned_state = try zeam_utils.clone(types.BeamState, &checkpoint_state, allocator);
 
     return cloned_state;
 }
@@ -1347,6 +1353,16 @@ fn downloadAndStoreCheckpointBlock(
     };
     defer batch.deinit();
     batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, ssz_data.items);
+    // Also index the checkpoint block in the finalized slot index so that
+    // blocks_by_range can serve it.  Without this, `onReqRespRequest`'s
+    // finalized-range path (slot <= finalized_slot) finds no entry in
+    // DbFinalizedSlotsNamespace and the unfinalized-range walk is skipped
+    // (its guard is `end_slot_exclusive > finalized_slot + 1`, which is false
+    // when start_slot == finalized_slot == checkpoint_slot).  The result is an
+    // empty blocks_by_range response for the checkpoint slot even though the
+    // block is present in DbBlocksNamespace and is served correctly via
+    // blocks_by_root.
+    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, block.block.slot, expected_root);
     db.commit(&batch) catch |err| {
         logger.warn("checkpoint block fetch: DB commit failed: {}", .{err});
         return;
