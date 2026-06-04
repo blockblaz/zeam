@@ -78,7 +78,7 @@ const zl = @import("zig_libp2p");
 const Multiaddr = @import("multiaddr").Multiaddr;
 const peer_id_pkg = zl.peer_id;
 
-const Ed25519 = std.crypto.sign.Ed25519;
+const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
 // Shared snappy + SSZ codec helpers; previously lived inside the legacy
 // `ethlibp2p.zig` and were `pub`'d for v2 reuse. After the Rust-glue
@@ -125,28 +125,35 @@ pub const EthLibp2pV2Params = struct {
     host_identity_key_path: ?[]const u8 = null,
 };
 
-/// Heap-allocated host signer state that captures the Ed25519 keypair
-/// for the libp2p TLS cert's `SignedKey` raw Ed25519 signature. Stored on
-/// `EthLibp2pV2` so the pointer in `HostIdentityKey.ed25519.sign_ctx`
+/// Heap-allocated host signer state that captures the secp256k1 keypair
+/// for the libp2p TLS cert's `SignedKey` DER ECDSA signature. Stored on
+/// `EthLibp2pV2` so the pointer in `HostIdentityKey.secp256k1.sign_ctx`
 /// stays valid for the lifetime of any cert minted from it.
 ///
-/// Ed25519 (NOT ECDSA-P-256) is the libp2p convention used by every other
-/// client in the lean ecosystem — including the `eth-beacon-genesis` tool
-/// lean-quickstart runs to pre-compute the `/p2p/...` peer ids in
-/// `nodes.yaml`. Using a different host-key algorithm would derive a
-/// different PeerId from the same 32-byte file seed and every outbound
-/// dial would fail `PeerIdMismatch` (which is exactly what happened on
-/// the ECDSA-P-256 code path that preceded this).
-const Ed25519HostSigner = struct {
-    kp: Ed25519.KeyPair,
+/// secp256k1 (NOT Ed25519 or P-256) is the libp2p convention in the lean
+/// ecosystem: every node's identity comes from a 32-byte secp256k1 private
+/// key, the matching compressed pubkey goes into the ENR, and the bootnode
+/// `/p2p/16Uiu2HA...` peer ids in `nodes.yaml` are the libp2p PeerId
+/// derived from `PublicKey{type=SECP256K1, data=<33-byte compressed>}`.
+/// Any other algorithm here would derive a different PeerId from the same
+/// `<node>.key` file and every outbound dial would fail `PeerIdMismatch`
+/// (which is exactly what happened on the Ed25519 path that preceded this).
+const Secp256k1HostSigner = struct {
+    kp: Secp256k1.KeyPair,
 
     fn sign(
         ctx: ?*anyopaque,
         message: []const u8,
-        out_sig: *[64]u8,
+        out_sig: []u8,
+        out_sig_len: *usize,
     ) anyerror!void {
-        const self: *Ed25519HostSigner = @ptrCast(@alignCast(ctx.?));
-        out_sig.* = (try self.kp.sign(message, null)).toBytes();
+        const self: *Secp256k1HostSigner = @ptrCast(@alignCast(ctx.?));
+        const sig = try self.kp.sign(message, null);
+        var der_buf: [Secp256k1.Signature.der_encoded_length_max]u8 = undefined;
+        const der = sig.toDer(&der_buf);
+        if (der.len > out_sig.len) return error.NoSpaceLeft;
+        @memcpy(out_sig[0..der.len], der);
+        out_sig_len.* = der.len;
     }
 };
 
@@ -250,8 +257,8 @@ pub const EthLibp2pV2 = struct {
     shutdown_flag: std.atomic.Value(bool) = .init(false),
 
     /// Heap-allocated so the pointer handed to
-    /// `libp2p_tls_cert.HostIdentityKey.ed25519.sign_ctx` stays valid.
-    host_signer: *Ed25519HostSigner,
+    /// `libp2p_tls_cert.HostIdentityKey.secp256k1.sign_ctx` stays valid.
+    host_signer: *Secp256k1HostSigner,
 
     /// `null` until `run` brings up a QUIC listener; `null` forever if the
     /// embedder left `listen_addresses` empty.
@@ -275,15 +282,16 @@ pub const EthLibp2pV2 = struct {
         params: EthLibp2pV2Params,
         logger: zeam_utils.ModuleLogger,
     ) !*Self {
-        // Build an Ed25519 host identity from a 32-byte seed. Ed25519 is the
-        // libp2p convention used by every other client in the lean ecosystem
-        // (eth-beacon-genesis, ethlambda, etc.) — the `16Uiu2HAk…` prefix in
-        // lean-quickstart's `nodes.yaml` is the canonical fingerprint for
-        // identity-multihashed Ed25519-PublicKey-protobuf PeerIds. Using any
-        // other algorithm here (we tried ECDSA-P-256 and it failed every
-        // dial with `PeerIdMismatch`) would derive a different PeerId from
-        // the same seed bytes and the cert would not agree with the
-        // bootnode-list `/p2p/...` peer ids the dialer expects.
+        // Build a secp256k1 host identity from a 32-byte private-key scalar.
+        // secp256k1 is the libp2p convention in the lean ecosystem: the
+        // bootnode `/p2p/16Uiu2HA...` ids in `nodes.yaml` come from each
+        // node's secp256k1 compressed pubkey (the same key that goes into
+        // the ENR's `secp256k1` field). The `<node>.key` file holds the
+        // 32-byte private-key scalar directly (NOT an Ed25519 or P-256
+        // seed). Using any other algorithm here would derive a different
+        // PeerId and every outbound dial would fail `PeerIdMismatch` —
+        // which is exactly what happened on the Ed25519 path that preceded
+        // this.
         var host_seed: [32]u8 = blk: {
             if (params.host_identity_seed) |s| break :blk s;
             if (params.host_identity_key_path) |p| {
@@ -301,23 +309,31 @@ pub const EthLibp2pV2 = struct {
             try fillRandomBytes(&buf);
             break :blk buf;
         };
-        const host_kp = try Ed25519.KeyPair.generateDeterministic(host_seed);
+        const host_sk = Secp256k1.SecretKey.fromBytes(host_seed) catch |e| {
+            logger.err(
+                "network-{d}:: host_identity_seed is not a canonical secp256k1 scalar: {any}",
+                .{ params.networkId, e },
+            );
+            return error.InvalidHostIdentitySeed;
+        };
+        const host_kp = try Secp256k1.KeyPair.fromSecretKey(host_sk);
 
-        const host_signer = try allocator.create(Ed25519HostSigner);
+        const host_signer = try allocator.create(Secp256k1HostSigner);
         errdefer allocator.destroy(host_signer);
         host_signer.* = .{ .kp = host_kp };
 
-        // Derive the matching libp2p PeerId from the Ed25519 host public key.
-        // For Ed25519 the libp2p PublicKey protobuf's `.data` field is the
-        // raw 32-byte pubkey (no PKIX wrapping); `PeerId.fromPublicKey`
-        // encodes the `{type=ED25519, data=<32 bytes>}` protobuf and uses
-        // identity-multihash (because the result is well under 42 bytes).
-        // That's the same path eth-beacon-genesis and ethlambda walk, so
-        // the derived PeerId matches the `/p2p/...` in the bootnode list.
-        var host_pub_bytes: [32]u8 = host_kp.public_key.bytes;
+        // Derive the matching libp2p PeerId from the secp256k1 host pubkey.
+        // For secp256k1 the libp2p PublicKey protobuf's `.data` field is the
+        // 33-byte COMPRESSED SEC1 encoding (header byte 0x02/0x03 + 32-byte
+        // X coordinate). The whole `{type=SECP256K1, data=<33 bytes>}`
+        // protobuf is ~37 bytes — well under the 42-byte inline cap, so
+        // `PeerId.fromPublicKey` produces an identity multihash and the
+        // result is what every libp2p secp256k1 PeerId in the lean ecosystem
+        // (ENR-derived bootnode multiaddrs, etc.) decodes to.
+        var host_pub_compressed: [33]u8 = host_kp.public_key.toCompressedSec1();
         var host_pk = peer_id_pkg.PublicKey{
-            .type = .ED25519,
-            .data = &host_pub_bytes,
+            .type = .SECP256K1,
+            .data = &host_pub_compressed,
         };
         const me = try peer_id_pkg.PeerId.fromPublicKey(allocator, &host_pk);
 
@@ -482,24 +498,27 @@ pub const EthLibp2pV2 = struct {
         self.drain_thread = try Thread.spawn(.{}, drainEventsTrampoline, .{self});
     }
 
-    /// Mints a fresh libp2p TLS cert from this node's Ed25519 host identity
-    /// and starts a `QuicRuntime` on `params.listen_addresses`. The cert +
-    /// key PEMs are handed to zquic in-memory via zig-libp2p v0.1.6's
-    /// `TlsPemSource.pem_bytes` (which routes through zquic v1.6.6's new
-    /// `cert_pem` / `key_pem` config fields — see ch4r10t33r/zquic#129).
-    /// Nothing is written to disk.
+    /// Mints a fresh libp2p TLS cert from this node's secp256k1 host
+    /// identity and starts a `QuicRuntime` on `params.listen_addresses`.
+    /// The cert + key PEMs are handed to zquic in-memory via zig-libp2p
+    /// v0.1.7's `TlsPemSource.pem_bytes` (which routes through zquic
+    /// v1.6.6's `cert_pem` / `key_pem` config fields — see
+    /// ch4r10t33r/zquic#129). The ephemeral cert key is always
+    /// ECDSA-P-256 (set by zig-libp2p's `generateSecp256k1`); the
+    /// SignedKey extension carries the secp256k1 host pubkey. Nothing
+    /// is written to disk.
     fn startQuicTransport(self: *Self) !void {
         const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
-        const host_pub_bytes: [32]u8 = self.host_signer.kp.public_key.bytes;
+        const host_pub_compressed: [33]u8 = self.host_signer.kp.public_key.toCompressedSec1();
 
         var cert_seed: [32]u8 = undefined;
         try fillRandomBytes(&cert_seed);
 
         var gen = try zl.security.libp2p_tls_cert.generate(self.allocator, .{
             .host_identity = .{
-                .ed25519 = .{
-                    .public_key_bytes = host_pub_bytes,
-                    .sign = Ed25519HostSigner.sign,
+                .secp256k1 = .{
+                    .public_key_sec1_compressed = host_pub_compressed,
+                    .sign = Secp256k1HostSigner.sign,
                     .sign_ctx = self.host_signer,
                 },
             },
@@ -726,15 +745,16 @@ pub const EthLibp2pV2 = struct {
     }
 
     /// Pure derivation of the libp2p PeerId-as-base58 from a 32-byte
-    /// Ed25519 seed — same path `init` uses internally, but exposed as
-    /// a free function so embedders can compute peer ids BEFORE any
-    /// `init` runs. Lets a multi-node simulation build connect_peers
-    /// strings for every other node without an init ordering dance.
-    /// Caller owns the returned slice.
+    /// secp256k1 private-key scalar — same path `init` uses internally,
+    /// but exposed as a free function so embedders can compute peer ids
+    /// BEFORE any `init` runs. Lets a multi-node simulation build
+    /// connect_peers strings for every other node without an init
+    /// ordering dance. Caller owns the returned slice.
     pub fn peerIdBase58FromSeed(allocator: Allocator, seed: [32]u8) ![]u8 {
-        const kp = try Ed25519.KeyPair.generateDeterministic(seed);
-        var pub_bytes: [32]u8 = kp.public_key.bytes;
-        var pk = peer_id_pkg.PublicKey{ .type = .ED25519, .data = &pub_bytes };
+        const sk = try Secp256k1.SecretKey.fromBytes(seed);
+        const kp = try Secp256k1.KeyPair.fromSecretKey(sk);
+        var pub_compressed: [33]u8 = kp.public_key.toCompressedSec1();
+        var pk = peer_id_pkg.PublicKey{ .type = .SECP256K1, .data = &pub_compressed };
         const pid = try peer_id_pkg.PeerId.fromPublicKey(allocator, &pk);
         var buf: [128]u8 = undefined;
         const slice = try pid.toBase58(&buf);
