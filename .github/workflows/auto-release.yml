@@ -272,12 +272,19 @@ jobs:
           echo "🔄 Rebasing shadow onto main..."
           git checkout -B shadow origin/shadow
           if git rebase origin/main; then
-            git push origin shadow --force-with-lease
-            NEW_SHA=$(git rev-parse --short HEAD)
-            echo "shadow_status=✅ rebased to $NEW_SHA" >> $GITHUB_OUTPUT
-            echo "shadow_sha=$NEW_SHA" >> $GITHUB_OUTPUT
-            echo "shadow_failed=false" >> $GITHUB_OUTPUT
-            echo "✅ Shadow rebase succeeded: $NEW_SHA"
+            if git push origin shadow --force-with-lease; then
+              NEW_SHA=$(git rev-parse --short HEAD)
+              echo "shadow_status=✅ rebased to $NEW_SHA" >> $GITHUB_OUTPUT
+              echo "shadow_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+              echo "shadow_failed=false" >> $GITHUB_OUTPUT
+              echo "✅ Shadow rebase succeeded: $NEW_SHA"
+            else
+              echo "shadow_status=❌ push failed — force-with-lease mismatch" >> $GITHUB_OUTPUT
+              echo "shadow_sha=" >> $GITHUB_OUTPUT
+              echo "shadow_failed=true" >> $GITHUB_OUTPUT
+              echo "❌ Shadow push failed"
+              exit 1
+            fi
           else
             git rebase --abort || true
             echo "shadow_status=❌ rebase conflict — manual fix needed" >> $GITHUB_OUTPUT
@@ -293,7 +300,7 @@ jobs:
         fi
 
     - name: Send Telegram shadow rebase failure notification
-      if: ${{ steps.rebase.outputs.shadow_failed == 'true' }}
+      if: always() && steps.rebase.outputs.shadow_failed == 'true'
       run: |
         VERSION="${{ needs.create-tags.outputs.version }}"
         REPO_URL="${{ github.server_url }}/${{ github.repository }}"
