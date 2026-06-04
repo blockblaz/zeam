@@ -2002,6 +2002,41 @@ test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
     try testing.expectEqual(actual, cp.count());
 }
 
+test "ConnectedPeers: selectPeerCopy respects min_slot filter" {
+    const FakeStatus = struct { head_slot: u64 };
+    const FakePeerInfo = struct {
+        peer_id: []const u8,
+        connected_at: i64,
+        latest_status: ?FakeStatus = null,
+    };
+    const CP = ConnectedPeersImpl(FakePeerInfo);
+    var cp = CP.init(testing.allocator);
+    defer cp.deinit();
+
+    // Initialize peers at 0, 5 and 10
+    try cp.connect("peer-0");
+
+    try cp.connect("peer-5");
+    _ = cp.setLatestStatus("peer-5", FakeStatus{ .head_slot = 5 });
+
+    try cp.connect("peer-10");
+    _ = cp.setLatestStatus("peer-10", FakeStatus{ .head_slot = 10 });
+
+    // min_slot=7 → only peer-10 eligible
+    const pick = try cp.selectPeerCopy(testing.allocator, 7);
+    defer if (pick) |p| testing.allocator.free(p);
+    try testing.expectEqualStrings("peer-10", pick.?);
+
+    // min_slot=20 → no peer qualifies, returns null
+    const none = try cp.selectPeerCopy(testing.allocator, 20);
+    try testing.expect(none == null);
+
+    // min_slot=null → any peer eligible
+    const any = try cp.selectPeerCopy(testing.allocator, null);
+    defer if (any) |p| testing.allocator.free(p);
+    try testing.expect(any != null);
+}
+
 test "LockedMap: withValueLocked holds the lock across the callback" {
     // Contract: the callback runs while the map's mutex is held, so the
     // caller can dupe out slice fields without racing a concurrent
