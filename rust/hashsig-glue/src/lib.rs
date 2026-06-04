@@ -1,7 +1,7 @@
 // Production config (default).
 //
 // Upstream renamed `Scheme...` → `SIG...` in `lifetime_2_to_the_32` only
-// (leanSig main, pulled in via leanMultisig `5eba3b1`). The `lifetime_2_to_the_8`
+// (leanSig main, pulled in via leanMultisig `f66d4a9`). The `lifetime_2_to_the_8`
 // test module below is unchanged and still exports `Scheme...`.
 #[cfg(not(feature = "test-config"))]
 mod config {
