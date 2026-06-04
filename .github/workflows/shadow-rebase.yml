@@ -44,9 +44,12 @@ jobs:
           echo "rebase_status=success" >> $GITHUB_OUTPUT
           echo "✅ Rebase succeeded"
         else
+          CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null \
+            | head -3 | tr '\n' ', ' | sed 's/, $//' || echo "unknown files")
+          echo "REBASE_CONFLICTS=$CONFLICTS" >> $GITHUB_ENV
           git rebase --abort || true
           echo "rebase_status=failed" >> $GITHUB_OUTPUT
-          echo "❌ Rebase failed"
+          echo "❌ Rebase failed: conflicts in $CONFLICTS"
           exit 1
         fi
 
@@ -60,13 +63,17 @@ jobs:
       if: failure()
       run: |
         MAIN_SHA="${{ github.sha }}"
-        COMMIT_MSG="${{ github.event.head_commit.message || 'manual trigger' }}"
+        COMMIT_MSG_FULL="${{ github.event.head_commit.message || 'manual trigger' }}"
+        COMMIT_MSG="${COMMIT_MSG_FULL%%$'\n'*}"
         REPO_URL="${{ github.server_url }}/${{ github.repository }}"
         RUN_URL="$REPO_URL/actions/runs/${{ github.run_id }}"
 
-        MESSAGE=$'🚨 Shadow branch rebase FAILED\n\nThe `shadow` branch could not be automatically rebased onto `main`.\nManual intervention is required.\n\nTrigger commit: '"${MAIN_SHA:0:8}"$'\n'
-        MESSAGE+="Message: ${COMMIT_MSG:0:80}"$'\n'
+        MESSAGE=$'🚨 Shadow branch rebase FAILED \n\n The `shadow` branch could not be automatically rebased onto `main`.\nManual intervention is required.\n\n'
+        MESSAGE+="Cause: conflicts in [${REBASE_CONFLICTS:-unknown}]"$'\n'
+        MESSAGE+="Trigger commit: ${MAIN_SHA:0:8}"$'\n'
+        MESSAGE+="Message: $COMMIT_MSG"$'\n'
         MESSAGE+="CI Run: $RUN_URL"
+        MESSAGE+=$'\n\n@grapebaba'
 
         PAYLOAD=$(jq -n \
           --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
