@@ -39,7 +39,7 @@ jobs:
           exit 0
         fi
         echo "🔄 Rebasing origin/shadow onto origin/main..."
-        git checkout shadow
+        git checkout -B shadow origin/shadow
         if git rebase origin/main; then
           echo "rebase_status=success" >> $GITHUB_OUTPUT
           echo "✅ Rebase succeeded"
