@@ -92,7 +92,7 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
             fn cb(_: *anyopaque, _: *const networks.ReqRespResponseEvent) anyerror!void {}
         }.cb,
     };
-    var pinned = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_a}, 0, handler, "serving-peer", 1)).?;
+    var pinned = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_a}, 0, handler, "serving-peer", null)).?;
     defer pinned.deinit(allocator);
     try std.testing.expectEqualStrings("serving-peer", pinned.peer_id);
     try std.testing.expectEqualStrings("serving-peer", ctx.last_peer.?);
@@ -101,7 +101,7 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
     try std.testing.expect(network.disconnectPeer("serving-peer"));
 
     const root_b: types.Root = [_]u8{0xbb} ** 32;
-    var fallback = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_b}, 0, handler, "serving-peer", 1)).?;
+    var fallback = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_b}, 0, handler, "serving-peer", null)).?;
     defer fallback.deinit(allocator);
     try std.testing.expectEqualStrings("fallback-peer", fallback.peer_id);
     try std.testing.expectEqualStrings("fallback-peer", ctx.last_peer.?);
