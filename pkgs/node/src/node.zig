@@ -1797,8 +1797,7 @@ pub const BeamNode = struct {
         range_unavailable: bool,
     ) void {
         const node_name = self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy);
-
-        const next_peer_opt = self.network.selectPeerForRangeSyncExcluding(snap.peer_id_copy) catch null;
+        const next_peer_opt = self.network.selectPeerForRangeSyncExcluding(snap.peer_id_copy, self.chain.forkChoice.getCurrentSlot() + 1) catch null;
         defer if (next_peer_opt) |p| self.allocator.free(p);
         const has_alternate_peer = if (next_peer_opt) |p| !std.mem.eql(u8, p, snap.peer_id_copy) else false;
 
@@ -2610,7 +2609,7 @@ pub const BeamNode = struct {
         if (missing_roots.items.len == 0) return;
 
         const handler = self.getReqRespResponseHandler();
-        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer) catch |err| blk: {
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer, self.chain.forkChoice.getCurrentSlot() + 1) catch |err| blk: {
             switch (err) {
                 error.NoPeersAvailable => {
                     // PR #842 review #1: previously this path bumped

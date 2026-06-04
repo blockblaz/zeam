@@ -92,8 +92,8 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
             fn cb(_: *anyopaque, _: *const networks.ReqRespResponseEvent) anyerror!void {}
         }.cb,
     };
-
-    var pinned = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_a}, 0, handler, "serving-peer")).?;
+    const min_slot_a = network.block_cache.getBlock(root_a).?.block.slot;
+    var pinned = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_a}, 0, handler, "serving-peer", min_slot_a)).?;
     defer pinned.deinit(allocator);
     try std.testing.expectEqualStrings("serving-peer", pinned.peer_id);
     try std.testing.expectEqualStrings("serving-peer", ctx.last_peer.?);
@@ -102,7 +102,8 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
     try std.testing.expect(network.disconnectPeer("serving-peer"));
 
     const root_b: types.Root = [_]u8{0xbb} ** 32;
-    var fallback = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_b}, 0, handler, "serving-peer")).?;
+    const min_slot_b = network.block_cache.getBlock(root_b).?.block.slot;
+    var fallback = (try network.ensureBlocksByRootRequest(&[_]types.Root{root_b}, 0, handler, "serving-peer", min_slot_b)).?;
     defer fallback.deinit(allocator);
     try std.testing.expectEqualStrings("fallback-peer", fallback.peer_id);
     try std.testing.expectEqualStrings("fallback-peer", ctx.last_peer.?);
@@ -1047,6 +1048,7 @@ pub const Network = struct {
         depth: u32,
         handler: networks.OnReqRespResponseCbHandler,
         preferred_peer: ?[]const u8,
+        min_slot: ?u64,
     ) !?BlocksByRootRequestResult {
         if (roots.len == 0) return null;
 
@@ -1089,8 +1091,8 @@ pub const Network = struct {
         // returns the backend error and the existing retry paths handle it.
         const peer = if (preferred_peer) |peer_id| blk: {
             if (self.hasPeer(peer_id)) break :blk try self.allocator.dupe(u8, peer_id);
-            break :blk (try self.selectPeer(null)) orelse return error.NoPeersAvailable;
-        } else (try self.selectPeer(null)) orelse return error.NoPeersAvailable;
+            break :blk (try self.selectPeer(min_slot)) orelse return error.NoPeersAvailable;
+        } else (try self.selectPeer(min_slot)) orelse return error.NoPeersAvailable;
         var peer_owned = true;
         errdefer if (peer_owned) self.allocator.free(peer);
 
