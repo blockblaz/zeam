@@ -517,7 +517,10 @@ pub const EthLibp2pV2 = struct {
         // on `self`; `deinit` frees them after the runtime is torn down.
         const cert_pem = try zl.security.libp2p_tls_cert.certDerToPem(self.allocator, gen.cert_der);
         errdefer self.allocator.free(cert_pem);
-        const key_pem = try zl.security.libp2p_tls_cert.ed25519SeedToPem(self.allocator, gen.cert_key_seed);
+        // zig-libp2p v0.1.7 mints an ECDSA-P-256 ephemeral cert key for the
+        // Ed25519 host arm (zquic's vendored TLS lib can't parse Ed25519
+        // PKCS#8 keys), so the matching PEM helper is `ecdsaP256SeedToPem`.
+        const key_pem = try zl.security.libp2p_tls_cert.ecdsaP256SeedToPem(self.allocator, gen.cert_key_seed);
         errdefer self.allocator.free(key_pem);
         self.tls_cert_pem = cert_pem;
         self.tls_key_pem = key_pem;
