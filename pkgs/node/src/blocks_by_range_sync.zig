@@ -67,18 +67,6 @@ pub fn shouldRefreshPeerStatus(
     return .{ .refresh = refresh, .wall_head_lag_slots = wall_head_lag_slots };
 }
 
-/// True when pre-finalization sync should report `peers_materially_ahead` based on
-/// wall-clock head lag alone (early devnets with `finalized_slot = 0`).
-pub fn isWallHeadLagSyncing(
-    our_finalized_slot: types.Slot,
-    max_peer_finalized_slot: types.Slot,
-    wall_head_lag_slots: u64,
-    threshold_slots: u64,
-) bool {
-    if (our_finalized_slot != 0 or max_peer_finalized_slot != 0) return false;
-    return wall_head_lag_slots >= threshold_slots;
-}
-
 /// Rotate a peer batch for rate-limited status refresh.
 pub fn peerBatchWindow(total_peers: usize, cursor: usize, batch_size: usize) struct {
     start: usize,
@@ -476,13 +464,6 @@ test "syncEndDecision fork abort" {
         .has_alternate_peer = true,
     };
     try std.testing.expectEqual(SyncEndAction.abort_fallback, syncEndDecision(input));
-}
-
-test "isWallHeadLagSyncing only applies before finalization" {
-    try std.testing.expect(isWallHeadLagSyncing(0, 0, 4, 4));
-    try std.testing.expect(!isWallHeadLagSyncing(0, 0, 3, 4));
-    try std.testing.expect(!isWallHeadLagSyncing(1, 0, 10, 4));
-    try std.testing.expect(!isWallHeadLagSyncing(0, 1, 10, 4));
 }
 
 test "peerBatchWindow rotates through peers" {

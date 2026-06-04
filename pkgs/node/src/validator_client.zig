@@ -195,41 +195,15 @@ pub const ValidatorClient = struct {
                 self.logger.info("attesting for slot={d} with no peers (self-import only)", .{slot});
             },
             .peers_materially_ahead => |info| {
-                // Pre-finalization cold-start exception: when BOTH our own
-                // finalized slot AND the best peer's finalized slot are 0,
-                // the `peers_materially_ahead` signal is coming from
-                // `isWallHeadLagSyncing` (`blocks_by_range_sync.zig:72`),
-                // which fires as soon as `wall_head_lag >= 4` on a fresh
-                // chain. Refusing to attest in that state is the wrong
-                // response — attestations on the best-current-head are
-                // exactly what fork choice needs to accumulate weight,
-                // reach supermajority, and produce the FIRST justified
-                // checkpoint. Without attestations, finalized_slot stays
-                // 0 forever, the wall-lag check keeps firing, and the
-                // chain never finalises (observed on PR #966 deploy:
-                // head frozen at slot 316 while wall clock at 505+,
-                // 100% of attestation production gated out).
-                //
-                // Once any finalization has happened (ours OR a peer's),
-                // `peers_materially_ahead` is reverting to its proper meaning —
-                // deep-sync, where attesting on an old head would be
-                // wasted weight — so we resume gating.
-                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
-                    self.logger.info(
-                        "peers_materially_ahead but pre-finalization (finalized_slot=0, max_peer_finalized_slot=0): attesting on current head_slot={d} to help reach first justification",
-                        .{info.head_slot},
-                    );
-                } else {
-                    self.chain.logBehindPeersDebug("skipping attestation production", info);
-                    self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
-                        slot,
-                        info.head_slot,
-                        info.finalized_slot,
-                        info.max_peer_finalized_slot,
-                        info.peer_count,
-                    });
-                    return null;
-                }
+                self.chain.logBehindPeersDebug("skipping attestation production", info);
+                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
+                    slot,
+                    info.head_slot,
+                    info.finalized_slot,
+                    info.max_peer_finalized_slot,
+                    info.peer_count,
+                });
+                return null;
             },
         }
 
