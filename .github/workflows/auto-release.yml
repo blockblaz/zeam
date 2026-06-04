@@ -270,7 +270,7 @@ jobs:
       run: |
         if git ls-remote --heads origin shadow | grep -q 'refs/heads/shadow'; then
           echo "🔄 Rebasing shadow onto main..."
-          git checkout shadow
+          git checkout -B shadow origin/shadow
           if git rebase origin/main; then
             git push origin shadow --force-with-lease
             NEW_SHA=$(git rev-parse --short HEAD)
