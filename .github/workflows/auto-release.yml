@@ -241,10 +241,73 @@ jobs:
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.docker_tag }}-amd64 \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.docker_tag }}-arm64
 
-  create-github-release:
-    needs: [ create-tags, build-and-push, create-manifest ]
+  rebase-shadow:
+    needs: create-tags
     runs-on: ubuntu-latest
     if: ${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
+    outputs:
+      shadow_status: ${{ steps.rebase.outputs.shadow_status }}
+      shadow_sha: ${{ steps.rebase.outputs.shadow_sha }}
+      shadow_failed: ${{ steps.rebase.outputs.shadow_failed }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Configure git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Fetch all branches
+      run: git fetch origin
+
+    - name: Rebase shadow onto main and push
+      id: rebase
+      run: |
+        if git ls-remote --heads origin shadow | grep -q 'refs/heads/shadow'; then
+          echo "🔄 Rebasing shadow onto main..."
+          git checkout -B shadow origin/shadow
+          if git rebase origin/main; then
+            if git push origin shadow --force-with-lease; then
+              NEW_SHA=$(git rev-parse --short HEAD)
+              echo "shadow_status=✅ rebased to $NEW_SHA" >> $GITHUB_OUTPUT
+              echo "shadow_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+              echo "shadow_failed=false" >> $GITHUB_OUTPUT
+              echo "✅ Shadow rebase succeeded: $NEW_SHA"
+            else
+              echo "shadow_status=❌ push failed — force-with-lease mismatch" >> $GITHUB_OUTPUT
+              echo "shadow_sha=" >> $GITHUB_OUTPUT
+              echo "shadow_failed=true" >> $GITHUB_OUTPUT
+              echo "❌ Shadow push failed"
+              exit 1
+            fi
+          else
+            git rebase --abort || true
+            echo "shadow_status=❌ rebase conflict — manual fix needed" >> $GITHUB_OUTPUT
+            echo "shadow_sha=" >> $GITHUB_OUTPUT
+            echo "shadow_failed=true" >> $GITHUB_OUTPUT
+            echo "❌ Shadow rebase failed; release will continue after notifying Telegram"
+            exit 1 
+          fi
+        else
+          echo "shadow_status=⚠️ shadow branch not found" >> $GITHUB_OUTPUT
+          echo "shadow_sha=" >> $GITHUB_OUTPUT
+          echo "shadow_failed=false" >> $GITHUB_OUTPUT
+        fi
+
+  create-github-release:
+    needs: [ create-tags, build-and-push, create-manifest, rebase-shadow ]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.create-tags.result == 'success' &&
+      needs.build-and-push.result == 'success' &&
+      needs.create-manifest.result == 'success' &&
+      needs.create-tags.outputs.has_devnet_tag == 'true'
 
     steps:
     - name: Checkout code
@@ -272,7 +335,13 @@ jobs:
       run: |
         DEVNET_TAG="${{ needs.create-tags.outputs.github_tag }}"
         VERSION="${{ needs.create-tags.outputs.version }}"
-        PREVIOUS_TAG=$(git tag -l | grep -iE "^[Dd]evnet[0-9]+" | sort -V -r | grep -v "^$DEVNET_TAG$" | head -1)
+        PREVIOUS_TAG=$(git tag -l \
+          | grep -iE "^[Dd]evnet[0-9]+$" \
+          | awk '{ print tolower($0), $0 }' \
+          | sort -V -r -k1,1 \
+          | awk '{ print $2 }' \
+          | grep -iv "^$DEVNET_TAG$" \
+          | head -1)
 
         if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$DEVNET_TAG" ]; then
           echo "✅ Found previous tag: $PREVIOUS_TAG"
@@ -390,33 +459,38 @@ jobs:
         GITHUB_TAG="${{ needs.create-tags.outputs.github_tag }}"
         VERSION="${{ needs.create-tags.outputs.version }}"
         REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+        REGISTRY="${{ env.REGISTRY }}"
+        IMAGE_NAME="${{ env.IMAGE_NAME }}"
+        SHADOW_STATUS="${{ needs.rebase-shadow.outputs.shadow_status }}"
+        SHADOW_STATUS="${SHADOW_STATUS:-⚠️ skipped}"
 
         MESSAGE="🚀 *Zeam $GITHUB_TAG Release SUCCESS*
 
         *Release Details:*
-        • Version: \`$VERSION\`
-        • Network: \`$GITHUB_TAG\`
+        • Version: `$VERSION`
+        • Network: `$GITHUB_TAG`
         • Repository: [${{ github.repository }}]($REPO_URL)
 
         *🐋 Docker Images Available:*
-        • Multi-arch: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$DOCKER_TAG\`
-        • AMD64: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$DOCKER_TAG-amd64\`
-        • ARM64: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$DOCKER_TAG-arm64\`
+        • Multi-arch: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG`
+        • AMD64: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-amd64`
+        • ARM64: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-arm64`
 
         *🔗 Quick Links:*
         • [GitHub Release]($REPO_URL/releases/tag/$GITHUB_TAG)
 
         *🌿 Deployment:*
-        • Code pushed to \`$(echo "$DOCKER_TAG")\` branch
+        • Code pushed to `$DOCKER_TAG` branch
+        • Shadow branch: $SHADOW_STATUS
 
         _🤖 Automated release notification_"
+
+        PAYLOAD=$(jq -n \
+          --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+          --arg text "$MESSAGE" \
+          '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", disable_web_page_preview: true}')
 
         # Send to Telegram
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -H "Content-Type: application/json" \
-          -d "{
-            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
-            \"text\": \"$MESSAGE\",
-            \"parse_mode\": \"Markdown\",
-            \"disable_web_page_preview\": true
-          }" && echo "📱 Telegram notification sent successfully" || echo "❌ Failed to send Telegram notification"
+          -d "$PAYLOAD" && echo "📱 Telegram notification sent successfully" || echo "❌ Failed to send Telegram notification"
