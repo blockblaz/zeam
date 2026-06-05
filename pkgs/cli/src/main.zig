@@ -436,13 +436,13 @@ fn mainInner(init: std.process.Init) !void {
             }
 
             // Start metrics server (doesn't need chain reference)
-            metrics_server_handle = metrics_server.startMetricsServer(allocator, beamcmd.@"metrics-port", &api_logger_config) catch |err| {
+            metrics_server_handle = metrics_server.startMetricsServer(init.io, allocator, beamcmd.@"metrics-port", &api_logger_config) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start metrics server", .{ .port = beamcmd.@"metrics-port" });
                 return err;
             };
 
             // Start API server early. Pass null for chain - in .beam command mode, chains are created later
-            api_server_handle = api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
+            api_server_handle = api_server.startAPIServer(init.io, allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.@"api-port" });
                 return err;
             };
@@ -683,11 +683,11 @@ fn mainInner(init: std.process.Init) !void {
             defer allocator.free(data_dir_3);
 
             const db_backend = beamcmd.@"db-backend";
-            var db_1 = try database.Db.openBackend(allocator, logger1_config.logger(.database), data_dir_1, db_backend);
+            var db_1 = try database.Db.openBackend(init.io, allocator, logger1_config.logger(.database), data_dir_1, db_backend);
             defer db_1.deinit();
-            var db_2 = try database.Db.openBackend(allocator, logger2_config.logger(.database), data_dir_2, db_backend);
+            var db_2 = try database.Db.openBackend(init.io, allocator, logger2_config.logger(.database), data_dir_2, db_backend);
             defer db_2.deinit();
-            var db_3 = try database.Db.openBackend(allocator, logger3_config.logger(.database), data_dir_3, db_backend);
+            var db_3 = try database.Db.openBackend(init.io, allocator, logger3_config.logger(.database), data_dir_3, db_backend);
             defer db_3.deinit();
 
             // Use the same shared registry for all beam nodes
@@ -920,7 +920,7 @@ fn mainInner(init: std.process.Init) !void {
             };
 
             var lean_node: node.Node = undefined;
-            lean_node.init(allocator, &start_options) catch |err| {
+            lean_node.init(init.io, allocator, &start_options) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize lean node");
                 return err;
             };
