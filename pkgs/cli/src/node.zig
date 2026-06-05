@@ -168,6 +168,7 @@ pub const NodeOptions = struct {
 /// A Node that encapsulates the networking, blockchain, and validator functionalities.
 /// It manages the event loop, network interface, clock, and beam node.
 pub const Node = struct {
+    io: std.Io,
     loop: xev.Loop,
     network: networks.EthLibp2p,
     beam_node: BeamNode,
@@ -261,6 +262,7 @@ pub const Node = struct {
     /// db directory has never been created). Set it to false when wiping a db
     /// that is known to exist (genesis time mismatch case).
     fn wipeAndReopenDb(
+        io: std.Io,
         db: *database.Db,
         allocator: std.mem.Allocator,
         database_path: []const u8,
@@ -270,7 +272,6 @@ pub const Node = struct {
         ignore_not_found: bool,
     ) !void {
         db.deinit();
-        const io = std.Io.Threaded.global_single_threaded.io();
         // Both backends store their working set under the same base
         // directory; deleting it yields a clean slate for either engine.
         const backend_dir = switch (backend) {
@@ -285,14 +286,16 @@ pub const Node = struct {
                 return wipe_err;
             }
         };
-        db.* = try database.Db.openBackend(allocator, logger_config.logger(.database), database_path, backend);
+        db.* = try database.Db.openBackend(io, allocator, logger_config.logger(.database), database_path, backend);
     }
 
     pub fn init(
         self: *Self,
+        io: std.Io,
         allocator: std.mem.Allocator,
         options: *const NodeOptions,
     ) !void {
+        self.io = io;
         self.allocator = allocator;
         self.options = options;
         self.api_server_handle = null;
@@ -301,7 +304,7 @@ pub const Node = struct {
         // If path is specified load from it, otherwise use default settings
         const chain_spec_owned = self.options.chain_spec != null;
         const chain_spec = if (self.options.chain_spec) |path|
-            std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1024 * 1024)) catch |err| {
+            std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| {
                 self.logger.err("failed to load chain spec at '{s}': {any}", .{ path, err });
                 return err;
             }
@@ -387,6 +390,7 @@ pub const Node = struct {
         errdefer self.clock.deinit(allocator);
 
         var db = try database.Db.openBackend(
+            io,
             allocator,
             options.logger_config.logger(.database),
             options.database_path,
@@ -407,7 +411,7 @@ pub const Node = struct {
                     local_finalized_state.config.genesis_time,
                     chain_config.genesis.genesis_time,
                 });
-                try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, options.db_backend, false);
+                try wipeAndReopenDb(io, &db, allocator, options.database_path, options.logger_config, self.logger, options.db_backend, false);
                 self.logger.info("stale database wiped, starting fresh & generating genesis", .{});
 
                 local_finalized_state.deinit();
@@ -418,7 +422,7 @@ pub const Node = struct {
         } else |_| {
             self.logger.info("no finalized state found in db, wiping database for a clean slate", .{});
             // ignore_not_found=true: db dir may not exist yet on a fresh install
-            try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, options.db_backend, true);
+            try wipeAndReopenDb(io, &db, allocator, options.database_path, options.logger_config, self.logger, options.db_backend, true);
             self.logger.info("starting fresh & generating genesis", .{});
             try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
         }
@@ -428,7 +432,7 @@ pub const Node = struct {
             self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
 
             // Try checkpoint sync, fall back to database/genesis on failure
-            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state_const| {
+            if (downloadCheckpointState(io, allocator, checkpoint_url, self.logger)) |downloaded_state_const| {
                 var downloaded_state = downloaded_state_const;
                 // Verify state against genesis config
                 if (verifyCheckpointState(allocator, &downloaded_state, &chain_config.genesis, self.logger)) {
@@ -460,7 +464,7 @@ pub const Node = struct {
                                 self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamBlockHeader) failed: {} — skipping", .{err});
                                 break :anchor_block_fetch;
                             };
-                            downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, anchor_state_root, &db, self.logger);
+                            downloadAndStoreCheckpointBlock(io, allocator, checkpoint_url, anchor_block_root, anchor_state_root, &db, self.logger);
                         }
                     } else {
                         self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
@@ -488,7 +492,7 @@ pub const Node = struct {
         // initialization (like lean_validators_count) are captured on real
         // metrics instead of being discarded by noop metrics.
         if (options.metrics_enable) {
-            try api.init(allocator);
+            try api.init(io, allocator);
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(zeam_utils.unixTimestampSeconds()));
         }
 
@@ -571,7 +575,7 @@ pub const Node = struct {
 
         self.thread_pool = try ThreadPool.init(.{
             .allocator = allocator,
-            .io = std.Io.Threaded.global_single_threaded.io(),
+            .io = io,
             .thread_count = @intCast(worker_count),
         });
         errdefer self.thread_pool.deinit();
@@ -625,6 +629,7 @@ pub const Node = struct {
 
             // Start metrics server (doesn't need chain reference)
             self.metrics_server_handle = try metrics_server.startMetricsServer(
+                io,
                 allocator,
                 options.metrics_port,
                 options.logger_config,
@@ -648,6 +653,7 @@ pub const Node = struct {
 
             // Start API server (pass chain pointer for chain-dependent endpoints)
             self.api_server_handle = try api_server.startAPIServer(
+                io,
                 allocator,
                 options.api_port,
                 options.logger_config,
@@ -1112,13 +1118,13 @@ pub fn buildStartOptions(
 /// Downloads finalized checkpoint state from the given URL and deserializes it
 /// Returns the deserialized state. The caller is responsible for calling deinit on it.
 fn downloadCheckpointState(
+    io: std.Io,
     allocator: std.mem.Allocator,
     url: []const u8,
     logger: zeam_utils.ModuleLogger,
 ) !types.BeamState {
     logger.info("downloading checkpoint state from: {s}", .{url});
 
-    const io = std.Io.Threaded.global_single_threaded.io();
     var client = std.http.Client{
         .allocator = allocator,
         .io = io,
@@ -1254,6 +1260,7 @@ const FINALIZED_BLOCK_PATH = "/lean/v0/blocks/finalized";
 /// anything — a missing anchor block is non-fatal: blocks_by_root will return
 /// empty for this root until the real block arrives via reqresp or gossip.
 fn downloadAndStoreCheckpointBlock(
+    io: std.Io,
     allocator: std.mem.Allocator,
     state_url: []const u8,
     expected_root: types.Root,
@@ -1283,7 +1290,6 @@ fn downloadAndStoreCheckpointBlock(
 
     logger.info("checkpoint block fetch: downloading anchor block from: {s}", .{block_url});
 
-    const io = std.Io.Threaded.global_single_threaded.io();
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 

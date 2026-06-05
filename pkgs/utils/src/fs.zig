@@ -1,10 +1,11 @@
 const std = @import("std");
+const process_io = @import("./process_io.zig");
 
 /// Checks if a directory exists at the given path.
 /// The path can be absolute or relative to the current working directory.
 /// Returns an error if the directory does not exist or cannot be opened.
 pub fn checkDIRExists(path: []const u8) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = process_io.get();
     if (std.fs.path.isAbsolute(path)) {
         const dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
         dir.close(io);
@@ -19,7 +20,7 @@ pub fn checkDIRExists(path: []const u8) !void {
 /// The caller is responsible for freeing the returned byte slice.
 /// `max_bytes` limits the maximum number of bytes to read to prevent excessive memory usage.
 pub fn readFileToEndAlloc(allocator: std.mem.Allocator, file_path: []const u8, max_bytes: usize) ![]u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = process_io.get();
     return std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_bytes));
 }
 

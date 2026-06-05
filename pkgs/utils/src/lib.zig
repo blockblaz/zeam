@@ -59,6 +59,8 @@ const fmt_factory = @import("./fmt.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
 pub const LazyJson = fmt_factory.LazyJson;
 
+pub const process_io = @import("./process_io.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

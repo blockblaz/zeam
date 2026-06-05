@@ -2,9 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const datetime = @import("datetime");
 const time_utils = @import("./time.zig");
+const process_io = @import("./process_io.zig");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return process_io.get();
 }
 
 const Colors = struct {

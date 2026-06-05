@@ -1018,7 +1018,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             }
             if (candidates.items.len == 0) return null;
 
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = zeam_utils.process_io.get();
             var random_source = std.Random.IoSource{ .io = io };
             const random = random_source.interface();
             const pick = random.uintLessThan(usize, candidates.items.len);
@@ -1256,7 +1256,7 @@ test "LockTimer: acquired+released emit zeam_lock_{wait,hold}_seconds in /metric
     // that this test's allocator footprint is not tracked by the
     // testing harness; that footprint is bounded by the histogram
     // bucket we add (single (lock, site) pair) so it is acceptable.
-    try zeam_metrics.init(std.heap.page_allocator);
+    try zeam_metrics.init(std.Io.Threaded.global_single_threaded.io(), std.heap.page_allocator);
 
     var t = LockTimer.start("locktimer_test_lock", "locktimer_test_site");
     t.acquired();
@@ -1673,7 +1673,7 @@ test "lean_chain_state_refcount_distribution: writer + N readers shape (slice c-
     // Test uses page_allocator for the same reason
     // `LockTimer: ... metrics output` does — the histogram bucket
     // backing storage outlives this test.
-    try zeam_metrics.init(std.heap.page_allocator);
+    try zeam_metrics.init(std.Io.Threaded.global_single_threaded.io(), std.heap.page_allocator);
 
     const N: usize = 4;
     var rcs: [N]*rc_beam_state.RcBeamState = undefined;

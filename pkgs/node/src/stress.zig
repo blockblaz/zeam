@@ -572,7 +572,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
     try std.Io.Dir.cwd().createDirPath(io, data_dir);
     defer std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database), data_dir);
+    var db = try database.Db.open(io, allocator, zeam_logger_config.logger(.database), data_dir);
     defer db.deinit();
 
     const connected_peers = try allocator.create(ConnectedPeers);
@@ -1075,7 +1075,7 @@ fn runStressSaturation(allocator: Allocator, cfg: SaturationConfig) !SaturationS
     try std.Io.Dir.cwd().createDirPath(io, data_dir);
     defer std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database), data_dir);
+    var db = try database.Db.open(io, allocator, zeam_logger_config.logger(.database), data_dir);
     defer db.deinit();
 
     const connected_peers = try allocator.create(ConnectedPeers);

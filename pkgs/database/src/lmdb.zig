@@ -45,7 +45,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
 
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
             logger.info("initializing LMDB", .{});
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = zeam_utils.process_io.get();
 
             comptime {
                 if (column_namespaces.len == 0 or !std.mem.eql(u8, column_namespaces[0].namespace, "default")) {

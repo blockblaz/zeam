@@ -462,7 +462,7 @@ fn shouldPersistMalformedDump() bool {
 /// segfaulted when logging it.  The fix: log from inside this function and return
 /// a plain bool; callers no longer touch the filename string at all (#725).
 fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = zeam_utils.process_io.get();
     // Create dumps directory if it doesn't exist
     std.Io.Dir.cwd().createDirPath(io, "deserialization_dumps") catch |e| {
         logger.err("Failed to create deserialization dumps directory: {any}", .{e});
