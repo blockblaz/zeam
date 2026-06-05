@@ -1025,7 +1025,7 @@ test "save and load block" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Create test data using helper functions
@@ -1080,7 +1080,7 @@ test "save and load state" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Create test data using helper functions
@@ -1125,7 +1125,7 @@ test "batch write and commit" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Create test data using helper functions
@@ -1201,7 +1201,7 @@ test "loadLatestFinalizedState" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Empty DB -> no finalized slot metadata

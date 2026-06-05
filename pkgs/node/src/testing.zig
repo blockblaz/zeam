@@ -105,7 +105,7 @@ pub const NodeTestContext = struct {
         const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
         errdefer allocator.free(data_dir);
 
-        var db = try database.Db.open(allocator, logger_config.logger(.database), data_dir);
+        var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, logger_config.logger(.database), data_dir);
         errdefer db.deinit();
 
         const spec_name = try allocator.dupe(u8, opts.spec_name);

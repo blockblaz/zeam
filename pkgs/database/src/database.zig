@@ -56,11 +56,11 @@ pub const Backend = enum {
 /// loud warning. Best-effort: any filesystem error here is suppressed
 /// — it is a diagnostic, not a correctness barrier.
 fn warnIfOtherBackendPopulated(
+    io: std.Io,
     logger: zeam_utils.ModuleLogger,
     path: []const u8,
     selected: Backend,
 ) void {
-    const io = std.Io.Threaded.global_single_threaded.io();
     const other: Backend = switch (selected) {
         .rocksdb => .lmdb,
         .lmdb => .rocksdb,
@@ -107,22 +107,24 @@ pub const Db = union(Backend) {
     /// Open with the default backend (rocksdb). Kept for call sites
     /// that don't care which engine is used (tests, legacy paths).
     pub fn open(
+        io: std.Io,
         allocator: Allocator,
         logger: zeam_utils.ModuleLogger,
         path: []const u8,
     ) !Db {
-        return openBackend(allocator, logger, path, .rocksdb);
+        return openBackend(io, allocator, logger, path, .rocksdb);
     }
 
     /// Open with an explicitly chosen backend. Used by the CLI so
     /// operators can select the engine via `--db-backend`.
     pub fn openBackend(
+        io: std.Io,
         allocator: Allocator,
         logger: zeam_utils.ModuleLogger,
         path: []const u8,
         backend: Backend,
     ) !Db {
-        warnIfOtherBackendPopulated(logger, path, backend);
+        warnIfOtherBackendPopulated(io, logger, path, backend);
         return switch (backend) {
             .rocksdb => Db{ .rocksdb = try RocksDbBackend.open(allocator, logger, path) },
             .lmdb => Db{ .lmdb = try LmdbBackend.open(allocator, logger, path) },
@@ -504,7 +506,7 @@ fn testSaveAndLoadBlock(backend: Backend) !void {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
+    var db = try Db.openBackend(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
 
     const block_root = test_helpers.createDummyRoot(0xAB);
@@ -541,7 +543,7 @@ fn testBatchWriteAndCommit(backend: Backend) !void {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
+    var db = try Db.openBackend(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
 
     const block_root = test_helpers.createDummyRoot(0xAA);
@@ -589,7 +591,7 @@ fn testLoadLatestFinalizedStateHappyPath(backend: Backend) !void {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
+    var db = try Db.openBackend(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
 
     // Empty db -> no finalized slot metadata
