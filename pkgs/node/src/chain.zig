@@ -5630,7 +5630,7 @@ test "process and add mock blocks into a node's chain" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try allocator.create(ConnectedPeers);
@@ -5724,7 +5724,7 @@ test "printSlot output demonstration" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Create empty node registry for test
@@ -5808,7 +5808,7 @@ test "buildTreeVisualization integration test" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -5901,7 +5901,7 @@ test "attestation validation - comprehensive" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try allocator.create(ConnectedPeers);
@@ -6198,7 +6198,7 @@ test "attestation validation - gossip future-slot bound" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try allocator.create(ConnectedPeers);
@@ -6331,7 +6331,7 @@ const FutureSlotTestFixture = struct {
 
         fx.tmp_dir = std.testing.tmpDir(.{});
         const data_dir = try std.fmt.allocPrint(fx.allocator, ".zig-cache/tmp/{s}", .{fx.tmp_dir.sub_path});
-        fx.db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), fx.allocator, fx.zeam_logger_config.logger(.database_test), data_dir);
+        fx.db = try database.Db.open(fx.allocator, fx.zeam_logger_config.logger(.database_test), data_dir);
 
         fx.connected_peers = try fx.allocator.create(ConnectedPeers);
         fx.connected_peers.* = ConnectedPeers.init(fx.allocator);
@@ -6798,7 +6798,7 @@ test "attestation processing - valid block attestation" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try allocator.create(ConnectedPeers);
@@ -6910,7 +6910,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try allocator.create(ConnectedPeers);
@@ -7054,7 +7054,7 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
     const tmp_dir = std.testing.tmpDir(.{});
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
-    const db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, zeam_logger_config.logger(.database_test), data_dir);
+    const db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
 
     const connected_peers = try allocator.create(ConnectedPeers);
     connected_peers.* = ConnectedPeers.init(allocator);
@@ -7771,7 +7771,7 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
     defer tmp_dir.cleanup();
     const data_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try std.testing.allocator.create(ConnectedPeers);
@@ -7967,7 +7967,7 @@ test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)"
     var path_buf: [128]u8 = undefined;
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try std.testing.allocator.create(ConnectedPeers);
@@ -8134,7 +8134,7 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
         var path_buf: [128]u8 = undefined;
         const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
-        var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+        var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
         defer db.deinit();
 
         const connected_peers = try std.testing.allocator.create(ConnectedPeers);
@@ -8293,7 +8293,7 @@ test "chain: concurrent re-import pressure — kept_existing path race + attesta
         defer tmp_dir.cleanup();
         var path_buf: [128]u8 = undefined;
         const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
-        var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+        var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
         defer db.deinit();
 
         const connected_peers = try std.testing.allocator.create(ConnectedPeers);
@@ -8527,7 +8527,7 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
     defer tmp_dir.cleanup();
     var path_buf: [128]u8 = undefined;
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+    var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     const connected_peers = try std.testing.allocator.create(ConnectedPeers);
@@ -8749,7 +8749,6 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
     var db = try database.Db.open(
-        std.Io.Threaded.global_single_threaded.io(),
         std.testing.allocator,
         zeam_logger_config.logger(.database_test),
         data_dir,
@@ -8872,7 +8871,6 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     var path_buf_2: [128]u8 = undefined;
     const data_dir_2 = try std.fmt.bufPrint(&path_buf_2, ".zig-cache/tmp/{s}", .{tmp_dir_2.sub_path});
     var db2 = try database.Db.open(
-        std.Io.Threaded.global_single_threaded.io(),
         std.testing.allocator,
         zeam_logger_config.logger(.database_test),
         data_dir_2,
@@ -9033,7 +9031,6 @@ test "chain-worker: imported_block_fn fires once per successful submitBlock with
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
     var db = try database.Db.open(
-        std.Io.Threaded.global_single_threaded.io(),
         std.testing.allocator,
         zeam_logger_config.logger(.database_test),
         data_dir,
@@ -9149,7 +9146,6 @@ test "chain-worker: rejected_block_fn fires on MissingPreState (TOCTOU race)" {
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
     var db = try database.Db.open(
-        std.Io.Threaded.global_single_threaded.io(),
         std.testing.allocator,
         zeam_logger_config.logger(.database_test),
         data_dir,
@@ -9259,7 +9255,6 @@ test "chain-worker: rejected_block_fn fires on PreFinalizedSlot" {
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
 
     var db = try database.Db.open(
-        std.Io.Threaded.global_single_threaded.io(),
         std.testing.allocator,
         zeam_logger_config.logger(.database_test),
         data_dir,
@@ -9370,7 +9365,6 @@ test "chain.statesGet under chain_worker enabled returns Backing.none + acquired
     var path_buf: [128]u8 = undefined;
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     var db = try database.Db.open(
-        std.Io.Threaded.global_single_threaded.io(),
         std.testing.allocator,
         zeam_logger_config.logger(.database_test),
         data_dir,
@@ -9473,7 +9467,6 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
     var path_buf: [128]u8 = undefined;
     const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     var db = try database.Db.open(
-        std.Io.Threaded.global_single_threaded.io(),
         std.testing.allocator,
         zeam_logger_config.logger(.database_test),
         data_dir,

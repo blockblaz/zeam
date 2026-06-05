@@ -3878,7 +3878,7 @@ test "Node peer tracking on connect/disconnect" {
     const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(std.Io.Threaded.global_single_threaded.io(), allocator, ctx.loggerConfig().logger(.database), data_dir);
+    var db = try database.Db.open(allocator, ctx.loggerConfig().logger(.database), data_dir);
     defer db.deinit();
 
     const spec_name = try allocator.dupe(u8, "zeamdev");

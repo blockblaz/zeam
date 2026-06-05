@@ -44,7 +44,7 @@ const StartupStatus = enum(u8) {
 /// chain is optional - if null, chain-dependent endpoints will return 503
 /// (API server starts before chain initialization, so chain may not be available yet)
 /// Note: Metrics are served by the separate metrics_server on a different port
-pub fn startAPIServer(io: std.Io, allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !*ApiServer {
+pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !*ApiServer {
     // Initialize the global event broadcaster for SSE events
     // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
     try event_broadcaster.initGlobalBroadcaster(allocator);
@@ -60,7 +60,6 @@ pub fn startAPIServer(io: std.Io, allocator: std.mem.Allocator, port: u16, logge
         return err;
     };
     ctx.* = .{
-        .io = io,
         .allocator = allocator,
         .port = port,
         .logger = logger,
@@ -246,7 +245,6 @@ fn routeConnection(io: std.Io, connection: net.Stream, allocator: std.mem.Alloca
 
 /// API server context
 pub const ApiServer = struct {
-    io: std.Io,
     allocator: std.mem.Allocator,
     port: u16,
     logger: ModuleLogger,
@@ -286,7 +284,7 @@ pub const ApiServer = struct {
     }
 
     fn run(self: *Self) void {
-        const io = self.io;
+        const io = std.Io.Threaded.global_single_threaded.io();
         const address = net.IpAddress.parseIp4("0.0.0.0", self.port) catch |err| {
             self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
             self.startup_status.store(.failed, .release);
@@ -623,7 +621,7 @@ pub const ApiServer = struct {
 
     /// Handle SSE events endpoint
     fn handleSSEEvents(self: *Self, stream: net.Stream) !void {
-        const io = self.io;
+        const io = std.Io.Threaded.global_single_threaded.io();
         var registered = false;
         errdefer if (!registered) stream.close(io);
         // Set SSE headers manually by writing HTTP response

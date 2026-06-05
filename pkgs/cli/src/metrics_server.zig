@@ -12,7 +12,6 @@ const STARTUP_POLL_NS: u64 = 1 * std.time.ns_per_ms;
 /// This is a lightweight server separate from the main API server.
 /// It has no rate limiting, SSE support, or chain dependency.
 pub fn startMetricsServer(
-    io: std.Io,
     allocator: std.mem.Allocator,
     port: u16,
     logger_config: *LoggerConfig,
@@ -21,7 +20,6 @@ pub fn startMetricsServer(
 
     const ctx = try allocator.create(MetricsServer);
     ctx.* = .{
-        .io = io,
         .allocator = allocator,
         .port = port,
         .logger = logger,
@@ -60,7 +58,6 @@ const StartupStatus = enum(u8) {
 
 /// Metrics server context
 pub const MetricsServer = struct {
-    io: std.Io,
     allocator: std.mem.Allocator,
     port: u16,
     logger: ModuleLogger,
@@ -79,7 +76,7 @@ pub const MetricsServer = struct {
     }
 
     fn run(self: *Self) void {
-        const io = self.io;
+        const io = std.Io.Threaded.global_single_threaded.io();
         const address = net.IpAddress.parseIp4("0.0.0.0", self.port) catch |err| {
             self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
             self.startup_status.store(.failed, .release);
