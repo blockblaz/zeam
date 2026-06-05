@@ -35,7 +35,6 @@ const LockTimer = locking.LockTimer;
 const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
-const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 const invalid_block_cache = @import("./invalid_block_cache.zig");
 const InvalidBlockSet = invalid_block_cache.InvalidBlockSet;
 
@@ -4935,30 +4934,16 @@ pub const BeamChain = struct {
                 self.logger.info("aggregating for slot={d} with no peers (local only)", .{slot});
             },
             .peers_materially_ahead => |info| {
-                // Same pre-finalization cold-start exception as
-                // validator_client.mayBeDoAttestation (see its long
-                // comment). Aggregation MUST proceed when both finalized
-                // slots are 0, otherwise we never produce the first
-                // aggregated payload and the chain can't reach a first
-                // justification. Once any finalization exists the gate
-                // returns to its proper deep-sync meaning.
-                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
-                    self.logger.info(
-                        "peers_materially_ahead but pre-finalization (finalized_slot=0, max_peer_finalized_slot=0): aggregating for slot={d} on current head_slot={d} to help reach first justification",
-                        .{ slot, info.head_slot },
-                    );
-                } else {
-                    self.logBehindPeersDebug("skipping aggregation production", info);
-                    self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
-                        slot,
-                        info.head_slot,
-                        info.finalized_slot,
-                        info.max_peer_finalized_slot,
-                        info.peer_count,
-                    });
-                    zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
-                    return;
-                }
+                self.logBehindPeersDebug("skipping aggregation production", info);
+                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d}, behind_peer_count={d})", .{
+                    slot,
+                    info.head_slot,
+                    info.finalized_slot,
+                    info.max_peer_finalized_slot,
+                    info.peer_count,
+                });
+                zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
+                return;
             },
         }
 
@@ -5482,9 +5467,8 @@ pub const BeamChain = struct {
         const our_head_slot = self.forkChoice.getHead().slot;
         const our_finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
-        // Find the maximum finalized AND head slot reported by any peer.
+        // Find the maximum finalized slot reported by any peer.
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
-        var max_peer_head_slot: types.Slot = our_head_slot;
 
         {
             var peer_guard = self.connected_peers.iterateLocked();
@@ -5496,27 +5480,31 @@ pub const BeamChain = struct {
                     if (status.finalized_slot > max_peer_finalized_slot) {
                         max_peer_finalized_slot = status.finalized_slot;
                     }
-                    if (status.head_slot > max_peer_head_slot) {
-                        max_peer_head_slot = status.head_slot;
-                    }
                 }
             }
         }
 
-        // `peers_materially_ahead` is the "deep sync" state. It must
-        // only fire on a finalization gap; a 1-slot head delta is normal
-        // gossip latency, not deep sync, and `peers_materially_ahead` consumers
-        // (`validator_client.maybeDoProposal` / `mayBeDoAttestation`) skip
-        // proposer/attestation duties — gating those on transient head
-        // lag would silently disable validators near the head.
+        // `peers_materially_ahead` maps to leanSpec **SYNCING** ("deep sync"). It must
+        // ONLY fire on a real peer finalization gap. A pre-finalization
+        // wall-clock head lag (every node at finalized_slot=0 on a fresh
+        // devnet) is NOT deep sync — no peer is actually ahead, the
+        // chain just hasn't started yet, and reporting
+        // `peers_materially_ahead` would deadlock proposer / attester /
+        // aggregator paths (they all skip their duties on that signal,
+        // so no block is ever produced and finalization never advances).
+        //
+        // Wall-lag status-driven catch-up is still handled outside this
+        // state: `blocks_by_range_sync.shouldRefreshPeerStatus`'s
+        // `.synced` arm refreshes peer statuses whenever wall-lag
+        // exceeds the threshold, so peer head discovery still happens
+        // without flipping the high-level sync state.
         //
         // Status-driven catch-up for the head-only-gap case is handled
-        // outside this state: the `.synced` arm of `handleReqRespResponse`
-        // calls `shouldCatchUpFromPeerStatus` directly so a peer that
-        // reports a higher head triggers catch-up without changing the
-        // node's high-level sync state.
+        // similarly: the `.synced` arm of `handleReqRespResponse` calls
+        // `shouldCatchUpFromPeerStatus` directly so a peer that reports
+        // a higher head triggers catch-up without a state transition.
 
-        // Check 1/2: our head or finalization is behind peer finalization.
+        // Our head or finalization is behind peer finalization.
         // Include the exact peers whose finalized slots make this node report
         // `peers_materially_ahead`, so logs can name the source of the decision.
         const behind_peer_finalization = our_head_slot < max_peer_finalized_slot or our_finalized_slot < max_peer_finalized_slot;
@@ -5534,26 +5522,6 @@ pub const BeamChain = struct {
                 }
             }
             return info;
-        }
-
-        // Check 3: pre-finalization networks — wall-clock head lag means we are
-        // not at chain tip even though finalization gaps are zero.
-        //
-        // BUT only if a peer is actually ahead of our head — i.e. there is someone to sync FROM.
-        // In a uniformly-slow network (e.g. the prod XMSS scheme, where each block's Type-2 merge
-        // can exceed an interval), every node's head lags the wall clock equally while all agree on
-        // the tip. Tripping behind_peers there disables propose+aggregate on ALL nodes with no peer
-        // to catch up from — a pre-finalization deadlock that prevents the first finalization from
-        // ever happening. If no peer reports a higher head, we are the tip: stay synced and keep
-        // producing/aggregating so the chain can progress and finalize.
-        const wall_lag = self.wall_head_lag_slots.load(.monotonic);
-        if (max_peer_head_slot > our_head_slot and blocks_by_range_sync.isWallHeadLagSyncing(
-            our_finalized_slot,
-            max_peer_finalized_slot,
-            wall_lag,
-            constants.SYNC_STATUS_WALL_HEAD_LAG_THRESHOLD_SLOTS,
-        )) {
-            return self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
         }
 
         return .synced;
