@@ -6903,7 +6903,7 @@ test "enqueuePendingBlock #788: dedup uses cached root, not re-hash" {
 test "#788 metrics: queue + drop counters appear in /metrics output" {
     if (zeam_metrics.isZKVM()) return;
 
-    try zeam_metrics.init(std.heap.page_allocator);
+    try zeam_metrics.init(std.Io.Threaded.global_single_threaded.io(), std.heap.page_allocator);
 
     // Set / bump every label so the scrape body contains a sample
     // line for each. The `catch {}` mirrors production usage —

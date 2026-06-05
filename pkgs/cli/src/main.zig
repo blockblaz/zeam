@@ -412,7 +412,7 @@ fn mainInner(init: std.process.Init) !void {
             std.log.info("Successfully proved and verified all transitions", .{});
         },
         .beam => |beamcmd| {
-            api.init(allocator) catch |err| {
+            api.init(init.io, allocator) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize API");
                 return err;
             };
