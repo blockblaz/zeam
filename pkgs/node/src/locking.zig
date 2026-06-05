@@ -1018,7 +1018,12 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
                 try candidates.append(allocator, entry.value_ptr.peer_id);
             }
 
-            if (candidates.items.len == 0) return null;
+            if (candidates.items.len == 0) {
+                if (min_slot != null) {
+                    zeam_metrics.metrics.zeam_select_peer_no_match_total.incr();
+                }
+                return null;
+            }
 
             const io = std.Io.Threaded.global_single_threaded.io();
             var random_source = std.Random.IoSource{ .io = io };
