@@ -1690,7 +1690,7 @@ test "ChainWorker: metrics — sendBlock/sendAttestation/runLoop bump lean_chain
     // mirroring the LockTimer test pattern. Uses page_allocator for
     // the metrics init so the (process-global) hashmap survives test
     // teardown — see locking.zig comment on the same trap.
-    try zeam_metrics.init(std.Io.Threaded.global_single_threaded.io(), std.heap.page_allocator);
+    try zeam_metrics.init(std.heap.page_allocator);
 
     var logger_config = zeam_utils.getTestLoggerConfig();
     var w = try ChainWorker.init(testing.allocator, .{

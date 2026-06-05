@@ -8,8 +8,8 @@ pub const MetricsError = error{
 };
 
 /// Initializes the metrics system. Must be called once at startup.
-pub fn init(io: std.Io, allocator: std.mem.Allocator) !void {
-    try zeam_metrics.init(io, allocator);
+pub fn init(allocator: std.mem.Allocator) !void {
+    try zeam_metrics.init(allocator);
 }
 
 /// Writes metrics to a writer (for Prometheus endpoint).

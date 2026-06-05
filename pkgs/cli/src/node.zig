@@ -428,7 +428,7 @@ pub const Node = struct {
             self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
 
             // Try checkpoint sync, fall back to database/genesis on failure
-            if (downloadCheckpointState(io, allocator, checkpoint_url, self.logger)) |downloaded_state_const| {
+            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state_const| {
                 var downloaded_state = downloaded_state_const;
                 // Verify state against genesis config
                 if (verifyCheckpointState(allocator, &downloaded_state, &chain_config.genesis, self.logger)) {
@@ -460,7 +460,7 @@ pub const Node = struct {
                                 self.logger.warn("checkpoint block fetch: hashTreeRoot(BeamBlockHeader) failed: {} — skipping", .{err});
                                 break :anchor_block_fetch;
                             };
-                            downloadAndStoreCheckpointBlock(io, allocator, checkpoint_url, anchor_block_root, anchor_state_root, &db, self.logger);
+                            downloadAndStoreCheckpointBlock(allocator, checkpoint_url, anchor_block_root, anchor_state_root, &db, self.logger);
                         }
                     } else {
                         self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
@@ -488,7 +488,7 @@ pub const Node = struct {
         // initialization (like lean_validators_count) are captured on real
         // metrics instead of being discarded by noop metrics.
         if (options.metrics_enable) {
-            try api.init(io, allocator);
+            try api.init(allocator);
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(zeam_utils.unixTimestampSeconds()));
         }
 
@@ -1114,13 +1114,13 @@ pub fn buildStartOptions(
 /// Downloads finalized checkpoint state from the given URL and deserializes it
 /// Returns the deserialized state. The caller is responsible for calling deinit on it.
 fn downloadCheckpointState(
-    io: std.Io,
     allocator: std.mem.Allocator,
     url: []const u8,
     logger: zeam_utils.ModuleLogger,
 ) !types.BeamState {
     logger.info("downloading checkpoint state from: {s}", .{url});
 
+    const io = std.Io.Threaded.global_single_threaded.io();
     var client = std.http.Client{
         .allocator = allocator,
         .io = io,
@@ -1256,7 +1256,6 @@ const FINALIZED_BLOCK_PATH = "/lean/v0/blocks/finalized";
 /// anything — a missing anchor block is non-fatal: blocks_by_root will return
 /// empty for this root until the real block arrives via reqresp or gossip.
 fn downloadAndStoreCheckpointBlock(
-    io: std.Io,
     allocator: std.mem.Allocator,
     state_url: []const u8,
     expected_root: types.Root,
@@ -1286,6 +1285,7 @@ fn downloadAndStoreCheckpointBlock(
 
     logger.info("checkpoint block fetch: downloading anchor block from: {s}", .{block_url});
 
+    const io = std.Io.Threaded.global_single_threaded.io();
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
