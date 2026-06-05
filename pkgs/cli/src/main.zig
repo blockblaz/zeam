@@ -301,6 +301,11 @@ pub fn main(init: std.process.Init) void {
 }
 
 fn mainInner(init: std.process.Init) !void {
+    // Install the process-wide blocking Io before any logging or thread spawning,
+    // so zeam's leaf blocking primitives use the real process Io rather than
+    // std's debug-only global single-threaded instance.
+    utils_lib.process_io.install(init.io);
+
     var gpa = std.heap.DebugAllocator(.{}).init;
     const allocator = gpa.allocator();
     defer {

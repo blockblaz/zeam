@@ -1018,7 +1018,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             }
             if (candidates.items.len == 0) return null;
 
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = zeam_utils.process_io.get();
             var random_source = std.Random.IoSource{ .io = io };
             const random = random_source.interface();
             const pick = random.uintLessThan(usize, candidates.items.len);

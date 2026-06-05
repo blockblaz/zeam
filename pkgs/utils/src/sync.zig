@@ -1,7 +1,8 @@
 const std = @import("std");
+const process_io = @import("./process_io.zig");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return process_io.get();
 }
 
 pub const Mutex = struct {

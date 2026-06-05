@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const process_io = @import("./process_io.zig");
 
 pub fn unixTimestampSeconds() i64 {
     if (builtin.target.os.tag == .freestanding) return 0;
@@ -21,7 +22,7 @@ pub fn unixTimestampMillis() i64 {
 pub fn sleepNs(ns: u64) void {
     if (builtin.target.os.tag == .freestanding) return;
 
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = process_io.get();
     std.Io.sleep(io, .{ .nanoseconds = ns }, .awake) catch {};
 }
 

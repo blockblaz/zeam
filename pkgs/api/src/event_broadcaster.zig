@@ -10,7 +10,7 @@ const Checkpoint = types.Checkpoint;
 const Mutex = zeam_utils.SyncMutex;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return zeam_utils.process_io.get();
 }
 
 /// Maximum size of the SSE send buffer in event_broadcaster.zig. Serialized events

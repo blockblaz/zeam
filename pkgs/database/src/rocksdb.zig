@@ -30,7 +30,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             const owned_path = try std.fmt.allocPrintSentinel(allocator, "{s}/rocksdb", .{path}, 0);
             errdefer allocator.free(owned_path);
 
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = zeam_utils.process_io.get();
             try std.Io.Dir.cwd().createDirPath(io, owned_path);
 
             // Ideally this should be configurable via cli args

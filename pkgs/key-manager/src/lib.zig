@@ -268,7 +268,7 @@ pub const MAX_SK_SIZE = 1024 * 1024 * 20;
 pub const MAX_PK_SIZE = 256;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return zeam_utils.process_io.get();
 }
 
 fn readFileAllocAtPath(allocator: Allocator, path: []const u8, max_size: usize) ![]u8 {
