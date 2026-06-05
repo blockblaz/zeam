@@ -61,8 +61,8 @@
             .hash = "thread_pool-0.1.0-m6B8f9j4AAAWx5c9ytLrH_NlntTMxSg049v76xVsgoSw",
         },
         .zig_libp2p = .{
-            .url = "git+https://github.com/ch4r10t33r/zig-libp2p.git?ref=bump/zquic-batch-fix#bd46537a4f34cf751b0cd9807d892119d0b0e26c",
-            .hash = "zig_libp2p-0.1.8-lil2hNRXEwAexRWbVcqHm8V-wclWALl2uPNbfGMZQwxA",
+            .url = "git+https://github.com/ch4r10t33r/zig-libp2p.git?ref=bump/zquic-rawapp-retransmit#b6c9af2ed382254978ec1010ff26132eaade4859",
+            .hash = "zig_libp2p-0.1.8-lil2hN1XEwAgYwAuxgmkFSZbbRVFKJhsMVACt0nosZ5V",
         },
     },
     .paths = .{""},
