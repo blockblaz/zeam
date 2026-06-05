@@ -102,7 +102,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     // Genesis is the anchor block and is not signature-verified, so it carries an empty proof.
     const gen_signed_block = types.SignedBlock{
         .block = genesis_block,
-        .proof = try xmss.ByteList512KiB.init(allocator),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
 
     try blockList.append(allocator, gen_signed_block);
@@ -334,7 +334,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         // Merge the per-attestation Type-1 proofs + the proposer singleton into the single Type-2
         // block proof carried by SignedBlock.proof.
-        var proof_bytes = try xmss.ByteList512KiB.init(allocator);
+        var proof_bytes = try types.MultiMessageAggregate.init(allocator);
         errdefer proof_bytes.deinit();
         try types.buildType2BlockProof(
             allocator,

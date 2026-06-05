@@ -2869,7 +2869,7 @@ pub const BeamChain = struct {
         self: *Self,
         produced: *const ProducedBlock,
         proposer_sig: *const types.SIGBYTES,
-        out_proof: *xmss.ByteList512KiB,
+        out_proof: *types.MultiMessageAggregate,
     ) !void {
         var borrow = self.statesGet(produced.blockRoot) orelse return BlockProductionError.MissingPreState;
         defer borrow.assertReleasedOrPanic();
@@ -3912,7 +3912,7 @@ pub const BeamChain = struct {
                     &post_state.validators,
                     &block.body.attestations,
                     @intCast(block.proposer_index),
-                    signedBlock.proof.constSlice(),
+                    signedBlock.proof.proof.constSlice(),
                     split_mask,
                     &recovered_list,
                 );
@@ -5153,7 +5153,7 @@ pub const BeamChain = struct {
             return;
         };
 
-        var proof = xmss.ByteList512KiB.init(chain.allocator) catch return;
+        var proof = types.MultiMessageAggregate.init(chain.allocator) catch return;
         var proof_owned = true;
         defer if (proof_owned) proof.deinit();
         chain.buildBlockProof(&produced_block, &proposer_signature, &proof) catch |e| {

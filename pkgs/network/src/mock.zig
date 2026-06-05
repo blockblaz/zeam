@@ -906,7 +906,7 @@ fn initTestBlockMessage(allocator: Allocator, slot: types.Slot) !interface.Gossi
                 .attestations = attestations,
             },
         },
-        .proof = try types.ByteList512KiB.init(allocator),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     } };
 }
 
@@ -1424,7 +1424,7 @@ fn buildSyntheticBlock(allocator: Allocator, slot: u64, parent_seed: u8) !types.
 
     return types.SignedBlock{
         .block = block,
-        .proof = try types.ByteList512KiB.init(allocator),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
 }
 

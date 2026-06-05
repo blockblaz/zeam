@@ -21,7 +21,7 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
 
     return types.SignedBlock{
         .block = test_block,
-        .proof = proof,
+        .proof = .{ .proof = proof },
     };
 }
 

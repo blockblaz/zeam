@@ -2096,7 +2096,7 @@ fn makeFixtureSignedBlockPtr(
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .proof = try types.ByteList512KiB.init(allocator),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
     return block_ptr;
 }

@@ -1059,7 +1059,7 @@ test "save and load block" {
     try std.testing.expect(loaded.body.attestations.len() == 0);
 
     // Verify attestation signatures count matches
-    try std.testing.expect(loaded_block.?.proof.len() == signed_block.proof.len());
+    try std.testing.expect(loaded_block.?.proof.proof.len() == signed_block.proof.proof.len());
 
     // Test loading a non-existent block
     const non_existent_root = test_helpers.createDummyRoot(0xFF);
@@ -1174,7 +1174,7 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.state_root, &signed_block.block.state_root));
 
     // Verify attestation signatures count matches
-    try std.testing.expect(loaded_block.?.proof.len() == signed_block.proof.len());
+    try std.testing.expect(loaded_block.?.proof.proof.len() == signed_block.proof.proof.len());
 
     // Verify state was saved and can be loaded
     const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);

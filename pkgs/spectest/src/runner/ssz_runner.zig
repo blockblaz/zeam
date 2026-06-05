@@ -187,8 +187,8 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "ByteListMiB", .zig_type = ByteListMiB, .has_deinit = true },
     .{ .name = "ByteList512KiB", .zig_type = ByteList512KiB, .has_deinit = true },
     // XMSS aggregation containers — exercised by ssz test_xmss_containers fixtures.
-    .{ .name = "TypeOneMultiSignature", .zig_type = types.TypeOneMultiSignature, .has_deinit = true },
-    .{ .name = "TypeTwoMultiSignature", .zig_type = types.TypeTwoMultiSignature, .has_deinit = true },
+    .{ .name = "SingleMessageAggregate", .zig_type = types.SingleMessageAggregate, .has_deinit = true },
+    .{ .name = "MultiMessageAggregate", .zig_type = types.MultiMessageAggregate, .has_deinit = true },
     // Merkleization-boundary fixtures.
     .{ .name = "BoundaryBitvector1", .zig_type = BoundaryBitvector1, .has_deinit = false },
     .{ .name = "BoundaryBitvector7", .zig_type = BoundaryBitvector7, .has_deinit = false },

@@ -1,6 +1,5 @@
 const std = @import("std");
 const json = std.json;
-const ssz = @import("ssz");
 const types = @import("@zeam/types");
 
 const params = @import("@zeam/params");
@@ -166,16 +165,10 @@ pub fn verifySignatures(
     }
     messages[attestations.len] = .{ .hash = block_root, .slot = @intCast(block.slot) };
 
-    // SSZ-decode the Type-2 container (the on-wire form of SignedBlock.proof); the FFI consumes
-    // the inner raw wire. A malformed blob is a structural rejection.
-    var container: types.TypeTwoMultiSignature = undefined;
-    ssz.deserialize(types.TypeTwoMultiSignature, signed_block.proof.constSlice(), &container, allocator) catch {
-        return StateTransitionError.InvalidBlockSignatures;
-    };
-    defer container.deinit();
-
+    // SignedBlock.proof IS the Type-2 container now (SSZ decoded it once at the SignedBlock
+    // boundary); verify directly against it. The FFI consumes the inner raw wire.
     const verify_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
-    container.verify(pks_per_message, messages) catch {
+    signed_block.proof.verify(pks_per_message, messages) catch {
         _ = verify_timer.observe();
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
         return StateTransitionError.InvalidBlockSignatures;

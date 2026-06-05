@@ -21,7 +21,7 @@ const Attestation = attestation.Attestation;
 // A proposer assembles one Type-1 proof per body attestation (produced by the parallel
 // per-att_data aggregation), then merges them with the proposer's own Type-1 into the single
 // Type-2 SignedBlock.proof. This list is the intermediate per-attestation Type-1 collection.
-pub const Type1ProofList = ssz.utils.List(aggregation.TypeOneMultiSignature, params.VALIDATOR_REGISTRY_LIMIT);
+pub const Type1ProofList = ssz.utils.List(aggregation.SingleMessageAggregate, params.VALIDATOR_REGISTRY_LIMIT);
 pub const ByteList512KiB = xmss.ByteList512KiB;
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
@@ -435,9 +435,10 @@ pub const BeamBlock = struct {
 
 pub const SignedBlock = struct {
     block: BeamBlock,
-    // The single merged Type-2 proof over all attestation Type-1s + the proposer's Type-1,
-    // SSZ-encoded into this byte list (replaces the older per-block BlockSignatures).
-    proof: xmss.ByteList512KiB,
+    // The single merged Type-2 proof over all attestation Type-1s + the proposer's Type-1.
+    // The `MultiMessageAggregate` container is the field itself, so SSZ (de)serialization of
+    // SignedBlock handles the proof's wire form once at this boundary (mirrors leanSpec #799).
+    proof: aggregation.MultiMessageAggregate,
 
     pub fn deinit(self: *SignedBlock) void {
         self.block.deinit();
@@ -447,7 +448,7 @@ pub const SignedBlock = struct {
     pub fn toJson(self: *const SignedBlock, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.empty;
         try obj.put(allocator, "block", try self.block.toJson(allocator));
-        const proof_hex = try utils.BytesToHex(allocator, self.proof.constSlice());
+        const proof_hex = try utils.BytesToHex(allocator, self.proof.proof.constSlice());
         try obj.put(allocator, "proof", json.Value{ .string = proof_hex });
         return json.Value{ .object = obj };
     }
@@ -463,20 +464,21 @@ pub const SignedBlock = struct {
 ///
 /// Inputs: one per-attestation Type-1 proof per body attestation (in body order, produced by the
 /// parallel per-att_data aggregation), plus the proposer's raw signature over the block root. We
-/// derive the proposer's singleton Type-1, then merge attestations-then-proposer into one Type-2
-/// and SSZ-encode it into `out_proof`.
+/// derive the proposer's singleton Type-1, then merge attestations-then-proposer into one Type-2,
+/// writing the merged Type-2 into `out_proof` (the `MultiMessageAggregate` container that IS
+/// `SignedBlock.proof`).
 ///
 /// `attestation_type1s` must be parallel with `agg_attestations` (same length, same order).
 pub fn buildType2BlockProof(
     allocator: Allocator,
     validators: *const Validators,
     agg_attestations: *const AggregatedAttestations,
-    attestation_type1s: []const aggregation.TypeOneMultiSignature,
+    attestation_type1s: []const aggregation.SingleMessageAggregate,
     proposer_index: usize,
     block_root: *const [32]u8,
     slot: u64,
     proposer_sig_bytes: *const SIGBYTES,
-    out_proof: *xmss.ByteList512KiB,
+    out_proof: *aggregation.MultiMessageAggregate,
 ) !void {
     const atts = agg_attestations.constSlice();
     if (atts.len != attestation_type1s.len) return error.AggregationInvalidInput;
@@ -529,14 +531,14 @@ pub fn buildType2BlockProof(
     defer proposer_participants.deinit();
     try attestation.aggregationBitsSet(&proposer_participants, proposer_index, true);
 
-    var proposer_t1 = try aggregation.TypeOneMultiSignature.init(allocator);
+    var proposer_t1 = try aggregation.SingleMessageAggregate.init(allocator);
     defer proposer_t1.deinit();
     {
         var raw_pks = [_]*const xmss.HashSigPublicKey{proposer_pk.handle};
         var raw_sigs = [_]*const xmss.HashSigSignature{proposer_sig.handle};
-        const no_children: []const aggregation.TypeOneMultiSignature = &.{};
+        const no_children: []const aggregation.SingleMessageAggregate = &.{};
         const no_child_pks: []const []*const xmss.HashSigPublicKey = &.{};
-        try aggregation.TypeOneMultiSignature.aggregate(
+        try aggregation.SingleMessageAggregate.aggregate(
             allocator,
             proposer_participants,
             no_children,
@@ -550,21 +552,15 @@ pub fn buildType2BlockProof(
     }
 
     // parts = attestation_type1s ++ [proposer_t1]
-    const parts = try allocator.alloc(aggregation.TypeOneMultiSignature, atts.len + 1);
+    const parts = try allocator.alloc(aggregation.SingleMessageAggregate, atts.len + 1);
     defer allocator.free(parts);
     for (attestation_type1s, 0..) |t1, i| parts[i] = t1;
     parts[atts.len] = proposer_t1;
 
-    // Merge into Type-2.
-    var t2 = try aggregation.TypeTwoMultiSignature.init(allocator);
-    defer t2.deinit();
-    try aggregation.TypeTwoMultiSignature.aggregate(allocator, parts, pks_per_part, &t2);
-
-    // SSZ-encode the Type-2 container into out_proof (the on-wire form of SignedBlock.proof).
-    var encoded: std.ArrayList(u8) = .empty;
-    defer encoded.deinit(allocator);
-    try ssz.serialize(aggregation.TypeTwoMultiSignature, t2, &encoded, allocator);
-    for (encoded.items) |b| try out_proof.append(b);
+    // Merge into the Type-2 container that IS SignedBlock.proof. The FFI writes the merged raw
+    // wire into out_proof.proof; the container itself is the field now, so there is no separate
+    // SSZ-encode step — SSZ (de)serialization happens once at the SignedBlock boundary.
+    try aggregation.MultiMessageAggregate.aggregate(allocator, parts, pks_per_part, out_proof);
 }
 
 /// Inverse of `buildType2BlockProof`: split the single
@@ -590,8 +586,8 @@ pub fn deconstructType2BlockProof(
 ) !void {
     const atts = agg_attestations.constSlice();
 
-    var t2: aggregation.TypeTwoMultiSignature = undefined;
-    try ssz.deserialize(aggregation.TypeTwoMultiSignature, proof_bytes, &t2, allocator);
+    var t2: aggregation.MultiMessageAggregate = undefined;
+    try ssz.deserialize(aggregation.MultiMessageAggregate, proof_bytes, &t2, allocator);
     defer t2.deinit();
 
     // Reconstruct the exact per-component pubkey layout the Type-2 was built with: each body
@@ -644,7 +640,7 @@ pub fn deconstructType2BlockProof(
         var message_hash: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(attestation.AttestationData, agg_att.data, &message_hash, allocator);
 
-        var recovered = try aggregation.TypeOneMultiSignature.init(allocator);
+        var recovered = try aggregation.SingleMessageAggregate.init(allocator);
         errdefer recovered.deinit();
         try t2.splitByMessage(pks_per_part, &message_hash, &recovered);
 
@@ -2096,7 +2092,7 @@ test "ssz seralize/deserialize signed beam block" {
             .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
             .body = .{ .attestations = attestations },
         },
-        .proof = try xmss.ByteList512KiB.init(std.testing.allocator),
+        .proof = try aggregation.MultiMessageAggregate.init(std.testing.allocator),
     };
     defer signed_block.deinit();
 
@@ -2151,7 +2147,7 @@ test "encode decode signed block roundtrip" {
             .state_root = ZERO_HASH,
             .body = .{ .attestations = attestations },
         },
-        .proof = try xmss.ByteList512KiB.init(std.testing.allocator),
+        .proof = try aggregation.MultiMessageAggregate.init(std.testing.allocator),
     };
     defer signed_block.deinit();
 
@@ -2167,15 +2163,15 @@ test "encode decode signed block roundtrip" {
     try std.testing.expect(decoded.block.proposer_index == signed_block.block.proposer_index);
     try std.testing.expect(std.mem.eql(u8, &decoded.block.parent_root, &signed_block.block.parent_root));
     try std.testing.expect(std.mem.eql(u8, &decoded.block.state_root, &signed_block.block.state_root));
-    try std.testing.expect(decoded.proof.len() == signed_block.proof.len());
+    try std.testing.expect(decoded.proof.proof.len() == signed_block.proof.proof.len());
 }
 
 test "encode decode signed block with non-empty proof" {
     var attestations = try AggregatedAttestations.init(std.testing.allocator);
     errdefer attestations.deinit();
 
-    // SignedBlock.proof is the opaque SSZ-encoded Type-2 proof blob. Round-trip a
-    // non-empty payload and assert it survives byte-for-byte.
+    // SignedBlock.proof is the MultiMessageAggregate container; its inner `proof` byte list holds
+    // the opaque Type-2 wire. Round-trip a non-empty payload and assert it survives byte-for-byte.
     var proof = try xmss.ByteList512KiB.init(std.testing.allocator);
     errdefer proof.deinit();
     const proof_payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
@@ -2189,7 +2185,7 @@ test "encode decode signed block with non-empty proof" {
             .state_root = ZERO_HASH,
             .body = .{ .attestations = attestations },
         },
-        .proof = proof,
+        .proof = .{ .proof = proof },
     };
     defer signed_block.deinit();
 
@@ -2202,8 +2198,8 @@ test "encode decode signed block with non-empty proof" {
     defer decoded.deinit();
 
     try std.testing.expect(decoded.block.slot == signed_block.block.slot);
-    try std.testing.expect(decoded.proof.len() == proof_payload.len);
-    try std.testing.expect(std.mem.eql(u8, decoded.proof.constSlice(), &proof_payload));
+    try std.testing.expect(decoded.proof.proof.len() == proof_payload.len);
+    try std.testing.expect(std.mem.eql(u8, decoded.proof.proof.constSlice(), &proof_payload));
 }
 
 // Regression: an AggregatedSignatureProof whose `participants` bitlist

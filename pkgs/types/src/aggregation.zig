@@ -22,7 +22,7 @@ pub const LOG_INV_RATE_PROD: usize = 2;
 
 /// A single-message multi-signature proof: many validators over one message+slot.
 /// `participants` is the validator bitfield; `proof` is the compact no-pubkeys wire form.
-pub const TypeOneMultiSignature = struct {
+pub const SingleMessageAggregate = struct {
     participants: attestation.AggregationBits,
     proof: ByteList512KiB,
 
@@ -82,7 +82,7 @@ pub const TypeOneMultiSignature = struct {
     pub fn aggregate(
         allocator: Allocator,
         xmss_participants: ?AggregationBits,
-        children: []const TypeOneMultiSignature,
+        children: []const SingleMessageAggregate,
         children_pub_keys: []const []*const xmss.HashSigPublicKey,
         raw_xmss_pks: []*const xmss.HashSigPublicKey,
         raw_xmss_sigs: []*const xmss.HashSigSignature,
@@ -149,16 +149,16 @@ pub const TypeOneMultiSignature = struct {
 };
 
 /// Compatibility alias: the per-attestation aggregate proof was renamed
-/// `AggregatedSignatureProof` → `TypeOneMultiSignature` (same shape: participants + proof bytes,
+/// `AggregatedSignatureProof` → `SingleMessageAggregate` (same shape: participants + proof bytes,
 /// same `aggregate()` signature). Aliased so the per-att_data aggregation code keeps
 /// compiling against the new type without a wholesale rename. Field rename `proof_data`→`proof`
 /// and container `ByteListMiB`→`ByteList512KiB` are reconciled at the call sites.
-pub const AggregatedSignatureProof = TypeOneMultiSignature;
+pub const AggregatedSignatureProof = SingleMessageAggregate;
 
 /// A multi-message multi-signature proof: a merge of N Type-1 proofs over distinct messages.
 /// On the wire a SignedBlock carries the SSZ-encoded form of this container as its single proof.
 /// `proof` is the compact no-pubkeys wire form (lz4+postcard; NOT SSZ-framed).
-pub const TypeTwoMultiSignature = struct {
+pub const MultiMessageAggregate = struct {
     proof: ByteList512KiB,
 
     const Self = @This();
@@ -192,10 +192,10 @@ pub const TypeTwoMultiSignature = struct {
     /// - `parts`: the Type-1 proofs to merge, in canonical component order (caller's responsibility:
     ///   block attestations in body order, then the proposer entry last).
     /// - `public_keys_per_part`: parallel per-part participant pubkey handles, same order as `parts`.
-    /// - `result` must be an init'd, empty `TypeTwoMultiSignature`.
+    /// - `result` must be an init'd, empty `MultiMessageAggregate`.
     pub fn aggregate(
         allocator: Allocator,
-        parts: []const TypeOneMultiSignature,
+        parts: []const SingleMessageAggregate,
         public_keys_per_part: []const []*const xmss.HashSigPublicKey,
         result: *Self,
     ) !void {
@@ -230,12 +230,12 @@ pub const TypeTwoMultiSignature = struct {
     /// `public_keys_per_message` is the per-component pubkey layout the Type-2 was built with.
     /// The recovered Type-1's `participants` is left EMPTY — the caller restores it from the
     /// matching attestation's aggregation bits.
-    /// `result` must be an init'd, empty `TypeOneMultiSignature`.
+    /// `result` must be an init'd, empty `SingleMessageAggregate`.
     pub fn splitByMessage(
         self: *const Self,
         public_keys_per_message: []const []*const xmss.HashSigPublicKey,
         message_hash: *const [32]u8,
-        result: *TypeOneMultiSignature,
+        result: *SingleMessageAggregate,
     ) !void {
         try xmss.splitType2ByMessage(
             &self.proof,

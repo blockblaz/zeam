@@ -1,6 +1,6 @@
 const aggregation = @import("./aggregation.zig");
-pub const TypeOneMultiSignature = aggregation.TypeOneMultiSignature;
-pub const TypeTwoMultiSignature = aggregation.TypeTwoMultiSignature;
+pub const SingleMessageAggregate = aggregation.SingleMessageAggregate;
+pub const MultiMessageAggregate = aggregation.MultiMessageAggregate;
 pub const AggregatedSignatureProof = aggregation.AggregatedSignatureProof;
 pub const ByteList512KiB = aggregation.ByteList512KiB;
 pub const LOG_INV_RATE_TEST = aggregation.LOG_INV_RATE_TEST;

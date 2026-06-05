@@ -261,7 +261,7 @@ pub const NodeTestContext = struct {
         try zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &block_root, allocator);
         const proposer_signature = try self.key_manager.signBlockRoot(block.block.proposer_index, &block_root, @intCast(block.block.slot));
 
-        var proof = try types.ByteList512KiB.init(allocator);
+        var proof = try types.MultiMessageAggregate.init(allocator);
         errdefer proof.deinit();
         try types.buildType2BlockProof(
             allocator,

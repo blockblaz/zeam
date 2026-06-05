@@ -4023,7 +4023,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .proof = try types.ByteList512KiB.init(allocator),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
 
     const block2_ptr = try allocator.create(types.SignedBlock);
@@ -4037,7 +4037,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .proof = try types.ByteList512KiB.init(allocator),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
 
     // Cache blocks
@@ -4273,7 +4273,7 @@ fn makeTestSignedBlockWithParent(
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .proof = try types.ByteList512KiB.init(allocator),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
 
     return block_ptr;
@@ -4734,7 +4734,7 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
     );
 
     // Merge into the single Type-2 proof and free the consumed Type-1 list.
-    var proof = try types.ByteList512KiB.init(allocator);
+    var proof = try types.MultiMessageAggregate.init(allocator);
     errdefer proof.deinit();
     try node.chain.buildBlockProof(&produced_block, &proposer_signature, &proof);
     for (produced_block.attestation_signatures.slice()) |*t1| t1.deinit();
