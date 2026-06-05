@@ -1059,7 +1059,7 @@ pub var lean_pending_blocks_drain_iters: Histogram = .{
 };
 
 /// Initializes the metrics system. Must be called once at startup.
-pub fn init(allocator: std.mem.Allocator) !void {
+pub fn init(io: std.Io, allocator: std.mem.Allocator) !void {
     if (g_initialized) return;
 
     // For ZKVM targets, use no-op metrics
@@ -1068,8 +1068,6 @@ pub fn init(allocator: std.mem.Allocator) !void {
         g_initialized = true;
         return;
     }
-
-    const io = std.Io.Threaded.global_single_threaded.io();
 
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
