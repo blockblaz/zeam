@@ -1797,7 +1797,7 @@ pub const BeamNode = struct {
         range_unavailable: bool,
     ) void {
         const node_name = self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy);
-        const next_peer_opt = self.network.selectPeerForRangeSyncExcluding(snap.peer_id_copy, self.chain.forkChoice.getCurrentSlot() + 1) catch null;
+        const next_peer_opt = self.network.selectPeerForRangeSyncExcluding(snap.peer_id_copy, self.chain.forkChoice.getHead().slot + 1) catch null;
         defer if (next_peer_opt) |p| self.allocator.free(p);
         const has_alternate_peer = if (next_peer_opt) |p| !std.mem.eql(u8, p, snap.peer_id_copy) else false;
 
