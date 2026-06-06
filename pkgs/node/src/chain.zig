@@ -121,16 +121,6 @@ pub const CachedProcessedBlockInfo = struct {
     // for database persistence and skips re-serializing the live SignedBlock, which
     // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
     sszBytes: ?[]const u8 = null,
-    // Set by `onBlocksBatch` after it has already run
-    // `stf.verifySignaturesParallelMultiBlock` across the full batch.
-    // When true, the `step="verify_signatures"` lap inside `onBlock`
-    // is skipped — re-running it per block would duplicate the work
-    // the caller already did and defeat the point of the batched path.
-    //
-    // Callers OUTSIDE the batched path must leave this false: missing
-    // a real signature verify would silently let bad blocks into fork
-    // choice. See PR #964.
-    preVerified: bool = false,
 };
 
 pub const GossipProcessingResult = struct {
@@ -308,7 +298,7 @@ pub const BeamChain = struct {
     ///      whose `alloc`/`free` are internally serialized; an `ArenaAllocator`
     ///      or any custom non-thread-safe allocator would race. If a future
     ///      change swaps the allocator, audit every consumer of `thread_pool`
-    ///      (`stf.verifySignaturesParallelMultiBlock`, `types.compactAttestations`).
+    ///      (`types.compactAttestations` and the propose/aggregate spawn paths).
     ///   2. The XMSS prover/verifier bytecode must be set up before the pool's
     ///      first verify. The CLI calls `xmss.setupXmssAggregation()` on the
     ///      main thread *before* constructing the thread pool, so workers
@@ -3674,16 +3664,8 @@ pub const BeamChain = struct {
             // frees its handle. An earlier mutex around this block was
             // the dominant contributor to a ~78ms mean lock hold.
             // A block carries one merged Type-2 proof, so verification is a single
-            // container.verify (no per-attestation parallel batch). thread_pool no longer needed here.
-            //
-            // Skip when the caller already batch-verified across multiple
-            // blocks (`onBlocksBatch` path): rerunning the verify here would
-            // duplicate the work that was the whole reason to batch in the
-            // first place. `blockInfo.preVerified` is set ONLY by that
-            // controlled caller; bare callers leave it false.
-            if (!blockInfo.preVerified) {
-                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
-            }
+            // container.verify (no per-attestation parallel batch).
+            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
 
             step_watch.lap("verify_signatures");
 
@@ -4038,35 +4020,26 @@ pub const BeamChain = struct {
         missing_roots: ?[]types.Root,
     };
 
-    /// Batched block import. Coalesces the XMSS aggregated-signature
-    /// verify across all blocks in `signedBlocks` into ONE rayon call
-    /// (the previously-instrumented `phase2_batch_verify` stage that is
-    /// 99% of `step="verify_signatures"` on a loaded chain — see PR
-    /// #963 data), then runs STF per block sequentially with
-    /// `preVerified=true` so the per-block `onBlock` does NOT redo the
-    /// verify. Targets the catch-up hot path where the chain-worker has
-    /// drained K blocks at once.
+    /// Batched block import. Imports each block in `signedBlocks` via
+    /// `onBlock` sequentially; each block verifies its own merged Type-2
+    /// proof. (devnet5 carries one merged proof per block, so a single
+    /// container.verify per block is the unit of work — there is no
+    /// per-attestation signature batch to coalesce across blocks.)
     ///
     /// Inputs:
     ///   signedBlocks  — K SignedBlock values, slot-ascending (caller's
-    ///                   responsibility; STF below depends on parent
-    ///                   states being importable in iteration order).
-    ///   block_roots   — pre-computed hashTreeRoot of each block, in
-    ///                   the same order. Required (multi-block path
-    ///                   skips the duplicate hashTreeRoot inside
-    ///                   `verifySignatures`).
+    ///                   responsibility; STF depends on parent states
+    ///                   being importable in iteration order).
+    ///   block_roots   — pre-computed hashTreeRoot of each block, in the
+    ///                   same order, forwarded to per-block onBlock.
     ///   pruneForkchoice — passed through to per-block onBlock.
     ///
     /// Returns: K-length slice of BatchBlockResult, owned by caller (free
     /// the outer slice; for each non-null `missing_roots` also free it).
     ///
-    /// K=0: returns empty slice. K=1: routes through `onBlock` for
-    /// identical semantics with non-batched paths (no batching upside).
-    ///
-    /// On a multi-block batch-verify failure, falls back to per-block
-    /// `onBlock(.{ preVerified = false })` so a single bad signature
-    /// in the batch doesn't drop the whole sweep — valid blocks still
-    /// import; the bad one(s) get marked with `missing_roots = null`.
+    /// K=0: returns empty slice. K=1: routes through `onBlock`, propagating
+    /// its error. K>1: imports per block; a single bad block is isolated
+    /// (logged, `missing_roots = null`) so it doesn't drop the whole sweep.
     pub fn onBlocksBatch(
         self: *Self,
         signedBlocks: []const types.SignedBlock,
@@ -4093,65 +4066,14 @@ pub const BeamChain = struct {
             return results;
         }
 
-        // For verify, all blocks need a state to look up validator
-        // pubkeys. In lean consensus the validator set is fixed at
-        // genesis (no dynamic registration), so pubkeys are identical
-        // across every block's parent state. Using the first block's
-        // parent state for all K verify tasks is sound and avoids
-        // having to STF blocks 1..N-1 just to compute their parent
-        // states for the verify pass. The actual STF below still does
-        // a per-block parent-state lookup and full state transition.
-        var parent_borrow = self.statesGet(signedBlocks[0].block.parent_root) orelse {
-            // `results` is released by the errdefer above; freeing it here too
-            // would double-free on this error return.
-            return BlockProcessingError.MissingPreState;
-        };
-        defer parent_borrow.assertReleasedOrPanic();
-        const shared_pre_snapshot = try parent_borrow.cloneAndRelease(self.allocator);
-        defer {
-            shared_pre_snapshot.deinit();
-            self.allocator.destroy(shared_pre_snapshot);
-        }
-
-        // Build the multi-block task slice. `block_roots` must outlive
-        // this scope; the caller's slice does (it owns the storage).
-        const tasks = try self.allocator.alloc(stf.VerifyMultiBlockTask, signedBlocks.len);
-        defer self.allocator.free(tasks);
-        for (signedBlocks, block_roots, 0..) |*sb, *root, i| {
-            tasks[i] = .{
-                .state = shared_pre_snapshot,
-                .signed_block = sb,
-                .precomputed_block_root = root,
-            };
-        }
-
-        // The one rayon call across every attestation in every block.
-        const batch_verify_ok = blk: {
-            stf.verifySignaturesParallelMultiBlock(
-                self.allocator,
-                tasks,
-                &self.public_key_cache,
-                self.thread_pool,
-            ) catch |err| {
-                self.logger.warn(
-                    "multi-block batch verify failed (K={d}): {any}; falling back to per-block import",
-                    .{ signedBlocks.len, err },
-                );
-                break :blk false;
-            };
-            break :blk true;
-        };
-
-        // Per-block STF. When the batch verify succeeded we pass
-        // `preVerified = true` so `onBlock` skips its own verify call;
-        // on fallback we run the regular path so a bad signature
-        // gets isolated to its specific block via the normal error
-        // return rather than failing the whole sweep.
+        // K>1: import each block via the regular onBlock path (each block
+        // verifies its own merged Type-2 proof). A single bad block is
+        // isolated (logged, missing_roots = null) rather than failing the
+        // whole sweep.
         for (signedBlocks, block_roots, 0..) |sb, root, i| {
             const missing = self.onBlock(sb, .{
                 .blockRoot = root,
                 .pruneForkchoice = pruneForkchoice,
-                .preVerified = batch_verify_ok,
             }) catch |err| {
                 self.logger.warn(
                     "onBlocksBatch: block 0x{x} slot={d} failed import: {any}",
