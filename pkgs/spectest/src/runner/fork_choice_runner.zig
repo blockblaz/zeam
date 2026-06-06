@@ -924,7 +924,7 @@ fn processAttestationStep(
         },
     };
 
-    const validator_id = try expectU64Field(att_obj, &.{ "validatorId", "validator_id" }, fixture_path, case_name, step_index, "attestation.validatorId");
+    const validator_id = try expectU64Field(att_obj, &.{ "validatorIndex", "validatorId", "validator_id" }, fixture_path, case_name, step_index, "attestation.validatorId");
     const data_obj = try expectObject(att_obj, "data", fixture_path, case_name, step_index);
     const attestation_data = try parseAttestationData(data_obj, fixture_path, case_name, step_index, "attestation.data");
 
@@ -2366,13 +2366,13 @@ fn buildState(
                 var label_buf: [96]u8 = undefined;
 
                 const attestation_pubkey = blk: {
-                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPubkey", .{base_label}) catch "validator.attestationPubkey";
-                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPubkey"}, ctx, att_label);
+                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPublicKey", .{base_label}) catch "validator.attestationPublicKey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPublicKey"}, ctx, att_label);
                 };
 
                 const proposal_pubkey = blk: {
-                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPubkey", .{base_label}) catch "validator.proposalPubkey";
-                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPubkey"}, ctx, prop_label);
+                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPublicKey", .{base_label}) catch "validator.proposalPublicKey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPublicKey"}, ctx, prop_label);
                 };
 
                 const validator_index: u64 = blk: {

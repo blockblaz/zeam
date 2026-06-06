@@ -251,8 +251,8 @@ pub fn buildStateFromJson(allocator: Allocator, value: JsonValue) !types.BeamSta
             };
             for (arr.items, 0..) |item, idx| {
                 const vobj = try requireObject(item);
-                const att_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"attestationPubkey"});
-                const prop_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"proposalPubkey"});
+                const att_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"attestationPublicKey"});
+                const prop_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"proposalPublicKey"});
                 const validator_index: u64 = if (vobj.get("index")) |iv| try parseU64Value(iv) else @intCast(idx);
                 validators.append(.{
                     .attestation_pubkey = att_pubkey,
@@ -778,7 +778,7 @@ fn processAttestationStep(
     const att_obj = try requireObject(att_value);
 
     // Parse validatorId (single validator, not aggregationBits)
-    const validator_id = try parseU64Field(att_obj, &.{ "validatorId", "validator_id" });
+    const validator_id = try parseU64Field(att_obj, &.{ "validatorIndex", "validatorId", "validator_id" });
     const data_obj = try parseObjectField(att_obj, &.{"data"});
     const att_data = try parseAttestationData(data_obj);
     const validators_slice = driver.fork_choice.anchorState.validators.constSlice();
