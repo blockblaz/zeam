@@ -1686,6 +1686,16 @@ pub const ForkChoice = struct {
         return false;
     }
 
+    /// Public, allocation-owning wrapper around `isAncestorOf` for attestation
+    /// ancestry validation: returns true iff `ancestor` is an ancestor of (or equal
+    /// to) `descendant`. `descendant` MUST already exist in the proto-array (callers
+    /// guarantee this via getProtoNode), matching `isAncestorOf`'s invariant.
+    pub fn isAncestorOfBlock(self: *Self, ancestor: types.Root, descendant: types.Root) bool {
+        var scratch = std.AutoHashMap(types.Root, void).init(self.allocator);
+        defer scratch.deinit();
+        return self.isAncestorOf(ancestor, descendant, &scratch);
+    }
+
     /// Calculate the reorg depth by counting blocks from old head to common ancestor.
     /// Uses pre-built new_head_ancestors map from isAncestorOf to avoid redundant traversal.
     fn calculateReorgDepth(self: *Self, old_head_root: types.Root, new_head_ancestors: *std.AutoHashMap(types.Root, void)) usize {

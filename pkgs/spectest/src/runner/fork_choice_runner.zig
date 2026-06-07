@@ -939,10 +939,13 @@ fn processAttestationStep(
 
     // Signature verification is not supported in this runner; detect fixture cases
     // that expect a signature failure and return an error to match the expected outcome.
-    if (step_obj.get("expectedError")) |err_value| {
+    if (step_obj.get("rejectionReason") orelse step_obj.get("expectedError")) |err_value| {
         switch (err_value) {
             .string => |err_str| {
-                if (std.mem.indexOf(u8, err_str, "ignature") != null) {
+                // The spec emits the language-neutral `INVALID_SIGNATURE`; older fixtures used a
+                // substring. zeam has no signature verification, so a synthetic error is the
+                // legitimate stand-in for the spec's signature rejection.
+                if (std.mem.eql(u8, err_str, "INVALID_SIGNATURE") or std.mem.indexOf(u8, err_str, "ignature") != null) {
                     return error.SignatureVerificationNotSupported;
                 }
             },
@@ -1121,6 +1124,17 @@ fn validateAttestationDataForGossip(
     }
     if (head_node.slot != data.head.slot) {
         return error.HeadCheckpointSlotMismatch;
+    }
+
+    // 4b. Ancestry (rejection reasons TARGET_NOT_ANCESTOR_OF_HEAD / SOURCE_NOT_ANCESTOR_OF_TARGET):
+    // the attestation's target must be an ancestor of its head, and its source an ancestor of its
+    // target. source/target/head are confirmed present above, so isAncestorOf's descendant-exists
+    // invariant holds.
+    if (!ctx.fork_choice.isAncestorOfBlock(data.target.root, data.head.root)) {
+        return error.TargetNotAncestorOfHead;
+    }
+    if (!ctx.fork_choice.isAncestorOfBlock(data.source.root, data.target.root)) {
+        return error.SourceNotAncestorOfTarget;
     }
 
     // 5. Attestation slot must not be too far in future.

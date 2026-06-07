@@ -429,6 +429,16 @@ pub const BeamState = struct {
             const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &stored_target_root);
             const has_known_root = has_correct_source_root and has_correct_target_root;
 
+            // A vote whose head is off the canonical chain (its head root does not match the
+            // canonical block at head.slot) cannot justify its target — it is skipped before any
+            // tally. Mirror the source/target canonicality check. Scoped to in-range head slots
+            // so a head at/after the current tip (not yet in historical_block_hashes) is left to
+            // the existing logic, not spuriously dropped.
+            const head_slot: Slot = attestation_data.head.slot;
+            const head_in_range = head_slot < historical_len;
+            const stored_head_root = if (head_in_range) try self.historical_block_hashes.get(@intCast(head_slot)) else utils.ZERO_HASH;
+            const head_off_canonical = head_in_range and !std.mem.eql(u8, &attestation_data.head.root, &stored_head_root);
+
             const target_not_ahead = target_slot <= source_slot;
             const is_target_justifiable = utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot) catch false;
 
@@ -437,13 +447,15 @@ pub const BeamState = struct {
                 // as we remove the target from justifications map as soon as its justified
                 is_target_already_justified or
                 !has_known_root or
+                head_off_canonical or
                 target_not_ahead or
                 !is_target_justifiable)
             {
-                logger.debug("skipping the attestation as not viable: !(source_justified={}) or target_already_justified={} !(known_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
+                logger.debug("skipping the attestation as not viable: !(source_justified={}) or target_already_justified={} !(known_root={}) or head_off_canonical={} or target_not_ahead={} or !(target_justifiable={})", .{
                     is_source_justified,
                     is_target_already_justified,
                     has_known_root,
+                    head_off_canonical,
                     target_not_ahead,
                     is_target_justifiable,
                 });

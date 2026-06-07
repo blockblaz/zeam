@@ -314,7 +314,8 @@ fn runCase(
     // a roundtrippable `serialized`. When present, the input is intentionally
     // malformed and the runner asserts that deserialization rejects it.
     const expect_exception_opt = blk: {
-        const v = case_obj.get("expectException") orelse break :blk null;
+        // Negative-vector field renamed `expectException` -> `rejectionReason` (language-neutral).
+        const v = case_obj.get("rejectionReason") orelse case_obj.get("expectException") orelse break :blk null;
         switch (v) {
             .string => |s| break :blk s,
             else => break :blk null,

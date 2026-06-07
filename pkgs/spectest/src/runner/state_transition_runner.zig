@@ -189,11 +189,13 @@ fn runCase(
         },
     };
 
-    const expect_exception = switch (case_obj.get("expectException") orelse JsonValue{ .null = {} }) {
+    // The consensus spec renamed the negative-vector field `expectException` -> `rejectionReason`
+    // (language-neutral rejection reasons). Read the new name first, keep the old as fallback.
+    const expect_exception = switch (case_obj.get("rejectionReason") orelse case_obj.get("expectException") orelse JsonValue{ .null = {} }) {
         .string => |text| text,
         .null => null,
         else => {
-            std.debug.print("fixture {s} case {s}: expectException must be string or null\n", .{ ctx.fixture_label, ctx.case_name });
+            std.debug.print("fixture {s} case {s}: rejectionReason must be string or null\n", .{ ctx.fixture_label, ctx.case_name });
             return FixtureError.InvalidFixture;
         },
     };
