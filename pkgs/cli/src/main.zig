@@ -650,7 +650,7 @@ fn mainInner(init: std.process.Init) !void {
             // Shared worker pool for CPU-bound chain work (attestation signature verification).
             // One pool is shared across all nodes in the process so total worker threads stay bounded
             // regardless of the number of nodes in the simulation.
-            const cpu_count = getNumCpus(allocator, init.io);
+            const cpu_count = try getNumCpus(allocator, init.io);
             const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
             const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
             const worker_count = @min(desired_workers, @as(usize, 4));

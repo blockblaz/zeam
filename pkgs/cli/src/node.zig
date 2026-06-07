@@ -494,7 +494,7 @@ pub const Node = struct {
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(zeam_utils.unixTimestampSeconds()));
         }
 
-        const cpu_count = getNumCpus(allocator, io);
+        const cpu_count = try getNumCpus(allocator, io);
         const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
         const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
 

@@ -10,95 +10,105 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const log = std.log.scoped(.cpu_count);
 
 const CgroupVersion = enum { v1, v2 };
 
 /// cgroup-aware logical CPU count: `min(cgroup quota, affinity)`, or the affinity
-/// count when no quota applies. Drop-in for `std.Thread.getCpuCount()` when
-/// sizing a thread pool. `gpa` is used only for two short-lived `/proc` reads
-/// on Linux (none on other platforms or when there is no quota).
-pub fn getNumCpus(gpa: Allocator, io: Io) usize {
-    const logical = logicalCpus();
-    const result = if (cgroupsNumCpus(gpa, io)) |quota| @min(quota, logical) else logical;
+/// count when no quota can be located. Drop-in for `std.Thread.getCpuCount()`
+/// when sizing a thread pool. Falls back to the affinity count whenever no quota
+/// is locatable (non-Linux, no cpu controller, no cgroup mount, unlimited);
+/// errors only when detection genuinely breaks — an unreadable affinity, `/proc`,
+/// or cgroup file, an unopenable cgroup dir, or malformed quota content. `gpa` is
+/// used only for two short-lived `/proc` reads.
+pub fn getNumCpus(gpa: Allocator, io: Io) !usize {
+    const logical = try logicalCpus();
+    const quota = try cgroupsNumCpus(gpa, io);
+    const result = if (quota) |q| @min(q, logical) else logical;
 
     assert(result >= 1);
     assert(result <= logical);
     return result;
 }
 
-/// Logical CPU count from the affinity mask.
-fn logicalCpus() usize {
-    const n = std.Thread.getCpuCount() catch 1;
+/// Logical CPU count from the affinity mask. Propagates the error rather than
+/// silently degrading — a failed affinity count would size the pool to 1 worker.
+fn logicalCpus() !usize {
+    const n = try std.Thread.getCpuCount();
     assert(n >= 1);
     return n;
 }
 
 /// The cgroup CPU quota as an effective core count (Linux only): locate the cpu
 /// controller via `/proc/self/{cgroup,mountinfo}`, then read its quota files.
-fn cgroupsNumCpus(gpa: Allocator, io: Io) ?usize {
+/// `null` when no quota can be located (non-Linux, no cpu controller, no cgroup
+/// mount, unresolvable path, controller not enabled, unlimited). Errors only on a
+/// broken read of an existing resource (unreadable `/proc` or quota file,
+/// unopenable cgroup dir) or malformed content — so a *readable* quota is never
+/// silently masked.
+fn cgroupsNumCpus(gpa: Allocator, io: Io) !?usize {
     if (builtin.os.tag != .linux) return null;
 
     const cwd = Io.Dir.cwd();
 
-    // Only the /proc reads themselves are worth warning about: failing to read
-    // them on Linux means a real quota could be silently missed (the pool may
-    // over-size in a CPU-limited container). Parse-level misses below are the
-    // benign "no limit applies" cases (no cpu controller, cpu.max == "max").
-    const cgroup = readProcFile(gpa, io, cwd, "/proc/self/cgroup", .limited(1 << 20)) orelse {
-        log.warn("failed to read /proc/self/cgroup; sizing by affinity CPU count", .{});
-        return null;
-    };
+    const cgroup = try readProcFile(gpa, io, cwd, "/proc/self/cgroup", .limited(1 << 20));
     defer gpa.free(cgroup);
 
-    const mountinfo = readProcFile(gpa, io, cwd, "/proc/self/mountinfo", .limited(8 << 20)) orelse {
-        log.warn("failed to read /proc/self/mountinfo; sizing by affinity CPU count", .{});
-        return null;
-    };
+    // Generous ceiling, not a tight bound: mountinfo scales with the mount count
+    // and can reach several MB under thousands of container mounts.
+    const mountinfo = try readProcFile(gpa, io, cwd, "/proc/self/mountinfo", .limited(8 << 20));
     defer gpa.free(mountinfo);
 
-    const subsys = Subsys.load(cgroup) orelse return null;
-    const mnt = MountInfo.load(mountinfo, subsys.version) orelse return null;
+    const subsys = Subsys.load(cgroup) orelse return null; // no cpu controller
+    const mnt = MountInfo.load(mountinfo, subsys.version) orelse return null; // no cgroup mount
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const base = translate(mnt.root, mnt.mount_point, subsys.base, &path_buf) orelse return null;
 
-    var dir = cwd.openDir(io, base, .{}) catch return null;
+    var dir = try cwd.openDir(io, base, .{});
     defer dir.close(io);
 
-    const quota = cpuQuotaFromDir(io, dir, subsys.version) orelse return null;
-    if (quota == 0) return null; // no usable limit; fall back to affinity
-    return quota;
+    return try cpuQuotaFromDir(io, dir, subsys.version);
 }
 
 /// Read a `/proc` pseudo-file whole; the caller owns the result. `/proc` reports
-/// size 0, so stream to EOF rather than doing a size-based read. Returns null
-/// past `limit` (`error.StreamTooLong`) rather than truncating.
-fn readProcFile(gpa: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, limit: Io.Limit) ?[]u8 {
+/// size 0, so stream to EOF rather than doing a size-based read. Errors (rather
+/// than truncating) past `limit` via `error.StreamTooLong`.
+fn readProcFile(gpa: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, limit: Io.Limit) ![]u8 {
     assert(sub_path.len > 0);
 
-    var file = dir.openFile(io, sub_path, .{}) catch return null;
+    var file = try dir.openFile(io, sub_path, .{});
     defer file.close(io);
 
     var buf: [4096]u8 = undefined;
     var reader = file.readerStreaming(io, &buf);
-    return reader.interface.allocRemaining(gpa, limit) catch null;
+    return try reader.interface.allocRemaining(gpa, limit);
 }
 
-/// CPU quota from an open cgroup directory, as an effective core count.
-fn cpuQuotaFromDir(io: Io, dir: Io.Dir, version: CgroupVersion) ?usize {
+/// CPU quota from an open cgroup directory, as an effective core count. `null`
+/// when the controller is not enabled here (quota file absent) or unlimited;
+/// errors on an unreadable or malformed quota file.
+fn cpuQuotaFromDir(io: Io, dir: Io.Dir, version: CgroupVersion) !?usize {
     switch (version) {
         .v2 => {
             var buf: [128]u8 = undefined;
-            const content = dir.readFile(io, "cpu.max", &buf) catch return null;
-            return parseCpuMaxV2(content);
+            const content = dir.readFile(io, "cpu.max", &buf) catch |err| switch (err) {
+                error.FileNotFound => return null, // cpu controller not enabled here
+                else => return err,
+            };
+            return try parseCpuMaxV2(content);
         },
         .v1 => {
             var quota_buf: [64]u8 = undefined;
             var period_buf: [64]u8 = undefined;
-            const quota = dir.readFile(io, "cpu.cfs_quota_us", &quota_buf) catch return null;
-            const period = dir.readFile(io, "cpu.cfs_period_us", &period_buf) catch return null;
-            return parseCpuV1(quota, period);
+            const quota = dir.readFile(io, "cpu.cfs_quota_us", &quota_buf) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+            const period = dir.readFile(io, "cpu.cfs_period_us", &period_buf) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+            return try parseCpuV1(quota, period);
         },
     }
 }
@@ -215,30 +225,31 @@ const MountInfo = struct {
 };
 
 /// Parse a v2 `cpu.max` value (`<quota> <period>` or `max <period>`) to
-/// `ceil(quota/period)` effective CPUs. Null when unlimited, malformed, or the
-/// period is zero.
-pub fn parseCpuMaxV2(content: []const u8) ?usize {
+/// `ceil(quota/period)` effective CPUs. `null` when unlimited (`max`); errors on
+/// malformed content or a zero quota/period.
+pub fn parseCpuMaxV2(content: []const u8) !?usize {
     var it = std.mem.tokenizeAny(u8, content, " \t\r\n");
-    const quota_s = it.next() orelse return null;
-    const period_s = it.next() orelse return null;
-
+    const quota_s = it.next() orelse return error.Malformed;
     if (std.mem.eql(u8, quota_s, "max")) return null; // unlimited
-    const quota = std.fmt.parseUnsigned(u64, quota_s, 10) catch return null;
-    const period = std.fmt.parseUnsigned(u64, period_s, 10) catch return null;
-    if (period == 0) return null;
+    const period_s = it.next() orelse return error.Malformed;
+
+    const quota = try std.fmt.parseUnsigned(u64, quota_s, 10);
+    const period = try std.fmt.parseUnsigned(u64, period_s, 10);
+    if (quota == 0 or period == 0) return error.Malformed;
     return ceilDiv(quota, period);
 }
 
 /// Parse v1 `cpu.cfs_quota_us` + `cpu.cfs_period_us` to `ceil(quota/period)`.
-/// Null when unlimited (quota `-1`), malformed, or the period is zero.
-pub fn parseCpuV1(quota_text: []const u8, period_text: []const u8) ?usize {
+/// `null` when unlimited (quota `-1`); errors on malformed content or a zero
+/// quota/period.
+pub fn parseCpuV1(quota_text: []const u8, period_text: []const u8) !?usize {
     const q = std.mem.trim(u8, quota_text, " \t\r\n");
     const p = std.mem.trim(u8, period_text, " \t\r\n");
 
-    // "-1" (unlimited) fails to parse as unsigned -> null.
-    const quota = std.fmt.parseUnsigned(u64, q, 10) catch return null;
-    const period = std.fmt.parseUnsigned(u64, p, 10) catch return null;
-    if (period == 0) return null;
+    if (std.mem.eql(u8, q, "-1")) return null; // unlimited
+    const quota = try std.fmt.parseUnsigned(u64, q, 10);
+    const period = try std.fmt.parseUnsigned(u64, p, 10);
+    if (quota == 0 or period == 0) return error.Malformed;
     return ceilDiv(quota, period);
 }
 
@@ -301,14 +312,17 @@ test "parseCpuMaxV2" {
         .{ "200000 100000\n", @as(?usize, 2) }, // trailing newline tolerated
         .{ "600000 100000", @as(?usize, 6) },
         .{ "max 100000", @as(?usize, null) }, // unlimited
-        .{ "100000 0", @as(?usize, null) }, // zero period
     };
     inline for (cases) |c| {
-        try std.testing.expectEqual(c[1], parseCpuMaxV2(c[0]));
+        try std.testing.expectEqual(c[1], try parseCpuMaxV2(c[0]));
     }
+    try std.testing.expectError(error.Malformed, parseCpuMaxV2("100000 0")); // zero period
+    try std.testing.expectError(error.Malformed, parseCpuMaxV2("0 100000")); // zero quota
+    try std.testing.expectError(error.Malformed, parseCpuMaxV2("100000")); // missing period
+    try std.testing.expectError(error.InvalidCharacter, parseCpuMaxV2("abc 100000")); // garbage
 }
 test "parseCpuMaxV2: huge quota does not overflow" {
-    try std.testing.expect(parseCpuMaxV2("18446744073709551615 2") != null);
+    try std.testing.expect((try parseCpuMaxV2("18446744073709551615 2")) != null);
 }
 
 test "parseCpuV1" {
@@ -317,11 +331,12 @@ test "parseCpuV1" {
         .{ "150000\n", "100000\n", @as(?usize, 2) }, // rounds up + trims
         .{ "600000", "100000", @as(?usize, 6) },
         .{ "-1", "100000", @as(?usize, null) }, // unlimited
-        .{ "100000", "0", @as(?usize, null) }, // zero period
     };
     inline for (cases) |c| {
-        try std.testing.expectEqual(c[2], parseCpuV1(c[0], c[1]));
+        try std.testing.expectEqual(c[2], try parseCpuV1(c[0], c[1]));
     }
+    try std.testing.expectError(error.Malformed, parseCpuV1("100000", "0")); // zero period
+    try std.testing.expectError(error.InvalidCharacter, parseCpuV1("abc", "100000")); // garbage
 }
 
 fn expectSubsys(got: ?Subsys, version: ?CgroupVersion, base: []const u8) !void {
@@ -400,22 +415,25 @@ test "cpuQuotaFromDir: v2" {
         .{ "200000 100000\n", @as(?usize, 2) },
         .{ sample_v2_good_max, @as(?usize, 6) },
         .{ sample_v2_ceil_max, @as(?usize, 2) },
-        .{ sample_v2_zero_max, @as(?usize, null) },
     };
     inline for (cases) |c| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cpu.max", .data = c[0] });
-        try std.testing.expectEqual(c[1], cpuQuotaFromDir(std.testing.io, tmp.dir, .v2));
+        try std.testing.expectEqual(c[1], try cpuQuotaFromDir(std.testing.io, tmp.dir, .v2));
     }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cpu.max", .data = sample_v2_zero_max });
+    try std.testing.expectError(error.Malformed, cpuQuotaFromDir(std.testing.io, tmp.dir, .v2));
 }
 test "cpuQuotaFromDir: v1" {
     const cases = .{
         .{ "300000\n", "100000\n", @as(?usize, 3) },
         .{ sample_v1_good_quota, sample_v1_good_period, @as(?usize, 6) },
         .{ sample_v1_ceil_quota, sample_v1_ceil_period, @as(?usize, 2) },
-        .{ sample_v1_zero_quota, sample_v1_zero_period, @as(?usize, null) },
     };
     inline for (cases) |c| {
         var tmp = std.testing.tmpDir(.{});
@@ -423,14 +441,20 @@ test "cpuQuotaFromDir: v1" {
 
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cpu.cfs_quota_us", .data = c[0] });
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cpu.cfs_period_us", .data = c[1] });
-        try std.testing.expectEqual(c[2], cpuQuotaFromDir(std.testing.io, tmp.dir, .v1));
+        try std.testing.expectEqual(c[2], try cpuQuotaFromDir(std.testing.io, tmp.dir, .v1));
     }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cpu.cfs_quota_us", .data = sample_v1_zero_quota });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cpu.cfs_period_us", .data = sample_v1_zero_period });
+    try std.testing.expectError(error.Malformed, cpuQuotaFromDir(std.testing.io, tmp.dir, .v1));
 }
-test "cpuQuotaFromDir: missing file" {
+test "cpuQuotaFromDir: missing file is no quota" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try std.testing.expectEqual(@as(?usize, null), cpuQuotaFromDir(std.testing.io, tmp.dir, .v2));
+    try std.testing.expectEqual(@as(?usize, null), try cpuQuotaFromDir(std.testing.io, tmp.dir, .v2));
 }
 
 test "readProcFile: streams a size-unknown file fully" {
@@ -439,22 +463,30 @@ test "readProcFile: streams a size-unknown file fully" {
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f", .data = "11:cpu:/\n" });
 
-    const got = readProcFile(std.testing.allocator, std.testing.io, tmp.dir, "f", .limited(1 << 20)).?;
+    const got = try readProcFile(std.testing.allocator, std.testing.io, tmp.dir, "f", .limited(1 << 20));
     defer std.testing.allocator.free(got);
 
     try std.testing.expectEqualStrings("11:cpu:/\n", got);
 }
-test "readProcFile: null past limit" {
+test "readProcFile: errors past limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f", .data = "a" ** (100 * 1024) });
-    try std.testing.expect(readProcFile(std.testing.allocator, std.testing.io, tmp.dir, "f", .limited(64 * 1024)) == null);
+    try std.testing.expectError(error.StreamTooLong, readProcFile(std.testing.allocator, std.testing.io, tmp.dir, "f", .limited(64 * 1024)));
+}
+test "readProcFile: missing file errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expectError(error.FileNotFound, readProcFile(std.testing.allocator, std.testing.io, tmp.dir, "nope", .limited(1 << 20)));
 }
 
 test "getNumCpus: at least 1" {
-    try std.testing.expect(getNumCpus(std.testing.allocator, std.testing.io) >= 1);
+    const n = try getNumCpus(std.testing.allocator, std.testing.io);
+    try std.testing.expect(n >= 1);
 }
 test "getNumCpus: never exceeds logical" {
-    try std.testing.expect(getNumCpus(std.testing.allocator, std.testing.io) <= logicalCpus());
+    const n = try getNumCpus(std.testing.allocator, std.testing.io);
+    try std.testing.expect(n <= try logicalCpus());
 }
