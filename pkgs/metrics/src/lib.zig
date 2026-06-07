@@ -469,6 +469,8 @@ const Metrics = struct {
     // Per-site errors swallowed by `BeamNode.onInterval`; sustained non-zero
     // rates mean the node is ticking but a duty/publish layer is failing.
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
+    // selectPeer no-match counter: fires when min_slot filter leaves zero candidates
+    zeam_select_peer_no_match_total: SelectPeerNoMatchCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     // Per-substep timing inside chain.onBlock.
@@ -682,6 +684,8 @@ const Metrics = struct {
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeCountGauge = metrics_lib.Gauge(u64);
+    // selectPeer no-match counter: fires when min_slot filter leaves zero candidates
+    const SelectPeerNoMatchCounter = metrics_lib.Counter(u64);
 };
 
 /// Timer struct returned to the application.
@@ -1210,6 +1214,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts (mirrors leanSpec _replay_pending_attestations). Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
         .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),
         .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, publishLocalProducedAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
+        .zeam_select_peer_no_match_total = Metrics.SelectPeerNoMatchCounter.init("zeam_select_peer_no_match_total", .{ .help = "selectPeer returned null because no peer met min_slot threshold" }, .{}),
     };
     metrics.zeam_blocks_by_root_inflight.set(0);
     metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};
