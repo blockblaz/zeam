@@ -707,8 +707,20 @@ fn processBlockStep(
         return FixtureError.FixtureMismatch;
     };
 
-    const target_intervals = slotToIntervals(block.slot);
-    try advanceForkchoiceIntervals(ctx, target_intervals, true);
+    // The block step carries a boolean `tickToSlot`: when true (the common case) the store
+    // clock is advanced to the block's slot before import; when false the block is imported
+    // WITHOUT advancing the clock — it arrives ahead of the (tick-driven) store clock.
+    // Fixtures predating the field are treated as true (the prior always-advance behavior).
+    const tick_to_slot: bool = if (step_obj.get("tickToSlot")) |v|
+        switch (v) {
+            .bool => |b| b,
+            else => true,
+        }
+    else
+        true;
+    if (tick_to_slot) {
+        try advanceForkchoiceIntervals(ctx, slotToIntervals(block.slot), true);
+    }
 
     // Heap-allocate so the pointer we store in `state_map`/`allocated_states`
     // outlives this function. A stack var would leave dangling pointers
