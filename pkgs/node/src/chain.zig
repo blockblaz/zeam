@@ -4684,6 +4684,20 @@ pub const BeamChain = struct {
             return AttestationValidationError.HeadCheckpointSlotMismatch;
         }
 
+        // 4. Ancestry: target must be an ancestor of head, and source an ancestor of
+        // target. Rejects sibling-fork attestations (matches the spectest runner and the
+        // consensus spec). source/target/head are confirmed present above, so
+        // isAncestorOfBlock's descendant-exists invariant holds. Placed after the slot
+        // checks so the more specific slot errors take precedence.
+        if (!self.forkChoice.isAncestorOfBlock(data.target.root, data.head.root)) {
+            self.logger.debug("attestation validation failed: target not ancestor of head", .{});
+            return AttestationValidationError.TargetNotAncestorOfHead;
+        }
+        if (!self.forkChoice.isAncestorOfBlock(data.source.root, data.target.root)) {
+            self.logger.debug("attestation validation failed: source not ancestor of target", .{});
+            return AttestationValidationError.SourceNotAncestorOfTarget;
+        }
+
         // (Future-slot bound check is hoisted above the proto-node
         // lookups — see the comment at the top of this function.)
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
@@ -5493,6 +5507,8 @@ const AttestationValidationError = error{
     TargetCheckpointSlotMismatch,
     HeadCheckpointSlotMismatch,
     HeadOlderThanTarget,
+    TargetNotAncestorOfHead,
+    SourceNotAncestorOfTarget,
     AttestationTooFarInFuture,
 };
 pub const BlockValidationError = error{
