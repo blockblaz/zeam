@@ -968,8 +968,8 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// Pick a random peer id under the shared lock. Returns a
         /// freshly-allocated copy of the peer id so the caller can use
         /// it after the lock is released. Caller frees with `allocator`.
-        pub fn selectPeerCopy(self: *Self, allocator: Allocator) !?[]u8 {
-            return self.selectPeerExcluding(allocator, null, false);
+        pub fn selectPeerCopy(self: *Self, allocator: Allocator, min_slot: ?u64) !?[]u8 {
+            return self.selectPeerExcluding(allocator, null, false, min_slot);
         }
 
         pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
@@ -991,12 +991,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// Pick a random connected peer, optionally excluding one id (for RPC retry).
         /// When `range_capable_only`, skips peers that reported `blocks_by_range` unavailable.
         /// Returns null when every connected peer is excluded (e.g. single-peer devnet).
-        pub fn selectPeerExcluding(
-            self: *Self,
-            allocator: Allocator,
-            exclude: ?[]const u8,
-            range_capable_only: bool,
-        ) !?[]u8 {
+        pub fn selectPeerExcluding(self: *Self, allocator: Allocator, exclude: ?[]const u8, range_capable_only: bool, min_slot: ?u64) !?[]u8 {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
@@ -1011,12 +1006,24 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
                 if (exclude) |ex| {
                     if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
                 }
+                if (comptime @hasField(PeerInfo, "latest_status")) {
+                    if (min_slot) |ms| {
+                        const peer_head_slot = if (entry.value_ptr.latest_status) |status| status.head_slot else 0;
+                        if (ms > peer_head_slot) continue;
+                    }
+                }
                 if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
                     if (entry.value_ptr.blocks_by_range_unavailable) continue;
                 }
                 try candidates.append(allocator, entry.value_ptr.peer_id);
             }
-            if (candidates.items.len == 0) return null;
+
+            if (candidates.items.len == 0) {
+                if (min_slot != null) {
+                    zeam_metrics.metrics.zeam_select_peer_no_match_total.incr();
+                }
+                return null;
+            }
 
             const io = std.Io.Threaded.global_single_threaded.io();
             var random_source = std.Random.IoSource{ .io = io };
@@ -1913,10 +1920,11 @@ test "LockedMap: concurrent put/get/remove smoke" {
 }
 
 test "ConnectedPeers: connect / disconnect / count atomic" {
+    const FakeStatus = struct { head_slot: u64 };
     const FakePeerInfo = struct {
         peer_id: []const u8,
         connected_at: i64,
-        latest_status: ?u32 = null,
+        latest_status: ?FakeStatus = null,
     };
     const CP = ConnectedPeersImpl(FakePeerInfo);
     var cp = CP.init(testing.allocator);
@@ -1938,8 +1946,8 @@ test "ConnectedPeers: connect / disconnect / count atomic" {
     try testing.expect(!cp.disconnect("peer-b"));
 
     // setLatestStatus on present + missing.
-    try testing.expect(cp.setLatestStatus("peer-a", @as(u32, 42)));
-    try testing.expect(!cp.setLatestStatus("peer-z", @as(u32, 0)));
+    try testing.expect(cp.setLatestStatus("peer-a", FakeStatus{ .head_slot = 42 }));
+    try testing.expect(!cp.setLatestStatus("peer-z", FakeStatus{ .head_slot = 0 }));
 
     // Iteration sees the remaining two entries under the shared lock.
     {
@@ -1951,16 +1959,17 @@ test "ConnectedPeers: connect / disconnect / count atomic" {
     }
 
     // selectPeerCopy returns an owned slice from the present set.
-    const picked = (try cp.selectPeerCopy(testing.allocator)) orelse return error.NoPick;
+    const picked = (try cp.selectPeerCopy(testing.allocator, null)) orelse return error.NoPick;
     defer testing.allocator.free(picked);
     try testing.expect(cp.contains(picked));
 }
 
 test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
+    const FakeStatus = struct { head_slot: u64 };
     const FakePeerInfo = struct {
         peer_id: []const u8,
         connected_at: i64,
-        latest_status: ?u32 = null,
+        latest_status: ?FakeStatus = null,
     };
     const CP = ConnectedPeersImpl(FakePeerInfo);
     var cp = CP.init(testing.allocator);
@@ -1996,6 +2005,41 @@ test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
         while (guard.iter.next()) |_| : (actual += 1) {}
     }
     try testing.expectEqual(actual, cp.count());
+}
+
+test "ConnectedPeers: selectPeerCopy respects min_slot filter" {
+    const FakeStatus = struct { head_slot: u64 };
+    const FakePeerInfo = struct {
+        peer_id: []const u8,
+        connected_at: i64,
+        latest_status: ?FakeStatus = null,
+    };
+    const CP = ConnectedPeersImpl(FakePeerInfo);
+    var cp = CP.init(testing.allocator);
+    defer cp.deinit();
+
+    // Initialize peers at 0, 5 and 10
+    try cp.connect("peer-0");
+
+    try cp.connect("peer-5");
+    _ = cp.setLatestStatus("peer-5", FakeStatus{ .head_slot = 5 });
+
+    try cp.connect("peer-10");
+    _ = cp.setLatestStatus("peer-10", FakeStatus{ .head_slot = 10 });
+
+    // min_slot=7 → only peer-10 eligible
+    const pick = try cp.selectPeerCopy(testing.allocator, 7);
+    defer if (pick) |p| testing.allocator.free(p);
+    try testing.expectEqualStrings("peer-10", pick.?);
+
+    // min_slot=20 → no peer qualifies, returns null
+    const none = try cp.selectPeerCopy(testing.allocator, 20);
+    try testing.expect(none == null);
+
+    // min_slot=null → any peer eligible
+    const any = try cp.selectPeerCopy(testing.allocator, null);
+    defer if (any) |p| testing.allocator.free(p);
+    try testing.expect(any != null);
 }
 
 test "LockedMap: withValueLocked holds the lock across the callback" {
