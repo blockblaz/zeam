@@ -81,7 +81,7 @@ pub fn verifySignatures(
     // Per-component scratch (pubkey handle arrays, message bindings) lives in this arena.
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const ar = arena.allocator();
+    const arena_allocator = arena.allocator();
 
     // Without a cache we keep the PublicKey wrappers alive until after verify so their Rust
     // handles can be freed. Storage is in the arena; handles need explicit deinit.
@@ -92,15 +92,15 @@ pub fn verifySignatures(
 
     // Component layout: one entry per body attestation in body order, then the proposer LAST.
     const num_messages = attestations.len + 1;
-    const pks_per_message = try ar.alloc([]*const xmss.HashSigPublicKey, num_messages);
-    const messages = try ar.alloc(xmss.MessageBinding, num_messages);
+    const pks_per_message = try arena_allocator.alloc([]*const xmss.HashSigPublicKey, num_messages);
+    const messages = try arena_allocator.alloc(xmss.MessageBinding, num_messages);
 
     // Reject duplicate AttestationData: each must appear at most once. Type-2 binds components by
     // (message, slot), so duplicates would be ambiguous.
-    var seen_roots = std.AutoHashMap([32]u8, void).init(ar);
+    var seen_roots = std.AutoHashMap([32]u8, void).init(arena_allocator);
 
     for (attestations, 0..) |aggregated_attestation, i| {
-        const validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ar);
+        const validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, arena_allocator);
 
         // aggregation_bits is the SOLE binding to pubkeys (Type-2 carries no participants), so
         // validate it explicitly: non-empty, every index in range.
@@ -108,7 +108,7 @@ pub fn verifySignatures(
             return StateTransitionError.InvalidBlockSignatures;
         }
 
-        const public_keys = try ar.alloc(*const xmss.HashSigPublicKey, validator_indices.items.len);
+        const public_keys = try arena_allocator.alloc(*const xmss.HashSigPublicKey, validator_indices.items.len);
         for (validator_indices.items, 0..) |validator_index, j| {
             if (validator_index >= validators.len) {
                 return StateTransitionError.InvalidValidatorId;
@@ -123,13 +123,13 @@ pub fn verifySignatures(
                     return StateTransitionError.InvalidBlockSignatures;
                 };
                 public_keys[j] = pubkey.handle;
-                try pubkey_wrappers.append(ar, pubkey);
+                try pubkey_wrappers.append(arena_allocator, pubkey);
             }
         }
         pks_per_message[i] = public_keys;
 
         var message_hash: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, ar);
+        try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, arena_allocator);
         const gop = try seen_roots.getOrPut(message_hash);
         if (gop.found_existing) {
             return StateTransitionError.InvalidBlockSignatures;
@@ -147,7 +147,7 @@ pub fn verifySignatures(
         return StateTransitionError.InvalidValidatorId;
     };
     defer proposer_pk.deinit();
-    const proposer_handles = try ar.alloc(*const xmss.HashSigPublicKey, 1);
+    const proposer_handles = try arena_allocator.alloc(*const xmss.HashSigPublicKey, 1);
     proposer_handles[0] = proposer_pk.handle;
     pks_per_message[attestations.len] = proposer_handles;
 
@@ -155,7 +155,7 @@ pub fn verifySignatures(
     if (precomputed_block_root) |root| {
         block_root = root.*;
     } else {
-        try zeam_utils.hashTreeRoot(types.BeamBlock, block.*, &block_root, ar);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block.*, &block_root, arena_allocator);
     }
     // Reject a block_root that collides with any attestation data root, so the per-message
     // split/verify stays unambiguous (cryptographically negligible).
