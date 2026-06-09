@@ -478,16 +478,18 @@ pub const BeamState = struct {
             // ceilDiv is not available so this seems like a less compute intensive way without
             // requring float division, can be further optimized
             if (3 * target_justifications_count >= 2 * num_validators) {
-                // Record the justified target in the per-slot bitfield regardless of order.
-                try utils.setSlotJustified(finalized_slot, &self.justified_slots, target_slot, true);
                 // Advance the latest_justified pointer only when the new target is
                 // strictly ahead. A block can carry supermajority attestations for several targets
                 // processed in non-increasing slot order (e.g. 4, 9, 6); assigning unconditionally
                 // would drag latest_justified backward to 6 after 9, regressing the checkpoint and
-                // freezing finalization. The bitfield above still records every justified target.
+                // freezing finalization.
                 if (attestation_data.target.slot > self.latest_justified.slot) {
                     self.latest_justified = attestation_data.target;
                 }
+                // Record the justified target in the per-slot bitfield after advancing
+                // latest_justified (zeam-local structure consumed by isSlotJustified and the
+                // finalization scan).
+                try utils.setSlotJustified(finalized_slot, &self.justified_slots, target_slot, true);
                 // Free the removed justifications array before removing from map
                 if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
                     allocator.free(kv.value);
