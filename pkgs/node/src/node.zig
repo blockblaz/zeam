@@ -3384,7 +3384,7 @@ pub const BeamNode = struct {
         for (roots_to_retry.items) |item| {
             if (self.scheduleUnservedRetry(item.root, item.depth)) {
                 const single = [_]types.Root{item.root};
-                self.fetchBlockByRoots(&single, item.depth) catch |err| {
+                self.fetchBlockByRoots(&single, item.depth, null) catch |err| {
                     self.logger.warn("retryUnservedBlockRoots: failed to re-fetch root after unserved EOS/failure: {any}", .{err});
                 };
             }
