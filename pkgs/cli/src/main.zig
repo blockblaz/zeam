@@ -98,9 +98,10 @@ pub const NodeCommand = struct {
     /// always aggregates at least one sig. Higher values trade slot latency
     /// for fewer sub-threshold aggregates on chatty subnets.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
-    /// Intra-interval block-build/aggregation deadline budget (see
-    /// `ChainOpts.proposal_deadline_pct`): build self-truncates at this percent
-    /// of the proposal interval; the remainder of the same interval signs.
+    /// Single-message attestation aggregation deadline budget (see
+    /// `ChainOpts.proposal_deadline_pct`): the proposer truncates attestation
+    /// gathering at this percent of the proposal interval; the remainder is for
+    /// block signing and the Type-2 multi-message merge.
     @"proposal-deadline-pct": u32 = node_lib.default_proposal_deadline_pct,
 
     /// Cap on the number of child STARK proofs the aggregator worker merges

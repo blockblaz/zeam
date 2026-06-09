@@ -56,6 +56,11 @@ const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
+    /// Optional monotonic-ns cutoff for the single-message attestation aggregation
+    /// phase (`getProposalAttestations`). `null` = unbounded. `proposeImpl` derives
+    /// this from `proposal_deadline_pct` so the proposer caps gathering and leaves the
+    /// rest of the interval for block signing and the Type-2 multi-message merge.
+    deadline_ns: ?i64 = null,
 
     pub fn format(self: BlockProductionParams, writer: anytype) !void {
         try writer.print("BlockProductionParams{{ slot={d}, proposer_index={d} }}", .{ self.slot, self.proposer_index });
@@ -111,7 +116,7 @@ pub const ChainOpts = struct {
 };
 
 /// Default value for `ChainOpts.proposal_deadline_pct`
-pub const default_proposal_deadline_pct: u32 = 90;
+pub const default_proposal_deadline_pct: u32 = 50;
 
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
@@ -472,7 +477,8 @@ pub const BeamChain = struct {
 
     /// See `ChainOpts.proposal_deadline_pct`. Surfaced as a config knob
     /// (CLI `--proposal-deadline-pct`) and stored here; devnet5's off-loop
-    /// `proposeImpl` is the active proposal path.
+    /// `proposeImpl` derives the single-message aggregation `deadline_ns` from
+    /// it (this percent of the proposal interval).
     proposal_deadline_pct: u32,
 
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
@@ -2714,7 +2720,7 @@ pub const BeamChain = struct {
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         // FFI call against the owned snapshot — no lock held during this
         // window.
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, null);
+        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -5060,7 +5066,15 @@ pub const BeamChain = struct {
 
         const validator = if (node.validator) |*v| v else return;
 
-        var produced_block = chain.produceBlock(.{ .slot = slot, .proposer_index = proposer_id }) catch |e| {
+        // Cap single-message attestation aggregation at `proposal_deadline_pct`% of the
+        // proposal interval, leaving the remainder for block signing and the Type-2
+        // multi-message merge. A timely block with fewer attestation_data beats a late
+        // block carrying more — the off-loop merge is the dominant cost, so we bound the
+        // controllable gathering phase rather than the merge.
+        const agg_budget_ns: i128 = @divFloor(@as(i128, constants.SECONDS_PER_INTERVAL_MS) * @as(i128, chain.proposal_deadline_pct) * std.time.ns_per_ms, 100);
+        const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + agg_budget_ns);
+
+        var produced_block = chain.produceBlock(.{ .slot = slot, .proposer_index = proposer_id, .deadline_ns = deadline_ns }) catch |e| {
             chain.logger.err("propose worker: produceBlock failed slot={d}: {any}", .{ slot, e });
             return;
         };
