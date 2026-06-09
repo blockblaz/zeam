@@ -5067,12 +5067,14 @@ pub const BeamChain = struct {
         const validator = if (node.validator) |*v| v else return;
 
         // Cap single-message attestation aggregation at `proposal_deadline_pct`% of the
-        // proposal interval, leaving the remainder for block signing and the Type-2
+        // proposal interval, reserving the remainder for block signing and the Type-2
         // multi-message merge. A timely block with fewer attestation_data beats a late
         // block carrying more — the off-loop merge is the dominant cost, so we bound the
-        // controllable gathering phase rather than the merge.
-        const agg_budget_ns: i128 = @divFloor(@as(i128, constants.SECONDS_PER_INTERVAL_MS) * @as(i128, chain.proposal_deadline_pct) * std.time.ns_per_ms, 100);
-        const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + agg_budget_ns);
+        // controllable gathering phase rather than the merge. Clamp to [0, 99] so the
+        // sign/merge step always keeps headroom (same form as main's produceBlockWorker).
+        const pct_clamped: i64 = @intCast(@min(chain.proposal_deadline_pct, 99));
+        const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
+        const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
 
         var produced_block = chain.produceBlock(.{ .slot = slot, .proposer_index = proposer_id, .deadline_ns = deadline_ns }) catch |e| {
             chain.logger.err("propose worker: produceBlock failed slot={d}: {any}", .{ slot, e });
