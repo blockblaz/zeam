@@ -1377,7 +1377,7 @@ fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.Aggre
     const proof_bytes = try parseHexBytesAlloc(allocator, proof_data_hex);
     defer allocator.free(proof_bytes);
 
-    var proof_data = try xmss.ByteListMiB.init(allocator);
+    var proof_data = try xmss.ByteList512KiB.init(allocator);
     errdefer proof_data.deinit();
     for (proof_bytes) |b| {
         proof_data.append(b) catch return error.InvalidField;

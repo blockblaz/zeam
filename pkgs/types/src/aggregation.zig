@@ -152,7 +152,7 @@ pub const SingleMessageAggregate = struct {
 /// `AggregatedSignatureProof` → `SingleMessageAggregate` (same shape: participants + proof bytes,
 /// same `aggregate()` signature). Aliased so the per-att_data aggregation code keeps
 /// compiling against the new type without a wholesale rename. Field rename `proof_data`→`proof`
-/// and container `ByteListMiB`→`ByteList512KiB` are reconciled at the call sites.
+/// and the `ByteList512KiB` proof-bytes container are reconciled at the call sites.
 pub const AggregatedSignatureProof = SingleMessageAggregate;
 
 /// A multi-message multi-signature proof: a merge of N Type-1 proofs over distinct messages.

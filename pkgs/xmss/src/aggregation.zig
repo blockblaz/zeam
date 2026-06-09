@@ -23,9 +23,6 @@ pub const MAX_AGGREGATE_PROOF_SIZE: usize = 512 * 1024;
 
 /// Variable-length byte list for compact Type-1/Type-2 proofs.
 pub const ByteList512KiB = ssz.utils.List(u8, MAX_AGGREGATE_PROOF_SIZE);
-/// Compat alias: the old name used `ByteListMiB` (1 MiB) for proof bytes; the proof cap is now
-/// `ByteList512KiB`. Aliased so test/spectest infra referencing the old name keeps compiling.
-pub const ByteListMiB = ByteList512KiB;
 
 /// Per-component (message hash, slot) binding used when verifying a Type-2 proof.
 pub const MessageBinding = struct {

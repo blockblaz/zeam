@@ -43,9 +43,7 @@ const SampleUint64Vector4 = [4]u64;
 const SampleBitlist16 = ssz.utils.Bitlist(16);
 const SampleBytes32List8 = ssz.utils.List([32]u8, 8);
 const SampleUint32List16 = ssz.utils.List(u32, 16);
-const ByteListMiB = xmss.ByteListMiB;
-// The proof-bytes list was renamed to ByteList512KiB; it is the same Zig type
-// as ByteListMiB (aliased in xmss), but spec fixtures key on the new name.
+// The proof-bytes list type used by spec fixtures (keyed as ByteList512KiB).
 const ByteList512KiB = xmss.ByteList512KiB;
 
 // Boundary fixture types (test_merkleization_boundaries) — exercise the
@@ -184,7 +182,6 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "SampleBitlist16", .zig_type = SampleBitlist16, .has_deinit = true },
     .{ .name = "SampleBytes32List8", .zig_type = SampleBytes32List8, .has_deinit = true },
     .{ .name = "SampleUint32List16", .zig_type = SampleUint32List16, .has_deinit = true },
-    .{ .name = "ByteListMiB", .zig_type = ByteListMiB, .has_deinit = true },
     .{ .name = "ByteList512KiB", .zig_type = ByteList512KiB, .has_deinit = true },
     // XMSS aggregation containers — exercised by ssz test_xmss_containers fixtures.
     .{ .name = "SingleMessageAggregate", .zig_type = types.SingleMessageAggregate, .has_deinit = true },

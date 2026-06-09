@@ -362,7 +362,7 @@ fn parseAggregatedSignatureProof(
     const proof_data_hex = try expect_mod.expectStringField(FixtureError, proof_data_obj, &.{"data"}, ctx, "attestationSignatures[].proofData.data");
     const proof_data_bytes = try parseHexBytes(allocator, ctx, proof_data_hex, "attestationSignatures[].proofData.data");
 
-    var proof_data = try xmss.ByteListMiB.init(allocator);
+    var proof_data = try xmss.ByteList512KiB.init(allocator);
     errdefer proof_data.deinit();
     for (proof_data_bytes) |b| {
         proof_data.append(b) catch return FixtureError.InvalidFixture;

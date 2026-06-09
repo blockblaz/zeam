@@ -4,7 +4,6 @@ const Allocator = std.mem.Allocator;
 const aggregate = @import("aggregation.zig");
 pub const MAX_AGGREGATE_PROOF_SIZE = aggregate.MAX_AGGREGATE_PROOF_SIZE;
 pub const ByteList512KiB = aggregate.ByteList512KiB;
-pub const ByteListMiB = aggregate.ByteListMiB;
 pub const MessageBinding = aggregate.MessageBinding;
 pub const AggregationError = aggregate.AggregationError;
 pub const setRayonThreads = aggregate.setRayonThreads;
