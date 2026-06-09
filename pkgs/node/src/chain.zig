@@ -7094,6 +7094,79 @@ test "produceBlock - older-but-justified source is accepted" {
     try std.testing.expect(found_older);
 }
 
+test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (proposal_deadline_pct wiring)" {
+    // proposal_deadline_pct is wired (via BlockProductionParams.deadline_ns) into
+    // getProposalAttestations -> compactAttestations. The deadline only bites on COMPACTION:
+    // compactAttestations returns inputs as-is when each AttestationData has a single proof,
+    // but an elapsed deadline short-circuits the merge of multiple proofs sharing one att_data
+    // to empty (cf. "compactAttestations: elapsed deadline returns empty prefix"). So with an
+    // elapsed cutoff a single proof passes through (1), but two proofs for the SAME att_data are
+    // dropped (0) — proving deadline_ns threads produceBlock -> getProposalAttestations ->
+    // compactAttestations.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var fx = try setupJustifiedSourceTestChain(allocator, 8);
+    defer {
+        fx.beam_chain.deinit();
+        fx.thread_pool.deinit();
+        fx.test_registry.deinit();
+        fx.db.deinit();
+        fx.tmp_dir.cleanup();
+    }
+    const mock_chain = fx.mock_chain;
+    const beam_chain = fx.beam_chain;
+
+    for (1..5) |i| {
+        const signed_block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(signed_block.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        allocator.free(missing_roots);
+    }
+
+    const justified_cp = mock_chain.latestJustified[4];
+    const justified_slot: types.Slot = justified_cp.slot;
+    const older_justified_slot: types.Slot = if (justified_slot > 1) justified_slot - 1 else justified_slot;
+    const older_source_root = mock_chain.blockRoots[older_justified_slot];
+    const proposal_slot: types.Slot = 5;
+    const parent_root = mock_chain.blockRoots[4];
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
+
+    const att_data = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = parent_root, .slot = 4 },
+        .source = .{ .root = older_source_root, .slot = older_justified_slot },
+    };
+    const proposer_index = proposal_slot % num_validators;
+
+    // Elapsed cutoff (1s in the past).
+    const elapsed: i64 = @intCast(zeam_utils.monotonicTimestampNs() - std.time.ns_per_s);
+
+    // Two disjoint proofs for the SAME att_data force compactAttestations to merge them; with
+    // the cutoff already elapsed the merge short-circuits to empty, so the produced block carries
+    // 0 attestations. A single proof would pass through untouched (the deadline is only consulted
+    // during a merge), and the sibling "older-but-justified source is accepted" test shows this
+    // att_data IS gathered when not deadline-bounded — so the 0 here is the cutoff's doing, not
+    // filtering. (One produceBlock call: getProposalHead mutates fork-choice, so it is not
+    // idempotent across calls.)
+    var proof_a = try types.AggregatedSignatureProof.init(allocator);
+    try types.aggregationBitsSet(&proof_a.participants, 0, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true);
+    var proof_b = try types.AggregatedSignatureProof.init(allocator);
+    try types.aggregationBitsSet(&proof_b.participants, 1, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true);
+
+    const produced = try beam_chain.produceBlock(.{
+        .slot = proposal_slot,
+        .proposer_index = proposer_index,
+        .deadline_ns = elapsed,
+    });
+    defer @constCast(&produced).deinit();
+    try std.testing.expectEqual(@as(usize, 0), produced.block.body.attestations.constSlice().len);
+}
+
 test "produceBlock - zero-hash source/target rejected by build_block" {
     // attestationDataMatchesChainExtended must reject attestations whose source or
     // target root is ZERO_HASH even when the slot would otherwise pass the justified check.
