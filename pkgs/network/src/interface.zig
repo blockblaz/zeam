@@ -94,7 +94,7 @@ pub const GossipSub = struct {
     /// Publish a gossip message. Returns `true` if the message was successfully
     /// handed off to the underlying transport (and is therefore expected to
     /// reach the network), `false` if the publish was dropped (e.g. backend
-    /// command channel full, see issue #808). Callers should not log the
+    /// command channel full). Callers should not log the
     /// publish as successful when this returns `false`.
     pub fn publish(self: GossipSub, obj: *const GossipMessage) anyerror!bool {
         return self.publishFn(self.ptr, obj);
@@ -371,7 +371,7 @@ pub const LeanSupportedProtocol = enum(u32) {
     // try_from (incoming RPC tag) AND Rust enum → u32 (outgoing tag).
     // The Rust side pins both via `#[repr(u32)]` + explicit discriminants;
     // a unit test (`try_from_round_trip_matches_repr` in the Rust file)
-    // guards against future drift. Reported by @ch4r10t33r on PR #824.
+    // guards against future drift.
     blocks_by_root = 0,
     status = 1,
     blocks_by_range = 2,
@@ -429,7 +429,7 @@ pub const LeanSupportedProtocol = enum(u32) {
 ///
 /// Intentionally module-private: this is a wire-shape shim for
 /// `ReqRespRequest.deserialize` only and exists purely to dodge an upstream
-/// SSZ panic surface (see #843). Once the bounds checks land in `ssz.zig`
+/// SSZ panic surface. Once the bounds checks land in `ssz.zig`
 /// itself this whole helper goes away. If a future caller in `pkgs/network/`
 /// needs the same validation, lift it then — don't widen the API now and
 /// invite reuse of a fix that is meant to be temporary.
@@ -1090,7 +1090,7 @@ test LeanNetworkTopic {
 
 test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panicking" {
     // Regression test for the Hive `reqresp/blocks_by_root/malformed_request`
-    // failures. The regression test merged with #845 used a hand-crafted
+    // failures. An earlier version of this regression test used a hand-crafted
     // 24-byte approximation; this test pins the real simulator input.
     //
     // The Hive simulator sends `encode_request_raw(&[0xab; 64])`:
@@ -1098,8 +1098,8 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
     //   - After zeam's snappy frame decode: 64 bytes all `0xAB`
     //   - SSZ offset field (bytes 0..4 LE): 0xABABABAB = 2880154539
     //
-    // Without the guard added in #845, the ssz.zig container deserializer at
-    // lib.zig:604 sliced `bytes[2880154539..]` on a 64-byte buffer and
+    // Without the guard, the ssz.zig container deserializer
+    // sliced `bytes[2880154539..]` on a 64-byte buffer and
     // panicked, killing the FFI thread and aborting zeam.
     //
     // Scope: this test exercises the post-decompression validation path only.

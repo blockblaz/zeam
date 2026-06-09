@@ -47,7 +47,6 @@ fn defaultSimpleTestRunner(b: *Builder) std.Build.Step.Compile.TestRunner {
 // is emitted exactly once. When multiple Rust staticlibs were linked together
 // directly, `ld64` on macOS rejected the duplicate strong definitions and the
 // `build-all-provers` job broke on any fresh (cache-miss) rebuild.
-// See blockblaz/zeam#773.
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     const glue_path = switch (prover) {
         // `.dummy` uses the dedicated multisig-only Cargo profile (ThinLTO,
@@ -80,7 +79,13 @@ pub fn build(b: *Builder) !void {
     const prover_option = b.option([]const u8, "prover", "Choose prover: dummy, risc0, openvm, or all (default: dummy)") orelse "dummy";
     const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .dummy;
 
-    const build_rust_lib_steps = build_rust_project(b, "rust", prover);
+    // Drop the jemalloc global allocator and use the system allocator. Needed
+    // for the Shadow network simulator: its preload shim re-enters malloc during
+    // its own first-syscall init while jemalloc holds its non-recursive init
+    // lock, which self-deadlocks (shadow/shadow#3763).
+    const no_jemalloc = b.option(bool, "no-jemalloc", "Disable the jemalloc global allocator (use the system allocator). Required under the Shadow simulator, whose shim deadlocks with jemalloc's init.") orelse false;
+
+    const build_rust_lib_steps = build_rust_project(b, "rust", prover, no_jemalloc);
 
     // LTO option (disabled by default for faster builds)
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
@@ -164,6 +169,9 @@ pub fn build(b: *Builder) !void {
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
     // Absolute path to test-keys for pre-generated validator keys
     build_options.addOption([]const u8, "test_keys_path", b.pathFromRoot("test-keys/hash-sig-keys"));
+    // Optional slot-time override, for tests/sims that need a wider slot than the preset's.
+    const seconds_per_slot_override = b.option(u64, "seconds-per-slot", "Override SECONDS_PER_SLOT (test/sim only; default = preset 4s)");
+    build_options.addOption(?u64, "seconds_per_slot_override", seconds_per_slot_override);
     const build_options_module = build_options.createModule();
 
     // add zeam-utils
@@ -182,6 +190,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
+    zeam_params.addImport("build_options", build_options_module);
 
     // add zeam-metrics (core metrics definitions)
     const zeam_metrics = b.addModule("@zeam/metrics", .{
@@ -326,7 +335,7 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
     zeam_network.addImport("@zeam/metrics", zeam_metrics);
-    // #942 follow-up: the publish-side forensic log line in `ethlibp2p.zig`
+    // The publish-side forensic log line in `ethlibp2p.zig`
     // includes the build git SHA so receivers across the fleet can correlate
     // broken-byte receipts back to the exact producer binary.
     zeam_network.addImport("build_options", build_options_module);
@@ -482,11 +491,11 @@ pub fn build(b: *Builder) !void {
     const test_step = b.step("test", "Run zeam core tests");
 
     // ---------------------------------------------------------------
-    // Single-node ingestion stress harness (issue #803 slice b).
+    // Single-node ingestion stress harness.
     //
     // Run with `zig build stress` (or `zig build stress -Doptimize=Debug`).
     // Configurable via env vars:
-    //   ZEAM_STRESS_DURATION_SECS  default 1800 (30 min, design-doc r3 merge gate)
+    //   ZEAM_STRESS_DURATION_SECS  default 1800 (30 min, the full merge-gate run)
     //   ZEAM_STRESS_NUM_BLOCKS     default 6
     //   ZEAM_STRESS_GOSSIP_THREADS default 3
     //   ZEAM_STRESS_RPC_THREADS    default 4
@@ -521,16 +530,16 @@ pub fn build(b: *Builder) !void {
     stress_exe.step.dependOn(&build_rust_lib_steps.step);
     const run_stress = b.addRunArtifact(stress_exe);
     if (b.args) |args| run_stress.addArgs(args);
-    const stress_step = b.step("stress", "Run single-node ingestion stress harness (issue #803 slice b)");
+    const stress_step = b.step("stress", "Run single-node ingestion stress harness");
     stress_step.dependOn(&run_stress.step);
 
     // -----------------------------------------------------------------
     // `stress-quick`: short-form stress harness wired into `zig build
     // test`. The full 30-min run is operator-driven; this 30s run is
-    // what CI executes on every PR so the slice-(a)/(b) merge gate
-    // actually has automated enforcement, not just a PR-comment
-    // attestation. The quick run uses the same code paths as the full
-    // run and will fail CI on:
+    // what CI executes on every change so the ingestion merge gate
+    // actually has automated enforcement, rather than relying on a
+    // manual attestation. The quick run uses the same code paths as the
+    // full run and will fail CI on:
     //   * any `MissingPreState` (states-map race),
     //   * any unexpected `chain.onBlock` error in gossip-flood,
     //   * any `recordFatal` from coherence checks (BlockCache,
@@ -545,13 +554,13 @@ pub fn build(b: *Builder) !void {
     const run_stress_quick = b.addRunArtifact(stress_exe);
     run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
     run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
-    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate, slice b)");
+    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate)");
     stress_quick_step.dependOn(&run_stress_quick.step);
     test_step.dependOn(&run_stress_quick.step);
 
     // -----------------------------------------------------------------
     // `stress-saturation` and `stress-quick-saturation`: chain-worker
-    // queue saturation harness (slice c-2c commit 6 of #803).
+    // queue saturation harness.
     //
     // The full `stress-saturation` step is operator-driven (~30s
     // default). The quick variant is wired into `zig build test` so
@@ -573,7 +582,7 @@ pub fn build(b: *Builder) !void {
     if (b.args) |args| run_stress_saturation.addArgs(args);
     const stress_saturation_step = b.step(
         "stress-saturation",
-        "Run the chain-worker queue saturation harness (issue #803 slice c-2c)",
+        "Run the chain-worker queue saturation harness",
     );
     stress_saturation_step.dependOn(&run_stress_saturation.step);
 
@@ -588,7 +597,7 @@ pub fn build(b: *Builder) !void {
     run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_SAT_ATTN_PRODUCERS", "16");
     const stress_quick_saturation_step = b.step(
         "stress-quick-saturation",
-        "Run a 15s chain-worker queue saturation harness (CI gate, slice c-2c)",
+        "Run a 15s chain-worker queue saturation harness (CI gate)",
     );
     stress_quick_saturation_step.dependOn(&run_stress_quick_saturation.step);
     test_step.dependOn(&run_stress_quick_saturation.step);
@@ -609,6 +618,8 @@ pub fn build(b: *Builder) !void {
     const integration_build_options_module = integration_build_options.createModule();
     cli_integration_tests.root_module.addImport("build_options", integration_build_options_module);
     cli_integration_tests.root_module.addImport("@zeam/utils", zeam_utils);
+    // params: lets the harness scale its timeouts by the slot time.
+    cli_integration_tests.root_module.addImport("@zeam/params", zeam_params);
 
     // Add CLI constants module to integration tests
     const cli_constants = b.addModule("cli_constants", .{
@@ -638,12 +649,9 @@ pub fn build(b: *Builder) !void {
     setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
 
-    // leanMetrics PR #35: lock the gauge↑scrape contract for
-    // `lean_gossip_mesh_peers` (and the append-only behaviour of the
-    // `registerScrapeRefresher` registry) in code so doc-only audits
-    // cannot regress silently — the same lesson as slice (b)
-    // (LockTimer → /metrics test) and slice c-2b
-    // (`lean_chain_state_refcount_distribution`).
+    // Lock the gauge↑scrape contract for `lean_gossip_mesh_peers` (and the
+    // append-only behaviour of the `registerScrapeRefresher` registry) in
+    // code so doc-only audits cannot regress it silently.
     const metrics_tests = b.addTest(.{
         .root_module = zeam_metrics,
     });
@@ -844,7 +852,7 @@ pub fn build(b: *Builder) !void {
     const spectest_generate_step = b.step("spectest:generate", "Regenerate spectest fixtures");
     spectest_generate_step.dependOn(&run_spectest_generate.step);
 
-    // The test-binary compile reads pkgs/spectest/src/generated/index.zig
+    // The test-binary compile reads the generated spectest index
     // (gitignored, regenerated by the generator step). Without this edge
     // the compile and the generator race when zig fans out parallel build
     // steps — the compile sometimes reads a stale or half-written index
@@ -913,10 +921,10 @@ fn setSpectestArgsAndEnv(
     }
 }
 
-fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
+fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice, no_jemalloc: bool) *Builder.Step.Run {
     // Every Rust glue crate is routed through the `zeam-glue` staticlib shim;
     // feature flags control which per-prover rlibs get linked in. See the
-    // comment on `addRustGlueLib` and blockblaz/zeam#773.
+    // comment on `addRustGlueLib`.
     //
     // We invoke `rustup run nightly cargo …` rather than `cargo +nightly`.
     // Both reach the same toolchain on a properly-installed rustup, but
@@ -932,12 +940,17 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Local-dev requirement: rustup must be installed. Standalone
     // Cargo (e.g. Homebrew-only) won't satisfy `rustup run nightly`
     // any more than it satisfied the previous `cargo +nightly` shape.
+    // jemalloc is the global allocator only for the multisig/default build (the
+    // lib.rs cfg excludes the zkVM provers, which ship their own). Enable its
+    // cargo feature here, unless -Dno-jemalloc was passed (e.g. for the Shadow
+    // simulator, where jemalloc deadlocks the shim — system allocator instead).
+    const multisig_features = if (no_jemalloc) "libp2p,hashsig,multisig" else "libp2p,hashsig,multisig,jemalloc";
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
             "rustup",    "run",                   "nightly",          "cargo",
             "-C",        path,                    "-Z",               "unstable-options",
             "build",     "--profile",             "multisig-release", "-p",
-            "zeam-glue", "--no-default-features", "--features",       "libp2p,hashsig,multisig",
+            "zeam-glue", "--no-default-features", "--features",       multisig_features,
         }),
         .risc0 => b.addSystemCommand(&.{
             "rustup",    "run",                   "nightly",       "cargo",

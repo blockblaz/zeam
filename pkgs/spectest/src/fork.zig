@@ -3,7 +3,7 @@ const std = @import("std");
 pub const Fork = struct {
     /// Human readable fork name used by Lean fixtures.
     name: []const u8,
-    /// Directory segment under leanSpec fixtures.
+    /// Directory segment under spec fixtures.
     path: []const u8,
     /// Qualified symbol exposed by this module.
     symbol: []const u8,

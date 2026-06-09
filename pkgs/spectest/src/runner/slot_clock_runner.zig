@@ -220,6 +220,6 @@ fn checkConfigU64(
             return;
         }
     }
-    // Missing config field is non-fatal — leanSpec versions vary on which
+    // Missing config field is non-fatal — spec versions vary on which
     // are emitted. Only mismatched values are an error.
 }

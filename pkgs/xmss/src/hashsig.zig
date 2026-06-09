@@ -106,7 +106,7 @@ extern fn hashsig_verify_ssz(
     signature_len: usize,
 ) callconv(.c) i32;
 
-/// Verify XMSS signature against the leanSpec test scheme (LOG_LIFETIME=8,
+/// Verify XMSS signature against the spec's test scheme (LOG_LIFETIME=8,
 /// DIMENSION=4). Used by spec-test fixtures whose `leanEnv=test` produces
 /// ~424-byte signatures that the production scheme cannot parse.
 extern fn hashsig_test_verify_ssz(
@@ -148,7 +148,7 @@ pub fn verifySsz(
     }
 }
 
-/// Verify signature against the leanSpec test scheme. Mirrors verifySsz but
+/// Verify signature against the spec's test scheme. Mirrors verifySsz but
 /// dispatches to the test-config FFI symbol. Used by spec-test fixtures.
 pub fn verifySszTest(
     pubkey_bytes: []const u8,

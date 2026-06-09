@@ -24,7 +24,7 @@ pub const Clock = struct {
     current_interval: isize,
     /// Wall-clock millis at the most recent `tickInterval()` call, or
     /// `NEVER_TICKED_MS` before the first tick. Read concurrently by
-    /// `SlotDriverWatchdog` (#863) — kept atomic so the watchdog
+    /// `SlotDriverWatchdog` — kept atomic so the watchdog
     /// thread never observes a torn value. Writers must use
     /// `release` ordering, readers `acquire` (or `monotonic` when the
     /// reader doesn't need to synchronise with anything else the
@@ -84,7 +84,7 @@ pub const Clock = struct {
     ///
     /// Use this when sync-gating decisions must remain correct even while
     /// the libxev slot driver is stalled or forkchoice ticks are blocked
-    /// behind a long-running mutator (#863). Reading `slot_clock.timeSlots`
+    /// behind a long-running mutator. Reading `slot_clock.timeSlots`
     /// in those decisions self-reinforces stalls: a starved counter caps
     /// the sync gap to zero, catch-up is skipped, the node stays stuck.
     ///
@@ -161,10 +161,10 @@ pub const Clock = struct {
     }
 
     pub fn run(self: *Self) !void {
-        // Issue #863 P4: bound each xev drain pass to ONE io_uring CQE
-        // batch via `.once` rather than `.until_done`.
+        // Bound each xev drain pass to one io_uring CQE batch via
+        // `.once` rather than `.until_done`.
         //
-        // The pre-#863 shape called `events.run(.until_done)` per pass,
+        // The earlier shape called `events.run(.until_done)` per pass,
         // which loops until `loop.active == 0`. Under sustained gossip
         // pressure (especially on a 4-subnet aggregator that sees 4×
         // attestation traffic, with ~74% of those attestations referring
@@ -172,7 +172,7 @@ pub const Clock = struct {
         // for the full trace), every callback enqueues additional work
         // (chain submits, peer-event broadcasts, RPC retries) so the
         // active-completion count never reaches zero and `tickInterval`
-        // doesn't run again until the storm subsides. Devnet-4 saw
+        // doesn't run again until the storm subsides. We observed
         // multi-second slot-driver stalls and ~96 finalized vs ~196 head
         // delta on the aggregator as a direct consequence.
         //
@@ -227,8 +227,7 @@ pub const Clock = struct {
             // ~`CLOCK_DISPARITY_MS` early while the interval timer was still
             // legitimately pending; `tickInterval` then re-armed/canceled that
             // timer and the canceled completion does not run `onInterval`,
-            // so gossip-heavy `.once` batches could skip slot duties (#886
-            // review).
+            // so gossip-heavy `.once` batches could skip slot duties.
             const time_now_ms: isize = @intCast(zeam_utils.unixTimestampMillis());
             if (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS <= time_now_ms) {
                 self.tickInterval();

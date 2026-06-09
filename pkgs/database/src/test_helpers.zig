@@ -2,8 +2,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
-/// Helper function to create a dummy block for testing
-pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, attestation_signatures: types.AttestationSignatures) !types.SignedBlock {
+/// Helper function to create a dummy block for testing. `proof` is the Type-2 proof blob
+/// carried by `SignedBlock.proof`; ownership is moved into the returned block.
+pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, proof: types.ByteList512KiB) !types.SignedBlock {
     const attestations_list = try types.AggregatedAttestations.init(allocator);
 
     var test_block = types.BeamBlock{
@@ -18,17 +19,10 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
     @memset(&test_block.parent_root, parent_root_fill);
     @memset(&test_block.state_root, state_root_fill);
 
-    const block_signatures = types.BlockSignatures{
-        .attestation_signatures = attestation_signatures,
-        .proposer_signature = types.ZERO_SIGBYTES,
-    };
-
-    const signed_block = types.SignedBlock{
+    return types.SignedBlock{
         .block = test_block,
-        .signature = block_signatures,
+        .proof = .{ .proof = proof },
     };
-
-    return signed_block;
 }
 
 /// Helper function to create a dummy state for testing
@@ -78,20 +72,12 @@ pub fn createDummyRoot(fill_byte: u8) types.Root {
     return root;
 }
 
-/// Helper function to create dummy attestation signatures with AggregatedSignatureProof objects
-pub fn createDummyAttestationSignatures(allocator: Allocator, num_proofs: usize) !types.AttestationSignatures {
-    var attestation_signatures = try types.AttestationSignatures.init(allocator);
-    errdefer attestation_signatures.deinit();
-
-    for (0..num_proofs) |i| {
-        var signature_proof = try types.AggregatedSignatureProof.init(allocator);
-        errdefer signature_proof.deinit();
-
-        // Set a participant bit for each proof
-        try types.aggregationBitsSet(&signature_proof.participants, i, true);
-
-        try attestation_signatures.append(signature_proof);
+/// Helper function to create a dummy Type-2 proof blob with `num_bytes` filler bytes.
+pub fn createDummyProof(allocator: Allocator, num_bytes: usize) !types.ByteList512KiB {
+    var proof = try types.ByteList512KiB.init(allocator);
+    errdefer proof.deinit();
+    for (0..num_bytes) |i| {
+        try proof.append(@intCast(i & 0xff));
     }
-
-    return attestation_signatures;
+    return proof;
 }

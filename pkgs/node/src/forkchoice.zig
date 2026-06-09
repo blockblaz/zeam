@@ -14,14 +14,16 @@ const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const constants = @import("./constants.zig");
 
-const AggregatedSignatureProof = types.AggregatedSignatureProof;
+const SingleMessageAggregate = types.SingleMessageAggregate;
 const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
 /// Maximum number of distinct AttestationData entries a single block may
-/// include, matching leanSpec's chain.config.MAX_ATTESTATIONS_DATA.
-pub const MAX_ATTESTATIONS_DATA: usize = 16;
+/// include (chain.config.MAX_ATTESTATIONS_DATA = 8).
+/// Single source of truth: re-export the params constant so the block-validation
+/// guard, verifySignatures, and the builder cap can never drift apart.
+pub const MAX_ATTESTATIONS_DATA: usize = params.MAX_ATTESTATIONS_DATA;
 
 fn validateAttestationDataLimits(
     allocator: Allocator,
@@ -208,7 +210,7 @@ pub const ProtoArray = struct {
                         if (bestChild.weight < node.weight) {
                             updateBest = true;
                         } else if (bestChild.weight == node.weight and (std.mem.order(u8, &bestChild.blockRoot, &node.blockRoot) == .lt)) {
-                            // tie break by lexicographically larger block root (leanSpec-compatible)
+                            // tie break by lexicographically larger block root
                             updateBest = true;
                         }
                     } else {
@@ -798,7 +800,7 @@ pub const ForkChoice = struct {
                 current_node.bestChild = new_best_child_idx;
 
                 // If bestDescendant is null, keep it null (can happen when applyDeltas uses cutoff_weight
-                // and the best branch has no node >= cutoff). See issue #545.
+                // and the best branch has no node >= cutoff).
                 if (current_node.bestDescendant) |old_best_descendant_idx| {
                     const new_best_descendant_idx = old_indices_to_new.get(old_best_descendant_idx) orelse @panic("invalid old index lookup for rebase best descendant");
                     current_node.bestDescendant = new_best_descendant_idx;
@@ -1021,11 +1023,25 @@ pub const ForkChoice = struct {
 
         // Promote latestNew → latestKnown in attestation tracker.
         // Attestations that were "new" (gossip) are now "known" (accepted).
+        //
+        // MERGE, do not overwrite. Block-recorded head votes land directly in
+        // latestKnown (onAttestation is_from_block) with latestNew==null. A blind
+        // `latestKnown = latestNew` would clobber them at the acceptance tick — so a
+        // block vote would only survive while re-included in every later block, and
+        // the first attestation-free block on a competing fork would erase the heavier
+        // fork's weight (head then falls to the lexicographic tie-break / deeper fork).
+        // accept_new_attestations unions latest_new into latest_known
+        // (head reads the highest-slot vote per validator), so do the same: keep the
+        // fresher of the two, gossip winning ties as it reflects the validator's
+        // current view, and never drop a known vote when latestNew is null/older.
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
-            // latestNew is always ahead of latestKnown (and will be non null if latestknown is not null)
-            tracker.latestKnown = tracker.latestNew;
-            try self.attestations.put(validator_id, tracker);
+            const new_vote = tracker.latestNew orelse continue;
+            const known_slot = (tracker.latestKnown orelse ProtoAttestation{}).slot;
+            if (tracker.latestKnown == null or new_vote.slot >= known_slot) {
+                tracker.latestKnown = new_vote;
+                try self.attestations.put(validator_id, tracker);
+            }
         }
 
         return self.updateHeadUnlocked();
@@ -1051,12 +1067,11 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     pub const ProposalAttestationsResult = struct {
         attestations: types.AggregatedAttestations,
-        signatures: types.AttestationSignatures,
+        signatures: types.Type1ProofList,
     };
 
     /// Checks whether `slot` is justified under the given tracking state,
-    /// matching leanSpec `build_block`'s `current_justified_slots.is_slot_justified`
-    /// (leanSpec commit 00556d8).
+    /// matching `build_block`'s `current_justified_slots.is_slot_justified`.
     /// Returns `false` (never an error) when `slot` is beyond the current
     /// justified_slots window — those slots are simply not yet justified.
     /// Slots at or before `finalized_slot` are implicitly justified (return `true`).
@@ -1072,7 +1087,6 @@ pub const ForkChoice = struct {
         return justified_slots.get(idx) catch false;
     }
 
-    /// Mirrors leanSpec `_attestation_data_matches_chain` (leanSpec commit 00556d8).
     /// Checks whether `att_data`'s source and target roots are consistent with
     /// the *extended* historical block hashes view — i.e. `state.historical_block_hashes`
     /// as it would appear after `process_block_header` on the candidate block:
@@ -1134,7 +1148,7 @@ pub const ForkChoice = struct {
             agg_attestations.deinit();
         };
 
-        var attestation_signatures = try types.AttestationSignatures.init(self.allocator);
+        var attestation_signatures = try types.Type1ProofList.init(self.allocator);
         var agg_sig_cleanup = true;
         errdefer if (agg_sig_cleanup) {
             for (attestation_signatures.slice()) |*sig| sig.deinit();
@@ -1143,7 +1157,7 @@ pub const ForkChoice = struct {
 
         // Fixed-point attestation collection with greedy proof selection.
         //
-        // leanSpec `build_block` (commit 00556d8): instead of filtering by a single
+        // `build_block`: instead of filtering by a single
         // justified root, we now accept any attestation whose *source slot* is marked
         // justified in `current_justified_slots`. This allows older-but-still-justified
         // sources to appear in a block, not just the latest justified checkpoint.
@@ -1155,7 +1169,7 @@ pub const ForkChoice = struct {
         // The loop restarts whenever justification OR finalization advances so we can
         // pick up attestations that become valid only after a justification update.
         var current_finalized_slot: types.Slot = pre_state.latest_finalized.slot;
-        // Spec note (leanSpec d0c5030 / commit 00556d8): when building on top of genesis
+        // When building on top of genesis
         // (pre_state.latest_block_header.slot == 0), process_block_header would set
         // latest_justified.root = parent_root. The old code applied that same derivation
         // eagerly so the source-root filter matched. With the new slot-based filter we no
@@ -1196,7 +1210,20 @@ pub const ForkChoice = struct {
             while (payload_it.next()) |entry| {
                 const att_data = entry.key_ptr;
 
-                // Source slot must already be justified on this chain (leanSpec build_block).
+                // Ensure time flows forward: a target must lie strictly after its source. An
+                // attestation with target.slot <= source.slot can NEVER justify a new checkpoint —
+                // process_attestations provably drops it (target_not_ahead) — so selecting it only
+                // wastes a MAX_ATTESTATIONS_DATA slot. This is a builder-side optimization NOT in
+                // build_block (which keeps genesis self-votes for head-vote weight), but it
+                // is necessary here, confirmed by experiment: zeam accumulates one distinct
+                // genesis-target self-vote att_data PER early slot (source=target=0, differing .slot),
+                // and by ~slot 9 there are more than MAX_ATTESTATIONS_DATA of them. Without this guard
+                // they fill the whole cap → blocks carry 0 justifying coverage → justification stalls
+                // and nodes diverge (reverting it reproduced a hard stall at cap=8: finalized=0,
+                // justified frozen ~9, heads forked).
+                if (att_data.target.slot <= att_data.source.slot) continue;
+
+                // Source slot must already be justified on this chain (build_block).
                 if (!isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.source.slot)) continue;
 
                 // Source and target roots must match our chain's historical block hashes
@@ -1204,15 +1231,15 @@ pub const ForkChoice = struct {
                 // Also rejects zero-hash source or target roots inline.
                 if (!attestationDataMatchesChainExtended(&pre_state.historical_block_hashes, parent_root, att_data.*)) continue;
 
-                // Skip attestations whose target slot is already justified on this chain,
-                // except for genesis self-votes used for fork-choice bootstrapping.
-                const is_genesis_self_vote = att_data.source.slot == 0 and att_data.target.slot == 0;
-                if (!is_genesis_self_vote and isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
+                // Skip attestations whose target slot is already justified on this chain. (No
+                // genesis self-vote exemption: the time-forward guard above already excludes them.)
+                if (isSlotJustifiedForBuild(current_finalized_slot, &current_justified_slots, att_data.target.slot)) continue;
 
                 if (!self.protoArray.indices.contains(att_data.head.root)) continue;
-                // Spec divergence (intentional): leanSpec removed the processed_att_data
-                // dedup in this commit, relying on a final proof_groups compaction pass.
-                // Zeam keeps it because we compact *inside* the loop and each AttestationData
+                // Intentional behavior difference: rather than dropping this
+                // processed_att_data dedup and relying on a final proof_groups
+                // compaction pass,
+                // zeam keeps it because we compact *inside* the loop and each AttestationData
                 // is processed exactly once per outer iteration. Removing the skip here would
                 // re-select the same entry on loop restarts, producing duplicate attestations
                 // in the candidate without changing the final justified checkpoint.
@@ -1229,7 +1256,7 @@ pub const ForkChoice = struct {
             const found_entries = sorted_entries.items.len > 0;
 
             for (sorted_entries.items) |map_entry| {
-                // Limit the number of distinct AttestationData entries per block (leanSpec #536).
+                // Limit the number of distinct AttestationData entries per block.
                 if (processed_att_data.count() >= self.config.spec.max_attestations_data) break;
 
                 try processed_att_data.put(map_entry.att_data.*, {});
@@ -1243,7 +1270,7 @@ pub const ForkChoice = struct {
                 defer covered.deinit();
 
                 while (true) {
-                    var best_proof: ?*const types.AggregatedSignatureProof = null;
+                    var best_proof: ?*const types.SingleMessageAggregate = null;
                     var best_new_coverage: usize = 0;
 
                     for (payloads.items) |*stored| {
@@ -1263,7 +1290,7 @@ pub const ForkChoice = struct {
 
                     if (best_proof == null or best_new_coverage == 0) break;
 
-                    var cloned_proof = try zeam_utils.clone(types.AggregatedSignatureProof, best_proof.?, self.allocator);
+                    var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, best_proof.?, self.allocator);
                     errdefer cloned_proof.deinit();
 
                     var att_bits = try zeam_utils.clone(types.AggregationBits, &cloned_proof.participants, self.allocator);
@@ -1344,7 +1371,7 @@ pub const ForkChoice = struct {
             try candidate_state.process_slots(self.allocator, slot, self.logger);
             try candidate_state.process_block(self.allocator, candidate_block, self.logger, null);
 
-            // Restart if justification or finalization advanced (leanSpec build_block).
+            // Restart if justification or finalization advanced (build_block).
             // When either changes, update all tracking state and re-scan for newly
             // eligible attestations (older sources whose slots are now justified, or
             // targets that were previously already-justified but aren't after a finality
@@ -1495,6 +1522,9 @@ pub const ForkChoice = struct {
         var target_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
         const nodes = self.protoArray.nodes.items;
 
+        // Walk the head down toward the safe target — bounded to JUSTIFICATION_LOOKBACK_SLOTS (3)
+        // steps, matching get_attestation_target's `for _ in range(JUSTIFICATION_LOOKBACK_SLOTS)`.
+        // This relies on safe_target tracking within this many slots of head in a healthy network.
         for (0..3) |i| {
             _ = i;
             if (nodes[target_idx].slot > self.safeTarget.slot) {
@@ -1619,8 +1649,8 @@ pub const ForkChoice = struct {
         // move to a shallower slot when attestation weights shift across
         // branches or when `latest_justified` itself advances to a different
         // subtree. Previously this returned `InvalidSafeTargetCompute`, which
-        // aborted the interval-3 tick and wedged the node's time loop on
-        // devnet-4 whenever target divergence produced a shallower
+        // aborted the interval-3 tick and wedged the node's time loop
+        // whenever target divergence produced a shallower
         // 2/3-supermajority subtree. Accept the new value and surface the
         // regression via a warn-level log so operators retain visibility.
         if (safe_target.slot < self.safeTarget.slot) {
@@ -1741,17 +1771,16 @@ pub const ForkChoice = struct {
                     .attestation_data = attestation_data,
                 };
 
-                // leanSpec PR #680 keeps the gossip ("new") and on-chain
-                // ("known") pools strictly separate: `update_safe_target`
+                // The gossip ("new") and on-chain
+                // ("known") pools stay strictly separate: `update_safe_target`
                 // operates on the new pool only, while head selection uses
-                // the known pool. Mirroring `latestKnown → latestNew` here
+                // the known pool. Copying `latestKnown → latestNew` here
                 // would smuggle on-chain weight back into the safe-target
-                // computation and break the
-                // `test_safe_target_ignores_known_pool_at_interval_3`
-                // contract from the spec test vectors.
+                // computation and violate the requirement that the
+                // safe-target computation at interval 3 ignore the known pool.
             }
         } else {
-            // leanSpec allows attestations up to 1 slot in the future:
+            // Attestations are allowed up to 1 slot in the future:
             //   assert data.slot <= current_slot + Slot(1)
             // In production, chain.validateAttestationData enforces the stricter gossip
             // check (data.slot <= current_slot) upstream.
@@ -1780,10 +1809,10 @@ pub const ForkChoice = struct {
     pub fn storeAggregatedPayload(
         self: *Self,
         attestation_data: *const types.AttestationData,
-        proof: types.AggregatedSignatureProof,
+        proof: types.SingleMessageAggregate,
         is_from_block: bool,
     ) !void {
-        var cloned_proof = try zeam_utils.clone(types.AggregatedSignatureProof, &proof, self.allocator);
+        var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, &proof, self.allocator);
         var cloned_proof_owned = true;
         errdefer if (cloned_proof_owned) cloned_proof.deinit();
 
@@ -1814,7 +1843,7 @@ pub const ForkChoice = struct {
                     self.latest_block_aggregated_payloads_slot = attestation_data.slot;
                 }
 
-                var block_proof = try zeam_utils.clone(types.AggregatedSignatureProof, &proof, self.allocator);
+                var block_proof = try zeam_utils.clone(types.SingleMessageAggregate, &proof, self.allocator);
                 var block_proof_owned = true;
                 errdefer if (block_proof_owned) block_proof.deinit();
 
@@ -1829,6 +1858,34 @@ pub const ForkChoice = struct {
                 block_proof_owned = false;
             }
         }
+    }
+
+    /// `_deconstruct_block_into_store` coverage gate: returns true if the local
+    /// aggregated-payload pools (new + known) already cover every validator set in `agg_bits` for
+    /// `att_data`. When true, re-aggregating this block attestation would add nothing locally, so
+    /// the caller skips the expensive Type-2 split ("only act when the block covers validators we do
+    /// not already hold"). An att_data never seen locally is NOT fully covered → returns false.
+    pub fn blockAttestationFullyCoveredLocally(self: *Self, att_data: *const types.AttestationData, agg_bits: *const types.AggregationBits) bool {
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
+        const want = agg_bits.len();
+        var bit: usize = 0;
+        bits: while (bit < want) : (bit += 1) {
+            if (!(agg_bits.get(bit) catch false)) continue;
+            if (self.latest_known_aggregated_payloads.get(att_data.*)) |list| {
+                for (list.items) |stored| {
+                    if (bit < stored.proof.participants.len() and (stored.proof.participants.get(bit) catch false)) continue :bits;
+                }
+            }
+            if (self.latest_new_aggregated_payloads.get(att_data.*)) |list| {
+                for (list.items) |stored| {
+                    if (bit < stored.proof.participants.len() and (stored.proof.participants.get(bit) catch false)) continue :bits;
+                }
+            }
+            return false; // this validator is not covered by any local proof for att_data
+        }
+        return true;
     }
 
     /// Format the full per-slot attestation aggregate coverage report.
@@ -1974,7 +2031,7 @@ pub const ForkChoice = struct {
     ///
     /// Earlier this function looked only at `latest_new_aggregated_payloads` and
     /// reported `coverage=none` whenever it was empty, even when dozens of
-    /// individual gossip sigs were waiting on the local duty subnet (#899).
+    /// individual gossip sigs were waiting on the local duty subnet.
     /// Operators misread the "none" line as "we have no input"; the input was
     /// in fact a different map. Reporting both sections separately removes the
     /// ambiguity and surfaces "we have raw sigs from subnet 0 but no
@@ -2068,7 +2125,7 @@ pub const ForkChoice = struct {
     fn buildAggregateSourceAttribution(
         self: *Self,
         att_data: types.AttestationData,
-        proof: *const types.AggregatedSignatureProof,
+        proof: *const types.SingleMessageAggregate,
         source_payload_bits: *types.AggregationBits,
         source_gossip_bits: *types.AggregationBits,
     ) !void {
@@ -2104,7 +2161,7 @@ pub const ForkChoice = struct {
         }
     }
 
-    /// Optional per-aggregate publish hook (ethlambda `AggregateProduced` path).
+    /// Optional per-aggregate publish hook (the produced-aggregate path).
     /// When set, each successful prove is committed and published before the
     /// next job starts; when null, results are collected into the return slice.
     pub const AggregatePublishCallback = *const fn (
@@ -2155,6 +2212,13 @@ pub const ForkChoice = struct {
         // `fcStore.latest_justified`. All gossip sigs and child payloads
         // (new + known) registered against the chosen key are still folded
         // into the aggregate; only the choice of key is narrowed.
+        //
+        // This single-key selection (main #957) supersedes the earlier
+        // deadline-capped multi-key pass: instead of looping over every group
+        // and bailing once AGGREGATION_DEADLINE_MS is spent, we prove exactly
+        // one justification-advancing group per tick. That keeps the per-tick
+        // prove bounded so a multi-second prod-scheme prove can't run past the
+        // slot and starve justification — the same goal the deadline loop had.
         const latest_justified = self.fcStore.latest_justified;
         if (selectJustificationAdvancingKey(&snap, att_data_keys, latest_justified)) |data| {
             var maybe_result = try types.computeSingleAggregatedSignature(
@@ -2204,12 +2268,12 @@ pub const ForkChoice = struct {
         return collected.toOwnedSlice(self.allocator);
     }
 
-    /// Commit one worker-produced aggregate (ethlambda `apply_aggregated_group`).
+    /// Commit one worker-produced aggregate into the live maps.
     fn commitOneAggregateResult(
         self: *Self,
         snap: *AggregateSnapshot,
         att_data: types.AttestationData,
-        signature: types.AggregatedSignatureProof,
+        signature: types.SingleMessageAggregate,
     ) !?types.SignedAggregatedAttestation {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
@@ -2236,18 +2300,18 @@ pub const ForkChoice = struct {
         // ssz.serialize corrupts the source value; serialize once, deinit the
         // worker proof, then deserialize separate copies for store and publish
         // so no fallible step runs while signature_live is true.
-        var stored_proof: types.AggregatedSignatureProof = undefined;
+        var stored_proof: types.SingleMessageAggregate = undefined;
         var stored_proof_owned = false;
         errdefer if (stored_proof_owned) stored_proof.deinit();
         const proof_bytes = try types.sszSerializeAndGetBytes(
             self.allocator,
-            types.AggregatedSignatureProof,
+            types.SingleMessageAggregate,
             owned_signature,
         );
         signature_live = false;
         owned_signature.deinit();
         defer self.allocator.free(proof_bytes);
-        try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &stored_proof, self.allocator);
+        try ssz.deserialize(types.SingleMessageAggregate, proof_bytes, &stored_proof, self.allocator);
         stored_proof_owned = true;
 
         try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
@@ -2261,7 +2325,7 @@ pub const ForkChoice = struct {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
 
         // Drop any existing stored aggregate whose participants are fully
-        // contained in the new one (#940 deferred-aggregation path). With
+        // contained in the new one (deferred-aggregation path). With
         // the live-raws change below, successive aggregator ticks re-prove
         // flat over a growing raw set, so the new aggregate normally
         // dominates every prior aggregate for this att_data. Without this
@@ -2298,8 +2362,8 @@ pub const ForkChoice = struct {
         // subsequent aggregator tick to recursively merge the just-committed
         // aggregate (now sitting in `latest_new_aggregated_payloads`) with any
         // newly-arrived raws. That merge fires `rec_xmss_aggregate` with
-        // children, which costs ~4.5 s on the devnet aggregator vs ~0.5 s for
-        // an equivalent flat re-prove (#940 phase metric: 99.97% of cost is
+        // children, which costs ~4.5 s on the aggregator vs ~0.5 s for
+        // an equivalent flat re-prove (99.97% of cost is
         // the STARK kernel, recursive proves dominate the p95 tail).
         //
         // Keeping raws live lets `prepareAggregateAttData` flat-re-prove over
@@ -2316,17 +2380,17 @@ pub const ForkChoice = struct {
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
         zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
 
-        // #942 observability: emit a one-line summary per committed aggregate
-        // so operators can see *what* the aggregator just published from
-        // structured logs alone (counterpart to the gossip-decode-failure
-        // preview added on the ingress side). Fields chosen to be cheap and
-        // diagnostic: validator count in the aggregate (`attestations`),
-        // attestation slot (`slot`), and the first 8 hex chars of the head /
-        // target / source roots so the same aggregate can be cross-referenced
-        // against block-import logs without dumping full 32-byte roots on
-        // every line. Logged at info — one line per committed aggregate
-        // matches the existing `agg start slot=...` line above and stays
-        // well under typical log-volume budgets at devnet committee sizes.
+        // Emit a one-line summary per committed aggregate so operators can
+        // see what the aggregator just published from structured logs alone
+        // (counterpart to the gossip-decode-failure preview on the ingress
+        // side). Fields chosen to be cheap and diagnostic: validator count in
+        // the aggregate (`attestations`), attestation slot (`slot`), and the
+        // first 8 hex chars of the head / target / source roots so the same
+        // aggregate can be cross-referenced against block-import logs without
+        // dumping full 32-byte roots on every line. Logged at info — one line
+        // per committed aggregate matches the existing `agg start slot=...`
+        // line above and stays well under typical log-volume budgets at
+        // realistic committee sizes.
         const head_short = att_data.head.root[0..4];
         const target_short = att_data.target.root[0..4];
         const source_short = att_data.source.root[0..4];
@@ -2343,8 +2407,8 @@ pub const ForkChoice = struct {
             },
         );
 
-        var publish_proof: types.AggregatedSignatureProof = undefined;
-        try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &publish_proof, self.allocator);
+        var publish_proof: types.SingleMessageAggregate = undefined;
+        try ssz.deserialize(types.SingleMessageAggregate, proof_bytes, &publish_proof, self.allocator);
         return .{ .data = att_data, .proof = publish_proof };
     }
 
@@ -2469,14 +2533,14 @@ pub const ForkChoice = struct {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
-            // Per leanSpec store.process_block: a block may include at most
-            // MAX_ATTESTATIONS_DATA (16) distinct AttestationData entries, and
+            // Per store.process_block: a block may include at most
+            // MAX_ATTESTATIONS_DATA (8) distinct AttestationData entries, and
             // each distinct entry must appear exactly once. Enforce this before
             // registering the block in protoArray so rejected blocks leave no
             // residue in fork choice state.
             try validateAttestationDataLimits(self.allocator, block.body.attestations.constSlice());
 
-            // onBlock is a pure store operation aligned with leanSpec's
+            // onBlock is a pure store operation aligned with
             // store.on_block: any block whose parent is in protoArray is stored,
             // and head selection naturally ignores forks that do not descend
             // from the finalized root (get_head walks best descendants from
@@ -2501,24 +2565,24 @@ pub const ForkChoice = struct {
                 break :r cblock_root;
             };
             if (opts.blockRoot != null) {
-                // Slice (e) of #803 — see metrics field doc on
+                // See metrics field doc on
                 // `lean_block_root_compute_skipped_total`.
                 zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
 
-                // PR #842 review #2: trust-but-verify the
+                // Trust-but-verify the
                 // caller-supplied root against a fresh hash in
                 // debug + ReleaseSafe builds. Cheap (debug-only)
                 // safety net for future call sites that thread a
                 // stale or wrong root through
                 // `OnBlockOpts.blockRoot`. The forkchoice's
-                // protoArray indexes by this root and the spec
-                // guarantees uniqueness via SSZ collision-
+                // protoArray indexes by this root and SSZ hashing
+                // guarantees uniqueness via collision-
                 // resistance; if a caller fabricates a root, we'd
                 // silently corrupt the protoArray. Per-call cost is
                 // one `hashTreeRoot(BeamBlock, ...)` and is paid
                 // ONLY in `Debug` / `ReleaseSafe`; `ReleaseFast` /
                 // `ReleaseSmall` skip the block entirely so
-                // production keeps the slice-(e) win.
+                // production keeps the saved root-recompute.
                 if (std.debug.runtime_safety) verify: {
                     var verify_root: [32]u8 = undefined;
                     zeam_utils.hashTreeRoot(types.BeamBlock, block, &verify_root, self.allocator) catch |err| {
@@ -2663,7 +2727,7 @@ pub const ForkChoice = struct {
         return self.hasBlockUnlocked(blockRoot);
     }
 
-    /// Slice (d) of #803: batch presence check.
+    /// Batch presence check.
     ///
     /// Snapshots `hasBlock` for every root in `roots` under a single
     /// shared-lock acquisition, writing results into `out` (which the
@@ -2887,7 +2951,7 @@ test "forkchoice block tree" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2925,7 +2989,7 @@ test "forkchoice block tree" {
     }
 }
 
-test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence semantics" {
+test "hasBlocksBatch: empty + length-mismatch + presence semantics" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -2941,7 +3005,7 @@ test "hasBlocksBatch (slice (d) of #803): empty + length-mismatch + presence sem
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -3030,7 +3094,7 @@ test "aggregate prunes attestation signatures" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3065,7 +3129,7 @@ test "aggregate prunes attestation signatures" {
     };
     // Two signatures from distinct validators on the same AttestationData.
     // A single sig with no peer payloads is now dropped from the snapshot
-    // by the aggregator pre-filter (issue #907 finding 4 — see
+    // by the aggregator pre-filter (see
     // `pruneTrivialFromAggregateSnapshot`) and is left in
     // `attestation_signatures` for a future non-trivial pass. Two sigs is
     // the minimum non-trivial shape that exercises the aggregation +
@@ -3092,7 +3156,7 @@ test "aggregate prunes attestation signatures" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), aggregations.len);
-    // After #940 deferred-aggregation: raws stay live so that the next
+    // After deferred-aggregation: raws stay live so that the next
     // aggregator tick can flat-re-prove over a growing set instead of paying
     // ~4.5 s for a recursive merge of the just-committed aggregate with new
     // gossip arrivals. The two raw sigs we inserted for this att_data are
@@ -3102,9 +3166,9 @@ test "aggregate prunes attestation signatures" {
     try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(attestation_data) != null);
 }
 
-test "aggregate (#890): does not acquire forkchoice main mutex" {
-    // Regression for the slot-driver stall on aggregator devnet nodes:
-    // before this PR, `forkChoice.aggregate` took `mutex.lock()` for the
+test "aggregate: does not acquire forkchoice main mutex" {
+    // Regression for the slot-driver stall on aggregator nodes:
+    // previously, `forkChoice.aggregate` took `mutex.lock()` for the
     // entire ~70s XMSS aggregate FFI, blocking libxev's `chain.onInterval`
     // (which also acquires the same mutex) and the chain-worker thread
     // (block import / per-attestation tracker updates).
@@ -3155,7 +3219,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3173,7 +3237,7 @@ test "aggregate (#890): does not acquire forkchoice main mutex" {
     // Seed two signatures so `aggregate` has work to do (otherwise an
     // empty-input or trivial-input return path could pass without ever
     // touching the mutex even before the fix). Two distinct validators
-    // is the minimum non-trivial shape after the issue #907 finding 4
+    // is the minimum non-trivial shape after the
     // aggregator pre-filter was added — a single sig with no peer
     // payloads is now dropped from the snapshot before
     // `computeAggregatedSignatures` runs, so it would not exercise the
@@ -3248,7 +3312,7 @@ fn createTestProtoBlock(slot: types.Slot, block_root_byte: u8, parent_root_byte:
     };
 }
 
-test "protoarray tie-break aligns with leanSpec hash ordering" {
+test "protoarray tie-break uses lexicographic hash ordering" {
     const allocator = std.testing.allocator;
 
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
@@ -3257,7 +3321,7 @@ test "protoarray tie-break aligns with leanSpec hash ordering" {
     defer proto_array.indices.deinit();
 
     // Equal-weight siblings with different slots.
-    // leanSpec picks lexicographically larger root, not higher slot.
+    // Pick the lexicographically larger root, not higher slot.
     try proto_array.onBlock(createTestProtoBlock(2, 0x10, 0xAA), 2);
     try proto_array.onBlock(createTestProtoBlock(1, 0x20, 0xAA), 2);
 
@@ -3330,7 +3394,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -3667,7 +3731,7 @@ fn stageAggregatedAttestation(
 ) !void {
     try fork_choice.onSignedAttestation(signed_attestation, true);
 
-    var proof = try types.AggregatedSignatureProof.init(allocator);
+    var proof = try types.SingleMessageAggregate.init(allocator);
     defer proof.deinit();
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
@@ -3705,8 +3769,8 @@ fn aggregationSlotAllowed(slot: types.Slot, slot_filter: ?[]const types.Slot) bo
     return false;
 }
 
-/// Collect `AttestationData` keys to snapshot, mirroring ethlambda's two-pass
-/// `snapshot_aggregation_inputs`: gossip groups first, then payload-only groups
+/// Collect `AttestationData` keys to snapshot in two passes:
+/// gossip groups first, then payload-only groups
 /// with at least two pending proofs. Scoped by `slot_filter` so zeam does not
 /// deep-clone every stale map entry on each worker run.
 fn collectAggregationSnapshotKeys(
@@ -3790,7 +3854,7 @@ fn cloneAggregatedPayloadsEntry(
 
     try gop.value_ptr.ensureTotalCapacityPrecise(allocator, src_list.items.len);
     for (src_list.items) |*stored| {
-        var cloned_proof = try zeam_utils.clone(types.AggregatedSignatureProof, &stored.proof, allocator);
+        var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, &stored.proof, allocator);
         errdefer cloned_proof.deinit();
 
         var cloned_source_payload: ?types.AggregationBits = null;
@@ -3816,7 +3880,7 @@ fn cloneAggregatedPayloadsEntry(
 }
 
 /// Deep-clone an `AggregatedPayloadsMap`. Each stored
-/// `AggregatedSignatureProof` is deep-cloned so the destination owns
+/// `SingleMessageAggregate` is deep-cloned so the destination owns
 /// its own Rust XMSS handle (independent refcount). Caller releases
 /// via `deinitAggregatedPayloadsMap`.
 fn cloneAggregatedPayloadsMap(
@@ -3834,7 +3898,7 @@ fn cloneAggregatedPayloadsMap(
 }
 
 /// Owned snapshot of signature/aggregation inputs for one aggregate worker pass.
-/// Taken under `signatures_mutex` using ethlambda-style job scoping: only
+/// Taken under `signatures_mutex` using job scoping: only
 /// in-window `att_data` keys (plus payload-only groups with ≥2 proofs) are
 /// cloned, not every entry retained in the live maps.
 const AggregateSnapshot = struct {
@@ -4206,7 +4270,7 @@ test "isAggregatorTrivialInput default threshold (2): 0 or 1 sig is trivial, 2+ 
     try std.testing.expect(!isAggregatorTrivialInput(0, 8, 2));
 }
 
-test "isAggregatorTrivialInput threshold=1 reverts to pre-#908 (only 0+0 trivial)" {
+test "isAggregatorTrivialInput threshold=1 keeps only 0+0 trivial" {
     try std.testing.expect(isAggregatorTrivialInput(0, 0, 1));
     try std.testing.expect(!isAggregatorTrivialInput(0, 1, 1));
     try std.testing.expect(!isAggregatorTrivialInput(0, 2, 1));
@@ -4220,7 +4284,7 @@ test "isAggregatorTrivialInput higher thresholds skip more no-children inputs" {
 
 /// Returns true when this worker's snapshot gossip vids for `att_data` were
 /// already consumed by an earlier aggregate commit, so merging/publishing this
-/// pass would duplicate aggregates (PR #920 review).
+/// pass would duplicate aggregates.
 fn shouldSuppressDuplicateAggregateCommit(
     snap: *const AggregateSnapshot,
     att_data: types.AttestationData,
@@ -4307,7 +4371,7 @@ test "shouldSuppressDuplicateAggregateCommit: snap gossip fully consumed suppres
     try std.testing.expect(shouldSuppressDuplicateAggregateCommit(&snap, att_data, &live));
 }
 
-// Regression (#933): commit must store one SSZ clone in fork choice and return
+// Regression: commit must store one SSZ clone in fork choice and return
 // an independent publish copy; both must remain valid after the map append.
 test "commitOneAggregateResult: stored and publish proofs are independent SSZ copies" {
     const allocator = std.testing.allocator;
@@ -4347,7 +4411,7 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -4369,9 +4433,9 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
         .source = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
     };
 
-    var signature = try types.AggregatedSignatureProof.init(allocator);
+    var signature = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&signature.participants, 0, true);
-    try signature.proof_data.append(0xAB);
+    try signature.proof.append(0xAB);
 
     var snap = AggregateSnapshot{
         .signatures = types.SignaturesMap.init(allocator),
@@ -4387,10 +4451,10 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
     const payloads = fork_choice.latest_new_aggregated_payloads.get(att_data) orelse return error.TestExpectedSome;
     try std.testing.expectEqual(@as(usize, 1), payloads.items.len);
 
-    var cloned_stored = try zeam_utils.clone(types.AggregatedSignatureProof, &payloads.items[0].proof, allocator);
+    var cloned_stored = try zeam_utils.clone(types.SingleMessageAggregate, &payloads.items[0].proof, allocator);
     defer cloned_stored.deinit();
 
-    var cloned_publish = try zeam_utils.clone(types.AggregatedSignatureProof, &signed.proof, allocator);
+    var cloned_publish = try zeam_utils.clone(types.SingleMessageAggregate, &signed.proof, allocator);
     defer cloned_publish.deinit();
 
     try std.testing.expect(try cloned_stored.participants.get(0));
@@ -4577,7 +4641,7 @@ fn collectCoverageFromSignaturesForData(
 /// Aggregate validator/subnet coverage of every individual gossip signature
 /// in `map` whose `AttestationData.slot == slot`. Used by
 /// `logNewPayloadsCoverageForAggregation` to surface the local-subnet input
-/// that `latest_new_aggregated_payloads` alone does not see (#899).
+/// that `latest_new_aggregated_payloads` alone does not see.
 fn collectGossipSigCoverageForSlot(
     map: *const SignaturesMap,
     slot: types.Slot,
@@ -4763,7 +4827,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -5751,7 +5815,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -5893,14 +5957,12 @@ test "rebase: deltas array is properly shrunk" {
     try std.testing.expect(ctx.fork_choice.deltas.items.len == 7);
 }
 
-test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
+test "rebase: bestChild/bestDescendant null handled in rebase" {
     // ========================================
     // Test: rebase does not panic when a node has bestChild set but bestDescendant null
     // ========================================
     //
-    // Regression test for issue #545:
-    //   https://github.com/blockblaz/zeam/issues/545
-    //
+    // Regression test:
     // When applyDeltas is called with cutoff_weight > 0, nodes below cutoff can have
     // bestDescendant = null while their parent still sets bestChild to them. Rebase
     // now treats null bestDescendant as bestChild for index remapping instead of panicking.

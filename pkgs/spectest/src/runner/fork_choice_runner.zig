@@ -742,7 +742,7 @@ fn processBlockStep(
         return FixtureError.FixtureMismatch;
     };
 
-    // leanSpec's store.on_block prunes stale gossip signatures and aggregated
+    // The spec's store.on_block prunes stale gossip signatures and aggregated
     // payloads whose target slot falls at or below the finalized checkpoint
     // as soon as finalization advances. Mirror that here so fixture checks on
     // the pruned maps observe the same state. (chain.zig does this
@@ -785,7 +785,7 @@ fn processBlockStep(
         };
         defer indices.deinit(ctx.allocator);
 
-        var proof_template = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+        var proof_template = types.SingleMessageAggregate.init(ctx.allocator) catch |err| {
             std.debug.print(
                 "fixture {s} case {s}{f}: failed to init proof template ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -924,7 +924,7 @@ fn processAttestationStep(
         },
     };
 
-    const validator_id = try expectU64Field(att_obj, &.{ "validatorId", "validator_id" }, fixture_path, case_name, step_index, "attestation.validatorId");
+    const validator_id = try expectU64Field(att_obj, &.{ "validatorIndex", "validatorId", "validator_id" }, fixture_path, case_name, step_index, "attestation.validatorId");
     const data_obj = try expectObject(att_obj, "data", fixture_path, case_name, step_index);
     const attestation_data = try parseAttestationData(data_obj, fixture_path, case_name, step_index, "attestation.data");
 
@@ -950,7 +950,7 @@ fn processAttestationStep(
         }
     }
 
-    // leanSpec's store receives a SignedAttestation here; it inserts into
+    // The spec's store receives a SignedAttestation here; it inserts into
     // attestation_signatures (keyed by AttestationData) and updates the
     // validator tracker. Since fixtures don't carry signatures, use a
     // zero-bytes placeholder — the signature itself isn't verified in the
@@ -1046,7 +1046,7 @@ fn processGossipAggregatedAttestationStep(
     }
 
     // Build a proof with participant bits for storage.
-    var proof = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+    var proof = types.SingleMessageAggregate.init(ctx.allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: failed to init proof ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -1077,9 +1077,9 @@ fn processGossipAggregatedAttestationStep(
     _ = try ctx.fork_choice.updateHead();
 }
 
-/// Validate attestation data per leanSpec store.validate_attestation rules.
+/// Validate attestation data per the spec's store.validate_attestation rules.
 ///
-/// Checks (matching leanSpec):
+/// Checks (matching the spec):
 /// 1. Source, target, and head blocks exist in the fork choice store
 /// 2. Checkpoint slot ordering: source.slot <= target.slot
 /// 3. Head must not be older than target: head.slot >= target.slot
@@ -1125,7 +1125,7 @@ fn validateAttestationDataForGossip(
 
     // 5. Attestation slot must not be too far in future.
     //
-    // leanSpec PR #682 tightened this from "1 whole slot" to
+    // The spec tightened this from "1 whole slot" to
     // "GOSSIP_DISPARITY_INTERVALS intervals". The check now operates in
     // interval units (forkchoice time vs `data.slot * INTERVALS_PER_SLOT`).
     // zeam mirrors the spec in `chain.validateAttestation`; the spectest
@@ -1963,7 +1963,7 @@ fn verifyAttestationChecks(
         // first attestation a validator submits at a given slot wins ties.
         // Reading from the tracker sidesteps the hashmap-iteration
         // non-determinism of `latest_*_aggregated_payloads` and makes the
-        // spec-test outcome stable under equivocation (leanSpec PR #690).
+        // spec-test outcome stable under equivocation.
         const tracker = ctx.fork_choice.attestations.get(validator) orelse {
             std.debug.print(
                 "fixture {s} case {s}{f}: validator {d} has no attestation tracker entry\n",
@@ -2366,13 +2366,13 @@ fn buildState(
                 var label_buf: [96]u8 = undefined;
 
                 const attestation_pubkey = blk: {
-                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPubkey", .{base_label}) catch "validator.attestationPubkey";
-                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPubkey"}, ctx, att_label);
+                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPublicKey", .{base_label}) catch "validator.attestationPublicKey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPublicKey"}, ctx, att_label);
                 };
 
                 const proposal_pubkey = blk: {
-                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPubkey", .{base_label}) catch "validator.proposalPubkey";
-                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPubkey"}, ctx, prop_label);
+                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPublicKey", .{base_label}) catch "validator.proposalPublicKey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPublicKey"}, ctx, prop_label);
                 };
 
                 const validator_index: u64 = blk: {

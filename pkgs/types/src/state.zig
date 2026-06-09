@@ -24,7 +24,7 @@ const Validators = validator.Validators;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-// PQ devnet0 config
+// PQ config
 pub const BeamStateConfig = struct {
     genesis_time: u64,
 
@@ -381,7 +381,7 @@ pub const BeamState = struct {
         defer if (owned_cache) |*oc| oc.deinit();
         const block_cache = cache orelse &(owned_cache.?);
         if (owned_cache != null) {
-            // Only populate cache in fallback path (tests). Chain.zig maintains the global cache.
+            // Only populate cache in fallback path (tests). The chain layer maintains the global cache.
             try self.initRootToSlotCache(block_cache);
         }
 
@@ -478,17 +478,17 @@ pub const BeamState = struct {
             // ceilDiv is not available so this seems like a less compute intensive way without
             // requring float division, can be further optimized
             if (3 * target_justifications_count >= 2 * num_validators) {
-                // The block becomes justified
-                //
-                // The chain now considers this block part of its safe head.
-                // Only advance the checkpoint forward.
-                // Attestations within a block can resolve in any order, and
-                // an earlier target processed after a later one must not
-                // drag latest_justified backwards.
+                // Advance the latest_justified pointer only when the new target is
+                // strictly ahead. A block can carry supermajority attestations for several targets
+                // processed in non-increasing slot order (e.g. 4, 9, 6); assigning unconditionally
+                // would drag latest_justified backward to 6 after 9, regressing the checkpoint and
+                // freezing finalization.
                 if (attestation_data.target.slot > self.latest_justified.slot) {
                     self.latest_justified = attestation_data.target;
                 }
-
+                // Record the justified target in the per-slot bitfield after advancing
+                // latest_justified (zeam-local structure consumed by isSlotJustified and the
+                // finalization scan).
                 try utils.setSlotJustified(finalized_slot, &self.justified_slots, target_slot, true);
                 // Free the removed justifications array before removing from map
                 if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
@@ -1086,8 +1086,8 @@ test "pruning keeps pending justifications" {
     try std.testing.expect(found);
 }
 
-// Helper: build a chain block_1..block_6 with the same shape as the upstream
-// leanSpec PR #802 finalization fixture. Each block sits on top of the
+// Helper: build a chain block_1..block_6 shaped for the finalization scenario.
+// Each block sits on top of the
 // previous one; supermajority attestations from block_2, block_5, and block_6
 // drive justification forward and finalize block_4 by the end of block_6.
 //
@@ -1213,7 +1213,7 @@ fn buildFinalizedSlot4Chain(
     try state.process_block(allocator, out_blocks[5], logger, null);
 }
 
-// Port of leanSpec PR #802 `test_stale_finalized_source_justifies_without_rewinding_finalization`.
+// A stale finalized source can justify a newer target without rewinding finalization.
 //
 // After finalizing block_4 through ordinary attestations, process a block_7
 // whose attestation uses a source (block_1, slot 1) that sits BELOW the
@@ -1284,7 +1284,7 @@ test "stale finalized source justifies without rewinding finalization" {
     try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
 }
 
-// Port of leanSpec PR #802 `test_source_at_finalized_boundary_justifies_without_refinalizing`.
+// A source whose slot is exactly at the finalized boundary justifies without refinalizing.
 //
 // Pins the boundary case: a source whose slot equals the finalized slot is
 // already final and may justify a newer target, but must never re-finalize.
@@ -1358,7 +1358,7 @@ test "root_to_slot_cache lifecycle" {
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
 
-    // Simulate chain.zig adding parent to cache before STF.
+    // Simulate the chain layer adding parent to cache before STF.
     try cache.put(block_1.parent_root, 0);
     try state.process_block(std.testing.allocator, block_1, logger, &cache);
 
@@ -1384,7 +1384,7 @@ test "root_to_slot_cache lifecycle" {
     att_0_to_1_transferred = true;
     defer block_2.deinit();
 
-    // Simulate chain.zig adding parent to cache before STF.
+    // Simulate the chain layer adding parent to cache before STF.
     try cache.put(block_2_parent_root, 1);
     try state.process_block(std.testing.allocator, block_2, logger, &cache);
 

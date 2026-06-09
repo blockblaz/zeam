@@ -2,6 +2,7 @@ const std = @import("std");
 const process = std.process;
 const net = std.Io.net;
 const zeam_utils = @import("@zeam/utils");
+const params = @import("@zeam/params");
 const build_options = @import("build_options");
 const constants = @import("cli_constants");
 const error_handler = @import("error_handler");
@@ -525,7 +526,7 @@ const SSEClient = struct {
 
         // The SSE stream is intentionally long-lived, so a plain blocking read
         // can hang forever when the simulator stops emitting events before the
-        // test's outer deadline is reached (observed on macOS CI in #900). Use
+        // test's outer deadline is reached (observed on macOS CI). Use
         // the std.Io timeout path directly rather than poll+Reader: on macOS CI
         // the stream reader can still block after readiness, preventing the
         // outer deadline from being checked.
@@ -633,7 +634,8 @@ test "admin aggregator endpoint - GET returns seed, POST toggles at runtime" {
     // The API server comes up before the chain is wired in (503 until
     // `setChain` is called inside main.zig after validator key generation).
     // Poll until the chain is ready, then assert the baseline.
-    const chain_ready_deadline_ms: i64 = 60_000;
+    // Scale with the slot time: a wider slot means readiness takes proportionally longer.
+    const chain_ready_deadline_ms: i64 = 60_000 * @as(i64, @intCast(params.SECONDS_PER_SLOT)) / 4;
     const poll_start = zeam_utils.unixTimestampMillis();
     var get_before = try zeam_request.getAggregator();
     while (get_before.status != .ok) {
@@ -713,7 +715,8 @@ test "SSE events integration test - wait for justification and finalization" {
 
     // Read events until justification, the first finalization, and a SECOND
     // finalization that lands AFTER node3 has joined, or timeout.
-    const timeout_ms: u64 = 480000; // 480 seconds timeout
+    // Scale with the slot time; the loop exits as soon as it sees finalization, so this is just a cap.
+    const timeout_ms: u64 = 480000 * params.SECONDS_PER_SLOT / 4;
     const start_ns = zeam_utils.monotonicTimestampNs();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;

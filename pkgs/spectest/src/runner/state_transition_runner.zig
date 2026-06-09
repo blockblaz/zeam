@@ -199,8 +199,8 @@ fn runCase(
     };
 
     if (blocks_array.items.len == 0 and expect_exception != null) {
-        // Slots-only monotonicity fixtures (leanSpec PR #643:
-        // test_process_slots_*) ship `pre` + `expectException` with no
+        // Slots-only monotonicity fixtures
+        // (test_process_slots_*) ship `pre` + `expectException` with no
         // blocks. The test is that `process_slots(state, state.slot)` (or
         // any `target <= state.slot`) must be rejected. There's no explicit
         // `targetSlot` in the JSON — the test name and the fixture shape
@@ -429,13 +429,13 @@ pub fn parseValidators(
                 var label_buf: [96]u8 = undefined;
 
                 const attestation_pubkey = blk: {
-                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPubkey", .{base_label}) catch "validator.attestationPubkey";
-                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPubkey"}, ctx, att_label);
+                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPublicKey", .{base_label}) catch "validator.attestationPublicKey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPublicKey"}, ctx, att_label);
                 };
 
                 const proposal_pubkey = blk: {
-                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPubkey", .{base_label}) catch "validator.proposalPubkey";
-                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPubkey"}, ctx, prop_label);
+                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPublicKey", .{base_label}) catch "validator.proposalPublicKey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPublicKey"}, ctx, prop_label);
                 };
 
                 const validator_index: u64 = blk: {
