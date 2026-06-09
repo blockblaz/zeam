@@ -18,7 +18,11 @@ const Allocator = std.mem.Allocator;
 const AggregatedAttestation = attestation.AggregatedAttestation;
 pub const AggregatedAttestations = ssz.utils.List(AggregatedAttestation, params.VALIDATOR_REGISTRY_LIMIT);
 const Attestation = attestation.Attestation;
-pub const AttestationSignatures = ssz.utils.List(aggregation.AggregatedSignatureProof, params.VALIDATOR_REGISTRY_LIMIT);
+// A proposer assembles one Type-1 proof per body attestation (produced by the parallel
+// per-att_data aggregation), then merges them with the proposer's own Type-1 into the single
+// Type-2 SignedBlock.proof. This list is the intermediate per-attestation Type-1 collection.
+pub const Type1ProofList = ssz.utils.List(aggregation.SingleMessageAggregate, params.VALIDATOR_REGISTRY_LIMIT);
+pub const ByteList512KiB = xmss.ByteList512KiB;
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;
@@ -36,17 +40,41 @@ const freeJsonValue = utils.freeJsonValue;
 
 /// Default `min_aggregation_inputs` for the aggregator-role pre-filter.
 ///
-/// Surfaced on the CLI as `--min-aggregation-inputs` (see
-/// `pkgs/cli/src/main.zig`) and consumed by the aggregator wrapper in
-/// `pkgs/node/src/forkchoice.zig` (NOT by `computeAggregatedSignatures`,
-/// which is spec-pure and aggregates whatever it is given). Default
-/// `2`: aggregator skips publishing when an `att_data` has only a
-/// single local gossip sig and no peer payload, since the raw sig is
-/// already on the gossip topic and a 1-validator "aggregate" carries
-/// no consensus signal (#907 finding 4). `1` reverts to pre-#908
-/// behavior (always aggregate ≥1 sig). Higher values trade slot
-/// latency for fewer sub-threshold aggregates on chatty subnets.
+/// Surfaced on the CLI as `--min-aggregation-inputs` and consumed by the
+/// aggregator wrapper (NOT by `computeAggregatedSignatures`, which
+/// aggregates whatever it is given). Default `2`: aggregator skips
+/// publishing when an `att_data` has only a single local gossip sig and
+/// no peer payload, since the raw sig is already on the gossip topic and
+/// a 1-validator "aggregate" carries no consensus signal. `1` reverts to
+/// always aggregating ≥1 sig. Higher values trade slot latency for fewer
+/// sub-threshold aggregates on chatty subnets.
 pub const default_min_aggregation_inputs: u32 = 2;
+
+/// Default `max_aggregation_children` for the aggregator-role STARK budget.
+///
+/// Surfaced on the CLI as `--max-aggregation-children` (see
+/// `pkgs/cli/src/main.zig`) and consumed by `prepareAggregateAttData` after
+/// greedy + subset-prune select children for this `att_data`. Caps the
+/// number of child STARK proofs passed into `rec_xmss_aggregate`; excess
+/// children are dropped (sorted by descending validator coverage).
+///
+/// Default `0`: aggregator worker NEVER takes the recursive code path,
+/// always proves flat over the raw signature set. Peer-published aggregates
+/// for the same `att_data` remain in `latest_known_aggregated_payloads`
+/// (gossip already propagated them; not re-publishing is information-
+/// preserving on the wire), and the block proposer's `compactAttestations`
+/// step can still merge them at block-proposal time. This keeps the
+/// worker's per-call latency bounded by flat-prove cost (~3.6 ms/sig on
+/// 16-core Hetzner per lean-bench `aggregate.flat_*_r2` at log_inv_rate=2,
+/// so well under 1 s for committee-sized inputs) instead of paying ~4.5 s
+/// for a recursive merge.
+///
+/// `1`: allow at most one peer child to be merged with raws — useful when
+/// operators want broader on-the-wire coverage from a single aggregator
+/// publish, accepting ~1.5 s per recursive prove. Higher values approach
+/// the pre-cap behaviour and reintroduce the multi-second tail (measured
+/// `num_children=3-4` proves averaged ~4.5 s, dominating the p95).
+pub const default_max_aggregation_children: u32 = 0;
 
 // signatures_map types for aggregation
 
@@ -135,7 +163,7 @@ pub const SignaturesMap = struct {
 /// Stored aggregated payload entry
 pub const StoredAggregatedPayload = struct {
     slot: Slot,
-    proof: aggregation.AggregatedSignatureProof,
+    proof: aggregation.SingleMessageAggregate,
     /// Validators in `proof` that entered this aggregate through child payloads.
     /// Null for externally supplied/legacy payloads where source attribution is unknown.
     source_payload_participants: ?attestation.AggregationBits = null,
@@ -147,7 +175,7 @@ pub const StoredAggregatedPayload = struct {
 /// List of aggregated payloads for a single key
 pub const AggregatedPayloadsList = std.ArrayList(StoredAggregatedPayload);
 
-/// Map type for aggregated payloads: AttestationData -> list of AggregatedSignatureProof.
+/// Map type for aggregated payloads: AttestationData -> list of SingleMessageAggregate.
 pub const AggregatedPayloadsMap = std.AutoHashMap(attestation.AttestationData, AggregatedPayloadsList);
 
 /// Aggregate all individual gossip signatures in an inner map into a single proof.
@@ -157,7 +185,7 @@ pub fn AggregateInnerMap(
     inner_map: *const SignaturesMap.InnerMap,
     att_data: attestation.AttestationData,
     validators: *const Validators,
-) !aggregation.AggregatedSignatureProof {
+) !aggregation.SingleMessageAggregate {
     var message_hash: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data, &message_hash, allocator);
 
@@ -221,10 +249,10 @@ pub fn AggregateInnerMap(
     for (sigs.items, 0..) |*sig, i| sig_handles[i] = sig.handle;
     for (pks.items, 0..) |*pk, i| pk_handles[i] = pk.handle;
 
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
 
-    try aggregation.AggregatedSignatureProof.aggregate(
+    try aggregation.SingleMessageAggregate.aggregate(
         allocator,
         participants,
         &.{},
@@ -248,6 +276,22 @@ pub const BeamBlockBody = struct {
             att.deinit();
         }
         self.attestations.deinit();
+    }
+
+    /// `ssz.utils.List.clone` is a shallow `appendSlice` that bit-copies items;
+    /// items containing `Bitlist` (`aggregation_bits`) need a per-item deep
+    /// clone so the destination doesn't alias the source's interior buffer.
+    pub fn clone(self: *const BeamBlockBody, allocator: Allocator) !BeamBlockBody {
+        var cloned_atts = try AggregatedAttestations.init(allocator);
+        errdefer {
+            for (cloned_atts.slice()) |*att| att.deinit();
+            cloned_atts.deinit();
+        }
+        for (self.attestations.constSlice()) |*att| {
+            const att_clone = try zeam_utils.clone(attestation.AggregatedAttestation, att, allocator);
+            try cloned_atts.append(att_clone);
+        }
+        return .{ .attestations = cloned_atts };
     }
 
     pub fn toJson(self: *const BeamBlockBody, allocator: Allocator) !json.Value {
@@ -389,52 +433,23 @@ pub const BeamBlock = struct {
     }
 };
 
-pub const BlockSignatures = struct {
-    attestation_signatures: AttestationSignatures,
-    proposer_signature: SIGBYTES,
-
-    pub fn deinit(self: *BlockSignatures) void {
-        for (self.attestation_signatures.slice()) |*group| {
-            group.deinit();
-        }
-        self.attestation_signatures.deinit();
-    }
-
-    pub fn toJson(self: *const BlockSignatures, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.empty;
-
-        var groups_array = json.Array.init(allocator);
-        errdefer groups_array.deinit();
-
-        for (self.attestation_signatures.constSlice()) |group| {
-            try groups_array.append(try group.toJson(allocator));
-        }
-
-        try obj.put(allocator, "attestation_signatures", json.Value{ .array = groups_array });
-        try obj.put(allocator, "proposer_signature", json.Value{ .string = try bytesToHex(allocator, &self.proposer_signature) });
-        return json.Value{ .object = obj };
-    }
-
-    pub fn toJsonString(self: *const BlockSignatures, allocator: Allocator) ![]const u8 {
-        var json_value = try self.toJson(allocator);
-        defer freeJsonValue(&json_value, allocator);
-        return utils.jsonToString(allocator, json_value);
-    }
-};
-
 pub const SignedBlock = struct {
     block: BeamBlock,
-    signature: BlockSignatures,
+    // The single merged Type-2 proof over all attestation Type-1s + the proposer's Type-1.
+    // The `MultiMessageAggregate` container is the field itself, so SSZ (de)serialization of
+    // SignedBlock handles the proof's wire form once at this boundary (mirrors leanSpec #799).
+    proof: aggregation.MultiMessageAggregate,
 
     pub fn deinit(self: *SignedBlock) void {
         self.block.deinit();
-        self.signature.deinit();
+        self.proof.deinit();
     }
 
     pub fn toJson(self: *const SignedBlock, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.empty;
         try obj.put(allocator, "block", try self.block.toJson(allocator));
-        try obj.put(allocator, "signature", try self.signature.toJson(allocator));
+        const proof_hex = try utils.BytesToHex(allocator, self.proof.proof.constSlice());
+        try obj.put(allocator, "proof", json.Value{ .string = proof_hex });
         return json.Value{ .object = obj };
     }
 
@@ -445,19 +460,196 @@ pub const SignedBlock = struct {
     }
 };
 
-pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: usize) !BlockSignatures {
-    var groups = try AttestationSignatures.init(allocator);
-    errdefer groups.deinit();
+/// Build the single Type-2 block proof carried by `SignedBlock.proof`.
+///
+/// Inputs: one per-attestation Type-1 proof per body attestation (in body order, produced by the
+/// parallel per-att_data aggregation), plus the proposer's raw signature over the block root. We
+/// derive the proposer's singleton Type-1, then merge attestations-then-proposer into one Type-2,
+/// writing the merged Type-2 into `out_proof` (the `MultiMessageAggregate` container that IS
+/// `SignedBlock.proof`).
+///
+/// `attestation_type1s` must be parallel with `agg_attestations` (same length, same order).
+pub fn buildType2BlockProof(
+    allocator: Allocator,
+    validators: *const Validators,
+    agg_attestations: *const AggregatedAttestations,
+    attestation_type1s: []const aggregation.SingleMessageAggregate,
+    proposer_index: usize,
+    block_root: *const [32]u8,
+    slot: u64,
+    proposer_sig_bytes: *const SIGBYTES,
+    out_proof: *aggregation.MultiMessageAggregate,
+) !void {
+    const atts = agg_attestations.constSlice();
+    if (atts.len != attestation_type1s.len) return error.AggregationInvalidInput;
 
-    for (0..num_aggregated_attestations) |_| {
-        const signatures = try aggregation.AggregatedSignatureProof.init(allocator);
-        try groups.append(signatures);
+    // All PublicKey wrappers — free their Rust handles exactly once at the end.
+    var pk_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+    defer {
+        for (pk_wrappers.items) |*w| w.deinit();
+        pk_wrappers.deinit(allocator);
     }
 
-    return .{
-        .attestation_signatures = groups,
-        .proposer_signature = utils.ZERO_SIGBYTES,
-    };
+    // Per-component participant pubkey handles: one slice per body attestation, then the proposer.
+    const pks_per_part = try allocator.alloc([]*const xmss.HashSigPublicKey, atts.len + 1);
+    defer {
+        for (pks_per_part) |slice| {
+            if (slice.len > 0) allocator.free(slice);
+        }
+        allocator.free(pks_per_part);
+    }
+    for (pks_per_part) |*s| s.* = &.{};
+
+    for (atts, 0..) |agg_att, i| {
+        var vids = try attestation.aggregationBitsToValidatorIndices(&agg_att.aggregation_bits, allocator);
+        defer vids.deinit(allocator);
+        const handles = try allocator.alloc(*const xmss.HashSigPublicKey, vids.items.len);
+        for (vids.items, 0..) |vid, j| {
+            const val = try validators.get(@intCast(vid));
+            const pk = try xmss.PublicKey.fromBytes(&val.attestation_pubkey);
+            try pk_wrappers.append(allocator, pk);
+            handles[j] = pk.handle;
+        }
+        pks_per_part[i] = handles;
+    }
+
+    // Proposer pubkey (proposal key) + raw signature handle.
+    const proposer_val = try validators.get(@intCast(proposer_index));
+    const proposer_pk = try xmss.PublicKey.fromBytes(&proposer_val.proposal_pubkey);
+    try pk_wrappers.append(allocator, proposer_pk);
+    {
+        const handles = try allocator.alloc(*const xmss.HashSigPublicKey, 1);
+        handles[0] = proposer_pk.handle;
+        pks_per_part[atts.len] = handles;
+    }
+
+    var proposer_sig = try xmss.Signature.fromBytes(proposer_sig_bytes[0..]);
+    defer proposer_sig.deinit();
+
+    // Proposer singleton Type-1 over the block root.
+    var proposer_participants = try attestation.AggregationBits.init(allocator);
+    defer proposer_participants.deinit();
+    try attestation.aggregationBitsSet(&proposer_participants, proposer_index, true);
+
+    var proposer_t1 = try aggregation.SingleMessageAggregate.init(allocator);
+    defer proposer_t1.deinit();
+    {
+        var raw_pks = [_]*const xmss.HashSigPublicKey{proposer_pk.handle};
+        var raw_sigs = [_]*const xmss.HashSigSignature{proposer_sig.handle};
+        const no_children: []const aggregation.SingleMessageAggregate = &.{};
+        const no_child_pks: []const []*const xmss.HashSigPublicKey = &.{};
+        try aggregation.SingleMessageAggregate.aggregate(
+            allocator,
+            proposer_participants,
+            no_children,
+            no_child_pks,
+            raw_pks[0..],
+            raw_sigs[0..],
+            block_root,
+            slot,
+            &proposer_t1,
+        );
+    }
+
+    // parts = attestation_type1s ++ [proposer_t1]
+    const parts = try allocator.alloc(aggregation.SingleMessageAggregate, atts.len + 1);
+    defer allocator.free(parts);
+    for (attestation_type1s, 0..) |t1, i| parts[i] = t1;
+    parts[atts.len] = proposer_t1;
+
+    // Merge into the Type-2 container that IS SignedBlock.proof. The FFI writes the merged raw
+    // wire into out_proof.proof; the container itself is the field now, so there is no separate
+    // SSZ-encode step — SSZ (de)serialization happens once at the SignedBlock boundary.
+    try aggregation.MultiMessageAggregate.aggregate(allocator, parts, pks_per_part, out_proof);
+}
+
+/// Inverse of `buildType2BlockProof`: split the single
+/// Type-2 block proof back into per-attestation Type-1 proofs, but only for the attestations the
+/// caller selected via `split_mask` (the FFI split is an expensive recursive-STARK prove, so the
+/// caller skips attestations whose target is at/behind justified or already covered locally —
+/// only spend a split on attestations that can still move justification
+/// forward / cover validators we don't already hold). Each recovered Type-1 has its `participants`
+/// restored from the matching attestation's aggregation bits (the FFI split leaves them empty).
+///
+/// `split_mask` is parallel with `agg_attestations`. `out_type1s` must be an empty `Type1ProofList`;
+/// on success it holds one proof per masked attestation, in body order (so the caller iterates the
+/// body and pops a recovered proof for each masked index in sequence). The full per-component pubkey
+/// layout is still reconstructed for ALL components (splitByMessage needs it to recover any one).
+pub fn deconstructType2BlockProof(
+    allocator: Allocator,
+    validators: *const Validators,
+    agg_attestations: *const AggregatedAttestations,
+    proposer_index: usize,
+    proof_bytes: []const u8,
+    split_mask: []const bool,
+    out_type1s: *Type1ProofList,
+) !void {
+    const atts = agg_attestations.constSlice();
+
+    var t2: aggregation.MultiMessageAggregate = undefined;
+    try ssz.deserialize(aggregation.MultiMessageAggregate, proof_bytes, &t2, allocator);
+    defer t2.deinit();
+
+    // Reconstruct the exact per-component pubkey layout the Type-2 was built with: each body
+    // attestation's participant attestation-pubkeys (body order), then the proposer's proposal key.
+    var pk_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+    defer {
+        for (pk_wrappers.items) |*w| w.deinit();
+        pk_wrappers.deinit(allocator);
+    }
+
+    const pks_per_part = try allocator.alloc([]*const xmss.HashSigPublicKey, atts.len + 1);
+    defer {
+        for (pks_per_part) |slice| {
+            if (slice.len > 0) allocator.free(slice);
+        }
+        allocator.free(pks_per_part);
+    }
+    for (pks_per_part) |*s| s.* = &.{};
+
+    for (atts, 0..) |agg_att, i| {
+        var vids = try attestation.aggregationBitsToValidatorIndices(&agg_att.aggregation_bits, allocator);
+        defer vids.deinit(allocator);
+        const handles = try allocator.alloc(*const xmss.HashSigPublicKey, vids.items.len);
+        for (vids.items, 0..) |vid, j| {
+            const val = try validators.get(@intCast(vid));
+            const pk = try xmss.PublicKey.fromBytes(&val.attestation_pubkey);
+            try pk_wrappers.append(allocator, pk);
+            handles[j] = pk.handle;
+        }
+        pks_per_part[i] = handles;
+    }
+    {
+        const proposer_val = try validators.get(@intCast(proposer_index));
+        const proposer_pk = try xmss.PublicKey.fromBytes(&proposer_val.proposal_pubkey);
+        try pk_wrappers.append(allocator, proposer_pk);
+        const handles = try allocator.alloc(*const xmss.HashSigPublicKey, 1);
+        handles[0] = proposer_pk.handle;
+        pks_per_part[atts.len] = handles;
+    }
+
+    // Split out only the masked attestation components (keyed by message hash) and restore
+    // participants from the body attestation's bits. Unmasked attestations skip the expensive split.
+    var committed: usize = 0;
+    errdefer {
+        for (out_type1s.slice()[0..committed]) |*t1| t1.deinit();
+    }
+    for (atts, 0..) |agg_att, i| {
+        if (i >= split_mask.len or !split_mask[i]) continue;
+
+        var message_hash: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(attestation.AttestationData, agg_att.data, &message_hash, allocator);
+
+        var recovered = try aggregation.SingleMessageAggregate.init(allocator);
+        errdefer recovered.deinit();
+        try t2.splitByMessage(pks_per_part, &message_hash, &recovered);
+
+        recovered.participants.deinit();
+        recovered.participants = try zeam_utils.clone(attestation.AggregationBits, &agg_att.aggregation_bits, allocator);
+
+        try out_type1s.append(recovered);
+        committed += 1;
+    }
 }
 
 fn slotAllowed(slot: Slot, slot_filter: ?[]const Slot) bool {
@@ -470,7 +662,7 @@ fn slotAllowed(slot: Slot, slot_filter: ?[]const Slot) bool {
 
 pub const AggregatedAttestationsResult = struct {
     attestations: AggregatedAttestations,
-    attestation_signatures: AttestationSignatures,
+    attestation_signatures: Type1ProofList,
     allocator: Allocator,
 
     const Self = @This();
@@ -479,7 +671,7 @@ pub const AggregatedAttestationsResult = struct {
         var attestations_list = try AggregatedAttestations.init(allocator);
         errdefer attestations_list.deinit();
 
-        var signatures_list = try AttestationSignatures.init(allocator);
+        var signatures_list = try Type1ProofList.init(allocator);
         errdefer signatures_list.deinit();
 
         return .{
@@ -501,14 +693,14 @@ pub const AggregatedAttestationsResult = struct {
     /// Spec-pure: this function aggregates whatever it is given. Callers
     /// that want to skip trivially-shaped inputs (e.g. the aggregator
     /// role wanting to avoid spending the full STARK prover budget on a
-    /// single-validator "aggregate" that carries no consensus signal —
-    /// see issue #907 finding 4) must filter the inputs they pass in.
+    /// single-validator "aggregate" that carries no consensus signal)
+    /// must filter the inputs they pass in.
     /// Block proposers, by contrast, MUST aggregate every `att_data`
     /// they choose to include in a block, even if its only input is a
     /// single gossip signature.
-    /// Aggregator batch entry: serial prep then sequential XMSS proves (ethlambda
-    /// worker loop). Parallel ThreadPool scope was removed — nested Rayon inside
-    /// each prove oversubscribed CPU and inflated p50/p95 on devnet (#925).
+    /// Aggregator batch entry: serial prep then sequential XMSS proves on the
+    /// worker loop. Parallel ThreadPool scope was removed — nested parallelism
+    /// inside each prove oversubscribed CPU and inflated p50/p95.
     pub fn computeAggregatedSignatures(
         self: *Self,
         validators: *const Validators,
@@ -517,6 +709,7 @@ pub const AggregatedAttestationsResult = struct {
         known_payloads: ?*const AggregatedPayloadsMap,
         slot_filter: ?[]const Slot,
         thread_pool: *ThreadPool,
+        max_aggregation_children: u32,
     ) !void {
         const allocator = self.allocator;
 
@@ -566,6 +759,7 @@ pub const AggregatedAttestationsResult = struct {
                 new_payloads,
                 known_payloads,
                 data,
+                max_aggregation_children,
             );
         }
         observeAggregateAttDataPrepPhase(prep_start_ns);
@@ -605,7 +799,7 @@ fn extendProofsGreedily(
     allocator: Allocator,
     payloads_map: ?*const AggregatedPayloadsMap,
     att_data: attestation.AttestationData,
-    selected: *std.ArrayList(aggregation.AggregatedSignatureProof),
+    selected: *std.ArrayList(aggregation.SingleMessageAggregate),
     covered: *std.DynamicBitSet,
     gossip_available: *const std.DynamicBitSet,
 ) !void {
@@ -649,8 +843,7 @@ fn extendProofsGreedily(
 
         // Clone and select the best proof
         used[best_idx.?] = true;
-        var cloned: aggregation.AggregatedSignatureProof = undefined;
-        try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, candidates.items[best_idx.?].proof, &cloned);
+        var cloned = try zeam_utils.clone(aggregation.SingleMessageAggregate, &candidates.items[best_idx.?].proof, allocator);
         errdefer cloned.deinit();
         try selected.append(allocator, cloned);
 
@@ -680,7 +873,7 @@ const CompactGroupEntry = struct {
 
 const CompactGroupResult = struct {
     attestation: AggregatedAttestation,
-    signature: aggregation.AggregatedSignatureProof,
+    signature: aggregation.SingleMessageAggregate,
 };
 
 /// Returns true if every bit set in `subset` is also set in `superset`,
@@ -708,7 +901,7 @@ pub fn participantsContainsAll(superset: attestation.AggregationBits, subset: at
 /// could not see new_payloads' candidate to compare against. Both end up
 /// in `selected_children`, and the combined `rec_xmss_aggregate` STARK
 /// merges them into a proof equivalent to the dominating child alone,
-/// paying ~4 s of prove time for no extra validator coverage (#940).
+/// paying ~4 s of prove time for no extra validator coverage.
 ///
 /// This pass removes any child whose participants are contained in another
 /// selected child's. Validator union is preserved (the dominating child
@@ -721,7 +914,7 @@ pub fn participantsContainsAll(superset: attestation.AggregationBits, subset: at
 /// Tie-break for equal sets: keep the lower-indexed entry (which comes from
 /// `new_payloads` first, then `known_payloads`) so behaviour is stable.
 fn pruneSubsumedChildren(
-    selected_children: *std.ArrayList(aggregation.AggregatedSignatureProof),
+    selected_children: *std.ArrayList(aggregation.SingleMessageAggregate),
 ) void {
     if (selected_children.items.len < 2) return;
     var i: usize = 0;
@@ -750,7 +943,7 @@ fn pruneSubsumedChildren(
 
 /// Returns true if any stored aggregate for `data` in `payloads_map` already
 /// covers every validator id in `raw_vids` (i.e. running an aggregator pass
-/// would not add any new coverage). #940 deferred-aggregation guard: once
+/// would not add any new coverage). Deferred-aggregation guard: once
 /// an aggregate dominates the raw signature set we hold, the next slot tick
 /// should skip and let the next gossip arrival re-fire the aggregator. An
 /// empty `raw_vids` is treated as "covered" (vacuously true for any stored
@@ -804,6 +997,11 @@ pub const SingleAggregatedSignature = CompactGroupResult;
 
 /// Single `att_data` aggregation: serial prep then one XMSS prove (ethlambda
 /// `aggregate_job` shape). Used by the aggregator per-job loop.
+///
+/// `max_aggregation_children` caps the number of child STARK proofs merged
+/// with raw signatures by the recursive prover. See
+/// `default_max_aggregation_children` for the rationale; threaded from
+/// `ForkChoice.max_aggregation_children` through `aggregateUnlocked`.
 pub fn computeSingleAggregatedSignature(
     allocator: Allocator,
     validators: *const Validators,
@@ -811,6 +1009,7 @@ pub fn computeSingleAggregatedSignature(
     new_payloads: ?*const AggregatedPayloadsMap,
     known_payloads: ?*const AggregatedPayloadsMap,
     data: attestation.AttestationData,
+    max_aggregation_children: u32,
 ) !?SingleAggregatedSignature {
     var prep = try prepareAggregateAttData(
         allocator,
@@ -819,6 +1018,7 @@ pub fn computeSingleAggregatedSignature(
         new_payloads,
         known_payloads,
         data,
+        max_aggregation_children,
     );
     defer prep.deinit(allocator);
 
@@ -863,7 +1063,7 @@ const AggregateAttDataFfiArgs = struct {
     message_hash: [32]u8,
     epoch: u64,
     xmss_participants: ?attestation.AggregationBits,
-    selected_children: []aggregation.AggregatedSignatureProof,
+    selected_children: []aggregation.SingleMessageAggregate,
     child_pk_slices: []const []*const xmss.HashSigPublicKey,
     pk_handles: []*const xmss.HashSigPublicKey,
     sig_handles: []*const xmss.HashSigSignature,
@@ -898,6 +1098,7 @@ fn prepareAggregateAttData(
     new_payloads: ?*const AggregatedPayloadsMap,
     known_payloads: ?*const AggregatedPayloadsMap,
     data: attestation.AttestationData,
+    max_aggregation_children: u32,
 ) !AggregateAttDataPrep {
     const epoch: u64 = data.slot;
     var message_hash: [32]u8 = undefined;
@@ -906,7 +1107,7 @@ fn prepareAggregateAttData(
     const max_validator = validators.len();
 
     // Collect the validator ids backed by a raw XMSS signature for this att_data
-    // up front (#940 deferred-aggregation path). Two uses below:
+    // up front (deferred-aggregation path). Two uses below:
     //   1. If any single stored aggregate already covers every raw vid, the
     //      worker has nothing new to add — skip.
     //   2. Otherwise, pass `raw_vids` as the `gossip_available` argument to
@@ -915,7 +1116,7 @@ fn prepareAggregateAttData(
     //      with the change in `commitOneAggregateResult` to no longer delete
     //      live raws after a commit, this converts the previously dominant
     //      "recursive merge of stored aggregate + new raws" pattern (mean
-    //      ~4.5 s per call on devnet) into a flat re-prove over the raw set
+    //      ~4.5 s per call) into a flat re-prove over the raw set
     //      (~0.5 s).
     var raw_vids = try std.DynamicBitSet.initEmpty(allocator, max_validator);
     defer raw_vids.deinit();
@@ -944,7 +1145,7 @@ fn prepareAggregateAttData(
         }
     }
 
-    var selected_children: std.ArrayList(aggregation.AggregatedSignatureProof) = .empty;
+    var selected_children: std.ArrayList(aggregation.SingleMessageAggregate) = .empty;
     errdefer {
         for (selected_children.items) |*child| child.deinit();
         selected_children.deinit(allocator);
@@ -960,7 +1161,7 @@ fn prepareAggregateAttData(
     // independently and cannot cross-compare candidates, so a small proof from
     // new_payloads can survive even when a strictly larger known_payloads proof
     // is later selected on top. Merging dominated children via STARK costs
-    // ~4 s per call for no extra coverage (#940). `covered_by_children` is
+    // ~4 s per call for no extra coverage. `covered_by_children` is
     // unaffected because the dominating child already covers the dropped
     // child's validators.
     pruneSubsumedChildren(&selected_children);
@@ -1022,12 +1223,10 @@ fn prepareAggregateAttData(
     if (!has_gossip and selected_children.items.len == 1) {
         const child = &selected_children.items[0];
 
-        var att_bits: attestation.AggregationBits = undefined;
-        try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits);
+        var att_bits = try zeam_utils.clone(attestation.AggregationBits, &child.participants, allocator);
         errdefer att_bits.deinit();
 
-        var cloned_child: aggregation.AggregatedSignatureProof = undefined;
-        try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, child.*, &cloned_child);
+        var cloned_child = try zeam_utils.clone(aggregation.SingleMessageAggregate, child, allocator);
         errdefer cloned_child.deinit();
 
         selected_children.items[0].deinit();
@@ -1042,6 +1241,61 @@ fn prepareAggregateAttData(
                 },
             },
         };
+    }
+
+    // Cap the number of children passed to the recursive STARK at
+    // `max_aggregation_children`. Greedy + prune left only proofs that each
+    // add validator coverage raws don't have, but every additional child is
+    // a ~1.3 s adder to `rec_xmss_aggregate` (measured:
+    // num_children=1 proves averaged ~1.5 s, num_children=3-4 averaged
+    // ~4.8 s). Operators who would rather bound worker latency than publish
+    // a maximally-covering aggregate per tick set this to 0 — peers' own
+    // gossipped aggregates remain in `latest_known_aggregated_payloads` for
+    // the block proposer to compact at proposal time. Children are dropped
+    // lowest-coverage first so the retained set keeps the most validators
+    // per remaining child.
+    //
+    // Placement: AFTER the `!has_gossip and len==1` fast-path above, so the
+    // cheap clone-only case still fires for cap=0. The cap is strictly a
+    // STARK-cost guard; the fast-path doesn't invoke `rec_xmss_aggregate`,
+    // so capping it would lose validator coverage for no latency benefit.
+    if (selected_children.items.len > @as(usize, max_aggregation_children)) {
+        const PopCountIndex = struct {
+            popcount: usize,
+            index: usize,
+        };
+        var rankings = try allocator.alloc(PopCountIndex, selected_children.items.len);
+        defer allocator.free(rankings);
+        for (selected_children.items, 0..) |*child, i| {
+            var count: usize = 0;
+            const bits = child.participants;
+            var bit_idx: usize = 0;
+            while (bit_idx < bits.len()) : (bit_idx += 1) {
+                if (bits.get(bit_idx) catch false) count += 1;
+            }
+            rankings[i] = .{ .popcount = count, .index = i };
+        }
+        const lessThan = struct {
+            fn cmp(_: void, a: PopCountIndex, b: PopCountIndex) bool {
+                if (a.popcount != b.popcount) return a.popcount > b.popcount; // desc
+                return a.index < b.index; // stable tie-break
+            }
+        }.cmp;
+        std.mem.sort(PopCountIndex, rankings, {}, lessThan);
+
+        var keep = try allocator.alloc(bool, selected_children.items.len);
+        defer allocator.free(keep);
+        @memset(keep, false);
+        for (rankings[0..@as(usize, max_aggregation_children)]) |entry| keep[entry.index] = true;
+
+        var idx_back = selected_children.items.len;
+        while (idx_back > 0) {
+            idx_back -= 1;
+            if (!keep[idx_back]) {
+                selected_children.items[idx_back].deinit();
+                _ = selected_children.swapRemove(idx_back);
+            }
+        }
     }
 
     var xmss_participants: ?attestation.AggregationBits = null;
@@ -1165,11 +1419,11 @@ fn runAggregateAttDataFfi(
     data: attestation.AttestationData,
     args: *AggregateAttDataFfiArgs,
 ) !CompactGroupResult {
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
 
     const pq_sig_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
-    try aggregation.AggregatedSignatureProof.aggregate(
+    try aggregation.SingleMessageAggregate.aggregate(
         allocator,
         args.xmss_participants,
         args.selected_children,
@@ -1182,8 +1436,7 @@ fn runAggregateAttDataFfi(
     );
     _ = pq_sig_timer.observe();
 
-    var att_bits: attestation.AggregationBits = undefined;
-    try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
+    var att_bits = try zeam_utils.clone(attestation.AggregationBits, &proof.participants, allocator);
     errdefer att_bits.deinit();
 
     return .{
@@ -1194,10 +1447,10 @@ fn runAggregateAttDataFfi(
 
 fn runAggregateAttDataPreps(allocator: Allocator, preps: []AggregateAttDataPrep, thread_pool: *ThreadPool) !void {
     _ = thread_pool;
-    // Ethlambda runs aggregation jobs sequentially on one blocking worker so
-    // Rayon gets the full CPU budget per prove. Parallel scope here nested
-    // ThreadPool workers each calling xmss_aggregate (Rayon inside) and hurt
-    // devnet aggregator p50 (#925).
+    // Run aggregation jobs sequentially on one blocking worker so each prove
+    // gets the full CPU budget. A parallel scope here nested ThreadPool workers
+    // each calling xmss_aggregate (already internally parallel) and hurt
+    // aggregator p50.
     for (preps) |*prep| {
         if (prep.outcome != .ffi) continue;
         const result = try runAggregateAttDataFfi(allocator, prep.data, &prep.outcome.ffi);
@@ -1214,6 +1467,9 @@ const AggregateAttDataSlot = struct {
 const CompactGroupSlot = struct {
     result: ?CompactGroupResult = null,
     err: ?anyerror = null,
+    /// Task observed the deadline already elapsed at dispatch time and
+    /// returned without running the FFI. Empty result, no error.
+    skipped: bool = false,
 };
 
 /// Per-entry preparation built serially before any worker thread runs.
@@ -1236,14 +1492,12 @@ const CompactGroupPrep = struct {
 fn compactSingleProof(
     allocator: Allocator,
     att_data: attestation.AttestationData,
-    sig: *const aggregation.AggregatedSignatureProof,
+    sig: *const aggregation.SingleMessageAggregate,
 ) !CompactGroupResult {
-    var cloned_proof: aggregation.AggregatedSignatureProof = undefined;
-    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, sig.*, &cloned_proof);
+    var cloned_proof = try zeam_utils.clone(aggregation.SingleMessageAggregate, sig, allocator);
     errdefer cloned_proof.deinit();
 
-    var att_bits: attestation.AggregationBits = undefined;
-    try utils.sszClone(allocator, attestation.AggregationBits, cloned_proof.participants, &att_bits);
+    var att_bits = try zeam_utils.clone(attestation.AggregationBits, &cloned_proof.participants, allocator);
     errdefer att_bits.deinit();
 
     return .{
@@ -1259,26 +1513,26 @@ fn compactMultiProofWithPrep(
     allocator: Allocator,
     att_data: attestation.AttestationData,
     indices: []const usize,
-    sig_slice: []const aggregation.AggregatedSignatureProof,
+    sig_slice: []const aggregation.SingleMessageAggregate,
     child_pk_slices: []const []*const xmss.HashSigPublicKey,
 ) !CompactGroupResult {
     const epoch: u64 = att_data.slot;
     var message_hash: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data, &message_hash, allocator);
 
-    const children = try allocator.alloc(aggregation.AggregatedSignatureProof, indices.len);
+    const children = try allocator.alloc(aggregation.SingleMessageAggregate, indices.len);
     defer allocator.free(children);
     for (indices, 0..) |idx, i| {
         children[i] = sig_slice[idx];
     }
 
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
 
     const empty_pks: []*const xmss.HashSigPublicKey = &.{};
     const empty_sigs: []*const xmss.HashSigSignature = &.{};
 
-    try aggregation.AggregatedSignatureProof.aggregate(
+    try aggregation.SingleMessageAggregate.aggregate(
         allocator,
         null, // no raw XMSS participants
         children,
@@ -1290,8 +1544,7 @@ fn compactMultiProofWithPrep(
         &proof,
     );
 
-    var att_bits: attestation.AggregationBits = undefined;
-    try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
+    var att_bits = try zeam_utils.clone(attestation.AggregationBits, &proof.participants, allocator);
     errdefer att_bits.deinit();
 
     return .{
@@ -1303,7 +1556,7 @@ fn compactMultiProofWithPrep(
 fn runCompactGroupPrep(
     allocator: Allocator,
     prep: CompactGroupPrep,
-    sig_slice: []const aggregation.AggregatedSignatureProof,
+    sig_slice: []const aggregation.SingleMessageAggregate,
 ) !CompactGroupResult {
     if (prep.entry.indices.len == 1) {
         return compactSingleProof(allocator, prep.entry.att_data, &sig_slice[prep.entry.indices[0]]);
@@ -1317,13 +1570,18 @@ fn runCompactGroupPrep(
     );
 }
 
+/// `deadline_ns` is an optional monotonic-ns cutoff. `null` = unbounded
+/// (legacy synchronous produceBlock). When set, parallel workers self-skip
+/// at dispatch if the deadline has elapsed; results are harvested as the
+/// longest contiguous prefix of completed slots.
 pub fn compactAttestations(
     allocator: Allocator,
     attestations: *AggregatedAttestations,
-    signatures: *AttestationSignatures,
+    signatures: *Type1ProofList,
     validators: *const Validators,
     thread_pool: anytype,
-) !struct { attestations: AggregatedAttestations, signatures: AttestationSignatures } {
+    deadline_ns: ?i64,
+) !struct { attestations: AggregatedAttestations, signatures: Type1ProofList } {
     const att_slice = attestations.constSlice();
     const sig_slice = signatures.constSlice();
 
@@ -1369,7 +1627,7 @@ pub fn compactAttestations(
         for (out_atts.slice()) |*att| att.deinit();
         out_atts.deinit();
     }
-    var out_sigs = try AttestationSignatures.init(allocator);
+    var out_sigs = try Type1ProofList.init(allocator);
     errdefer {
         for (out_sigs.slice()) |*sig| sig.deinit();
         out_sigs.deinit();
@@ -1468,6 +1726,12 @@ pub fn compactAttestations(
     // Parallel path: per-AttestationData aggregation across the shared
     // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
     // touch FFI deserialization themselves.
+    //
+    // Each worker checks `deadline_ns` at dispatch and self-skips if
+    // already past — bounding the total work without needing to cancel the
+    // FFI (uncancellable run-to-completion). Tasks already mid-FFI when
+    // the deadline elapses run to completion; that's the soft upper bound.
+    // Callers that want unbounded compaction pass `std.math.maxInt(i128)`.
     const slots = try allocator.alloc(CompactGroupSlot, preps.len);
     defer allocator.free(slots);
     for (slots) |*slot| slot.* = .{};
@@ -1480,28 +1744,39 @@ pub fn compactAttestations(
         }
     }
 
+    // `deadline_ns` is i64 to avoid i128 in the scope.spawn args tuple
+    // (breaks ThreadPool's @fieldParentPtr alignment). The compare against
+    // `monotonicTimestampNs()` (i128) widens once inside the worker.
     const Runner = struct {
         fn runScope(
             scope: anytype,
             preps_in: []const CompactGroupPrep,
-            sigs: []const aggregation.AggregatedSignatureProof,
+            sigs: []const aggregation.SingleMessageAggregate,
             alloc: Allocator,
             out_slots: []CompactGroupSlot,
             any_err: *std.atomic.Value(bool),
+            deadline: ?i64,
         ) Allocator.Error!void {
             for (preps_in, 0..) |prep, i| {
-                try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err });
+                try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err, deadline });
             }
         }
 
         fn runOne(
             alloc: Allocator,
             prep: CompactGroupPrep,
-            sigs: []const aggregation.AggregatedSignatureProof,
+            sigs: []const aggregation.SingleMessageAggregate,
             out_slot: *CompactGroupSlot,
             any_err: *std.atomic.Value(bool),
+            deadline: ?i64,
         ) void {
             if (any_err.load(.acquire)) return;
+            if (deadline) |d| {
+                if (zeam_utils.monotonicTimestampNs() >= @as(i128, d)) {
+                    out_slot.skipped = true;
+                    return;
+                }
+            }
             const result = runCompactGroupPrep(alloc, prep, sigs) catch |err| {
                 out_slot.err = err;
                 any_err.store(true, .release);
@@ -1518,14 +1793,25 @@ pub fn compactAttestations(
         allocator,
         slots,
         &any_err,
+        deadline_ns,
     });
 
     for (slots) |*slot| {
         if (slot.err) |err| return err;
     }
 
+    // Strict-prefix harvest: take the longest contiguous run of completed
+    // slots starting at index 0, stop at the first skipped/incomplete one.
+    // Late completions past a gap are discarded so the block always contains
+    // the deterministic top-N (e.g. {ad1, ad2} when ad1+ad2 finish; never
+    // {ad3} alone when ad1+ad2 didn't).
+    var truncated = false;
     for (slots) |*slot| {
-        var result = slot.result orelse continue;
+        if (slot.skipped or slot.result == null) {
+            truncated = true;
+            break;
+        }
+        var result = slot.result.?;
         slot.result = null;
 
         var att_moved = false;
@@ -1539,6 +1825,21 @@ pub fn compactAttestations(
         att_moved = true;
         try out_sigs.append(result.signature);
         sig_moved = true;
+    }
+
+    // Free results past the prefix gap so the errdefer-cleanup of `slots`
+    // doesn't see them — we own them now, drop them.
+    for (slots) |*slot| {
+        if (slot.result) |*r| {
+            r.attestation.deinit();
+            r.signature.deinit();
+            slot.result = null;
+        }
+    }
+
+    if (truncated) {
+        zeam_metrics.metrics.zeam_proposal_deadline_hits_total.incr();
+        zeam_metrics.zeam_proposal_partial_prefix_size.record(@floatFromInt(out_atts.constSlice().len));
     }
 
     // Free old input entries
@@ -1659,7 +1960,7 @@ fn testDeinitPayloadsMap(allocator: Allocator, payloads: *AggregatedPayloadsMap)
 }
 
 fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloadsMap, data: attestation.AttestationData, validator_index: usize) !void {
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
     try attestation.aggregationBitsSet(&proof.participants, validator_index, true);
 
@@ -1708,7 +2009,7 @@ test "computeAggregatedSignatures filters attestation data by slot list" {
     defer thread_pool.deinit();
 
     const allowed_slots = [_]Slot{10};
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool, default_max_aggregation_children);
 
     try std.testing.expectEqual(@as(usize, 1), result.attestations.len());
     const aggregated = try result.attestations.get(0);
@@ -1740,12 +2041,12 @@ test "computeAggregatedSignatures slot filter matches unfiltered for same-slot i
 
     const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
-    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool);
+    try unfiltered.computeAggregatedSignatures(&validators, &signatures_a, &payloads_a, null, null, thread_pool, default_max_aggregation_children);
 
     var filtered = try AggregatedAttestationsResult.init(allocator);
     defer filtered.deinit();
     const allowed_slots = [_]Slot{12};
-    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..], thread_pool);
+    try filtered.computeAggregatedSignatures(&validators, &signatures_b, &payloads_b, null, allowed_slots[0..], thread_pool, default_max_aggregation_children);
 
     try std.testing.expectEqual(unfiltered.attestations.len(), filtered.attestations.len());
     try std.testing.expectEqual(unfiltered.attestation_signatures.len(), filtered.attestation_signatures.len());
@@ -1774,17 +2075,14 @@ test "computeAggregatedSignatures empty slot filter result is clean" {
     const allowed_slots = [_]Slot{14};
     const thread_pool = try setupTestPrimitives(allocator);
     defer thread_pool.deinit();
-    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool);
+    try result.computeAggregatedSignatures(&validators, &signatures, &payloads, null, allowed_slots[0..], thread_pool, default_max_aggregation_children);
 
     try std.testing.expectEqual(@as(usize, 0), result.attestations.len());
     try std.testing.expectEqual(@as(usize, 0), result.attestation_signatures.len());
 }
 
 test "ssz seralize/deserialize signed beam block" {
-    var attestations = try AggregatedAttestations.init(std.testing.allocator);
-
-    var signatures = try createBlockSignatures(std.testing.allocator, attestations.len());
-    errdefer signatures.deinit();
+    const attestations = try AggregatedAttestations.init(std.testing.allocator);
 
     var signed_block = SignedBlock{
         .block = .{
@@ -1794,7 +2092,7 @@ test "ssz seralize/deserialize signed beam block" {
             .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
             .body = .{ .attestations = attestations },
         },
-        .signature = signatures,
+        .proof = try aggregation.MultiMessageAggregate.init(std.testing.allocator),
     };
     defer signed_block.deinit();
 
@@ -1841,9 +2139,6 @@ test "encode decode signed block roundtrip" {
     var attestations = try AggregatedAttestations.init(std.testing.allocator);
     errdefer attestations.deinit();
 
-    var signatures = try createBlockSignatures(std.testing.allocator, attestations.len());
-    errdefer signatures.deinit();
-
     var signed_block = SignedBlock{
         .block = .{
             .slot = 0,
@@ -1852,7 +2147,7 @@ test "encode decode signed block roundtrip" {
             .state_root = ZERO_HASH,
             .body = .{ .attestations = attestations },
         },
-        .signature = signatures,
+        .proof = try aggregation.MultiMessageAggregate.init(std.testing.allocator),
     };
     defer signed_block.deinit();
 
@@ -1868,24 +2163,19 @@ test "encode decode signed block roundtrip" {
     try std.testing.expect(decoded.block.proposer_index == signed_block.block.proposer_index);
     try std.testing.expect(std.mem.eql(u8, &decoded.block.parent_root, &signed_block.block.parent_root));
     try std.testing.expect(std.mem.eql(u8, &decoded.block.state_root, &signed_block.block.state_root));
-    try std.testing.expect(decoded.signature.attestation_signatures.len() == signed_block.signature.attestation_signatures.len());
+    try std.testing.expect(decoded.proof.proof.len() == signed_block.proof.proof.len());
 }
 
-test "encode decode signed block with non-empty attestation signatures" {
+test "encode decode signed block with non-empty proof" {
     var attestations = try AggregatedAttestations.init(std.testing.allocator);
     errdefer attestations.deinit();
 
-    var attestation_signatures = try AttestationSignatures.init(std.testing.allocator);
-    errdefer attestation_signatures.deinit();
-
-    var signature_proof = try aggregation.AggregatedSignatureProof.init(std.testing.allocator);
-    errdefer signature_proof.deinit();
-
-    // Set participants for validators 0 and 1
-    try attestation.aggregationBitsSet(&signature_proof.participants, 0, true);
-    try attestation.aggregationBitsSet(&signature_proof.participants, 1, true);
-
-    try attestation_signatures.append(signature_proof);
+    // SignedBlock.proof is the MultiMessageAggregate container; its inner `proof` byte list holds
+    // the opaque Type-2 wire. Round-trip a non-empty payload and assert it survives byte-for-byte.
+    var proof = try xmss.ByteList512KiB.init(std.testing.allocator);
+    errdefer proof.deinit();
+    const proof_payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    for (proof_payload) |b| try proof.append(b);
 
     var signed_block = SignedBlock{
         .block = .{
@@ -1895,10 +2185,7 @@ test "encode decode signed block with non-empty attestation signatures" {
             .state_root = ZERO_HASH,
             .body = .{ .attestations = attestations },
         },
-        .signature = .{
-            .attestation_signatures = attestation_signatures,
-            .proposer_signature = ZERO_SIGBYTES,
-        },
+        .proof = .{ .proof = proof },
     };
     defer signed_block.deinit();
 
@@ -1911,12 +2198,11 @@ test "encode decode signed block with non-empty attestation signatures" {
     defer decoded.deinit();
 
     try std.testing.expect(decoded.block.slot == signed_block.block.slot);
-    try std.testing.expect(decoded.signature.attestation_signatures.len() == 1);
-    const decoded_group = try decoded.signature.attestation_signatures.get(0);
-    try std.testing.expect(decoded_group.participants.len() == 2);
+    try std.testing.expect(decoded.proof.proof.len() == proof_payload.len);
+    try std.testing.expect(std.mem.eql(u8, decoded.proof.proof.constSlice(), &proof_payload));
 }
 
-// Regression: an AggregatedSignatureProof whose `participants` bitlist
+// Regression: an SingleMessageAggregate whose `participants` bitlist
 // has trailing zero bits (i.e., len() > highest_set_bit + 1) must still
 // produce an `aggregation_bits` that is byte-for-byte identical to
 // `participants`. Rebuilding `aggregation_bits` by re-setting only the
@@ -1926,7 +2212,7 @@ test "encode decode signed block with non-empty attestation signatures" {
 test "compactSingleProof: aggregation_bits matches participants when participants has trailing zeros" {
     const allocator = std.testing.allocator;
 
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     defer proof.deinit();
 
     // Force participants.len() == 6 with bits set only at {0, 2}.
@@ -1984,7 +2270,7 @@ test "compactSingleProof: aggregation_bits matches participants when participant
     try std.testing.expectEqualSlices(u8, participants_bytes.items, bits_bytes.items);
 }
 
-// Regression (#929): single-child passthrough (.done) must not double-free when
+// Regression: single-child passthrough (.done) must not double-free when
 // computeSingleAggregatedSignature returns and prep.deinit runs.
 test "computeSingleAggregatedSignature: single-child passthrough survives prep deinit" {
     const allocator = std.testing.allocator;
@@ -2008,6 +2294,7 @@ test "computeSingleAggregatedSignature: single-child passthrough survives prep d
         &payloads,
         null,
         att_data,
+        default_max_aggregation_children,
     );
     var result = maybe_result orelse return error.TestExpectedSome;
     defer {
@@ -2015,9 +2302,73 @@ test "computeSingleAggregatedSignature: single-child passthrough survives prep d
         result.signature.deinit();
     }
 
-    var cloned: aggregation.AggregatedSignatureProof = undefined;
-    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, result.signature, &cloned);
+    var cloned = try zeam_utils.clone(aggregation.SingleMessageAggregate, &result.signature, allocator);
     defer cloned.deinit();
 
     try std.testing.expect(cloned.participants.len() > 0);
+}
+
+// Two entries sharing one AttestationData force `needs_compaction = true`
+// so we enter the parallel path. Empty validators short-circuits the XMSS
+// pre-phase. With deadline in the past, every dispatched worker sees the
+// elapsed deadline at task start and self-skips → strict-prefix harvest
+// returns an empty result.
+test "compactAttestations: elapsed deadline returns empty prefix" {
+    const allocator = std.testing.allocator;
+
+    const thread_pool = try setupTestPrimitives(allocator);
+    defer thread_pool.deinit();
+
+    var validators = try Validators.init(allocator);
+    defer validators.deinit();
+
+    var attestations = try AggregatedAttestations.init(allocator);
+    var attestations_consumed = false;
+    defer if (!attestations_consumed) {
+        for (attestations.slice()) |*att| att.deinit();
+        attestations.deinit();
+    };
+
+    var signatures = try Type1ProofList.init(allocator);
+    var signatures_consumed = false;
+    defer if (!signatures_consumed) {
+        for (signatures.slice()) |*sig| sig.deinit();
+        signatures.deinit();
+    };
+
+    const att_data = attestation.AttestationData{
+        .slot = 1,
+        .head = .{ .root = ZERO_HASH, .slot = 0 },
+        .target = .{ .root = ZERO_HASH, .slot = 0 },
+        .source = .{ .root = ZERO_HASH, .slot = 0 },
+    };
+
+    inline for ([_]u32{ 0, 1 }) |_| {
+        const bits = try attestation.AggregationBits.init(allocator);
+        try attestations.append(.{ .aggregation_bits = bits, .data = att_data });
+
+        const proof = try aggregation.SingleMessageAggregate.init(allocator);
+        try signatures.append(proof);
+    }
+
+    var result = try compactAttestations(
+        allocator,
+        &attestations,
+        &signatures,
+        &validators,
+        thread_pool,
+        0,
+    );
+    // inputs consumed by compactAttestations; cancel double-free defers.
+    attestations_consumed = true;
+    signatures_consumed = true;
+    defer {
+        for (result.attestations.slice()) |*att| att.deinit();
+        result.attestations.deinit();
+        for (result.signatures.slice()) |*sig| sig.deinit();
+        result.signatures.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), result.attestations.constSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), result.signatures.constSlice().len);
 }

@@ -6,8 +6,26 @@
 //! the only things we care about are the `#[no_mangle] pub extern "C"`
 //! functions defined in those crates, which rustc preserves in the final
 //! archive as long as the rlib is part of the link set.
-//!
-//! See blockblaz/zeam#773 for the motivation.
+
+// Route every Rust allocation in the process — the prover (rayon witnesses),
+// the libp2p networking stack, hashsig — through jemalloc. It releases freed
+// memory back to the OS far more readily than the system allocator and
+// fragments less under the prover's large, bursty allocations, which is the
+// dominant source of node RSS. This is the only staticlib in the link set, so
+// the global allocator declared here governs the whole process's Rust side.
+//
+// The openvm/risc0 zkVM backends ship their own #[global_allocator]
+// (e.g. openvm_stark_backend), and only one is allowed per binary — so jemalloc
+// is installed only when neither zkVM prover is built. The multisig (devnet5)
+// and default builds, which carry the heavy prover, get it by default.
+//
+// The `jemalloc` feature lets build.zig omit the allocator for `-Dno-jemalloc`:
+// the Shadow simulator's shim re-enters malloc during its own first-syscall
+// init, which deadlocks jemalloc's non-recursive init lock (shadow/shadow#3763).
+// That build drops this feature and falls back to the system allocator.
+#[cfg(all(feature = "jemalloc", not(any(feature = "openvm", feature = "risc0"))))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(feature = "libp2p")]
 extern crate libp2p_glue;

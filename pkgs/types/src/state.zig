@@ -24,7 +24,7 @@ const Validators = validator.Validators;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-// PQ devnet0 config
+// PQ config
 pub const BeamStateConfig = struct {
     genesis_time: u64,
 
@@ -381,7 +381,7 @@ pub const BeamState = struct {
         defer if (owned_cache) |*oc| oc.deinit();
         const block_cache = cache orelse &(owned_cache.?);
         if (owned_cache != null) {
-            // Only populate cache in fallback path (tests). Chain.zig maintains the global cache.
+            // Only populate cache in fallback path (tests). The chain layer maintains the global cache.
             try self.initRootToSlotCache(block_cache);
         }
 
@@ -478,7 +478,17 @@ pub const BeamState = struct {
             // ceilDiv is not available so this seems like a less compute intensive way without
             // requring float division, can be further optimized
             if (3 * target_justifications_count >= 2 * num_validators) {
-                self.latest_justified = attestation_data.target;
+                // Advance the latest_justified pointer only when the new target is
+                // strictly ahead. A block can carry supermajority attestations for several targets
+                // processed in non-increasing slot order (e.g. 4, 9, 6); assigning unconditionally
+                // would drag latest_justified backward to 6 after 9, regressing the checkpoint and
+                // freezing finalization.
+                if (attestation_data.target.slot > self.latest_justified.slot) {
+                    self.latest_justified = attestation_data.target;
+                }
+                // Record the justified target in the per-slot bitfield after advancing
+                // latest_justified (zeam-local structure consumed by isSlotJustified and the
+                // finalization scan).
                 try utils.setSlotJustified(finalized_slot, &self.justified_slots, target_slot, true);
                 // Free the removed justifications array before removing from map
                 if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
@@ -489,15 +499,26 @@ pub const BeamState = struct {
                     .{ &self.latest_justified.root, self.latest_justified.slot },
                 );
 
-                // source is finalized if target is the next valid justifiable hash
-                var can_target_finalize = true;
-                const start_slot_usize: usize = @intCast(source_slot + 1);
-                const end_slot_usize: usize = @intCast(target_slot);
-                for (start_slot_usize..end_slot_usize) |slot_usize| {
-                    const slot: Slot = @intCast(slot_usize);
-                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
-                        can_target_finalize = false;
-                        break;
+                // Finalization advances only when the source lies past the old
+                // finalized point. A source at or behind that boundary is
+                // already final and may justify a newer target without
+                // re-finalizing — entering the scan from below the finalized
+                // boundary would call IsJustifiableSlot with candidate <
+                // finalized_slot and abort the state transition.
+                //
+                // When the source is newer and every slot in between is
+                // non-justifiable relative to the old finalized point, the
+                // source checkpoint becomes finalized.
+                var can_target_finalize = source_slot > finalized_slot;
+                if (can_target_finalize) {
+                    const start_slot_usize: usize = @intCast(source_slot + 1);
+                    const end_slot_usize: usize = @intCast(target_slot);
+                    for (start_slot_usize..end_slot_usize) |slot_usize| {
+                        const slot: Slot = @intCast(slot_usize);
+                        if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
+                            can_target_finalize = false;
+                            break;
+                        }
                     }
                 }
                 logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
@@ -1065,6 +1086,261 @@ test "pruning keeps pending justifications" {
     try std.testing.expect(found);
 }
 
+// Helper: build a chain block_1..block_6 shaped for the finalization scenario.
+// Each block sits on top of the
+// previous one; supermajority attestations from block_2, block_5, and block_6
+// drive justification forward and finalize block_4 by the end of block_6.
+//
+// After this helper returns:
+//   * state.slot == 6
+//   * state.latest_justified == (block_5_root, slot 5)
+//   * state.latest_finalized == (block_4_root, slot 4)
+//
+// Each block's root can only be computed via hashTreeRoot(latest_block_header)
+// AFTER process_slot fills in the missing state_root (process_slot zeroes it
+// in until the next slot transition, so hashing earlier yields a stale root
+// that would not match what process_block_header later appends to
+// historical_block_hashes). The helper therefore advances to slot N+1 BEFORE
+// hashing block_N and building block_(N+1)'s attestations.
+//
+// `out_blocks` receives the six produced blocks and `out_built` is incremented
+// after each successful block construction so the caller can safely deinit
+// just the initialised entries even when the helper errors mid-way.
+fn buildFinalizedSlot4Chain(
+    allocator: Allocator,
+    state: *BeamState,
+    logger: zeam_utils.ModuleLogger,
+    out_blocks: *[6]block.BeamBlock,
+    out_built: *usize,
+) !void {
+    // block_1 (slot 1): empty
+    try state.process_slots(allocator, 1, logger);
+    out_blocks[0] = try makeBlock(allocator, state, state.slot, &[_]attestation.AggregatedAttestation{});
+    out_built.* = 1;
+    try state.process_block(allocator, out_blocks[0], logger, null);
+
+    // Advance to slot 2 so block_1's state_root is materialised into
+    // latest_block_header before we hash it.
+    try state.process_slots(allocator, 2, logger);
+    var block_1_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_1_root, allocator);
+    const genesis_root = try state.historical_block_hashes.get(0);
+
+    // block_2 (slot 2): att(genesis -> block_1) by [0,1,2] — justifies block_1
+    var att_2 = try makeAggregatedAttestation(
+        allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        .{ .root = genesis_root, .slot = 0 },
+        .{ .root = block_1_root, .slot = 1 },
+    );
+    var att_2_transferred = false;
+    defer if (!att_2_transferred) att_2.deinit();
+    out_blocks[1] = try makeBlock(allocator, state, state.slot, &[_]attestation.AggregatedAttestation{att_2});
+    att_2_transferred = true;
+    out_built.* = 2;
+    try state.process_block(allocator, out_blocks[1], logger, null);
+
+    // Advance to slot 3 to materialise block_2's state_root.
+    try state.process_slots(allocator, 3, logger);
+    var block_2_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_root, allocator);
+
+    // block_3 (slot 3): att(block_1 -> block_2) by [0,1] — supermajority on 3
+    // validators (>= 2/3), so block_2 is also justified and finalization
+    // advances to block_1. This matches the upstream test post-state.
+    var att_3 = try makeAggregatedAttestation(
+        allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = block_1_root, .slot = 1 },
+        .{ .root = block_2_root, .slot = 2 },
+    );
+    var att_3_transferred = false;
+    defer if (!att_3_transferred) att_3.deinit();
+    out_blocks[2] = try makeBlock(allocator, state, state.slot, &[_]attestation.AggregatedAttestation{att_3});
+    att_3_transferred = true;
+    out_built.* = 3;
+    try state.process_block(allocator, out_blocks[2], logger, null);
+
+    // Advance to slot 4 (state_root for block_3 not needed downstream).
+    try state.process_slots(allocator, 4, logger);
+
+    // block_4 (slot 4): empty
+    out_blocks[3] = try makeBlock(allocator, state, state.slot, &[_]attestation.AggregatedAttestation{});
+    out_built.* = 4;
+    try state.process_block(allocator, out_blocks[3], logger, null);
+
+    // Advance to slot 5 to materialise block_4's state_root.
+    try state.process_slots(allocator, 5, logger);
+    var block_4_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_4_root, allocator);
+
+    // block_5 (slot 5): att(block_2 -> block_4) by [0,1,2] — justifies block_4
+    var att_5 = try makeAggregatedAttestation(
+        allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        .{ .root = block_2_root, .slot = 2 },
+        .{ .root = block_4_root, .slot = 4 },
+    );
+    var att_5_transferred = false;
+    defer if (!att_5_transferred) att_5.deinit();
+    out_blocks[4] = try makeBlock(allocator, state, state.slot, &[_]attestation.AggregatedAttestation{att_5});
+    att_5_transferred = true;
+    out_built.* = 5;
+    try state.process_block(allocator, out_blocks[4], logger, null);
+
+    // Advance to slot 6 to materialise block_5's state_root.
+    try state.process_slots(allocator, 6, logger);
+    var block_5_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_5_root, allocator);
+
+    // block_6 (slot 6): att(block_4 -> block_5) by [0,1,2] — justifies block_5
+    // AND finalizes block_4 (range is empty, source > finalized).
+    var att_6 = try makeAggregatedAttestation(
+        allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        .{ .root = block_4_root, .slot = 4 },
+        .{ .root = block_5_root, .slot = 5 },
+    );
+    var att_6_transferred = false;
+    defer if (!att_6_transferred) att_6.deinit();
+    out_blocks[5] = try makeBlock(allocator, state, state.slot, &[_]attestation.AggregatedAttestation{att_6});
+    att_6_transferred = true;
+    out_built.* = 6;
+    try state.process_block(allocator, out_blocks[5], logger, null);
+}
+
+// A stale finalized source can justify a newer target without rewinding finalization.
+//
+// After finalizing block_4 through ordinary attestations, process a block_7
+// whose attestation uses a source (block_1, slot 1) that sits BELOW the
+// finalized boundary (slot 4). The new target (block_6, slot 6) must be
+// justified without re-entering the finalization-advance scan from below the
+// finalized boundary — which would otherwise call IsJustifiableSlot with a
+// candidate slot smaller than the finalized slot and abort state transition
+// with `InvalidJustifiableSlot`.
+test "stale finalized source justifies without rewinding finalization" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    var blocks_1_to_6: [6]block.BeamBlock = undefined;
+    var built: usize = 0;
+    defer for (blocks_1_to_6[0..built]) |*b| b.deinit();
+
+    try buildFinalizedSlot4Chain(std.testing.allocator, &state, logger, &blocks_1_to_6, &built);
+
+    try std.testing.expectEqual(@as(Slot, 6), state.slot);
+    try std.testing.expectEqual(@as(Slot, 5), state.latest_justified.slot);
+    try std.testing.expectEqual(@as(Slot, 4), state.latest_finalized.slot);
+
+    // After block_6 has been processed, historical_block_hashes holds slots
+    // 0..5 (block_6's root is only appended when block_7 is processed).
+    const block_1_root = try state.historical_block_hashes.get(1);
+    const block_4_root = try state.historical_block_hashes.get(4);
+
+    // block_7 (slot 7): att(block_1 -> block_6) by [0,1,2] — STALE source.
+    // process_slots(7) materialises block_6's state_root into latest_block_header,
+    // making hashTreeRoot give the canonical block_6 hash.
+    try state.process_slots(std.testing.allocator, 7, logger);
+    var block_6_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_6_root, std.testing.allocator);
+
+    var att_7 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        .{ .root = block_1_root, .slot = 1 },
+        .{ .root = block_6_root, .slot = 6 },
+    );
+    var att_7_transferred = false;
+    defer if (!att_7_transferred) att_7.deinit();
+    var block_7 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_7});
+    att_7_transferred = true;
+    defer block_7.deinit();
+
+    // Must succeed: the stale-source attestation justifies block_6 without
+    // attempting to advance finalization below the existing finalized boundary.
+    try state.process_block(std.testing.allocator, block_7, logger, null);
+
+    // Post-state: justified advances to block_6; finalized unchanged at block_4.
+    try std.testing.expectEqual(@as(Slot, 7), state.slot);
+    try std.testing.expectEqual(@as(Slot, 6), state.latest_justified.slot);
+    try std.testing.expectEqualSlices(u8, &block_6_root, &state.latest_justified.root);
+    try std.testing.expectEqual(@as(Slot, 4), state.latest_finalized.slot);
+    try std.testing.expectEqualSlices(u8, &block_4_root, &state.latest_finalized.root);
+
+    // justified_slots covers slots 5 and 6 (both true) — len = state.slot - 1 - finalized = 2.
+    try std.testing.expectEqual(@as(usize, 2), state.justified_slots.len());
+    try std.testing.expectEqual(true, try state.justified_slots.get(0));
+    try std.testing.expectEqual(true, try state.justified_slots.get(1));
+
+    // No pending justifications: the supermajority at block_7 cleared block_6's entry.
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_roots.len());
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
+}
+
+// A source whose slot is exactly at the finalized boundary justifies without refinalizing.
+//
+// Pins the boundary case: a source whose slot equals the finalized slot is
+// already final and may justify a newer target, but must never re-finalize.
+// The `source.slot > finalized_slot` guard is what protects this case.
+test "source at finalized boundary justifies without refinalizing" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    var blocks_1_to_6: [6]block.BeamBlock = undefined;
+    var built: usize = 0;
+    defer for (blocks_1_to_6[0..built]) |*b| b.deinit();
+
+    try buildFinalizedSlot4Chain(std.testing.allocator, &state, logger, &blocks_1_to_6, &built);
+
+    const block_4_root = try state.historical_block_hashes.get(4);
+
+    // block_7 (slot 7): att(block_4 -> block_6) by [0,1,2] — source AT boundary.
+    // process_slots(7) materialises block_6's state_root into latest_block_header,
+    // making hashTreeRoot give the canonical block_6 hash.
+    try state.process_slots(std.testing.allocator, 7, logger);
+    var block_6_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_6_root, std.testing.allocator);
+
+    var att_7 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        .{ .root = block_4_root, .slot = 4 },
+        .{ .root = block_6_root, .slot = 6 },
+    );
+    var att_7_transferred = false;
+    defer if (!att_7_transferred) att_7.deinit();
+    var block_7 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_7});
+    att_7_transferred = true;
+    defer block_7.deinit();
+
+    try state.process_block(std.testing.allocator, block_7, logger, null);
+
+    // Same expected post-state as the stale-source test: block_6 justified,
+    // block_4 still finalized.
+    try std.testing.expectEqual(@as(Slot, 7), state.slot);
+    try std.testing.expectEqual(@as(Slot, 6), state.latest_justified.slot);
+    try std.testing.expectEqualSlices(u8, &block_6_root, &state.latest_justified.root);
+    try std.testing.expectEqual(@as(Slot, 4), state.latest_finalized.slot);
+    try std.testing.expectEqualSlices(u8, &block_4_root, &state.latest_finalized.root);
+
+    try std.testing.expectEqual(@as(usize, 2), state.justified_slots.len());
+    try std.testing.expectEqual(true, try state.justified_slots.get(0));
+    try std.testing.expectEqual(true, try state.justified_slots.get(1));
+
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_roots.len());
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
+}
+
 test "root_to_slot_cache lifecycle" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(null);
@@ -1082,7 +1358,7 @@ test "root_to_slot_cache lifecycle" {
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
 
-    // Simulate chain.zig adding parent to cache before STF.
+    // Simulate the chain layer adding parent to cache before STF.
     try cache.put(block_1.parent_root, 0);
     try state.process_block(std.testing.allocator, block_1, logger, &cache);
 
@@ -1108,7 +1384,7 @@ test "root_to_slot_cache lifecycle" {
     att_0_to_1_transferred = true;
     defer block_2.deinit();
 
-    // Simulate chain.zig adding parent to cache before STF.
+    // Simulate the chain layer adding parent to cache before STF.
     try cache.put(block_2_parent_root, 1);
     try state.process_block(std.testing.allocator, block_2, logger, &cache);
 
@@ -1198,6 +1474,104 @@ test "root_to_slot_cache lifecycle" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "same-block multi-target attestations advance latest_justified to highest slot" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 4);
+    defer state.deinit();
+
+    // Build an empty linear chain block_1 .. block_9.
+    var empty_blocks: [9]block.BeamBlock = undefined;
+    var built: usize = 0;
+    defer for (empty_blocks[0..built]) |*b| b.deinit();
+
+    var slot_i: Slot = 1;
+    while (slot_i <= 9) : (slot_i += 1) {
+        try state.process_slots(std.testing.allocator, slot_i, logger);
+        empty_blocks[built] = try makeBlock(
+            std.testing.allocator,
+            &state,
+            state.slot,
+            &[_]attestation.AggregatedAttestation{},
+        );
+        built += 1;
+        try state.process_block(std.testing.allocator, empty_blocks[built - 1], logger, null);
+    }
+
+    // Advance to slot 10 and snapshot the canonical roots needed for the
+    // attestations. block_9's root isn't in historical_block_hashes until
+    // block_10 is processed, so derive it from the now-complete latest header.
+    try state.process_slots(std.testing.allocator, 10, logger);
+
+    const genesis_root = try state.historical_block_hashes.get(0);
+    const block_4_root = try state.historical_block_hashes.get(4);
+    const block_6_root = try state.historical_block_hashes.get(6);
+    var block_9_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_9_root, std.testing.allocator);
+
+    // Supermajority across validators {0, 1, 2} (3 of 4 = 2/3+ threshold).
+    // Source is the genesis checkpoint, which is implicitly justified.
+    const source = Checkpoint{ .root = genesis_root, .slot = 0 };
+
+    var att_to_4 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        source,
+        .{ .root = block_4_root, .slot = 4 },
+    );
+    var att_to_4_transferred = false;
+    defer if (!att_to_4_transferred) att_to_4.deinit();
+
+    var att_to_9 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        source,
+        .{ .root = block_9_root, .slot = 9 },
+    );
+    var att_to_9_transferred = false;
+    defer if (!att_to_9_transferred) att_to_9.deinit();
+
+    var att_to_6 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1, 2 },
+        state.slot,
+        source,
+        .{ .root = block_6_root, .slot = 6 },
+    );
+    var att_to_6_transferred = false;
+    defer if (!att_to_6_transferred) att_to_6.deinit();
+
+    // Body order is [4, 9, 6]: slot 6 is processed after slot 9 so it would
+    // drag latest_justified backwards if iteration weren't careful.
+    var block_10 = try makeBlock(
+        std.testing.allocator,
+        &state,
+        state.slot,
+        &[_]attestation.AggregatedAttestation{ att_to_4, att_to_9, att_to_6 },
+    );
+    att_to_4_transferred = true;
+    att_to_9_transferred = true;
+    att_to_6_transferred = true;
+    defer block_10.deinit();
+
+    try state.process_block(std.testing.allocator, block_10, logger, null);
+
+    // latest_justified must land on slot 9 (the highest justified target),
+    // not slot 6 which was processed last.
+    try std.testing.expectEqual(@as(Slot, 9), state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &state.latest_justified.root, &block_9_root));
+
+    // No finalization expected; the chain is still anchored at genesis.
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_finalized.slot);
+
+    // Slots 4, 6, and 9 are all individually marked justified.
+    try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 4));
+    try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 6));
+    try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 9));
 }
 
 test "encode decode state roundtrip" {

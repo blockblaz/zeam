@@ -1,4 +1,4 @@
-//! Chain-worker thread + bounded queue scaffold (slice c-1 of #803).
+//! Chain-worker thread + bounded queue scaffold.
 //!
 //! Background: today every chain-mutation entry point (`onBlock`,
 //! `onGossipBlock`, `onGossipAttestation`, `onGossipAggregatedAttestation`,
@@ -63,12 +63,11 @@ const zeam_utils = @import("@zeam/utils");
 // `std.Io.Threaded` is owned per-`ChainWorker`, not borrowed from
 // `std.Io.Threaded.global_single_threaded`.
 //
-// Per @GrapeBaBa's review on PR #826: the global single-threaded
-// instance is example-only — it has `.allocator = .failing` and
-// `.async_limit = .nothing`, which is fine for example/test code but
-// not the right shape for a real worker thread that may need to
-// schedule futexes / signal blocked condvars. Production code must
-// own its `Threaded` instance.
+// The global single-threaded instance is example-only — it has
+// `.allocator = .failing` and `.async_limit = .nothing`, which is fine for
+// example/test code but not the right shape for a real worker thread that may
+// need to schedule futexes / signal blocked condvars. Production code must own
+// its `Threaded` instance.
 //
 // `ChainWorker.init` allocates a `Threaded` on the heap (stable
 // address — `Threaded.io()` stores `userdata = self` so moving the
@@ -118,12 +117,10 @@ pub const Message = union(enum) {
     /// Owns: `signed_block` (transitively the block body's
     /// attestations + signatures slices).
     ///
-    /// Slice (e) of #803: `block_root` carries the producer's
-    /// already-computed hash-tree root of `signed_block.block` when
-    /// available. Producers always compute it (gossip ingress at
-    /// `BeamNode.onGossip`, RPC ingress at
-    /// `processBlockByRoot|RangeChunk`, locally-produced via
-    /// `publishBlock`); threading it through here lets the worker's
+    /// `block_root` carries the producer's already-computed hash-tree root of
+    /// `signed_block.block` when available. Producers always compute it (gossip
+    /// ingress at `onGossip`, RPC ingress at `processBlockByRoot|RangeChunk`,
+    /// locally-produced via `publishBlock`); threading it through here lets the worker's
     /// `onBlock` callback skip the second `hashTreeRoot` call,
     /// removing one of three duplicate hashes per gossip block.
     /// `null` means "unknown — recompute"; the worker side handles
@@ -140,16 +137,16 @@ pub const Message = union(enum) {
     /// Aggregated-attestation gossip. Producer is libp2p gossip handler.
     /// Owns: `proof` slices inside the aggregated attestation.
     on_gossip_aggregated_attestation: types.SignedAggregatedAttestation,
-    /// **TEST-ONLY in production today; see #863 follow-up.**
+    /// Test-only in production today; pending a follow-up.
     /// `processPendingBlocks` drain trigger. Heap-free (slot is a
     /// value type). The libxev tick currently runs
     /// `processPendingBlocks` inline so the returned missing-roots
-    /// can flow back into `BeamNode.fetchBlockByRoots`. Wiring a
+    /// can flow back into `fetchBlockByRoots`. Wiring a
     /// worker producer requires plumbing those missing roots
-    /// through a worker→BeamNode backchannel (see
+    /// through a worker→node backchannel (see
     /// `imported_block_fn` for the analogous on_block path) — until
-    /// that lands, this variant is exercised ONLY by the queue
-    /// smoke tests in `chain_worker.zig` and the corresponding
+    /// that lands, this variant is exercised only by the queue
+    /// smoke tests here and the corresponding
     /// thunk warns + bumps
     /// `lean_chain_worker_process_pending_blocks_dropped_missing_roots_total`
     /// if it ever fires with non-empty missing roots, so an
@@ -157,8 +154,8 @@ pub const Message = union(enum) {
     process_pending_blocks: struct {
         current_slot: types.Slot,
     },
-    /// `processFinalizationFollowup` move-off path (slice c-2 will
-    /// dispatch this; c-1 just defines the shape).
+    /// `processFinalizationFollowup` move-off path (dispatch wiring comes
+    /// later; this just defines the shape).
     ///
     /// Carries the producer's snapshot of `(previous_finalized,
     /// latest_finalized)` rather than letting the worker re-read from
@@ -169,7 +166,7 @@ pub const Message = union(enum) {
     /// SSE events with the wrong `prev` checkpoint, or skip an
     /// intermediate finalization the producer was responsible for
     /// announcing. Matches the parameter shape of
-    /// `BeamChain.processFinalizationAdvancement` (chain.zig:1660).
+    /// `BeamChain.processFinalizationAdvancement`.
     ///
     /// Heap-free: `Checkpoint` is `(Root, Slot)`, a value type.
     process_finalization_followup: struct {
@@ -237,9 +234,8 @@ pub const Message = union(enum) {
 /// close get `error.QueueClosed`.
 /// Bounded MPSC queue — thin wrapper around `std.Io.Queue(T)`.
 ///
-/// Per @GrapeBaBa's review on PR #826, c-1 uses the stdlib's built-in
-/// queue rather than a hand-rolled mutex+condvar bounded ring. This
-/// gives us:
+/// We use the stdlib's built-in queue rather than a hand-rolled
+/// mutex+condvar bounded ring. This gives us:
 ///
 ///   * Wait-free producer via `put(io, &.{msg}, min=0)` (returns 0
 ///     when full, 1 on success, `error.Closed` after close).
@@ -430,10 +426,9 @@ pub const AggregatedAttestationQueue = BoundedQueue(Message);
 /// chain method.
 pub const Handlers = struct {
     ctx: *anyopaque,
-    /// Slice (e) of #803: `block_root` is the producer's already-
-    /// computed hash-tree root of `signed_block.block`, or `null` if
-    /// the producer didn't have one. The handler should pass it
-    /// straight into `BeamChain.onBlock` via
+    /// `block_root` is the producer's already-computed hash-tree root of
+    /// `signed_block.block`, or `null` if the producer didn't have one. The
+    /// handler should pass it straight into `BeamChain.onBlock` via
     /// `CachedProcessedBlockInfo.blockRoot` so the worker thread
     /// doesn't re-hash the same block.
     on_block: *const fn (
@@ -441,6 +436,26 @@ pub const Handlers = struct {
         signed_block: types.SignedBlock,
         prune_forkchoice: bool,
         block_root: ?types.Root,
+    ) void,
+    /// Batched block import (PR #966). Called by the drain loop when
+    /// `outstandingDepth > BLOCK_BATCH_THRESHOLD` — coalesces up to
+    /// `BLOCK_BATCH_MAX` `.on_block` messages into one dispatch so the
+    /// XMSS aggregated-signature verify can run as ONE rayon call across
+    /// every attestation in every block (the `phase2_batch_verify` stage
+    /// that is 99% of `step="verify_signatures"` on a loaded chain — see
+    /// PR #963 instrumentation).
+    ///
+    /// `items.len >= 2` by construction (the drain only dispatches the
+    /// batched path when it pulled at least 2 messages); single-block
+    /// pops still route through `on_block` for unchanged latency on
+    /// gossip / locally-produced blocks. The handler is responsible for
+    /// deiniting each item's `signed_block` — the drain loop releases
+    /// the underlying queue slots after the handler returns but does NOT
+    /// call `Message.deinit` for batched items (the slice is built
+    /// outside the queue).
+    on_blocks_batch: *const fn (
+        ctx: *anyopaque,
+        items: []const BlockBatchItem,
     ) void,
     on_gossip_attestation: *const fn (ctx: *anyopaque, gossip: networks.AttestationGossip) void,
     on_gossip_aggregated_attestation: *const fn (ctx: *anyopaque, agg: types.SignedAggregatedAttestation) void,
@@ -459,16 +474,16 @@ pub const Handlers = struct {
     /// import, so this variant is only needed when the libxev side
     /// imports a block (e.g. via the inline fallback path) or when
     /// the producer wants to nudge the worker after structural work
-    /// that may unblock buffered attestations (#863).
+    /// that may unblock buffered attestations.
     replay_pending_attestations: *const fn (ctx: *anyopaque) void,
 };
 
 /// Default capacities. Generous enough that a 30s gossip burst on
-/// devnet4 (~3 attestations/slot × 32 validators × 8 slots ≈ 800) does
-/// not saturate. Tuned by the slice c-2 stress harness. Aggregated
-/// attestations get a separate 512-message burst budget: under current
-/// devnet load they arrive below raw-attestation volume. The worker
-/// drains one raw attestation per loop; aggregated attestations use
+/// a busy network (~3 attestations/slot × 32 validators × 8 slots ≈ 800) does
+/// not saturate. Tuned by the stress harness. Aggregated attestations get a
+/// separate 512-message burst budget: under current load they arrive below
+/// raw-attestation volume. The worker drains one raw attestation per loop;
+/// aggregated attestations use
 /// `AGGREGATED_ATTESTATION_BATCH_*` when the queue is deep.
 pub const DEFAULT_BLOCK_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_ATTESTATION_QUEUE_CAPACITY: usize = 1024;
@@ -476,9 +491,35 @@ pub const DEFAULT_AGGREGATED_ATTESTATION_QUEUE_CAPACITY: usize = 512;
 
 /// When outstanding aggregated-attestation depth exceeds this, the
 /// worker drains up to `AGGREGATED_ATTESTATION_BATCH_MAX` per loop
-/// iteration instead of one (reduces backlog under devnet bursts).
+/// iteration instead of one (reduces backlog under heavy bursts).
 pub const AGGREGATED_ATTESTATION_BATCH_THRESHOLD: usize = 16;
 pub const AGGREGATED_ATTESTATION_BATCH_MAX: usize = 32;
+
+/// When outstanding block-queue depth exceeds this, the worker drains
+/// up to `BLOCK_BATCH_MAX` `.on_block` messages and dispatches them
+/// through the batched handler `Handlers.on_blocks_batch`. At depth ≤
+/// threshold the loop falls back to the single-block path so latency
+/// stays bounded for gossip / locally-produced blocks (which are the
+/// dominant case at steady state — head-aligned nodes rarely see
+/// queue depth >1).
+///
+/// Tuned to match `BLOCKS_BY_RANGE_SYNC_THRESHOLD = 4` so a single
+/// catch-up sweep can produce a full batch worth coalescing. Threshold
+/// is 2 (not 1) so a stray solo block doesn't trigger the batched
+/// path; with threshold 2 we batch only when ≥2 blocks are actually
+/// queued.
+pub const BLOCK_BATCH_THRESHOLD: usize = 2;
+pub const BLOCK_BATCH_MAX: usize = 4;
+
+/// One block's payload in a batched `Handlers.on_blocks_batch` call.
+/// Fields mirror the `Message.on_block` variant — see its doc comment
+/// for the ownership contract on `signed_block` (transferred from the
+/// producer; the handler is responsible for deiniting).
+pub const BlockBatchItem = struct {
+    signed_block: types.SignedBlock,
+    prune_forkchoice: bool,
+    block_root: ?types.Root,
+};
 
 /// Owns the chain-worker thread, the bounded queues, and a stop flag.
 ///
@@ -679,9 +720,9 @@ pub const ChainWorker = struct {
 
     /// Enqueue a `replay_pending_attestations` nudge on the attestation
     /// queue. Same wake/backpressure contract as `sendAttestation` but
-    /// with its OWN drop label (`replay_pending`) so it doesn't muddy
-    /// the per-attestation-message queue-depth metric (zclawz review on
-    /// PR #890): one nudge fans out into N replays inside the worker,
+    /// with its own drop label (`replay_pending`) so it doesn't muddy
+    /// the per-attestation-message queue-depth metric: one nudge fans out
+    /// into N replays inside the worker,
     /// so charging it against `queue="attestation"` would make
     /// dashboards read "attestation throughput fine" while the
     /// pending-buffer behind it sits at 800+ entries. The buffer
@@ -823,7 +864,68 @@ pub const ChainWorker = struct {
 
             // Block queue stays first (highest priority), but each loop also
             // gives raw and aggregated attestations one dispatch opportunity.
-            if (self.block_queue.tryRecv()) |msg| {
+            //
+            // PR #966: when outstanding block depth > BLOCK_BATCH_THRESHOLD,
+            // drain up to BLOCK_BATCH_MAX `.on_block` messages and dispatch
+            // them through the batched handler so the XMSS verify runs as
+            // ONE rayon call across all attestations in all blocks. Below
+            // threshold we keep the single-block path so latency for gossip
+            // / locally-produced blocks (the dominant case at steady state)
+            // is unchanged.
+            //
+            // Mirrors the `aggregated_attestation_queue` batching pattern
+            // a few lines below — same depth-vs-threshold gate, same
+            // bounded drain.
+            const block_depth = self.block_queue.outstandingDepth();
+            const should_batch = block_depth > BLOCK_BATCH_THRESHOLD;
+            if (should_batch) {
+                var batch: [BLOCK_BATCH_MAX]BlockBatchItem = undefined;
+                var batch_len: usize = 0;
+                // Collect up to BLOCK_BATCH_MAX `.on_block` messages.
+                // Other message variants (rare on this queue) drop us out
+                // of batched collection and dispatch single-block to keep
+                // ordering semantics identical to today's loop.
+                while (batch_len < BLOCK_BATCH_MAX) : (batch_len += 1) {
+                    const popped = self.block_queue.tryRecv() orelse break;
+                    switch (popped) {
+                        .on_block => |payload| {
+                            batch[batch_len] = .{
+                                .signed_block = payload.signed_block,
+                                .prune_forkchoice = payload.prune_forkchoice,
+                                .block_root = payload.block_root,
+                            };
+                        },
+                        else => {
+                            // Non-on_block variant. Flush whatever we
+                            // batched so far, then dispatch this one
+                            // single-shot for unchanged semantics.
+                            if (batch_len > 0) {
+                                self.dispatchBlocksBatch(batch[0..batch_len]);
+                                var i: usize = 0;
+                                while (i < batch_len) : (i += 1) {
+                                    self.block_queue.markProcessed();
+                                }
+                                self.recordBlockQueueDepth();
+                                batch_len = 0;
+                            }
+                            self.dispatch(popped);
+                            self.block_queue.markProcessed();
+                            self.recordBlockQueueDepth();
+                            dispatched_any = true;
+                            break;
+                        },
+                    }
+                }
+                if (batch_len > 0) {
+                    self.dispatchBlocksBatch(batch[0..batch_len]);
+                    var i: usize = 0;
+                    while (i < batch_len) : (i += 1) {
+                        self.block_queue.markProcessed();
+                    }
+                    self.recordBlockQueueDepth();
+                    dispatched_any = true;
+                }
+            } else if (self.block_queue.tryRecv()) |msg| {
                 self.dispatch(msg);
                 self.block_queue.markProcessed();
                 self.recordBlockQueueDepth();
@@ -843,7 +945,7 @@ pub const ChainWorker = struct {
 
             // Batch agg dispatch only runs `on_gossip_aggregated_attestation` on this
             // single chain-worker thread. It does not call `forkChoice.aggregate()`
-            // (snapshot-then-release via `AggregateSnapshot`, #863/#890); committee
+            // (snapshot-then-release via `AggregateSnapshot`); committee
             // aggregation stays on the dedicated aggregate Io.Threaded path.
             const agg_depth = self.aggregated_attestation_queue.outstandingDepth();
             const agg_batch: usize = if (agg_depth > AGGREGATED_ATTESTATION_BATCH_THRESHOLD)
@@ -941,7 +1043,30 @@ pub const ChainWorker = struct {
     /// frees any heap-owned payload — the worker remains the sole
     /// owner from `tryRecv` through handler return, regardless of
     /// whether the handler succeeded or threw internally.
+    /// Batched-block dispatch. Releases each item's `signed_block` after
+    /// the handler returns — the handler treats the slice as borrowed
+    /// for the call duration (mirrors `dispatch`'s `defer m.deinit()`
+    /// shape, just lifted across N items).
+    fn dispatchBlocksBatch(self: *Self, items: []const BlockBatchItem) void {
+        defer for (items) |item| {
+            var sb = item.signed_block;
+            sb.deinit();
+        };
+        const h = self.handlers orelse {
+            self.logger.warn(
+                "chain-worker: dropping batched on_blocks_batch ({d} items, no handlers wired)",
+                .{items.len},
+            );
+            return;
+        };
+        zeam_metrics.metrics.zeam_chain_worker_block_dispatch_total.incr(.{ .path = "batch" }) catch {};
+        h.on_blocks_batch(h.ctx, items);
+    }
+
     fn dispatch(self: *Self, msg: Message) void {
+        if (msg == .on_block) {
+            zeam_metrics.metrics.zeam_chain_worker_block_dispatch_total.incr(.{ .path = "single" }) catch {};
+        }
         var m = msg;
         defer m.deinit();
         const h = self.handlers orelse {
@@ -1393,7 +1518,7 @@ test "Message.deinit: on_block frees the SignedBlock heap (no leak under testing
     // lists), wrap it in a Message, and verify deinit cleans up.
     // testing.allocator panics on leak so the assertion is implicit.
     const attestations = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures = try types.createBlockSignatures(testing.allocator, attestations.len());
+    const proof = try types.ByteList512KiB.init(testing.allocator);
 
     var msg: Message = .{
         .on_block = .{
@@ -1405,7 +1530,7 @@ test "Message.deinit: on_block frees the SignedBlock heap (no leak under testing
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations },
                 },
-                .signature = signatures,
+                .proof = .{ .proof = proof },
             },
             .prune_forkchoice = false,
         },
@@ -1421,7 +1546,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
     // contract that lets new callers thread their precomputed root
     // through the queue without it getting silently dropped.
     const attestations1 = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures1 = try types.createBlockSignatures(testing.allocator, attestations1.len());
+    const proof1 = try types.ByteList512KiB.init(testing.allocator);
     var msg_default: Message = .{
         .on_block = .{
             .signed_block = .{
@@ -1432,7 +1557,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations1 },
                 },
-                .signature = signatures1,
+                .proof = .{ .proof = proof1 },
             },
             .prune_forkchoice = false,
         },
@@ -1442,7 +1567,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
 
     // Carry an explicit precomputed root.
     const attestations2 = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures2 = try types.createBlockSignatures(testing.allocator, attestations2.len());
+    const proof2 = try types.ByteList512KiB.init(testing.allocator);
     var sentinel: types.Root = undefined;
     var k: u8 = 0;
     for (sentinel[0..]) |*b| {
@@ -1459,7 +1584,7 @@ test "on_block carries optional block_root (slice (e) of #803)" {
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations2 },
                 },
-                .signature = signatures2,
+                .proof = .{ .proof = proof2 },
             },
             .prune_forkchoice = true,
             .block_root = sentinel,
@@ -1523,7 +1648,7 @@ test "ChainWorker.drainOnStop: pending messages freed on shutdown (no leak)" {
     // worker may or may not have popped the message before stop;
     // either way, no heap should leak.
     const attestations = try types.AggregatedAttestations.init(testing.allocator);
-    const signatures = try types.createBlockSignatures(testing.allocator, attestations.len());
+    const proof = try types.ByteList512KiB.init(testing.allocator);
     const msg: Message = .{
         .on_block = .{
             .signed_block = .{
@@ -1534,7 +1659,7 @@ test "ChainWorker.drainOnStop: pending messages freed on shutdown (no leak)" {
                     .state_root = std.mem.zeroes(types.Root),
                     .body = .{ .attestations = attestations },
                 },
-                .signature = signatures,
+                .proof = .{ .proof = proof },
             },
             .prune_forkchoice = false,
         },

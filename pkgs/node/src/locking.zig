@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Per-resource locking primitives for slice (a) of the BeamNode threading
-// refactor. See `docs/threading_refactor_slice_a.md` (commit a76c274) for the
-// design these helpers implement.
+// Per-resource locking primitives for the BeamNode threading refactor.
 //
 // This file provides three primitives:
 //
@@ -313,11 +311,11 @@ pub const MAX_CACHED_BLOCKS: usize = 1024;
 ///
 /// This is the *only* shape the production code (and tests asserting
 /// post-unlock invariants) should use. The legacy borrow-shape
-/// `BlockAndSsz` / `getBlockAndSsz` were removed in PR #820 (slice a-3
-/// follow-up) because their slice headers pointed into cache-owned
-/// memory that a concurrent `removeFetchedBlock` could free between
-/// the lock release and the caller's read — a textbook UAF that macOS
-/// CI surfaced via the new N3 concurrent stress test on commit 42b4566.
+/// `BlockAndSsz` / `getBlockAndSsz` were removed because their slice
+/// headers pointed into cache-owned memory that a concurrent
+/// `removeFetchedBlock` could free between the lock release and the
+/// caller's read — a textbook UAF that macOS CI surfaced via the N3
+/// concurrent stress test.
 /// Holding the cache mutex across the consumer's STF / XMSS work is the
 /// alternative shape and is *worse* (blocks every reader for hundreds of
 /// ms); clone-then-release is the correct discipline.
@@ -331,7 +329,7 @@ pub const OwnedBlockAndSsz = struct {
     }
 };
 
-/// `BlockCache` slice-discipline rules (slice a-3, PR #820 follow-up).
+/// `BlockCache` slice-discipline rules.
 ///
 /// **Read-then-unlock is UNSAFE for ssz / SignedBlock.** Both store
 /// allocator-owned slices that another thread can `removeFetchedBlock`
@@ -403,9 +401,8 @@ pub const BlockCache = struct {
     /// critical section as the block + parent link, preserving the
     /// triple-atomic invariant: a concurrent reader using
     /// `cloneBlockAndSsz` observes either both-null or both-Some, never
-    /// a partial state. (PR #820 / issue #803 — the legacy
-    /// `insertBlockPtr` + later `attachSsz` shape created a window
-    /// where readers saw block-only.)
+    /// a partial state. (The legacy `insertBlockPtr` + later `attachSsz`
+    /// shape created a window where readers saw block-only.)
     ///
     /// When `ssz` is null the SSZ slot is left empty; callers can attach
     /// the bytes later via `attachSsz`. Direct readers of `getBlock` and
@@ -552,16 +549,16 @@ pub const BlockCache = struct {
     ///
     /// All allocations happen INSIDE the critical section so the cloned
     /// data has no aliasing back into cache-owned memory once the lock
-    /// is released. The block clone uses `types.sszClone` (round-trip
-    /// serialize/deserialize) so every interior heap field is freshly
-    /// allocated under `allocator`. The ssz clone uses `allocator.dupe`.
+    /// is released. The block clone uses `zeam_utils.clone` so every
+    /// interior heap field is freshly allocated under `allocator`. The
+    /// ssz clone uses `allocator.dupe`.
     ///
     /// Use this for any caller that needs (block, ssz) to remain valid
     /// across cache mutations or long-running work (e.g. `chain.onBlock`
     /// → STF + XMSS verify, hundreds of ms). The previous borrow-shape
     /// `getBlockAndSsz` returned slice headers that pointed into
     /// cache-owned storage; a concurrent `removeFetchedBlock` would free
-    /// those bytes mid-STF (UAF — bug 14, macOS CI #820).
+    /// those bytes mid-STF (UAF — bug 14, surfaced by macOS CI).
     pub fn cloneBlockAndSsz(
         self: *Self,
         root: types.Root,
@@ -572,12 +569,11 @@ pub const BlockCache = struct {
 
         const block_ptr = self.blocks.getPtr(root) orelse return null;
 
-        // Deep-clone the SignedBlock under the cache lock. `sszClone`
-        // round-trips through ssz bytes so the result has no aliasing
-        // back into cache-owned storage. If this fails (OOM mid-clone),
-        // we have not allocated anything else yet — just propagate.
-        var cloned_block: types.SignedBlock = undefined;
-        try types.sszClone(allocator, types.SignedBlock, block_ptr.*, &cloned_block);
+        // Deep-clone the SignedBlock under the cache lock so the result
+        // has no aliasing back into cache-owned storage. If this fails
+        // (OOM mid-clone), we have not allocated anything else yet —
+        // just propagate.
+        var cloned_block = try zeam_utils.clone(types.SignedBlock, block_ptr, allocator);
         errdefer cloned_block.deinit();
 
         // Dupe the ssz bytes (if any). Done AFTER the block clone so the
@@ -768,8 +764,6 @@ pub const BlockCache = struct {
     /// which leaked a window where another thread could remove the entry
     /// or its parent's children list. Returns true if a block was
     /// present + removed.
-    ///
-    /// Refs: PR #820 / issue #803.
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -877,8 +871,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// peer, so the map size does not change. The legacy fetchSub-
         /// then-fetchAdd-around-OOM-able-dupe shape risked leaving the
         /// counter permanently low if either dupe failed (the errdefer
-        /// would unwind the put, but not re-add the count). See PR #820 /
-        /// issue #803.
+        /// would unwind the put, but not re-add the count).
         pub fn connect(self: *Self, peer_id: []const u8) !void {
             self.rwlock.lock();
             defer self.rwlock.unlock();
@@ -969,8 +962,8 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// Pick a random peer id under the shared lock. Returns a
         /// freshly-allocated copy of the peer id so the caller can use
         /// it after the lock is released. Caller frees with `allocator`.
-        pub fn selectPeerCopy(self: *Self, allocator: Allocator) !?[]u8 {
-            return self.selectPeerExcluding(allocator, null, false);
+        pub fn selectPeerCopy(self: *Self, allocator: Allocator, min_slot: ?u64) !?[]u8 {
+            return self.selectPeerExcluding(allocator, null, false, min_slot);
         }
 
         pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
@@ -992,12 +985,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// Pick a random connected peer, optionally excluding one id (for RPC retry).
         /// When `range_capable_only`, skips peers that reported `blocks_by_range` unavailable.
         /// Returns null when every connected peer is excluded (e.g. single-peer devnet).
-        pub fn selectPeerExcluding(
-            self: *Self,
-            allocator: Allocator,
-            exclude: ?[]const u8,
-            range_capable_only: bool,
-        ) !?[]u8 {
+        pub fn selectPeerExcluding(self: *Self, allocator: Allocator, exclude: ?[]const u8, range_capable_only: bool, min_slot: ?u64) !?[]u8 {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
@@ -1012,12 +1000,24 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
                 if (exclude) |ex| {
                     if (std.mem.eql(u8, entry.key_ptr.*, ex)) continue;
                 }
+                if (comptime @hasField(PeerInfo, "latest_status")) {
+                    if (min_slot) |ms| {
+                        const peer_head_slot = if (entry.value_ptr.latest_status) |status| status.head_slot else 0;
+                        if (ms > peer_head_slot) continue;
+                    }
+                }
                 if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
                     if (entry.value_ptr.blocks_by_range_unavailable) continue;
                 }
                 try candidates.append(allocator, entry.value_ptr.peer_id);
             }
-            if (candidates.items.len == 0) return null;
+
+            if (candidates.items.len == 0) {
+                if (min_slot != null) {
+                    zeam_metrics.metrics.zeam_select_peer_no_match_total.incr();
+                }
+                return null;
+            }
 
             const io = std.Io.Threaded.global_single_threaded.io();
             var random_source = std.Random.IoSource{ .io = io };
@@ -1046,7 +1046,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
 ///
 /// Debug builds enforce single-release via the `released: bool` sentinel —
 /// dropping a borrow without releasing it panics in `assertReleased`, the
-/// same shape as `MutexGuard.released` from #787.
+/// same shape as `MutexGuard.released`.
 ///
 /// Naming note: the previous draft called the consume-and-release helper
 /// `sszClone`, which read like a non-mutating snapshot helper. The current
@@ -1060,8 +1060,8 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
 ///     (RwLock, write side). Used by `statesCommitKeepExisting` so that the
 ///     caller in `onBlock` can deref the in-map pointer (DB write +
 ///     forkchoice confirm) without racing `pruneStates` (which also takes
-///     the exclusive side) freeing the entry. See PR #820 / issue #803 for
-///     the UAF that motivated this variant.
+///     the exclusive side) freeing the entry. This variant exists to close
+///     that UAF.
 ///   * `.events_mutex` — backed by `BeamChain.events_lock` (Mutex). Used
 ///     only by the `cached_finalized_state` / DB-fallback paths inside
 ///     `BeamChain.getFinalizedState` when the state is NOT in the in-memory
@@ -1082,14 +1082,14 @@ pub const BorrowedState = struct {
     /// Optional LockTimer travelling with the borrow so the
     /// `zeam_lock_hold_seconds` histogram observes the FULL hold span,
     /// not just up to the helper's return. Set by the hand-off site;
-    /// `deinit` calls `t.released()` after unlocking. PR #820 / issue
-    /// #803: previously the LockTimer ended at the helper's return, so
-    /// long-lived borrows (especially the new states_exclusive borrow)
-    /// had their hold span systematically under-reported.
+    /// `deinit` calls `t.released()` after unlocking. Previously the
+    /// LockTimer ended at the helper's return, so long-lived borrows
+    /// (especially the states_exclusive borrow) had their hold span
+    /// systematically under-reported.
     timer: ?LockTimer = null,
     /// Optional RcBeamState refcount that gates the borrow's lifetime.
-    /// Set by the lock-free read path (slice c-2b commit 4 of #803):
-    /// when chain-worker is the sole writer to `BeamChain.states`,
+    /// Set by the lock-free read path: when chain-worker is the sole
+    /// writer to `BeamChain.states`,
     /// `statesGet` / `getFinalizedState` cache-hit may take an
     /// `rc.tryAcquire()` and drop the backing lock immediately,
     /// returning a `Backing.none` borrow whose `state` pointer is
@@ -1135,10 +1135,9 @@ pub const BorrowedState = struct {
         }
         // Decrement tier-5 depth AFTER unlocking so the sibling-rule
         // assertion at the next acquire site sees the correct depth.
-        // PR #820 / issue #803: previously chain.getFinalizedState
-        // decremented before returning the borrow, so HTTP / event-
-        // broadcaster callers silently bypassed the sibling-rule check
-        // for the entire borrow lifetime.
+        // Previously getFinalizedState decremented before returning the
+        // borrow, so HTTP / event-broadcaster callers silently bypassed
+        // the sibling-rule check for the entire borrow lifetime.
         if (self.tier5_held) {
             self.tier5_held = false;
             leaveTier5();
@@ -1174,7 +1173,7 @@ pub const BorrowedState = struct {
         errdefer self.deinit();
         const owned = try allocator.create(types.BeamState);
         errdefer allocator.destroy(owned);
-        try types.sszClone(allocator, types.BeamState, self.state.*, owned);
+        owned.* = try zeam_utils.clone(types.BeamState, self.state, allocator);
         // Past the last `try`: success path. Drop the borrow explicitly.
         self.deinit();
         return owned;
@@ -1200,7 +1199,6 @@ pub const BorrowedState = struct {
     /// `released` field that callsites stored in stack-locals — the
     /// helper read a stale copy and never panicked. The `OrPanic`
     /// rename + signature audit forces a rewire at every callsite.
-    /// Reported by @ch4r10t33r in PR #820 / issue #803.
     pub fn assertReleasedOrPanic(self: *const BorrowedState) void {
         if (builtin.mode == .Debug) {
             if (!self.released) {
@@ -1494,7 +1492,7 @@ test "BorrowedState: cloneAndRelease works for states_exclusive_rwlock backing" 
 }
 
 test "BorrowedState: states_exclusive_rwlock backing blocks pruner-shaped reacquire until deinit" {
-    // Smoke test for the PR #820 contract: while a BorrowedState backed by
+    // Smoke test for the contract: while a BorrowedState backed by
     // states_exclusive_rwlock is alive, an exclusive reacquire (the shape
     // pruneStates uses on states_lock) must block. Once the borrow is
     // released via deinit, the reacquire proceeds.
@@ -1579,7 +1577,7 @@ fn makeTestStateForBorrowed() !types.BeamState {
 }
 
 test "BorrowedState: Backing.none + acquired_rc deinit releases the rc" {
-    // Slice c-2b commit 4 of #803: the lock-free read path returns a
+    // The lock-free read path returns a
     // Backing.none borrow whose lifetime is gated entirely by an
     // RcBeamState refcount. deinit must release the rc; testing.allocator
     // catches a leak if it does not.
@@ -1654,8 +1652,7 @@ test "BorrowedState: cloneAndRelease against Backing.none + acquired_rc releases
 }
 
 test "lean_chain_state_refcount_distribution: writer + N readers shape (slice c-2b commit 5)" {
-    // Slice c-2b commit 5 of #803: the
-    // `lean_chain_state_refcount_distribution` histogram is updated by
+    // The `lean_chain_state_refcount_distribution` histogram is updated by
     // a scrape-time observer that samples `rc.count()` for every
     // map-resident BeamState. This audit-pattern test verifies the
     // distribution shape end-to-end without spinning a full BeamChain:
@@ -1815,10 +1812,10 @@ test "BlockCache: helper init/deinit when empty" {
 // Note: BlockCache atomic-insert / partial-state invariant tests would need
 // a real SignedBlock/BeamBlock builder; the contract is unit-tested via the
 // `removeChildrenOf bounded` test below which exercises the BFS. Full
-// triple-insert tests will land alongside the (a-3) network wiring once we
-// have a SignedBlock test factory in pkgs/node, since the existing factories
-// live in pkgs/state-transition under genMockChain and pulling that in here
-// creates a test cycle.
+// triple-insert tests will land alongside the network wiring once we
+// have a SignedBlock test factory in this package, since the existing
+// factories live under genMockChain in state-transition and pulling that
+// in here creates a test cycle.
 //
 // What we DO test in (a-2):
 //   * removeChildrenOf bounded by MAX_CACHED_BLOCKS (the worst-case
@@ -1914,10 +1911,11 @@ test "LockedMap: concurrent put/get/remove smoke" {
 }
 
 test "ConnectedPeers: connect / disconnect / count atomic" {
+    const FakeStatus = struct { head_slot: u64 };
     const FakePeerInfo = struct {
         peer_id: []const u8,
         connected_at: i64,
-        latest_status: ?u32 = null,
+        latest_status: ?FakeStatus = null,
     };
     const CP = ConnectedPeersImpl(FakePeerInfo);
     var cp = CP.init(testing.allocator);
@@ -1939,8 +1937,8 @@ test "ConnectedPeers: connect / disconnect / count atomic" {
     try testing.expect(!cp.disconnect("peer-b"));
 
     // setLatestStatus on present + missing.
-    try testing.expect(cp.setLatestStatus("peer-a", @as(u32, 42)));
-    try testing.expect(!cp.setLatestStatus("peer-z", @as(u32, 0)));
+    try testing.expect(cp.setLatestStatus("peer-a", FakeStatus{ .head_slot = 42 }));
+    try testing.expect(!cp.setLatestStatus("peer-z", FakeStatus{ .head_slot = 0 }));
 
     // Iteration sees the remaining two entries under the shared lock.
     {
@@ -1952,16 +1950,17 @@ test "ConnectedPeers: connect / disconnect / count atomic" {
     }
 
     // selectPeerCopy returns an owned slice from the present set.
-    const picked = (try cp.selectPeerCopy(testing.allocator)) orelse return error.NoPick;
+    const picked = (try cp.selectPeerCopy(testing.allocator, null)) orelse return error.NoPick;
     defer testing.allocator.free(picked);
     try testing.expect(cp.contains(picked));
 }
 
 test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
+    const FakeStatus = struct { head_slot: u64 };
     const FakePeerInfo = struct {
         peer_id: []const u8,
         connected_at: i64,
-        latest_status: ?u32 = null,
+        latest_status: ?FakeStatus = null,
     };
     const CP = ConnectedPeersImpl(FakePeerInfo);
     var cp = CP.init(testing.allocator);
@@ -1997,6 +1996,41 @@ test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
         while (guard.iter.next()) |_| : (actual += 1) {}
     }
     try testing.expectEqual(actual, cp.count());
+}
+
+test "ConnectedPeers: selectPeerCopy respects min_slot filter" {
+    const FakeStatus = struct { head_slot: u64 };
+    const FakePeerInfo = struct {
+        peer_id: []const u8,
+        connected_at: i64,
+        latest_status: ?FakeStatus = null,
+    };
+    const CP = ConnectedPeersImpl(FakePeerInfo);
+    var cp = CP.init(testing.allocator);
+    defer cp.deinit();
+
+    // Initialize peers at 0, 5 and 10
+    try cp.connect("peer-0");
+
+    try cp.connect("peer-5");
+    _ = cp.setLatestStatus("peer-5", FakeStatus{ .head_slot = 5 });
+
+    try cp.connect("peer-10");
+    _ = cp.setLatestStatus("peer-10", FakeStatus{ .head_slot = 10 });
+
+    // min_slot=7 → only peer-10 eligible
+    const pick = try cp.selectPeerCopy(testing.allocator, 7);
+    defer if (pick) |p| testing.allocator.free(p);
+    try testing.expectEqualStrings("peer-10", pick.?);
+
+    // min_slot=20 → no peer qualifies, returns null
+    const none = try cp.selectPeerCopy(testing.allocator, 20);
+    try testing.expect(none == null);
+
+    // min_slot=null → any peer eligible
+    const any = try cp.selectPeerCopy(testing.allocator, null);
+    defer if (any) |p| testing.allocator.free(p);
+    try testing.expect(any != null);
 }
 
 test "LockedMap: withValueLocked holds the lock across the callback" {
@@ -2106,7 +2140,7 @@ fn makeFixtureSignedBlockPtr(
                 .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
-        .signature = try types.createBlockSignatures(allocator, 0),
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
     return block_ptr;
 }
@@ -2125,7 +2159,7 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
     //     across a concurrent `removeFetchedBlock`). Counts how many
     //     times the (block-Some, ssz-null) partial state was observed
     //     so we can assert the bounded-window claim is actually
-    //     exercised. Pre-PR-#820-followup this test used the
+    //     exercised. An earlier version of this test used the
     //     borrow-shape `getBlockAndSsz` and macOS CI exposed a UAF on
     //     `bs.ssz.?[0] == 0xDE` because the borrowed slice header
     //     aliased cache-owned bytes that the Remover thread freed +
@@ -2140,7 +2174,7 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
     // No XMSS, no STF — fixtures only. The contract under test is
     // BlockCache atomicity, not signature validity.
     //
-    // ITER reduced from 1500 to 300 in PR #820 follow-up: the reader
+    // ITER reduced from 1500 to 300: the reader
     // now uses `cloneBlockAndSsz`, which performs a full SSZ
     // round-trip (serialize + deserialize) on each successful probe
     // under the cache mutex. That's the production-relevant API — see
@@ -2260,7 +2294,7 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
                     continue;
                 };
                 // Use the cloning variant: the borrow-shape
-                // `getBlockAndSsz` was removed in PR #820 follow-up
+                // `getBlockAndSsz` was removed
                 // because its returned slice headers pointed into
                 // cache-owned memory that a concurrent
                 // `removeFetchedBlock` could free — the same UAF that
@@ -2352,7 +2386,7 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
 // calls for a single-node ingestion harness that floods gossip + RPC
 // with a backed forkchoice. That harness lives outside the unit test
 // pkg — it would need a real Network backend / mock libp2p / forked
-// chain seed and is best run as a `pkgs/sim` scenario. The unit-tested
+// chain seed and is best run as a sim scenario. The unit-tested
 // LockedMap / ConnectedPeers concurrency smokes above are the merge
 // gate for the lock-correctness side; a separate sim run is the merge
-// gate for the throughput side, tracked in #803.
+// gate for the throughput side.

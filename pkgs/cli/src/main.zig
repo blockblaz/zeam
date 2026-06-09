@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const json = std.json;
 const build_options = @import("build_options");
 const constants = @import("constants.zig");
@@ -76,29 +77,42 @@ pub const NodeCommand = struct {
     @"aggregate-subnet-ids": ?[]const u8 = null,
     @"shadow-xmss-aggregate-signatures-rate": ?f64 = null,
     @"shadow-xmss-verify-aggregated-signatures-rate": ?f64 = null,
+    @"shadow-xmss-merge-rate": ?f64 = null,
     @"db-backend": database.Backend = .rocksdb,
     @"chain-spec": ?[]const u8 = null,
-    /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `true` post
-    /// devnet-4 burn-in (#788 follow-up + slice (d)/(e) PR): the
-    /// worker path is the supported prod path; the synchronous path
-    /// stays in place as a kill-switch via `--chain-worker false`.
+    /// Route producer-side gossip handlers through the chain-worker queue.
+    /// Default `true`: the worker path is the supported prod path; the
+    /// synchronous path stays in place as a kill-switch via `--chain-worker false`.
     @"chain-worker": bool = true,
     /// Override the rayon worker count used by the multisig (XMSS) aggregate
     /// prover. `null` (the default, surfaced as omitted on the CLI) keeps the
     /// existing post-system-thread split that gives roughly half of the
     /// remaining cores to the Zig pool and half to rayon — fine for non-
     /// aggregator nodes. Aggregators on CPU-rich hosts can pass a value here
-    /// to give the prover more parallelism without rebuilding (#899).
+    /// to give the prover more parallelism without rebuilding.
     @"rayon-threads": ?u32 = null,
     /// Minimum (children + gossip-sig) inputs required before the aggregator
     /// invokes the recursive STARK prover for an `AttestationData`. Default
-    /// `2` (post-#908) skips the no-children + single-gossip-sig case where
-    /// the prover would produce a 1-validator aggregate of zero consensus
-    /// value. `1` reverts to pre-#908 behavior (always aggregate ≥1 sig).
-    /// Higher values trade slot latency for fewer sub-threshold aggregates
-    /// on chatty subnets. See issue #907 finding 4.
+    /// `2` skips the no-children + single-gossip-sig case where the prover
+    /// would produce a 1-validator aggregate of zero consensus value. `1`
+    /// always aggregates at least one sig. Higher values trade slot latency
+    /// for fewer sub-threshold aggregates on chatty subnets.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
+    /// Single-message attestation aggregation deadline budget (see
+    /// `ChainOpts.proposal_deadline_pct`): the proposer truncates attestation
+    /// gathering at this percent of the proposal interval; the remainder is for
+    /// block signing and the Type-2 multi-message merge.
+    @"proposal-deadline-pct": u32 = node_lib.default_proposal_deadline_pct,
+
+    /// Cap on the number of child STARK proofs the aggregator worker merges
+    /// with raw signatures via `rec_xmss_aggregate`.
+    /// Default `0` keeps per-call latency bounded by flat-prove cost
+    /// (~0.5 s on 16-core Hetzner per lean-bench at log_inv_rate=2). Higher
+    /// values let the worker emit broader aggregates per tick at the cost
+    /// of ~1.3 s per additional child (in one measurement,
+    /// `num_children=3-4` proves averaged ~4.8 s, dominating the p95 tail).
+    /// See `types.default_max_aggregation_children` for full rationale.
+    @"max-aggregation-children": u32 = types.default_max_aggregation_children,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -123,11 +137,14 @@ pub const NodeCommand = struct {
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .@"shadow-xmss-aggregate-signatures-rate" = "Shadow sim only: signatures aggregated per second; injects sleep = n/rate into aggregation so CPU cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE",
         .@"shadow-xmss-verify-aggregated-signatures-rate" = "Shadow sim only: signatures verified per second inside an aggregate; injects sleep = n/rate into verification. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE",
+        .@"shadow-xmss-merge-rate" = "Shadow sim only: Type-1 components merged into a Type-2 per second; injects sleep = n/rate into the proposal Type-2 merge so block-building cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_MERGE_RATE",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
-        .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to pre-#908 behavior. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
+        .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to the earlier behavior that always aggregated at least one signature. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
+        .@"proposal-deadline-pct" = "Percentage of one proposal interval (SECONDS_PER_INTERVAL_MS, default 800ms) budgeted to the block-build/aggregation worker. This is an intra-interval split: the worker self-truncates at this percentage and the remaining (100-pct)% of the SAME interval is reserved for the finalize step (STF on the harvested partial body + propose-side sign + gossip publish), so the signed block is ready before the attestation interval. Default 90 (~720ms aggregation + ~80ms finalize/sign at the default 800ms interval). Lower this on slow validator hardware to widen the finalize/sign window; raise toward 99 to maximise aggregation throughput. Clamped to [0, 99] inside the consumer.",
+        .@"max-aggregation-children" = "Cap on the number of child STARK proofs the aggregator worker merges with raw signatures via rec_xmss_aggregate. Default 0 keeps per-call latency bounded by flat-prove cost (~0.5 s/call on typical aggregator hardware) by never taking the recursive code path; peer-published aggregates for the same att_data remain in latest_known_aggregated_payloads for the block proposer to compact at proposal time. Set 1 to allow at most one peer child to be merged (~1.5 s/call). Higher values reintroduce the multi-second tail (in one measurement, num_children=3-4 averaged ~4.8 s).",
         .help = "Show help information for the node command",
     };
 };
@@ -285,15 +302,25 @@ pub fn main(init: std.process.Init) void {
 }
 
 fn mainInner(init: std.process.Init) !void {
+    // The merged CLI arg struct (node flags + Shadow-sim XMSS rate flags) has
+    // enough fields that simargs' comptime field walk exceeds the default
+    // 1000-branch quota; raise it for this function's comptime evaluation.
+    @setEvalBranchQuota(100000);
+
+    // Debug builds use the DebugAllocator so development and tests keep leak
+    // and use-after-free detection. Release builds use libc's allocator: the
+    // DebugAllocator retains freed pages for its safety checks and never hands
+    // them back to the OS, so a long-running node ratchets RSS up to its peak.
+    // malloc/free is thread-safe, which the chain's worker pool requires.
     var gpa = std.heap.DebugAllocator(.{}).init;
-    const allocator = gpa.allocator();
-    defer {
+    const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    defer if (builtin.mode == .Debug) {
         const leaked = gpa.deinit();
         if (leaked == .leak) {
             std.log.err("Memory leak detected!", .{});
             std.process.exit(1);
         }
-    }
+    };
 
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
@@ -443,8 +470,8 @@ fn mainInner(init: std.process.Init) !void {
                 .ignore_unknown_fields = true,
                 .allocate = .alloc_if_needed,
             };
-            // See pkgs/cli/src/node.zig (and #831): `parseFromSlice` returns
-            // string fields aliased into the `Parsed` arena. `ChainSpec.deinit`
+            // `parseFromSlice` returns string fields aliased into the
+            // `Parsed` arena. `ChainSpec.deinit`
             // later calls `allocator.free` on `name` / `fork_digest`, so move
             // both fields onto the top-level allocator before the arena dies.
             const parsed = try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options);
@@ -750,24 +777,32 @@ fn mainInner(init: std.process.Init) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.started) return;
 
-                    // Wait until finalization has advanced beyond genesis on the reference node
-                    const finalized_slot = self.reference_node.chain.forkChoice.fcStore.latest_finalized.slot;
+                    // Wait until finalization has advanced beyond genesis on the
+                    // reference node. Read through the shared-locked accessor:
+                    // `fcStore.latest_finalized` is a multi-field Checkpoint
+                    // written under the fork-choice mutex by the reference
+                    // node's chain-worker thread, so a raw field read from this
+                    // clock-callback thread is a data race (observed as a torn
+                    // garbage slot under a non-serializing allocator).
+                    const finalized_slot = self.reference_node.chain.forkChoice.getLatestFinalized().slot;
                     if (finalized_slot == 0) return;
 
                     std.debug.print("\n=== STARTING NODE 3 (delayed sync node) at interval {d} ===\n", .{interval});
                     std.debug.print("=== Finalization reached slot {d} on reference node — starting node 3 ===\n", .{finalized_slot});
                     std.debug.print("=== Node 3 will sync from genesis using parent block syncing ===\n\n", .{});
 
-                    // Start BeamNode first so it registers selective gossip
-                    // topic handlers; EthLibp2p.run() then derives the
-                    // gossipsub subscribe set from those handlers (instead of
-                    // joining every attestation subnet). See
-                    // pkgs/network/src/ethlibp2p.zig run() for the rationale.
-                    try self.beam_node.run();
+                    // Register peer + req-resp handlers before the network
+                    // starts (same race-fix as nodes 1/2): otherwise node 3's
+                    // inbound STATUS handling and peer registration can be lost,
+                    // leaving it unable to sync. Gossip subscribe still happens
+                    // inside `beam_node.run()` after `net.run()`.
+                    try self.beam_node.subscribeNetworkEventHandlers();
 
                     if (self.network) |net| {
                         try net.run();
                     }
+
+                    try self.beam_node.run();
                     self.started = true;
 
                     std.debug.print("=== NODE 3 STARTED - will now sync via STATUS and parent block requests ===\n\n", .{});
@@ -784,6 +819,15 @@ fn mainInner(init: std.process.Init) !void {
                 .ptr = &delayed_runner,
                 .onIntervalCb = DelayedNodeRunner.onInterval,
             };
+
+            // Subscribe peer + req-resp handlers BEFORE the networks start
+            // accepting connections, so the one-shot peer-connect event (and
+            // early STATUS requests) are never lost to a handler-not-yet-
+            // registered race. These only append to in-process handler lists;
+            // gossip mesh subscribe still happens later in `BeamNode.run()`
+            // because it needs the running swarm command channel.
+            try beam_node_1.subscribeNetworkEventHandlers();
+            try beam_node_2.subscribeNetworkEventHandlers();
 
             // Start the rust libp2p networks BEFORE the beam nodes:
             // `BeamNode.run()` calls `gossip.subscribe(...)`, which now
@@ -839,6 +883,7 @@ fn mainInner(init: std.process.Init) !void {
             xmss.shadow_cost.init(
                 leancmd.@"shadow-xmss-aggregate-signatures-rate",
                 leancmd.@"shadow-xmss-verify-aggregated-signatures-rate",
+                leancmd.@"shadow-xmss-merge-rate",
             );
             std.Io.Dir.cwd().createDirPath(init.io, leancmd.@"data-dir") catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "create data directory", .{ .path = leancmd.@"data-dir" });
@@ -871,6 +916,8 @@ fn mainInner(init: std.process.Init) !void {
                 .db_backend = leancmd.@"db-backend",
                 .rayon_threads = leancmd.@"rayon-threads",
                 .min_aggregation_inputs = leancmd.@"min-aggregation-inputs",
+                .proposal_deadline_pct = leancmd.@"proposal-deadline-pct",
+                .max_aggregation_children = leancmd.@"max-aggregation-children",
             };
 
             defer start_options.deinit(allocator);

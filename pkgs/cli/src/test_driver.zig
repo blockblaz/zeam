@@ -1,4 +1,4 @@
-/// Fork-choice test driver for hive lean-spec-tests.
+/// Fork-choice test driver for the hive consensus test fixtures.
 ///
 /// Implements:
 ///   POST /lean/v0/test_driver/fork_choice/init
@@ -7,8 +7,8 @@
 ///   POST /lean/v0/test_driver/state_transition/run
 ///   POST /lean/v0/test_driver/verify_signatures/run
 ///
-/// Logic mirrors pkgs/spectest/src/runner/fork_choice_runner.zig but adapted
-/// for persistent per-request state and HTTP responses.
+/// Logic mirrors the fork-choice runner but adapted for persistent
+/// per-request state and HTTP responses.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
@@ -251,8 +251,8 @@ pub fn buildStateFromJson(allocator: Allocator, value: JsonValue) !types.BeamSta
             };
             for (arr.items, 0..) |item, idx| {
                 const vobj = try requireObject(item);
-                const att_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"attestationPubkey"});
-                const prop_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"proposalPubkey"});
+                const att_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"attestationPublicKey"});
+                const prop_pubkey = try parseBytesField(types.Bytes52, vobj, &.{"proposalPublicKey"});
                 const validator_index: u64 = if (vobj.get("index")) |iv| try parseU64Value(iv) else @intCast(idx);
                 validators.append(.{
                     .attestation_pubkey = att_pubkey,
@@ -458,7 +458,7 @@ pub fn initForkChoiceDriver(
 
     const anchor_state_ptr = try driver_allocator.create(types.BeamState);
     errdefer driver_allocator.destroy(anchor_state_ptr);
-    try types.sszClone(driver_allocator, types.BeamState, anchor_state_temp, anchor_state_ptr);
+    anchor_state_ptr.* = try zeam_utils.clone(types.BeamState, &anchor_state_temp, driver_allocator);
     errdefer anchor_state_ptr.deinit();
 
     // Compute anchor block root for state_map
@@ -667,7 +667,7 @@ fn processBlockStep(
         new_state_ptr.deinit();
         driver.allocator.destroy(new_state_ptr);
     }
-    try types.sszClone(driver.allocator, types.BeamState, parent_state_ptr.*, new_state_ptr);
+    new_state_ptr.* = try zeam_utils.clone(types.BeamState, parent_state_ptr, driver.allocator);
 
     state_transition.apply_transition(driver.allocator, new_state_ptr, block, .{
         .logger = driver.fork_choice.logger,
@@ -686,7 +686,7 @@ fn processBlockStep(
 
     // Store block body attestations as known aggregated payloads
     for (aggregated_attestations) |agg_att| {
-        var proof_template = types.AggregatedSignatureProof.init(driver.allocator) catch continue;
+        var proof_template = types.SingleMessageAggregate.init(driver.allocator) catch continue;
         defer proof_template.deinit();
 
         const bits_len = agg_att.aggregation_bits.len();
@@ -725,7 +725,7 @@ fn processTickStep(
     driver: *ForkChoiceDriverState,
     step_obj: std.json.ObjectMap,
 ) !void {
-    // Tick step supports two alternative forms (mirrors leanSpec ForkChoiceStep::Tick):
+    // Tick step supports two alternative forms:
     //   "time": unix timestamp  — convert to intervals via genesis_time
     //   "interval": direct interval count
     const anchor_genesis_time = driver.fork_choice.anchorState.config.genesis_time;
@@ -778,17 +778,17 @@ fn processAttestationStep(
     const att_obj = try requireObject(att_value);
 
     // Parse validatorId (single validator, not aggregationBits)
-    const validator_id = try parseU64Field(att_obj, &.{ "validatorId", "validator_id" });
+    const validator_id = try parseU64Field(att_obj, &.{ "validatorIndex", "validatorId", "validator_id" });
     const data_obj = try parseObjectField(att_obj, &.{"data"});
     const att_data = try parseAttestationData(data_obj);
     const validators_slice = driver.fork_choice.anchorState.validators.constSlice();
     if (validator_id >= validators_slice.len) return error.UnknownValidator;
     try validateAttestationDataForGossip(driver, att_data);
 
-    // XMSS signature verification. The hive lean-spec-tests fixtures embed a
-    // SignedAttestation per gossip step (see leanSpec/.../gossip_attestation_spec.py:
-    // valid_signature=False produces an all-zero structurally-valid signature
-    // that must fail XMSS verification). Hive fixtures use leanEnv=prod, so we
+    // XMSS signature verification. The hive fixtures embed a
+    // SignedAttestation per gossip step: a valid_signature=False entry produces
+    // an all-zero structurally-valid signature that must fail XMSS
+    // verification. Hive fixtures use leanEnv=prod, so we
     // dispatch to xmss.verifySsz (the test-scheme path is exercised by the
     // local spectest runner instead).
     const sig_value = att_obj.get("signature") orelse return error.SignatureVerificationFailed;
@@ -848,7 +848,7 @@ fn processGossipAggregatedAttestationStep(
     }
 
     // Build proof template for storeAggregatedPayload
-    var proof_template = types.AggregatedSignatureProof.init(driver.allocator) catch return error.OutOfMemory;
+    var proof_template = types.SingleMessageAggregate.init(driver.allocator) catch return error.OutOfMemory;
     defer proof_template.deinit();
     const bits_len = aggregation_bits.len();
     for (0..bits_len) |i| {
@@ -914,7 +914,6 @@ pub fn stepForkChoiceDriver(
         };
     } else if (std.mem.eql(u8, step_type, "attestation")) {
         // Single-validator gossip attestation: {"validatorId": N, "data": {...}}
-        // Mirrors ForkChoiceStep::Attestation in leanSpec.
         processAttestationStep(driver, step_obj) catch |err| {
             if (isProtocolError(err) or err == error.OutOfMemory) return err;
             accepted = false;
@@ -1058,7 +1057,7 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
 
     var transition_error: ?[]const u8 = null;
 
-    // Slots-only monotonicity fixtures (leanSpec PR #643: test_process_slots_*)
+    // Slots-only monotonicity fixtures (test_process_slots_*)
     // ship `pre` + `expectException` with no blocks. The test asserts that
     // `process_slots(state, state.slot)` (or any `target <= state.slot`) is
     // rejected. zeam's `state.process_slots` returns `InvalidPreState` on
@@ -1113,7 +1112,7 @@ pub fn runStateTransition(allocator: Allocator, body_bytes: []const u8) ![]u8 {
 
 /// POST /lean/v0/test_driver/verify_signatures/run
 /// Verifies block signatures against an anchor state.
-/// Implements XMSS proposer + attestation signature verification for hive lean-spec-tests.
+/// Implements XMSS proposer + attestation signature verification for the hive test fixtures.
 pub fn runVerifySignatures(allocator: Allocator, body_bytes: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1339,8 +1338,8 @@ fn verifyAttestationSignatures(
     return any_failed;
 }
 
-/// Parse an AggregatedSignatureProof from a JSON value (test driver format).
-fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.AggregatedSignatureProof {
+/// Parse an SingleMessageAggregate from a JSON value (test driver format).
+fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.SingleMessageAggregate {
     const obj = switch (value) {
         .object => |m| m,
         else => return error.InvalidField,
@@ -1378,15 +1377,15 @@ fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.Aggre
     const proof_bytes = try parseHexBytesAlloc(allocator, proof_data_hex);
     defer allocator.free(proof_bytes);
 
-    var proof_data = try xmss.ByteListMiB.init(allocator);
+    var proof_data = try xmss.ByteList512KiB.init(allocator);
     errdefer proof_data.deinit();
     for (proof_bytes) |b| {
         proof_data.append(b) catch return error.InvalidField;
     }
 
-    return types.AggregatedSignatureProof{
+    return types.SingleMessageAggregate{
         .participants = participants,
-        .proof_data = proof_data,
+        .proof = proof_data,
     };
 }
 

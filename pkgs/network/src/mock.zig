@@ -31,7 +31,7 @@ pub const Mock = struct {
     pending_publish_drain_scheduled: bool,
     nextPeerIndex: usize,
     nextRequestId: u64,
-    /// Issue #808 review: when set to true, every `publish` call returns
+    /// When set to true, every `publish` call returns
     /// `false` without invoking subscribers — simulating the rust-libp2p
     /// command channel having dropped the publish. Lets the node-level
     /// `failed to publish … (backend dropped publish)` warn arms in
@@ -305,7 +305,7 @@ pub const Mock = struct {
         };
     }
 
-    /// Issue #808 review knob: toggle the simulated drop on every publish.
+    /// Test knob: toggle the simulated drop on every publish.
     pub fn setForcePublishDrop(self: *Self, drop: bool) void {
         self.force_publish_drop = drop;
     }
@@ -407,12 +407,11 @@ pub const Mock = struct {
     }
 
     fn enqueuePublish(self: *Self, data: *const interface.GossipMessage, sender_peer_id: []const u8) !void {
-        const cloned_message = try data.clone(self.allocator);
+        const cloned_message = try self.allocator.create(interface.GossipMessage);
         var message_owned_by_queue = false;
-        errdefer if (!message_owned_by_queue) {
-            cloned_message.deinit();
-            self.allocator.destroy(cloned_message);
-        };
+        errdefer if (!message_owned_by_queue) self.allocator.destroy(cloned_message);
+        cloned_message.* = try zeam_utils.clone(interface.GossipMessage, data, self.allocator);
+        errdefer if (!message_owned_by_queue) cloned_message.deinit();
 
         const sender_peer_id_copy = try self.allocator.dupe(u8, sender_peer_id);
         var sender_peer_id_owned_by_queue = false;
@@ -560,34 +559,6 @@ pub const Mock = struct {
         }
     }
 
-    fn cloneResponse(self: *Self, response: *const interface.ReqRespResponse) !interface.ReqRespResponse {
-        return switch (response.*) {
-            .status => |status_resp| interface.ReqRespResponse{ .status = status_resp },
-            .blocks_by_root => |block_resp| blk: {
-                var cloned_block: types.SignedBlock = undefined;
-                try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
-                break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
-            },
-            .blocks_by_range => |block_resp| blk: {
-                var cloned_block: types.SignedBlock = undefined;
-                try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
-                break :blk interface.ReqRespResponse{ .blocks_by_range = cloned_block };
-            },
-        };
-    }
-
-    fn cloneRequest(self: *Self, request: *const interface.ReqRespRequest) !interface.ReqRespRequest {
-        return switch (request.*) {
-            .status => |status_req| interface.ReqRespRequest{ .status = status_req },
-            .blocks_by_root => |block_req| blk: {
-                var cloned_request: types.BlockByRootRequest = undefined;
-                try types.sszClone(self.allocator, types.BlockByRootRequest, block_req, &cloned_request);
-                break :blk interface.ReqRespRequest{ .blocks_by_root = cloned_request };
-            },
-            .blocks_by_range => |block_req| interface.ReqRespRequest{ .blocks_by_range = block_req },
-        };
-    }
-
     fn notifySuccess(self: *Self, request_id: u64, method: interface.LeanSupportedProtocol, response: interface.ReqRespResponse) void {
         var event = interface.ReqRespResponseEvent.initSuccess(request_id, method, response);
         defer event.deinit(self.allocator);
@@ -643,7 +614,7 @@ pub const Mock = struct {
 
         // Buffer the response for async delivery instead of immediate notification
         // This fixes timing issues where responses arrive before request tracking is set up
-        const cloned = try ctx.mock.cloneResponse(response);
+        const cloned = try zeam_utils.clone(interface.ReqRespResponse, response, ctx.mock.allocator);
         try ctx.buffered_responses.append(ctx.mock.allocator, cloned);
     }
 
@@ -743,7 +714,7 @@ pub const Mock = struct {
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!bool {
         // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
-        // Issue #808: when the test harness toggles `force_publish_drop`, behave
+        // When the test harness toggles `force_publish_drop`, behave
         // like a real backend that dropped the publish (rust-libp2p command
         // channel full): no subscriber invocation, return `false` so the
         // caller exercises its drop-handling branch.
@@ -802,7 +773,7 @@ pub const Mock = struct {
         const target_idx = try self.ensurePeerEntry(peer_id);
         const target_peer = &self.peers.items[target_idx];
 
-        var request_copy = try self.cloneRequest(req);
+        var request_copy = try zeam_utils.clone(interface.ReqRespRequest, req, self.allocator);
         defer request_copy.deinit();
 
         const method = std.meta.activeTag(request_copy);
@@ -925,8 +896,6 @@ fn initTestBlockMessage(allocator: Allocator, slot: types.Slot) !interface.Gossi
     var attestations = try types.AggregatedAttestations.init(allocator);
     errdefer attestations.deinit();
 
-    const signature = try types.createBlockSignatures(allocator, attestations.len());
-
     return .{ .block = .{
         .block = .{
             .slot = slot,
@@ -937,7 +906,7 @@ fn initTestBlockMessage(allocator: Allocator, slot: types.Slot) !interface.Gossi
                 .attestations = attestations,
             },
         },
-        .signature = signature,
+        .proof = try types.MultiMessageAggregate.init(allocator),
     } };
 }
 
@@ -1017,7 +986,7 @@ test "Mock messaging across two subscribers" {
     try std.testing.expect(received1.block.block.slot == received2.block.block.slot);
     try std.testing.expect(received1.block.block.proposer_index == received2.block.block.proposer_index);
 
-    // ---- Issue #808 review #2: force_publish_drop coverage ----
+    // ---- force_publish_drop coverage ----
     // Reset subscriber call counters and toggle the drop knob: a subsequent
     // publish must return false and must NOT invoke any subscriber. This
     // gives the new `failed to publish … (backend dropped publish)` warn
@@ -1142,11 +1111,10 @@ test "Mock pending publish drain callback rearms without allocation" {
             self.calls += 1;
 
             if (message.block.block.slot == 1) {
-                const cloned_message = try self.nested_message.clone(self.allocator);
-                errdefer {
-                    cloned_message.deinit();
-                    self.allocator.destroy(cloned_message);
-                }
+                const cloned_message = try self.allocator.create(interface.GossipMessage);
+                errdefer self.allocator.destroy(cloned_message);
+                cloned_message.* = try zeam_utils.clone(interface.GossipMessage, self.nested_message, self.allocator);
+                errdefer cloned_message.deinit();
 
                 const sender_peer_id_copy = try self.allocator.dupe(u8, "reentrant");
                 errdefer self.allocator.free(sender_peer_id_copy);
@@ -1191,12 +1159,12 @@ test "Mock pending publish drain callback rearms without allocation" {
 
     var initial_message = try initTestBlockMessage(allocator, 1);
     defer initial_message.deinit();
-    const initial_clone = try initial_message.clone(allocator);
+
+    const initial_clone = try allocator.create(interface.GossipMessage);
     var initial_clone_owned_by_queue = false;
-    errdefer if (!initial_clone_owned_by_queue) {
-        initial_clone.deinit();
-        allocator.destroy(initial_clone);
-    };
+    errdefer if (!initial_clone_owned_by_queue) allocator.destroy(initial_clone);
+    initial_clone.* = try zeam_utils.clone(interface.GossipMessage, &initial_message, allocator);
+    errdefer if (!initial_clone_owned_by_queue) initial_clone.deinit();
     const sender_peer_id_copy = try allocator.dupe(u8, "mock_publisher");
     var sender_peer_id_owned_by_queue = false;
     errdefer if (!sender_peer_id_owned_by_queue) allocator.free(sender_peer_id_copy);
@@ -1393,7 +1361,7 @@ test "Mock status RPC between peers" {
 }
 
 // =====================================================================
-// blocks_by_range mock-network roundtrip tests (PR #824 / issue #823)
+// blocks_by_range mock-network roundtrip tests
 // =====================================================================
 //
 // These tests exercise the wire-level contract of the new
@@ -1406,35 +1374,33 @@ test "Mock status RPC between peers" {
 //
 // What these tests pin:
 //   * Multi-chunk delivery: M chunks in slot-ascending order, single
-//     `completed` event at the end. Mirrors the spec contract for
-//     blocks_by_range and the current chain.zig server-side response
+//     `completed` event at the end. Mirrors the wire contract for
+//     blocks_by_range and the current server-side response
 //     order (finalized walk first, then unfinalized via forkchoice).
 //   * Empty-stream-but-finish: server has nothing to send, just
 //     `finish()` — peer sees `completed` with zero chunks, no error.
-//     This is the start_slot > head.slot case Partha listed.
+//     This is the start_slot > head.slot case.
 //   * RESOURCE_UNAVAILABLE error-path: server replies with code 3 +
 //     message; peer sees the failure event, never a chunk, never a
-//     bare `completed`. Pins the MIN_SLOTS_FOR_BLOCK_REQUESTS gate at
-//     `node.zig:1196-1206`.
+//     bare `completed`. Pins the MIN_SLOTS_FOR_BLOCK_REQUESTS gate.
 //   * Single-chunk happy path: just a sanity check that the
-//     blocks_by_range payload variant flows through cloneResponse +
+//     blocks_by_range payload variant flows through the response clone +
 //     deferred delivery cleanly (no UAF on the SignedBlock interior).
 //
 // What these tests deliberately do NOT cover:
 //   * Server-side range-walk logic (loadFinalizedSlotIndex,
 //     forkchoice descendant walk, finalized/unfinalized boundary,
 //     empty-slot skip, genesis-parent + self-parent loop guards) —
-//     that lives in chain.zig and exercises a real DB / forkchoice;
+//     that lives in the chain layer and exercises a real DB / forkchoice;
 //     better fit for a BeamNode-level integration test.
 //   * Sync-trigger logic (gap > 64 → range vs head-by-root) — that
-//     lives in onReqRespResponse's status arm at `node.zig:957-1000`
-//     and needs a real chain to drive `getSyncStatus` decisions.
+//     lives in onReqRespResponse's status arm and needs a real chain
+//     to drive `getSyncStatus` decisions.
 //   * Chunk-handler MissingPreState recovery in
 //     `processBlockByRangeChunk` — same reason.
 //
-// Per @ch4r10t33r's review on PR #824: these mock tests close the
-// "no dedicated unit test for the range RPC" gap on the WIRE
-// contract; the BeamNode-level scenarios remain a follow-up.
+// These mock tests close the "no dedicated unit test for the range RPC"
+// gap on the wire contract; the BeamNode-level scenarios remain a follow-up.
 
 fn buildSyntheticBlock(allocator: Allocator, slot: u64, parent_seed: u8) !types.SignedBlock {
     // Build a minimal synthetic SignedBlock for the mock test fixtures.
@@ -1442,7 +1408,7 @@ fn buildSyntheticBlock(allocator: Allocator, slot: u64, parent_seed: u8) !types.
     // opaque payload, the requester just confirms the slot field
     // round-trips and the chunk sequence is correct.
     //
-    // Construction uses the standard helpers from `pkgs/types/src/block.zig`
+    // Construction uses the standard block helpers
     // (`BeamBlock.setToDefault` + `createBlockSignatures`) so the
     // resulting SignedBlock is allocator-aware and `deinit()`-safe.
     // We then overwrite only the fields the tests actually inspect:
@@ -1456,10 +1422,9 @@ fn buildSyntheticBlock(allocator: Allocator, slot: u64, parent_seed: u8) !types.
     block.parent_root[0] = parent_seed;
     block.state_root[0] = parent_seed +% 1;
 
-    const signatures = try types.createBlockSignatures(allocator, 0);
     return types.SignedBlock{
         .block = block,
-        .signature = signatures,
+        .proof = try types.MultiMessageAggregate.init(allocator),
     };
 }
 
@@ -1602,7 +1567,7 @@ test "Mock blocks_by_range RPC: multi-chunk in slot-ascending order" {
 }
 
 test "Mock blocks_by_range RPC: empty stream + clean finish (start_slot past head)" {
-    // Pins the start_slot > head.slot path Partha listed. The server
+    // Pins the start_slot > head.slot path. The server
     // has nothing to emit (empty slot list) and immediately calls
     // `finish()`. Peer should observe zero chunks + a single `completed`
     // event, no error.
@@ -1706,8 +1671,7 @@ test "Mock blocks_by_range RPC: empty stream + clean finish (start_slot past hea
 }
 
 test "Mock blocks_by_range RPC: RESOURCE_UNAVAILABLE error path (history window)" {
-    // Pins the MIN_SLOTS_FOR_BLOCK_REQUESTS gate at
-    // node.zig:1196-1206. Server replies with code
+    // Pins the MIN_SLOTS_FOR_BLOCK_REQUESTS gate. Server replies with code
     // RPC_ERR_RESOURCE_UNAVAILABLE (3) + message; peer should observe
     // a `failure` event with that code, NOT a bare `completed`, and
     // never any chunk.

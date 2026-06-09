@@ -115,7 +115,7 @@ pub const SignedAttestation = struct {
 
 pub const SignedAggregatedAttestation = struct {
     data: AttestationData,
-    proof: aggregation.AggregatedSignatureProof,
+    proof: aggregation.SingleMessageAggregate,
 
     pub fn deinit(self: *SignedAggregatedAttestation) void {
         self.proof.deinit();

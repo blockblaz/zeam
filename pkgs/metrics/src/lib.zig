@@ -32,7 +32,7 @@ var g_initialized: bool = false;
 const Metrics = struct {
     zeam_chain_onblock_duration_seconds: ChainHistogram,
     // Per-substep timing inside `chain.onBlock` — used to attribute the
-    // multi-second tail observed on aggregator nodes (#863). Step labels:
+    // multi-second tail observed on aggregator nodes. Step labels:
     //   "block_root_compute" — hash_tree_root of the inner block when the
     //       caller did not supply a precomputed root.
     //   "parent_state_clone" — snapshot+clone of parent state under
@@ -51,7 +51,12 @@ const Metrics = struct {
     //       `_duration_seconds` so dashboards can sanity-check that the
     //       sub-step buckets sum to roughly the total).
     zeam_chain_onblock_step_duration_seconds: ChainOnblockStepHistogram,
-    // Slot-driver stall watchdog (#863): a dedicated thread samples the
+    // Per-imported-block weight metrics so the `zeam_chain_onblock_*_duration_seconds`
+    // histograms can be correlated with block "heaviness" — whether a slow block
+    // carried many attestations/participants or hit a per-block constant cost.
+    zeam_chain_onblock_num_aggregated_attestations: BlockAggregatedPayloadsHistogram,
+    zeam_chain_onblock_total_participants: BlockTotalParticipantsHistogram,
+    // Slot-driver stall watchdog: a dedicated thread samples the
     // libxev tick clock every WATCHDOG_PROBE_MS via `Clock.lastTickMs()`
     // (atomic acquire load); if the value falls more than
     // WATCHDOG_THRESHOLD_MS behind wall clock it logs an ERROR and
@@ -83,23 +88,23 @@ const Metrics = struct {
     lean_pq_sig_aggregated_signatures_total: PQSigAggregatedSignaturesTotalCounter,
     lean_pq_sig_attestations_in_aggregated_signatures_total: PQSigAttestationsInAggregatedTotalCounter,
     lean_pq_sig_aggregated_signatures_building_time_seconds: PQSigBuildingTimeHistogram,
-    // Zeam-specific phase attribution for aggregate production (#899).
+    // Zeam-specific phase attribution for aggregate production.
     // phase="snapshot" clones live signature/payload maps under signatures_mutex.
     // phase="att_data_prep" serial prepareAggregateAttData (hashTreeRoot, greedy
     // payload pick, handle setup) inside computeAggregatedSignatures.
-    // phase="xmss_prove" leanMultisig rec_xmss_aggregate via xmss_aggregate FFI.
+    // phase="xmss_prove" recursive rec_xmss_aggregate via xmss_aggregate FFI.
     // phase="compute_ffi" full computeAggregatedSignatures (prep + parallel proves).
     // phase="commit" publishes results back into latest_new_aggregated_payloads.
     zeam_pq_sig_aggregated_signatures_building_phase_seconds: PQSigBuildingPhaseHistogram,
-    /// Wall time inside `xmss_aggregate` / leanMultisig `rec_xmss_aggregate` only
-    /// (one recursive STARK prove per att_data). Compare directly to lean-bench /
+    /// Wall time inside `xmss_aggregate` / `rec_xmss_aggregate` only
+    /// (one recursive STARK prove per att_data). Compare directly to
     /// `cargo run --release -- recursion --n 2`; zeam worker histograms include
     /// snapshot, prep, child-proof deserialize, and serialize on top of this.
     zeam_xmss_rec_aggregate_prove_seconds: XmssRecAggregateProveHistogram,
     /// Same wall time as `zeam_xmss_rec_aggregate_prove_seconds`, labeled by
     /// coarse `num_raw` / `num_children` input-size buckets so the build
     /// histogram tail can be classified as steady-state full-committee proves
-    /// vs partial-input reproves (see #940 investigation plan item 1).
+    /// vs partial-input reproves.
     /// Buckets are deliberately low-cardinality — see `numRawBucket` /
     /// `numChildrenBucket` below for the exact mapping.
     zeam_xmss_rec_aggregate_prove_by_input_seconds: XmssRecAggregateProveByInputHistogram,
@@ -108,27 +113,38 @@ const Metrics = struct {
     /// "post") sum to a value very close to one observation on
     /// `zeam_xmss_rec_aggregate_prove_seconds` (delta is the FFI call/return
     /// overhead, sub-microsecond). This lets us tell whether zeam's per-call
-    /// cost lives in argument deserialization or in the leanMultisig STARK
-    /// itself — the two have very different fixes. See #940.
+    /// cost lives in argument deserialization or in the recursive STARK
+    /// itself — the two have very different fixes.
     zeam_xmss_rec_aggregate_phase_seconds: XmssRecAggregatePhaseHistogram,
     lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
+    // Per-stage timing for the signature-verify path, labeled by stage, to
+    // attribute the `step="verify_signatures"` cost. Registered for verify-cost
+    // attribution; not currently observed under the single merged-proof
+    // verifySignatures path.
+    zeam_stf_verify_signatures_stage_duration_seconds: StfVerifySignaturesStageHistogram,
+    // Number of blocks coalesced into one `verifySignaturesParallelMultiBlock`
+    // call. K=1 means we routed through the single-block path; K>1 means
+    // the chain-worker drained ≥2 blocks together. Pair with the
+    // `phase2_batch_verify_multiblock` stage to confirm that batching
+    // actually amortises rayon overhead as K grows.
+    zeam_stf_verify_signatures_batch_size: StfVerifySignaturesBatchSizeHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
     // Network peer metrics
     lean_connected_peers: LeanConnectedPeersGauge,
     lean_peer_connection_events_total: PeerConnectionEventsCounter,
     lean_peer_disconnection_events_total: PeerDisconnectionEventsCounter,
-    // Issue #808: per-reason count of swarm commands dropped before reaching
+    // Per-reason count of swarm commands dropped before reaching
     // the rust-libp2p event loop (channel full / closed / uninitialized).
     // Refreshed from a Rust-side atomic on every scrape via a registered
     // refresher — see `registerScrapeRefresher` and the network-layer
-    // implementation in `pkgs/network/src/ethlibp2p.zig`.
+    // implementation.
     zeam_libp2p_swarm_command_dropped_total: LibP2pSwarmCommandDroppedCounter,
-    // leanMetrics PR #35: number of remote peers in the gossipsub mesh
+    // Number of remote peers in the gossipsub mesh
     // across all subscribed topics. Refreshed from a Rust-side atomic on
     // every scrape via a registered refresher — see
-    // `registerScrapeRefresher` and the network-layer implementation in
-    // `pkgs/network/src/ethlibp2p.zig`. TODO: per-remote-peer label scheme
+    // `registerScrapeRefresher` and the network-layer implementation.
+    // TODO: per-remote-peer label scheme
     // (matching `lean_connected_peers`) requires subscribing to gossipsub
     // Subscribed/Unsubscribed events; left as follow-up work.
     lean_gossip_mesh_peers: LeanGossipMeshPeersGauge,
@@ -174,6 +190,16 @@ const Metrics = struct {
     lean_gossip_block_size_bytes: GossipBlockSizeBytesHistogram,
     lean_gossip_attestation_size_bytes: GossipAttestationSizeBytesHistogram,
     lean_gossip_aggregation_size_bytes: GossipAggregationSizeBytesHistogram,
+    /// Count gossip-ingress decode rejections, labeled by
+    /// `topic_kind` (block | attestation | aggregation) and `reason`
+    /// (snappy_empty | snappy_varint | snappy_oversized | snappy_truncated |
+    /// snappy_decode | ssz_decode). Without this counter, the only operator-
+    /// visible signal that zeam has stopped accepting gossip is `lean_head_slot`
+    /// drifting behind wall-clock — by which point the node is already off
+    /// consensus. With it, the failure mode is dashboard-visible the moment
+    /// decode starts failing, and the `reason` label attributes upstream
+    /// vs. our-side framing mismatches vs. SSZ-body issues separately.
+    zeam_gossip_decode_failures_total: ZeamGossipDecodeFailuresCounter,
     // Attestation production time histogram
     lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
     // compactAttestations metrics
@@ -189,24 +215,34 @@ const Metrics = struct {
     lean_block_proposal_child_payloads_consumed_total: BlockProposalChildPayloadsConsumedTotalCounter,
     lean_block_proposal_attestation_data_selected: BlockProposalAttestationDataSelectedHistogram,
     lean_block_proposal_aggregates_selected: BlockProposalAggregatesSelectedHistogram,
+    // Interval-aware proposer metrics.
+    zeam_proposal_deadline_hits_total: ZeamProposalDeadlineHitsCounter,
+    zeam_proposal_partial_prefix_size: ZeamProposalPartialPrefixSizeHistogram,
+    zeam_proposal_skipped_empty_total: ZeamProposalSkippedEmptyCounter,
     // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
-    /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run` (issues #863, #867).
+    /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run`.
     /// Large values imply completion backlog (gossip / reqresp / bridge) before the next tick.
     zeam_xev_clock_until_done_drain_seconds: XevClockUntilDoneDrainHistogram,
     /// Count of clock-loop `run(.until_done)` drains taking ≥500ms wall time.
     zeam_xev_clock_until_done_slow_ge_500ms_total: ZeamXevClockUntilDoneSlowGe500msCounter,
     /// Count of clock-loop `run(.until_done)` drains taking ≥1s wall time.
     zeam_xev_clock_until_done_slow_ge_1s_total: ZeamXevClockUntilDoneSlowGe1sCounter,
+    /// Wall time spent inside individual libxev callbacks, labeled by callsite.
+    /// Used to attribute slow `zeam_xev_clock_until_done_drain_seconds` to a
+    /// specific synchronous chunk of work executed on the libxev thread.
+    /// Each callsite name is a fixed low-cardinality string; see
+    /// `observeLibxevCallback` for the canonical site list.
+    zeam_libxev_callback_duration_seconds: LibxevCallbackDurationHistogram,
     // Fork-choice tick interval duration: actual elapsed time between forkchoice tickIntervalUnlocked calls
     zeam_fork_choice_tick_interval_duration_seconds: ForkChoiceTickIntervalDurationHistogram,
     /// Wall time for the per-slot aggregation tick (interval 2): `maybeAggregateOnInterval`
     /// plus `publishProducedAggregations` when the aggregator produces gossip aggregates.
     zeam_node_aggregation_interval_tick_seconds: AggregationIntervalTickHistogram,
-    /// Counter for skipped aggregate submissions, labeled by reason.
-    /// Reasons: "not_aggregator", "not_synced", "missing_state", "spawn_failed".
+    /// Standard leanMetrics counter for skipped aggregate submissions, labeled by reason.
+    /// Reasons: "not_aggregator", "not_synced", "missing_state", "spawn_failed", "other".
     /// (In-flight triggers are coalesced via `zeam_aggregate_coalesced_total`.)
-    zeam_aggregate_skip_total: AggregateSkipCounter,
+    lean_aggregator_skipped_total: AggregateSkipCounter,
     /// Slot-driver aggregation triggers coalesced while a worker was in flight.
     /// A single catch-up run is scheduled when the worker finishes.
     zeam_aggregate_coalesced_total: AggregateCoalescedCounter,
@@ -220,7 +256,7 @@ const Metrics = struct {
     /// use this counter to tell whether the local aggregator is producing for
     /// its duty subnet at all without inferring it from the worker histogram.
     zeam_aggregator_publish_aggregations_total: AggregatorPublishAggregationsCounter,
-    // BeamNode mutex contention metrics (issue #786)
+    // BeamNode mutex contention metrics.
     // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
     // Hold time = how long the callsite kept the mutex locked.
     // Labeled by callsite so we can attribute stalls to onInterval vs onGossip vs req-resp paths.
@@ -232,7 +268,7 @@ const Metrics = struct {
     // Drop these two series in the release after slice (a) lands.
     zeam_node_mutex_wait_time_seconds: NodeMutexWaitTimeHistogram,
     zeam_node_mutex_hold_time_seconds: NodeMutexHoldTimeHistogram,
-    // Per-resource lock contention metrics (slice a-2 of #803). Wait/hold
+    // Per-resource lock contention metrics. Wait/hold
     // time labeled by both `lock` (states, pending_blocks, pubkey_cache,
     // root_to_slot, events, block_cache, ...) and `site` (callsite). The
     // legacy `zeam_node_mutex_*` series above is double-emitted into for one
@@ -244,7 +280,7 @@ const Metrics = struct {
     // measurement floor before deciding whether to bound the queue or add
     // a cursor optimisation.
     lean_pending_blocks_drain_iters: PendingBlocksDrainItersHistogram,
-    // Issue #788: visibility into the future-block queueing path.
+    // Visibility into the future-block queueing path.
     //   * `lean_pending_blocks_depth` — instantaneous queue depth, set on
     //     every successful enqueue and every `processPendingBlocks` drain.
     //     Combined with `_evicted_total{reason="cap"}` it tells operators
@@ -254,7 +290,7 @@ const Metrics = struct {
     //     blocks dropped from the queue, by reason: `cap` (capacity hit),
     //     `pre_finalized` (slot < finalized), `too_far_future` (slot >
     //     current_slot + MAX_FUTURE_SLOT_QUEUE_TOLERANCE; drain-side
-    //     eviction added in PR #841 review #8), `duplicate` (same root
+    //     eviction), `duplicate` (same root
     //     already queued), `append_oom` (allocator failure on capacity
     //     reservation; the new block is dropped, the queue is unchanged).
     //   * `lean_pending_blocks_replayed_total{result}` — cumulative count
@@ -262,23 +298,47 @@ const Metrics = struct {
     //     terminal result: `accepted` / `rejected` / `error`.
     //   * `lean_blocks_future_slot_dropped_total` — cumulative count of
     //     gossip blocks hard-rejected as `FutureSlot` (beyond the
-    //     queueable window), the symptom #788 was tracking.
+    //     queueable window).
     lean_pending_blocks_depth: LeanPendingBlocksDepthGauge,
     lean_pending_blocks_evicted_total: LeanPendingBlocksEvictedCounter,
     lean_pending_blocks_replayed_total: LeanPendingBlocksReplayedCounter,
     lean_blocks_future_slot_dropped_total: LeanBlocksFutureSlotDroppedCounter,
-    // Chain-worker queue + loop metrics (slice c-1 of #803).
+    // Chain-worker queue + loop metrics.
     //   * `_dropped_total{queue="block"|"attestation"|"aggregated_attestation"}` — producer
     //     `trySend` rejections when the queue was full.
     //   * `_depth{queue="..."}` — outstanding accepted work, incremented
     //     on successful sends and decremented after worker processing; for
-    //     backlog visibility on devnet stress.
+    //     backlog visibility under stress.
     //   * `lean_chain_worker_loop_iters_total` — worker-loop liveness
     //     counter; external watchdogs use the delta between scrapes
     //     to detect stalls without touching queue state.
     lean_chain_queue_dropped_total: LeanChainQueueDroppedCounter,
     lean_chain_queue_depth: LeanChainQueueDepthGauge,
     lean_chain_worker_loop_iters_total: LeanChainWorkerLoopItersCounter,
+    /// PR #966: per-dispatch-path counter so dashboards can see how often
+    /// the chain-worker actually managed to batch ≥2 blocks vs falling
+    /// back to the single-block path. `path="single"` increments once
+    /// per `.on_block` Message dispatched through the unbatched code
+    /// path (block queue depth ≤ BLOCK_BATCH_THRESHOLD at drain time);
+    /// `path="batch"` increments once per `Handlers.on_blocks_batch`
+    /// dispatch. Sum the latter with the K from
+    /// `zeam_stf_verify_signatures_batch_size_count` to recover the
+    /// total number of blocks that took the batched path.
+    zeam_chain_worker_block_dispatch_total: ZeamChainWorkerBlockDispatchCounter,
+    /// Total roots inserted into `BeamChain.invalid_block_roots` over the
+    /// process lifetime (de-duped — a re-mark of the same root does not
+    /// increment). A sustained nonzero rate signals a peer producing
+    /// malformed blocks; pair with the cross-client logs from devnet
+    /// 2a4b7197 (ream's "Failed to deserialize AggregatedXMSS proof") to
+    /// attribute the producer.
+    zeam_chain_invalid_block_root_marked_total: ZeamChainInvalidBlockRootMarkedCounter,
+    /// Early-drops at `chain.onBlock`'s entry guard. Labeled by site:
+    /// "self" = block's own root was already cached; "parent" = cascade
+    /// from a cached parent_root (descendant-of-invalid). High and
+    /// growing hit rate indicates a peer / orphan-dependents path is
+    /// repeatedly redelivering the same known-bad root — exactly the
+    /// 12,676-chunks-per-5-min livelock observed on slot=13.
+    zeam_chain_invalid_block_root_hit_total: ZeamChainInvalidBlockRootHitCounter,
     /// Tripwire counter (zclawz review on PR #890): bumped from
     /// `chainWorkerProcessPendingBlocksThunk` whenever it returns a
     /// non-empty `missing_roots` slice. The thunk has no production
@@ -289,12 +349,12 @@ const Metrics = struct {
     /// roots backchannel and is silently stranding sync — the
     /// thunk would otherwise just log a warn that's easy to miss.
     lean_chain_worker_process_pending_blocks_dropped_missing_roots_total: LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter,
-    // Slice c-2b commit 5 of #803: distribution of refcount values across
+    // Distribution of refcount values across
     // map-resident BeamState entries at scrape time. Sampled by the chain
     // via `recordChainStateRefcountDistribution` registered as a
     // context-bearing scrape refresher (see `registerScrapeRefresherCtx`).
     lean_chain_state_refcount_distribution: LeanChainStateRefcountDistributionHistogram,
-    // Slice (e) of #803: visibility into the centralised hash-root
+    // Visibility into the centralised hash-root
     // cache. Each block ingress now carries the block_root computed
     // once at the gossip / RPC entry point through every downstream
     // consumer (chain.onGossip, enqueuePendingBlock,
@@ -308,7 +368,7 @@ const Metrics = struct {
     // broken there — useful for catching a regression that drops
     // the root on the floor in a future refactor.
     lean_block_root_compute_skipped_total: LeanBlockRootComputeSkippedCounter,
-    // Slice (d) of #803: visibility into the parallel net-fetch +
+    // Visibility into the parallel net-fetch +
     // missed-root prune dedup. Bumped per `fetchBlockByRoots` call by
     // outcome bucket. Every entry of the input `roots` lands in
     // exactly one bucket, so the outcome counters sum to `roots.len`
@@ -320,26 +380,26 @@ const Metrics = struct {
     //     `fetchBlockByRoots` call is already responsible.
     //   * `fetched` — dispatched to a peer via `blocks_by_root`.
     //   * `fetch_no_peers` — dispatch attempted but `selectPeer`
-    //     returned `error.NoPeersAvailable` (PR #842 review #1).
+    //     returned `error.NoPeersAvailable`.
     //   * `fetch_failed` — dispatch attempted but failed for any
     //     other reason (queue full, encode failure, …).
     //   * `dedup_lost_race` — every requested root entered
     //     `network.pending_block_roots` or `network.block_cache`
     //     between our `hasBlocksBatch` snapshot and the network
-    //     helper's re-check, so dispatch was suppressed (PR #842
-    //     review followup). The benign TOCTOU window is documented
+    //     helper's re-check, so dispatch was suppressed. The benign
+    //     TOCTOU window is documented
     //     in `BeamNode.fetchBlockByRoots`.
     lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
-    // Issue #893: `blocks_by_range` catch-up outcomes (retry, abort, success, …). zeam-specific.
+    // `blocks_by_range` catch-up outcomes (retry, abort, success, …). zeam-specific.
     zeam_blocks_by_range_sync_total: ZeamBlocksByRangeSyncCounter,
-    // Issue #863 P2: gossip attestation/aggregation drops on the libxev
+    // P2: gossip attestation/aggregation drops on the libxev
     // main thread BEFORE they are routed to the chain-worker. Bumped by
     // `chain.onGossip` for raw attestations and aggregations. zeam-
     // specific (other lean clients shape this differently). Labels:
     //   * `kind` — `attestation` (raw gossip att) or `aggregation`
     //     (aggregated payload).
     //   * `reason`:
-    //     - `syncing` — chain.getSyncStatus() is `behind_peers` /
+    //     - `syncing` — chain.getSyncStatus() is `peers_materially_ahead` /
     //       `fc_initing` / `no_peers`; suppress validation work and the
     //       follow-up `BlocksByRoot` fetch enqueue (the death-spiral fix).
     //       Recovery comes from `BlocksByRange` / gossip block import.
@@ -354,8 +414,8 @@ const Metrics = struct {
     //       these (per the established `chainWorkerOn*Thunk` no-feedback
     //       contract) so this counter is the only signal.
     zeam_gossip_atts_dropped_total: ZeamGossipAttsDroppedCounter,
-    // Issue #863 P3: per-resource concurrency cap on outbound
-    // `BlocksByRoot` RPCs. The pre-#863 path issued one RPC per
+    // P3: per-resource concurrency cap on outbound
+    // `BlocksByRoot` RPCs. The earlier path issued one RPC per
     // attestation that referenced an unknown head, multiplied by 4x
     // subnet fanout for an aggregator — under flood the libxev thread
     // would fork off hundreds of RPCs that themselves timed out and
@@ -368,11 +428,11 @@ const Metrics = struct {
     //     have not yet been finalized via `finalizePendingRequest`.
     //   * the cap-rejection bucket is folded into
     //     `lean_block_fetch_dedup_total{outcome="inflight_cap"}` so
-    //     dashboards see all suppression-by-this-PR causes side by side
+    //     dashboards see all suppression causes side by side
     //     with the existing dedup outcomes — keeps the
     //     `sum(rate(... by outcome)) == sum(rate(...))` invariant.
     zeam_blocks_by_root_inflight: ZeamBlocksByRootInflightGauge,
-    // Issue #863 P4: Clock.run drain bounding visibility. The pre-#863
+    // P4: Clock.run drain bounding visibility. The earlier
     // shape called `events.run(.until_done)` per pass, which under
     // flood drained for many seconds and starved `tickInterval`.
     // P4 swaps to `.once` (one io_uring CQE batch per pass), which
@@ -382,12 +442,12 @@ const Metrics = struct {
     // ~1.25 Hz at 4s slots) is a quick liveness signal independent of
     // the existing `lean_tick_interval_duration_seconds` histogram.
     zeam_xev_clock_drain_passes_total: ZeamXevClockDrainPassesCounter,
-    // leanSpec parity (`subspecs/sync/service.py`): gossip attestations
+    // Spec parity: gossip attestations
     // and aggregations whose referenced source/target/head block isn't
     // yet imported, or whose slot is still in the future, are buffered
     // for replay after the next successful `onBlock` import (see
     // `_replay_pending_attestations` in the spec; mirrored as
-    // `replayPendingAttestations` in `chain.zig`).
+    // `replayPendingAttestations`).
     //
     //   * `lean_pending_attestations_buffered_total{kind, reason}` —
     //     cumulative entries pushed into the pending-attestation buffer.
@@ -409,9 +469,11 @@ const Metrics = struct {
     // Per-site errors swallowed by `BeamNode.onInterval`; sustained non-zero
     // rates mean the node is ticking but a duty/publish layer is failing.
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
+    // selectPeer no-match counter: fires when min_slot filter leaves zero candidates
+    zeam_select_peer_no_match_total: SelectPeerNoMatchCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
-    // Per-substep timing inside chain.onBlock — see #863 root-cause work.
+    // Per-substep timing inside chain.onBlock.
     // Same bucket layout as ChainHistogram so dashboards can stack the
     // step series and the total side-by-side without bucket-aligned diffs.
     const ChainOnblockStepLabel = struct { step: []const u8 };
@@ -419,6 +481,23 @@ const Metrics = struct {
         f32,
         ChainOnblockStepLabel,
         &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
+    );
+    // Same bucket layout as ChainOnblockStepHistogram so dashboards can
+    // stack the verify-signatures stages under `step="verify_signatures"`
+    // and confirm they sum to roughly the parent step's wall-clock.
+    const StfVerifySignaturesStageLabel = struct { stage: []const u8 };
+    const StfVerifySignaturesStageHistogram = metrics_lib.HistogramVec(
+        f32,
+        StfVerifySignaturesStageLabel,
+        &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 },
+    );
+    // Batch sizes 1..16+ cover the practical range:
+    // - K=1: chain-worker drained one block (gossip / locally produced / sparse catch-up)
+    // - K=2..4: typical catch-up sweep (BLOCKS_BY_RANGE_SYNC_THRESHOLD = 4)
+    // - K=8..16: backlog drain after a stall
+    const StfVerifySignaturesBatchSizeHistogram = metrics_lib.Histogram(
+        f32,
+        &[_]f32{ 1, 2, 4, 8, 16, 32 },
     );
     // Watchdog counters (#863): wall-clock heartbeats from the slot-driver
     // libxev thread. The watchdog thread bumps `_fired_total` whenever it
@@ -482,10 +561,19 @@ const Metrics = struct {
     const LeanForkChoiceReorgDepthHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 3, 5, 7, 10, 20, 30, 50, 100 });
     // Finalization metric types
     const LeanFinalizationsTotalCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
-    // Chain-worker queue + loop metric types (slice c-1 of #803).
+    // Chain-worker queue + loop metric types.
     const LeanChainQueueDroppedCounter = metrics_lib.CounterVec(u64, struct { queue: []const u8 });
     const LeanChainQueueDepthGauge = metrics_lib.GaugeVec(u64, struct { queue: []const u8 });
     const LeanChainWorkerLoopItersCounter = metrics_lib.Counter(u64);
+    const ZeamChainWorkerBlockDispatchCounter = metrics_lib.CounterVec(u64, struct { path: []const u8 });
+    // Invalid-block-roots cache counters (slot=13 #942 follow-up). `marked`
+    // increments once per fresh insert; `hit{site}` increments on every
+    // early-drop in `chain.onBlock` so the ratio shows how much wasted
+    // verify the cache saved. Two `site` values: "self" (block's own root
+    // was previously marked) and "parent" (cascade: parent_root was marked,
+    // so child is invalid by descent).
+    const ZeamChainInvalidBlockRootMarkedCounter = metrics_lib.Counter(u64);
+    const ZeamChainInvalidBlockRootHitCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter = metrics_lib.Counter(u64);
     // Refcount-distribution buckets [1, 2, 4, 8, 16, 32, +Inf]. Typical
     // value is 1 (writer-only); transient 2-4 under reader concurrency;
@@ -503,18 +591,24 @@ const Metrics = struct {
     const AttestationAggregateCoverageSubnetsGauge = metrics_lib.GaugeVec(u64, struct { section: []const u8 });
     const AttestationAggregateCoverageDiffValidatorsGauge = metrics_lib.GaugeVec(u64, struct { direction: []const u8 });
     // Committee aggregation histogram type
-    // Buckets widened for Devnet-4: was [0.005..1], now [0.05..4]
+    // Buckets widened: was [0.005..1], now [0.05..4]
     const CommitteeSignaturesAggregationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
     // Block production metric types
     const BlockBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     const BlockPayloadAggregationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
     const BlockAggregatedPayloadsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128 });
+    // Total participant count summed across all aggregated_attestations in
+    // a block. Each attestation can have up to NUM_VALIDATORS participants;
+    // realistic block totals on devnet sit in the low hundreds today and
+    // grow with the validator set. Buckets cover that range with headroom.
+    const BlockTotalParticipantsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 8, 32, 128, 512, 1024, 2048, 4096, 8192 });
     const BlockBuildingSuccessCounter = metrics_lib.Counter(u64);
     const BlockBuildingFailuresCounter = metrics_lib.Counter(u64);
     // Sync status gauge type: 0=idle, 1=syncing, 2=synced
     const LeanNodeSyncStatusGauge = metrics_lib.GaugeVec(u64, struct { status: []const u8 });
     // Gossip message size histogram types
     const GossipBlockSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000 });
+    const ZeamGossipDecodeFailuresCounter = metrics_lib.CounterVec(u64, struct { topic_kind: []const u8, reason: []const u8 });
     const GossipAttestationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 512, 1_024, 2_048, 4_096, 8_192, 16_384 });
     const GossipAggregationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1_024, 4_096, 16_384, 65_536, 131_072, 262_144, 524_288, 1_048_576 });
     // Attestation production time histogram type
@@ -522,12 +616,22 @@ const Metrics = struct {
     // compactAttestations metric types
     const CompactAttestationsTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 });
     const TickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
-    /// Buckets from sub-ms through multi-second xev drains observed on loaded devnets (#863).
+    /// Buckets from sub-ms through multi-second xev drains observed under load.
     const XevClockUntilDoneDrainHistogram = metrics_lib.Histogram(f32, &[_]f32{
         0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60,
     });
     const ZeamXevClockUntilDoneSlowGe500msCounter = metrics_lib.Counter(u64);
     const ZeamXevClockUntilDoneSlowGe1sCounter = metrics_lib.Counter(u64);
+    /// Per-callsite libxev callback duration. Buckets span
+    /// 100us through 5s to capture both fast dispatches (queue submits,
+    /// metric increments) and pathological CPU-bound callbacks
+    /// (hashTreeRoot of a multi-MB block, SSZ clones of a STARK proof).
+    const LibxevCallbackSiteLabel = struct { site: []const u8 };
+    const LibxevCallbackDurationHistogram = metrics_lib.HistogramVec(
+        f32,
+        LibxevCallbackSiteLabel,
+        &[_]f32{ 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5 },
+    );
     const ForkChoiceTickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
     /// Aggregation tick (interval-in-slot 2): spans sub-ms through multi-second stalls.
     const AggregationIntervalTickHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
@@ -538,6 +642,10 @@ const Metrics = struct {
     const BlockProposalChildPayloadsConsumedTotalCounter = metrics_lib.Counter(u64);
     const BlockProposalAttestationDataSelectedHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16, 32 });
     const BlockProposalAggregatesSelectedHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16, 32, 64, 128 });
+    // Interval-aware proposer types.
+    const ZeamProposalDeadlineHitsCounter = metrics_lib.Counter(u64);
+    const ZeamProposalPartialPrefixSizeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16 });
+    const ZeamProposalSkippedEmptyCounter = metrics_lib.Counter(u64);
     // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
     // both fast acquisitions and long stalls observed when STF runs under the lock.
     const NodeMutexLabel = struct { site: []const u8 };
@@ -550,16 +658,15 @@ const Metrics = struct {
     const LockHoldTimeHistogram = metrics_lib.HistogramVec(f32, LockLabel, &NODE_MUTEX_BUCKETS);
     // pending_blocks drain iteration histogram type (slice a-2)
     const PendingBlocksDrainItersHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 });
-    // Issue #788: future-block queue visibility.
+    // Future-block queue visibility.
     const LeanPendingBlocksDepthGauge = metrics_lib.Gauge(u64);
     const LeanPendingBlocksEvictedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
     const LeanPendingBlocksReplayedCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
     const LeanBlocksFutureSlotDroppedCounter = metrics_lib.Counter(u64);
-    // Slice (d)/(e) of #803.
     const LeanBlockRootComputeSkippedCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
     const ZeamBlocksByRangeSyncCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
-    // Issue #863 P2/P3 metric types.
+    // P2/P3 metric types.
     const ZeamGossipAttsDroppedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, reason: []const u8 });
     const ZeamBlocksByRootInflightGauge = metrics_lib.Gauge(u64);
     const ZeamXevClockDrainPassesCounter = metrics_lib.Counter(u64);
@@ -567,7 +674,7 @@ const Metrics = struct {
     const LeanPendingAttsEvictedCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8 });
     const LeanPendingAttsReplayCounter = metrics_lib.CounterVec(u64, struct { kind: []const u8, outcome: []const u8 });
     const LeanPendingAttsSizeGauge = metrics_lib.GaugeVec(u64, struct { kind: []const u8 });
-    // Issue #837 — see `lean_node_interval_error_total` field doc.
+    // See `lean_node_interval_error_total` field doc.
     const LeanNodeIntervalErrorCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
     const AggregateCoalescedCounter = metrics_lib.Counter(u64);
@@ -577,6 +684,8 @@ const Metrics = struct {
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeCountGauge = metrics_lib.Gauge(u64);
+    // selectPeer no-match counter: fires when min_slot filter leaves zero candidates
+    const SelectPeerNoMatchCounter = metrics_lib.Counter(u64);
 };
 
 /// Timer struct returned to the application.
@@ -696,9 +805,27 @@ fn observeBlockPayloadAggregationTime(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeChainOnblockNumAggregatedAttestations(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockAggregatedPayloadsHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainOnblockTotalParticipants(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockTotalParticipantsHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeBlockAggregatedPayloads(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.BlockAggregatedPayloadsHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeStfVerifySignaturesBatchSize(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.StfVerifySignaturesBatchSizeHistogram = @ptrCast(@alignCast(histogram_ptr));
     histogram.observe(value);
 }
 
@@ -741,6 +868,12 @@ fn observeBlockProposalAttestationDataSelected(ctx: ?*anyopaque, value: f32) voi
 fn observeBlockProposalAggregatesSelected(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return;
     const histogram: *Metrics.BlockProposalAggregatesSelectedHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeZeamProposalPartialPrefixSize(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ZeamProposalPartialPrefixSizeHistogram = @ptrCast(@alignCast(histogram_ptr));
     histogram.observe(value);
 }
 
@@ -797,6 +930,18 @@ fn observePendingBlocksDrainIters(ctx: ?*anyopaque, value: f32) void {
 pub var zeam_chain_onblock_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeChainOnblock,
+};
+pub var zeam_chain_onblock_num_aggregated_attestations: Histogram = .{
+    .context = null,
+    .observe = &observeChainOnblockNumAggregatedAttestations,
+};
+pub var zeam_chain_onblock_total_participants: Histogram = .{
+    .context = null,
+    .observe = &observeChainOnblockTotalParticipants,
+};
+pub var zeam_stf_verify_signatures_batch_size: Histogram = .{
+    .context = null,
+    .observe = &observeStfVerifySignaturesBatchSize,
 };
 pub var lean_state_transition_time_seconds: Histogram = .{
     .context = null,
@@ -884,6 +1029,10 @@ pub var lean_block_proposal_aggregates_selected: Histogram = .{
     .context = null,
     .observe = &observeBlockProposalAggregatesSelected,
 };
+pub var zeam_proposal_partial_prefix_size: Histogram = .{
+    .context = null,
+    .observe = &observeZeamProposalPartialPrefixSize,
+};
 pub var lean_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeTickIntervalDuration,
@@ -929,6 +1078,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
         .zeam_chain_onblock_step_duration_seconds = try Metrics.ChainOnblockStepHistogram.init(allocator, io, "zeam_chain_onblock_step_duration_seconds", .{ .help = "Per-substep wall-clock duration inside chain.onBlock, labeled by step. See #863 for context. Buckets match zeam_chain_onblock_duration_seconds for stack-aligned dashboarding." }, .{}),
+        .zeam_stf_verify_signatures_stage_duration_seconds = try Metrics.StfVerifySignaturesStageHistogram.init(allocator, io, "zeam_stf_verify_signatures_stage_duration_seconds", .{ .help = "Per-stage wall-clock duration inside stf.verifySignaturesParallel, labeled by stage. Splits the step=\"verify_signatures\" cost recorded by zeam_chain_onblock_step_duration_seconds across phase1_prep / phase2_batch_verify / proposer_block_root / proposer_xmss_verify. Multi-block path adds _multiblock suffix to the same stages. See PR #963 / #964." }, .{}),
+        .zeam_stf_verify_signatures_batch_size = Metrics.StfVerifySignaturesBatchSizeHistogram.init("zeam_stf_verify_signatures_batch_size", .{ .help = "Number of blocks coalesced into a single stf.verifySignaturesParallelMultiBlock call. K=1 means the single-block path was used; K>1 means the chain-worker batched the drain. Pair with zeam_stf_verify_signatures_stage_duration_seconds{stage=\"phase2_batch_verify_multiblock\"} to measure batching amortisation. See PR #964." }, .{}),
+        .zeam_chain_onblock_num_aggregated_attestations = Metrics.BlockAggregatedPayloadsHistogram.init("zeam_chain_onblock_num_aggregated_attestations", .{ .help = "Number of aggregated_attestations in each block processed by chain.onBlock (block import). Pair with zeam_chain_onblock_step_duration_seconds{step=\"verify_signatures\"} to attribute slow-block timings to block heaviness vs per-block constant cost. See PR #963." }, .{}),
+        .zeam_chain_onblock_total_participants = Metrics.BlockTotalParticipantsHistogram.init("zeam_chain_onblock_total_participants", .{ .help = "Sum of participants across all aggregated_attestations in each block processed by chain.onBlock. Companion to zeam_chain_onblock_num_aggregated_attestations: same block can have few aggregations but many total participants if the aggregator did its job. See PR #963." }, .{}),
         .zeam_slot_driver_stall_fired_total = Metrics.ZeamSlotDriverStallFiredCounter.init("zeam_slot_driver_stall_fired_total", .{ .help = "Total times the watchdog (#863) observed the libxev slot driver stalled past its threshold (default 5s). Each firing also records the stall duration in zeam_slot_driver_stall_seconds and emits an ERROR log." }, .{}),
         .zeam_slot_driver_stall_seconds = Metrics.ZeamSlotDriverStallSecondsHistogram.init("zeam_slot_driver_stall_seconds", .{ .help = "Distribution of slot-driver stall durations observed by the watchdog (#863). Stalls beyond ~1s indicate the libxev loop, libp2p Rust thread, or chain-worker held the main loop hostage; pair with zeam_chain_onblock_step_duration_seconds to attribute." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
@@ -954,7 +1107,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         // Aggregated attestation signature metrics
         .lean_pq_sig_aggregated_signatures_total = Metrics.PQSigAggregatedSignaturesTotalCounter.init("lean_pq_sig_aggregated_signatures_total", .{ .help = "Total number of aggregated signatures" }, .{}),
         .lean_pq_sig_attestations_in_aggregated_signatures_total = Metrics.PQSigAttestationsInAggregatedTotalCounter.init("lean_pq_sig_attestations_in_aggregated_signatures_total", .{ .help = "Total number of attestations included into aggregated signatures" }, .{}),
-        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Per att_data wall time for AggregatedSignatureProof.aggregate (bitfield merge + xmss.aggregateSignatures, including leanMultisig STARK). For bare rec_xmss_aggregate prove time comparable to lean-bench, use zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
+        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Per att_data wall time for SingleMessageAggregate.aggregate (bitfield merge + xmss.aggregateSignatures, including leanMultisig STARK). For bare rec_xmss_aggregate prove time comparable to lean-bench, use zeam_xmss_rec_aggregate_prove_seconds." }, .{}),
         .zeam_pq_sig_aggregated_signatures_building_phase_seconds = try Metrics.PQSigBuildingPhaseHistogram.init(allocator, io, "zeam_pq_sig_aggregated_signatures_building_phase_seconds", .{ .help = "Phase-level time for aggregate production, labeled by phase (snapshot|att_data_prep|xmss_prove|compute_ffi|commit). See #899 / #907." }, .{}),
         .zeam_xmss_rec_aggregate_prove_seconds = Metrics.XmssRecAggregateProveHistogram.init("zeam_xmss_rec_aggregate_prove_seconds", .{ .help = "Wall time inside xmss_aggregate (leanMultisig rec_xmss_aggregate STARK prove + FFI key clones, one att_data). Compare to leanBench aggregate.flat_*_r2; worker/phase metrics add snapshot, prep, child-proof deserialize, and serialize." }, .{}),
         .zeam_xmss_rec_aggregate_prove_by_input_seconds = try Metrics.XmssRecAggregateProveByInputHistogram.init(allocator, io, "zeam_xmss_rec_aggregate_prove_by_input_seconds", .{ .help = "Same observation as zeam_xmss_rec_aggregate_prove_seconds, additionally labeled by num_raw (count of raw gossip XMSS signatures) and num_children (count of recursive child STARK proofs) input-size buckets (#940). Buckets: num_raw in {0,1,2,3,4,5,6,7,8,9-15,16-31,32+}; num_children in {0,1,2,3-4,5-7,8+}. Used to classify the aggregate build histogram tail (steady-state full-committee prove vs partial-input reprove)." }, .{}),
@@ -1003,6 +1156,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Bytes size of a gossip block message" }, .{}),
         .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Bytes size of a gossip attestation message" }, .{}),
         .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Bytes size of a gossip aggregated attestation message" }, .{}),
+        .zeam_gossip_decode_failures_total = try Metrics.ZeamGossipDecodeFailuresCounter.init(allocator, io, "zeam_gossip_decode_failures_total", .{ .help = "Gossip-ingress decode rejections, labeled by topic_kind (block|attestation|aggregation) and reason (snappy_empty|snappy_varint|snappy_oversized|snappy_truncated|snappy_decode|ssz_decode). Operator-visible signal that zeam has stopped accepting gossip BEFORE lean_head_slot drifts off wall-clock. See issue #942." }, .{}),
         .lean_attestations_production_time_seconds = Metrics.AttestationProductionTimeHistogram.init("lean_attestations_production_time_seconds", .{ .help = "Time taken to produce attestation" }, .{}),
         // compactAttestations metrics
         .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
@@ -1013,20 +1167,24 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_block_proposal_child_payloads_consumed_total = Metrics.BlockProposalChildPayloadsConsumedTotalCounter.init("lean_block_proposal_child_payloads_consumed_total", .{ .help = "Child aggregated payloads selected during greedy proof picking (before recursive compaction)." }, .{}),
         .lean_block_proposal_attestation_data_selected = Metrics.BlockProposalAttestationDataSelectedHistogram.init("lean_block_proposal_attestation_data_selected", .{ .help = "Distinct AttestationData entries in the proposal block body." }, .{}),
         .lean_block_proposal_aggregates_selected = Metrics.BlockProposalAggregatesSelectedHistogram.init("lean_block_proposal_aggregates_selected", .{ .help = "Aggregated signature proofs in the proposal result after compaction." }, .{}),
+        .zeam_proposal_deadline_hits_total = Metrics.ZeamProposalDeadlineHitsCounter.init("zeam_proposal_deadline_hits_total", .{ .help = "Number of compactAttestations runs whose returned prefix was truncated because the caller-supplied deadline elapsed mid-loop." }, .{}),
+        .zeam_proposal_partial_prefix_size = Metrics.ZeamProposalPartialPrefixSizeHistogram.init("zeam_proposal_partial_prefix_size", .{ .help = "Number of AttestationData groups fully committed by deadline-aware compactAttestations when the deadline truncated the loop." }, .{}),
+        .zeam_proposal_skipped_empty_total = Metrics.ZeamProposalSkippedEmptyCounter.init("zeam_proposal_skipped_empty_total", .{ .help = "Number of interval-0 finalize calls that found no partial proposal body for the proposer's slot." }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_1s_total = Metrics.ZeamXevClockUntilDoneSlowGe1sCounter.init("zeam_xev_clock_until_done_slow_ge_1s_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 1s (#863)." }, .{}),
+        .zeam_libxev_callback_duration_seconds = try Metrics.LibxevCallbackDurationHistogram.init(allocator, io, "zeam_libxev_callback_duration_seconds", .{ .help = "Wall-clock time spent inside individual libxev callbacks, labeled by site (issue #942). Tracks synchronous CPU work blocking the libxev thread between drain passes. Compare against zeam_xev_clock_until_done_drain_seconds and the slow_ge_*ms counters to attribute slow drains to a specific callsite. Sites include onGossip.block.hash_tree_root, onGossip.block.ssz_clone, onGossip.aggregation.ssz_clone, onGossip.attestation.dispatch, onInterval.tick, chain.onGossip.dispatch." }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_node_aggregation_interval_tick_seconds = Metrics.AggregationIntervalTickHistogram.init("zeam_node_aggregation_interval_tick_seconds", .{ .help = "Wall time for BeamNode at per-slot interval 2: maybeAggregateOnInterval plus publishProducedAggregations (includes null/skip/error paths)." }, .{}),
-        .zeam_aggregate_skip_total = try Metrics.AggregateSkipCounter.init(allocator, io, "zeam_aggregate_skip_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
+        .lean_aggregator_skipped_total = try Metrics.AggregateSkipCounter.init(allocator, io, "lean_aggregator_skipped_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed, other. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
         .zeam_aggregate_coalesced_total = Metrics.AggregateCoalescedCounter.init("zeam_aggregate_coalesced_total", .{ .help = "Aggregation slot triggers coalesced while a worker was in flight; one catch-up run is scheduled when the worker finishes." }, .{}),
         .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of one aggregate worker run (snapshot through publishProducedAggregations), including all XMSS recursive STARK FFI inside computeAggregatedSignatures. Primary latency signal for aggregator slot budget (issue #907)." }, .{}),
         .zeam_aggregator_publish_aggregations_total = try Metrics.AggregatorPublishAggregationsCounter.init(allocator, io, "zeam_aggregator_publish_aggregations_total", .{ .help = "SignedAggregatedAttestation messages published by the local aggregator worker, labeled by attestation subnet. Distinct from lean_pq_sig_aggregated_signatures_total (block-proposal path only) so cross-client dashboards keep the standard metric's semantics intact." }, .{}),
-        // BeamNode mutex contention metrics (issue #786)
+        // BeamNode mutex contention metrics.
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
         .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
-        // Per-resource lock contention metrics (slice a-2 of #803).
+        // Per-resource lock contention metrics.
         .zeam_lock_wait_seconds = try Metrics.LockWaitTimeHistogram.init(allocator, io, "zeam_lock_wait_seconds", .{ .help = "Time spent waiting to acquire a per-resource lock, labeled by lock and callsite." }, .{}),
         .zeam_lock_hold_seconds = try Metrics.LockHoldTimeHistogram.init(allocator, io, "zeam_lock_hold_seconds", .{ .help = "Time a per-resource lock was held, labeled by lock and callsite." }, .{}),
         .lean_pending_blocks_drain_iters = Metrics.PendingBlocksDrainItersHistogram.init("lean_pending_blocks_drain_iters", .{ .help = "Number of iterations chain.processPendingBlocks ran through before draining the queue or finding nothing ready." }, .{}),
@@ -1034,17 +1192,20 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_blocks_evicted_total = try Metrics.LeanPendingBlocksEvictedCounter.init(allocator, io, "lean_pending_blocks_evicted_total", .{ .help = "Total number of blocks evicted from the pending-blocks queue, by reason (issue #788)." }, .{}),
         .lean_pending_blocks_replayed_total = try Metrics.LeanPendingBlocksReplayedCounter.init(allocator, io, "lean_pending_blocks_replayed_total", .{ .help = "Total number of replays from pending_blocks, by terminal result (issue #788)." }, .{}),
         .lean_blocks_future_slot_dropped_total = Metrics.LeanBlocksFutureSlotDroppedCounter.init("lean_blocks_future_slot_dropped_total", .{ .help = "Total number of gossip blocks hard-rejected as FutureSlot beyond the queueable window (issue #788)." }, .{}),
-        // Chain-worker queue + loop metrics (slice c-1 of #803).
+        // Chain-worker queue + loop metrics.
         .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation|aggregated_attestation|replay_pending). The `replay_pending` label is a single nudge that drains the in-process pending-attestation buffers — buffer depth itself is exposed via `lean_pending_attestations_size{kind}`." }, .{}),
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Outstanding chain-worker messages accepted by producers but not yet fully processed or explicitly discarded during shutdown, labeled by queue (block|attestation|aggregated_attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
+        .zeam_chain_worker_block_dispatch_total = try Metrics.ZeamChainWorkerBlockDispatchCounter.init(allocator, io, "zeam_chain_worker_block_dispatch_total", .{ .help = "Chain-worker block-dispatch path counter. path=\"single\" counts `.on_block` dispatches via the unbatched code path (block queue depth ≤ BLOCK_BATCH_THRESHOLD); path=\"batch\" counts `.on_blocks_batch` dispatches (one per batched call, K blocks each). Combine with zeam_stf_verify_signatures_batch_size_count to recover total blocks taken via the batched path. See PR #966." }, .{}),
+        .zeam_chain_invalid_block_root_marked_total = Metrics.ZeamChainInvalidBlockRootMarkedCounter.init("zeam_chain_invalid_block_root_marked_total", .{ .help = "Block roots inserted into the chain's invalid-block-roots cache after a deterministic-failure verify verdict (signature deserialize/verify fail, structural mismatch, proposer-sig fail). De-duped per root. Slot=13 #942 follow-up." }, .{}),
+        .zeam_chain_invalid_block_root_hit_total = try Metrics.ZeamChainInvalidBlockRootHitCounter.init(allocator, io, "zeam_chain_invalid_block_root_hit_total", .{ .help = "Early-drops at chain.onBlock's invalid-block-roots guard. site=\"self\" when the block's own root was already cached; site=\"parent\" when the cascade fires on a known-invalid parent_root. High rate signals an orphan-dependents refetch storm against a known-bad root." }, .{}),
         .lean_chain_worker_process_pending_blocks_dropped_missing_roots_total = Metrics.LeanChainWorkerProcessPendingBlocksDroppedMissingRootsCounter.init("lean_chain_worker_process_pending_blocks_dropped_missing_roots_total", .{ .help = "Tripwire (#890): non-zero only if a future worker producer dispatches `process_pending_blocks` without wiring the missing-roots backchannel. MUST stay 0 in steady state." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
-        // Slice (d)/(e) of #803 — see field doc for label semantics.
+        // See field doc for label semantics.
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
         .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race, inflight_cap." }, .{}),
         .zeam_blocks_by_range_sync_total = try Metrics.ZeamBlocksByRangeSyncCounter.init(allocator, io, "zeam_blocks_by_range_sync_total", .{ .help = "Total number of `blocks_by_range` catch-up request outcomes (issue #893). zeam-specific. Labeled by outcome: success, retry, exhausted, abort, timeout, pre_finalized_noop." }, .{}),
-        // Issue #863 P2/P3/P4 — see field doc for label semantics.
+        // P2/P3/P4 — see field doc for label semantics.
         .zeam_gossip_atts_dropped_total = try Metrics.ZeamGossipAttsDroppedCounter.init(allocator, io, "zeam_gossip_atts_dropped_total", .{ .help = "Total number of gossip attestations/aggregations dropped on the libxev main thread before chain-worker dispatch. Labeled by kind={attestation,aggregation} and reason={syncing,future_slot,worker_validation_failed}. zeam-specific. See blockblaz/zeam#863." }, .{}),
         .zeam_blocks_by_root_inflight = Metrics.ZeamBlocksByRootInflightGauge.init("zeam_blocks_by_root_inflight", .{ .help = "Instantaneous count of outbound `BlocksByRoot` RPCs that have been dispatched but not yet finalized via `finalizePendingRequest`. Capped at MAX_CONCURRENT_BLOCKS_BY_ROOT (8) to bound per-flood dispatch fan-out. zeam-specific. See blockblaz/zeam#863." }, .{}),
         .zeam_xev_clock_drain_passes_total = Metrics.ZeamXevClockDrainPassesCounter.init("zeam_xev_clock_drain_passes_total", .{ .help = "Cumulative passes through `Clock.run`'s libxev drain (one io_uring CQE batch per pass via `events.run(.once)`). Compare scrape deltas against the expected ~1.25 Hz at 4s slots / 5 intervals to detect slot-driver wedges independent of `lean_tick_interval_duration_seconds`. See blockblaz/zeam#863." }, .{}),
@@ -1053,6 +1214,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pending_attestations_replay_total = try Metrics.LeanPendingAttsReplayCounter.init(allocator, io, "lean_pending_attestations_replay_total", .{ .help = "Outcomes of replayPendingAttestations attempts (mirrors leanSpec _replay_pending_attestations). Labeled by kind={attestation,aggregation} and outcome={accepted,buffered,dropped}." }, .{}),
         .lean_pending_attestations_size = try Metrics.LeanPendingAttsSizeGauge.init(allocator, io, "lean_pending_attestations_size", .{ .help = "Instantaneous pending-attestation buffer depth, labeled by kind={attestation,aggregation}. Bounded by MAX_PENDING_ATTESTATIONS (1024)." }, .{}),
         .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, publishLocalProducedAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
+        .zeam_select_peer_no_match_total = Metrics.SelectPeerNoMatchCounter.init("zeam_select_peer_no_match_total", .{ .help = "selectPeer returned null because no peer met min_slot threshold" }, .{}),
     };
     metrics.zeam_blocks_by_root_inflight.set(0);
     metrics.lean_pending_attestations_size.set(.{ .kind = "attestation" }, 0) catch {};
@@ -1089,6 +1251,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
     zeam_chain_onblock_duration_seconds.context = @ptrCast(&metrics.zeam_chain_onblock_duration_seconds);
+    zeam_chain_onblock_num_aggregated_attestations.context = @ptrCast(&metrics.zeam_chain_onblock_num_aggregated_attestations);
+    zeam_chain_onblock_total_participants.context = @ptrCast(&metrics.zeam_chain_onblock_total_participants);
+    zeam_stf_verify_signatures_batch_size.context = @ptrCast(&metrics.zeam_stf_verify_signatures_batch_size);
     lean_state_transition_time_seconds.context = @ptrCast(&metrics.lean_state_transition_time_seconds);
     lean_state_transition_slots_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_slots_processing_time_seconds);
     lean_state_transition_block_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_block_processing_time_seconds);
@@ -1112,6 +1277,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
     lean_block_proposal_attestation_data_selected.context = @ptrCast(&metrics.lean_block_proposal_attestation_data_selected);
     lean_block_proposal_aggregates_selected.context = @ptrCast(&metrics.lean_block_proposal_aggregates_selected);
+    zeam_proposal_partial_prefix_size.context = @ptrCast(&metrics.zeam_proposal_partial_prefix_size);
     lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
     zeam_xev_clock_until_done_drain_seconds.context = @ptrCast(&metrics.zeam_xev_clock_until_done_drain_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
@@ -1136,11 +1302,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
 ///
 /// Two callback shapes are supported:
 ///   * `void → void` — for FFI-backed atomic counters that need no
-///     context (issue #808 — libp2p swarm command drops, leanMetrics PR
-///     #35 — `lean_gossip_mesh_peers`).
+///     context (libp2p swarm command drops, `lean_gossip_mesh_peers`).
 ///   * `*anyopaque → void` — for callers that need to thread a pointer
-///     back to themselves rather than coerce state into a global (slice
-///     c-2b commit 5 of #803 — `lean_chain_state_refcount_distribution`,
+///     back to themselves rather than coerce state into a global
+///     (`lean_chain_state_refcount_distribution`,
 ///     where the observer iterates a `*BeamChain` states map under its
 ///     shared lock).
 ///
@@ -1156,7 +1321,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
 /// is touched at startup only). `MAX_SCRAPE_REFRESHERS` is sized
 /// generously vs. the current ~2 callsites; if a future contributor
 /// needs more, raise the constant rather than adding a parallel slot.
-const MAX_SCRAPE_REFRESHERS: usize = 16;
+/// Raised 16 → 32 to accommodate the growing node-test suite (each
+/// `BeamNode.init` registers a chain-state refcount refresher and the
+/// registry is process-global, so every additional node test consumes a
+/// slot for the test-binary lifetime).
+const MAX_SCRAPE_REFRESHERS: usize = 32;
 
 var g_scrape_refreshers: [MAX_SCRAPE_REFRESHERS]*const fn () void = undefined;
 var g_scrape_refreshers_len: usize = 0;
@@ -1247,6 +1416,18 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
     try metrics_lib.write(&metrics, writer);
 }
 
+/// Record wall-clock time spent inside one libxev callback.
+/// `site` must be a fixed compile-time string from the canonical list
+/// documented on `zeam_libxev_callback_duration_seconds` — runtime-built
+/// strings would inflate the Prometheus series cardinality.
+pub fn observeLibxevCallback(site: []const u8, elapsed_seconds: f32) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_libxev_callback_duration_seconds.observe(
+        .{ .site = site },
+        elapsed_seconds,
+    ) catch {};
+}
+
 /// Record a sub-phase of aggregate attestation production (see
 /// `zeam_pq_sig_aggregated_signatures_building_phase_seconds`).
 pub fn observeAggregateAttestationBuildPhase(phase: []const u8, elapsed_seconds: f32) void {
@@ -1257,12 +1438,12 @@ pub fn observeAggregateAttestationBuildPhase(phase: []const u8, elapsed_seconds:
     ) catch {};
 }
 
-/// Record leanMultisig `rec_xmss_aggregate` wall time for one att_data
+/// Record `rec_xmss_aggregate` wall time for one att_data
 /// (xmss_aggregate FFI). `num_raw` is the count of raw gossip XMSS signatures
 /// fed to this prove; `num_children` is the count of recursive child STARK
 /// proofs included. Both flow into the labeled
 /// `zeam_xmss_rec_aggregate_prove_by_input_seconds` companion via
-/// low-cardinality bucket strings (see #940).
+/// low-cardinality bucket strings.
 pub fn observeXmssRecAggregateProve(elapsed_seconds: f32, num_raw: usize, num_children: usize) void {
     if (!g_initialized or isZKVM()) return;
     metrics.zeam_xmss_rec_aggregate_prove_seconds.observe(elapsed_seconds);
@@ -1274,7 +1455,7 @@ pub fn observeXmssRecAggregateProve(elapsed_seconds: f32, num_raw: usize, num_ch
 }
 
 /// Coarse low-cardinality bucket for the `num_raw` label on
-/// `zeam_xmss_rec_aggregate_prove_by_input_seconds`. Current ansible-devnet
+/// `zeam_xmss_rec_aggregate_prove_by_input_seconds`. Current
 /// committees are 8-validator so values 0..8 stay distinct; larger committees
 /// roll into wider buckets to bound Prometheus series cardinality.
 fn numRawBucket(n: usize) []const u8 {
@@ -1308,9 +1489,26 @@ pub fn observeXmssRecAggregatePhase(phase: []const u8, elapsed_ns: u64) void {
     ) catch {};
 }
 
+/// Record one gossip-ingress decode rejection. `topic_kind` must
+/// be one of "block" | "attestation" | "aggregation"; `reason` is one of
+/// "snappy_empty" | "snappy_varint" | "snappy_oversized" | "snappy_truncated"
+/// | "snappy_decode" | "ssz_decode" — see the metric help text on
+/// `zeam_gossip_decode_failures_total` for the full enumeration.
+///
+/// Safe to call from FFI / network callback contexts: no allocation, label
+/// keys are interned by the registry. Silently no-ops before
+/// `metrics.init()` so test runs that haven't started the registry don't
+/// crash. Cardinality bound: 3 topic_kinds × 6 reasons = 18 series.
+pub fn incrGossipDecodeFailure(topic_kind: []const u8, reason: []const u8) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.zeam_gossip_decode_failures_total.incr(
+        .{ .topic_kind = topic_kind, .reason = reason },
+    ) catch {};
+}
+
 /// Coarse low-cardinality bucket for the `num_children` label on
 /// `zeam_xmss_rec_aggregate_prove_by_input_seconds`. `num_children=0` is the
-/// only value seen on flat aggregation today (#940); other buckets exist for
+/// only value seen on flat aggregation today; other buckets exist for
 /// the recursive path.
 fn numChildrenBucket(n: usize) []const u8 {
     return switch (n) {
@@ -1329,15 +1527,14 @@ fn numChildrenBucket(n: usize) []const u8 {
 
 const testing = std.testing;
 
-// leanMetrics PR #35 — lock the gauge↑scrape contract for
+// Lock the gauge↑scrape contract for
 // `lean_gossip_mesh_peers` in code so a future contributor cannot drop
 // the gauge from the `Metrics` struct, rename it, or break the
-// `writeMetrics` serializer without a CI failure here. Slice (b)'s
-// explicit lesson (LockTimer → /metrics output test in
-// `pkgs/node/src/locking.zig`) and slice c-2b's
-// `lean_chain_state_refcount_distribution` audit (PR #803) was that
+// `writeMetrics` serializer without a CI failure here. The lesson from
+// the LockTimer → /metrics output test and the
+// `lean_chain_state_refcount_distribution` audit was that
 // doc-only audits regress silently — every Prometheus-exposed metric
-// added by this PR/repo earns a 20-line scrape test.
+// earns a 20-line scrape test.
 //
 // We cannot exercise the FFI side (`get_mesh_peers_total →
 // refreshMeshPeersMetric → gauge`) without a real swarm, but the path
@@ -1487,13 +1684,12 @@ test "registerScrapeRefresher fans out to all registered callbacks" {
     try testing.expectEqual(@as(u32, 2), Hits.ctx_second);
 }
 
-// Slice (d)/(e) of #803 (PR #842 review #4 / nit followup):
-// lock the metrics scrape contract for the slice (d) per-fetch dedup
-// counters and the slice (e) per-site root-compute-skipped counters
+// Lock the metrics scrape contract for the per-fetch dedup
+// counters and the per-site root-compute-skipped counters
 // in code, so a label rename / family drop / serializer regression
-// fails CI here, not silently in production. Mirrors the slice-(b)
-// LockTimer audit pattern (`pkgs/node/src/locking.zig`) and the #788
-// metric audit added in PR #841.
+// fails CI here, not silently in production. Mirrors the
+// LockTimer audit pattern and the future-block-queue
+// metric audit.
 test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in /metrics output" {
     if (isZKVM()) return;
 
@@ -1503,15 +1699,13 @@ test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in 
     // failures are swallowed to mirror production usage (the chain /
     // node code uses `catch {}` on every metric write).
 
-    // lean_block_root_compute_skipped_total{site} — slice (e).
+    // lean_block_root_compute_skipped_total{site}.
     metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onGossip" }) catch {};
     metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onBlock" }) catch {};
     metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.processPendingBlocks" }) catch {};
     metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
 
-    // lean_block_fetch_dedup_total{outcome} — slice (d). PR #842
-    // review #1 added `fetch_no_peers` and `fetch_failed`; the
-    // review followup added `dedup_lost_race`. Assert all seven
+    // lean_block_fetch_dedup_total{outcome}. Assert all seven
     // outcomes appear so a label rename / drop fails CI.
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_forkchoice" }, 3) catch {};
     metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_block_cache" }, 5) catch {};
@@ -1581,6 +1775,36 @@ test "attestation aggregate coverage metrics use leanSpec names" {
     try testing.expect(std.mem.indexOf(u8, body, "direction=\"timely_only\"") != null);
 }
 
+test "aggregator skipped metric uses leanMetrics name and reasons" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    const reasons = [_][]const u8{
+        "not_aggregator",
+        "not_synced",
+        "missing_state",
+        "spawn_failed",
+        "other",
+    };
+    for (reasons) |reason| {
+        metrics.lean_aggregator_skipped_total.incr(.{ .reason = reason }) catch {};
+    }
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "lean_aggregator_skipped_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_aggregate_skip_total") == null);
+    for (reasons) |reason| {
+        var expected: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&expected, "reason=\"{s}\"", .{reason});
+        try testing.expect(std.mem.indexOf(u8, body, label) != null);
+    }
+}
+
 // Issues #863 / #867: clock-loop xev drain observability must stay in the
 // Prometheus scrape output (histogram + slow-drain counters).
 test "issues #863/#867: xev until_done drain metrics appear in /metrics output" {
@@ -1600,4 +1824,26 @@ test "issues #863/#867: xev until_done drain metrics appear in /metrics output" 
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_drain_seconds") != null);
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_500ms_total") != null);
     try testing.expect(std.mem.indexOf(u8, body, "zeam_xev_clock_until_done_slow_ge_1s_total") != null);
+}
+
+// Per-callsite libxev callback duration histogram is the
+// primary attribution signal for slow xev drains. Verify both the
+// metric name and a representative `site` label show up in the
+// Prometheus scrape body.
+test "issue #942: libxev callback duration histogram appears in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    observeLibxevCallback("onGossip.block.hash_tree_root", 0.042);
+    observeLibxevCallback("onInterval.tick", 0.003);
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_libxev_callback_duration_seconds") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"onGossip.block.hash_tree_root\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"onInterval.tick\"") != null);
 }

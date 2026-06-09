@@ -12,7 +12,6 @@ pub const apply_raw_block = transition.apply_raw_block;
 pub const StateTransitionError = transition.StateTransitionError;
 pub const StateTransitionOpts = transition.StateTransitionOpts;
 pub const verifySignatures = transition.verifySignatures;
-pub const verifySignaturesParallel = transition.verifySignaturesParallel;
 pub const verifySingleAttestation = transition.verifySingleAttestation;
 
 const mockImport = @import("./mock.zig");
@@ -49,7 +48,7 @@ test "apply transition on mocked chain" {
 
         // Verify signatures before applying state transition
         // Pass null for pubkey_cache since tests don't need caching optimization
-        try verifySignatures(allocator, &beam_state, &signed_block, null);
+        try verifySignatures(allocator, &beam_state, &signed_block, null, null);
 
         try apply_transition(allocator, &beam_state, signed_block.block, .{ .logger = module_logger });
     }
@@ -59,6 +58,40 @@ test "apply transition on mocked chain" {
     var post_state_root: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(types.BeamState, beam_state, &post_state_root, allocator);
     try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].block.state_root));
+}
+
+test "verifySignatures: a block with empty aggregation_bits is rejected before verify" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try genMockChain(allocator, 2, null);
+    var signed_block = mock_chain.blocks[1];
+    const state = mock_chain.genesis_state;
+
+    // Append an attestation whose aggregation_bits select no validators. In
+    // devnet5 a block carries a single merged Type-2 proof (there is no
+    // per-attestation signature list), so aggregation_bits is the SOLE binding
+    // to pubkeys: an empty set is structurally invalid, and verifySignatures
+    // rejects it (InvalidBlockSignatures) before the expensive Type-2 verify.
+    const phantom_att = types.AggregatedAttestation{
+        .data = .{
+            .slot = 1,
+            .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+        },
+        .aggregation_bits = try types.AggregationBits.init(allocator),
+    };
+    try signed_block.block.body.attestations.append(phantom_att);
+
+    var block_root: [32]u8 = undefined;
+    try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, allocator);
+
+    try std.testing.expectError(
+        types.StateTransitionError.InvalidBlockSignatures,
+        verifySignatures(allocator, &state, &signed_block, null, &block_root),
+    );
 }
 
 test "genStateBlockHeader" {

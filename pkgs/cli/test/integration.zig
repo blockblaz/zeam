@@ -2,6 +2,7 @@ const std = @import("std");
 const process = std.process;
 const net = std.Io.net;
 const zeam_utils = @import("@zeam/utils");
+const params = @import("@zeam/params");
 const build_options = @import("build_options");
 const constants = @import("cli_constants");
 const error_handler = @import("error_handler");
@@ -525,7 +526,7 @@ const SSEClient = struct {
 
         // The SSE stream is intentionally long-lived, so a plain blocking read
         // can hang forever when the simulator stops emitting events before the
-        // test's outer deadline is reached (observed on macOS CI in #900). Use
+        // test's outer deadline is reached (observed on macOS CI). Use
         // the std.Io timeout path directly rather than poll+Reader: on macOS CI
         // the stream reader can still block after readiness, preventing the
         // outer deadline from being checked.
@@ -633,7 +634,8 @@ test "admin aggregator endpoint - GET returns seed, POST toggles at runtime" {
     // The API server comes up before the chain is wired in (503 until
     // `setChain` is called inside main.zig after validator key generation).
     // Poll until the chain is ready, then assert the baseline.
-    const chain_ready_deadline_ms: i64 = 60_000;
+    // Scale with the slot time: a wider slot means readiness takes proportionally longer.
+    const chain_ready_deadline_ms: i64 = 60_000 * @as(i64, @intCast(params.SECONDS_PER_SLOT)) / 4;
     const poll_start = zeam_utils.unixTimestampMillis();
     var get_before = try zeam_request.getAggregator();
     while (get_before.status != .ok) {
@@ -691,7 +693,6 @@ test "admin aggregator endpoint - GET returns seed, POST toggles at runtime" {
 
 test "SSE events integration test - wait for justification and finalization" {
     const allocator = std.testing.allocator;
-    const node3_id = 2;
 
     // Get executable path
     const exe_path = try getZeamExecutable();
@@ -712,19 +713,16 @@ test "SSE events integration test - wait for justification and finalization" {
 
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
-    // Read events until justification, finalization, and node3 parent-sync progress are verified, or timeout.
-    // Node3 starts after the first finalization. Sync is proven when either:
-    //   - node3 emits its own new_finalization, or
-    //   - global finalization advances beyond the first finalized slot, or
-    //   - new_head events keep arriving after node3's delayed start (chain still progressing).
-    const timeout_ms: u64 = 480000; // 480 seconds timeout
+    // Read events until justification, the first finalization, and a SECOND
+    // finalization that lands AFTER node3 has joined, or timeout.
+    // Scale with the slot time; the loop exits as soon as it sees finalization, so this is just a cap.
+    const timeout_ms: u64 = 480000 * params.SECONDS_PER_SLOT / 4;
     const start_ns = zeam_utils.monotonicTimestampNs();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
     var got_finalization = false;
     var got_node3_sync = false;
     var first_finalized_slot: u64 = 0;
-    var head_count_at_finalization: usize = 0;
 
     var current_ns = zeam_utils.monotonicTimestampNs();
     while (current_ns < deadline_ns and !(got_justification and got_finalization and got_node3_sync)) {
@@ -748,41 +746,22 @@ test "SSE events integration test - wait for justification and finalization" {
                         // First finalization — this triggers node3 to start syncing
                         got_finalization = true;
                         first_finalized_slot = slot;
-                        head_count_at_finalization = sse_client.getEventCount("new_head");
                         std.debug.print(
-                            "INFO: First finalization at slot {} — node 3 will start syncing (heads={})\n",
-                            .{ slot, head_count_at_finalization },
+                            "INFO: First finalization at slot {} — node 3 will start syncing\n",
+                            .{slot},
                         );
                     } else if (got_finalization and !got_node3_sync and slot > first_finalized_slot) {
                         got_node3_sync = true;
                         std.debug.print(
-                            "INFO: Advanced finalization at slot {} (first was {}) — chain progressed after node 3 joined\n",
+                            "INFO: Advanced finalization at slot {} (first was {}) — chain finalized after node 3 joined\n",
                             .{ slot, first_finalized_slot },
                         );
-                    }
-
-                    if (!got_node3_sync and slot > 0 and e.node_id != null and e.node_id.? == node3_id) {
-                        got_node3_sync = true;
-                        std.debug.print("INFO: Found node3 finalization with slot {}\n", .{slot});
                     }
                 }
             }
 
             // IMPORTANT: Free the event memory after processing
             e.deinit(allocator);
-        }
-
-        if (got_finalization and !got_node3_sync) {
-            const head_count_now = sse_client.getEventCount("new_head");
-            // CI often records ~25 heads by first finalization (node3 start) and only
-            // one more before the chain stalls; require strictly more, not a +N margin.
-            if (head_count_now > head_count_at_finalization) {
-                got_node3_sync = true;
-                std.debug.print(
-                    "INFO: Head events progressed after node 3 join ({} -> {})\n",
-                    .{ head_count_at_finalization, head_count_now },
-                );
-            }
         }
 
         current_ns = zeam_utils.monotonicTimestampNs();
@@ -810,16 +789,9 @@ test "SSE events integration test - wait for justification and finalization" {
 
     std.debug.print("INFO: Received events - Head: {}, Justification: {}, Finalization: {}\n", .{ head_events, justification_events, finalization_events });
 
-    // Last-chance: the extra head may land after the deadline loop exits.
-    if (got_finalization and !got_node3_sync and head_events > head_count_at_finalization) {
-        got_node3_sync = true;
-        std.debug.print(
-            "INFO: Head events progressed after node 3 join ({} -> {}) at timeout\n",
-            .{ head_count_at_finalization, head_events },
-        );
-    }
-
-    // Require justification, finalization, and node3 sync verification
+    // Require justification, the first finalization, and a finalization that
+    // advanced after node3 joined (got_node3_sync). The last condition is the
+    // core property: the network kept finalizing with node3 in it.
     try std.testing.expect(got_justification);
     try std.testing.expect(got_finalization);
     try std.testing.expect(got_node3_sync);

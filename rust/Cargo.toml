@@ -19,7 +19,7 @@ strip = "symbols"
 codegen-units = 16  # Multiple units keep risc0 and openvm code separate
 
 # Optimized profile for the multisig-only (dummy prover) build. This is the
-# image used by production aggregators on the devnet; the leanMultisig prover
+# image used by production aggregators under load; the leanMultisig prover
 # is the per-slot hot path and benefits noticeably from cross-crate inlining
 # (ThinLTO) and single-codegen-unit compilation. Because this build excludes
 # both risc0 and openvm via `--no-default-features --features
@@ -30,7 +30,7 @@ codegen-units = 16  # Multiple units keep risc0 and openvm code separate
 # Keep opt-level at the inherited `3`. Do NOT switch to `opt-level = "z"`
 # (or `"s"`) here: combined with `codegen-units = 1` they miscompile
 # leanMultisig's prover on x86_64 Linux (rustc >= 1.95) — see the comment on
-# `[profile.openvm-release]` and zeam#734 / leanEthereum/leanMultisig#198.
+# `[profile.openvm-release]`.
 [profile.multisig-release]
 inherits = "release"
 lto = "thin"
@@ -49,8 +49,7 @@ lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols 
 #   - opt-level = "s" + codegen-units = 1  -> clean
 #   - opt-level = "z" + codegen-units >= 2 -> clean
 # We pick `s` + CGU=1 because it keeps the single-CGU size benefit without
-# the aggressive -Oz inlining heuristics that expose the bug. Tracked in
-# zeam#734 and leanEthereum/leanMultisig#198.
+# the aggressive -Oz inlining heuristics that expose the bug.
 opt-level = "s"      # "s" rather than "z": see comment above
 codegen-units = 1    # Better optimization (slower compilation)
 panic = "abort"      # Remove unwinding code for smaller binary
@@ -59,8 +58,7 @@ panic = "abort"      # Remove unwinding code for smaller binary
 [profile.risc0-release]
 inherits = "release"
 lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols separate
-# See openvm-release above for why opt-level is "s" and not "z"
-# (zeam#734, leanEthereum/leanMultisig#198).
+# See openvm-release above for why opt-level is "s" and not "z".
 opt-level = "s"
 codegen-units = 1    # Better optimization (slower compilation)
 panic = "abort"      # Remove unwinding code for smaller binary

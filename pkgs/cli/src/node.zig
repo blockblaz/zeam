@@ -96,10 +96,9 @@ pub const NodeOptions = struct {
     max_attestations_data: ?u8 = null,
     db_backend: database.Backend = .rocksdb,
     chain_spec: ?[]const u8 = null,
-    /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `true` post
-    /// devnet-4 burn-in: the worker path is the supported prod path;
-    /// surfaced as `--chain-worker` on the `zeam node` CLI, with
+    /// Route producer-side gossip handlers through the chain-worker
+    /// queue. Defaults to `true`: the worker path is the supported prod
+    /// path; surfaced as `--chain-worker` on the `zeam node` CLI, with
     /// `--chain-worker false` as the kill-switch for the legacy
     /// synchronous path.
     chain_worker_enabled: bool = true,
@@ -107,20 +106,28 @@ pub const NodeOptions = struct {
     /// `null` keeps the existing automatic split (half of the post-system-
     /// thread budget to Zig workers, half to rayon). Aggregators in
     /// CPU-rich environments can set this higher to give the prover more
-    /// parallelism without rebuilding (#899). Surfaced as `--rayon-threads`
+    /// parallelism without rebuilding. Surfaced as `--rayon-threads`
     /// on the `zeam node` CLI.
     rayon_threads: ?u32 = null,
     /// Minimum (children + gossip-sig) inputs required before the
     /// aggregator pre-filter lets an `AttestationData` reach the FFI.
     /// Threaded through to `ForkChoice.min_aggregation_inputs` and
-    /// applied by `pruneTrivialFromAggregateSnapshot` in
-    /// `pkgs/node/src/forkchoice.zig` BEFORE
+    /// applied by `pruneTrivialFromAggregateSnapshot` before
     /// `computeAggregatedSignatures` runs (the FFI itself stays
-    /// spec-pure). Surfaced as `--min-aggregation-inputs` on the
-    /// `zeam node` CLI; default is
-    /// `pkgs/types/src/block.zig:default_min_aggregation_inputs`. See
-    /// issue #907 finding 4.
+    /// free of this filtering). Surfaced as `--min-aggregation-inputs` on the
+    /// `zeam node` CLI; default is `default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
+    /// Percentage of the proposal interval allocated as the build-worker
+    /// deadline budget.
+    proposal_deadline_pct: u32 = node_lib.default_proposal_deadline_pct,
+    /// Cap on the number of child STARK proofs merged with raw signatures
+    /// by the aggregator-worker path. Threaded through to
+    /// `ForkChoice.max_aggregation_children` and applied by
+    /// `prepareAggregateAttData` after greedy + subset-prune. Surfaced as
+    /// `--max-aggregation-children` on the `zeam node` CLI; default is
+    /// `pkgs/types/src/block.zig:default_max_aggregation_children` (0 —
+    /// flat-only worker path).
+    max_aggregation_children: u32 = types.default_max_aggregation_children,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -172,7 +179,7 @@ pub const Node = struct {
     anchor_state: *types.BeamState,
     /// Shared worker pool for CPU-bound chain work (attestation signature verification).
     thread_pool: *ThreadPool,
-    /// Background watchdog that monitors libxev slot-driver liveness (#863).
+    /// Background watchdog that monitors libxev slot-driver liveness.
     /// `null` until `run()` spawns it; `stop()` joins it.
     slot_driver_watchdog: ?SlotDriverWatchdog = null,
 
@@ -310,7 +317,7 @@ pub const Node = struct {
         // `allocator.free(self.name)` / `allocator.free(self.fork_digest)`. We
         // must move both fields out of the arena onto the top-level allocator
         // before dropping the arena, otherwise shutdown panics with
-        // "Invalid free" once `chain.deinit -> config.deinit` runs (see #831).
+        // "Invalid free" once `chain.deinit -> config.deinit` runs.
         const parsed = try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options);
         defer parsed.deinit();
         var chain_options = parsed.value;
@@ -348,7 +355,7 @@ pub const Node = struct {
         }
 
         // Apply max_attestations_data if provided via config.yaml.
-        // ChainConfig.init falls back to 16 (leanSpec default) when this field is null.
+        // ChainConfig.init falls back to 16 (spec default) when this field is null.
         if (options.max_attestations_data) |max| {
             chain_options.max_attestations_data = max;
         }
@@ -427,7 +434,7 @@ pub const Node = struct {
                         self.anchor_state.* = downloaded_state;
                         // Fetch the real anchor block from the checkpoint provider and store
                         // it in the DB so blocks_by_root can serve it with the correct
-                        // hash_tree_root.  Mirrors leanSpec fetch_finalized_anchor: compute
+                        // hash_tree_root.  Compute the finalized anchor: derive
                         // anchor_block_root + expected_state_root, then fetch + verify both
                         // root and state_root pairing before persisting.
                         //
@@ -486,7 +493,7 @@ pub const Node = struct {
         const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
 
         // Aggregators: XMSS recursive prove (rayon) is the per-slot bottleneck. Keep a
-        // small Zig pool for capped in-flight aggregate workers (#907).
+        // small Zig pool for capped in-flight aggregate workers.
         const worker_count = if (options.is_aggregator) blk: {
             const aggregator_zig_workers = @max(@as(usize, 2), desired_workers / 4);
             break :blk @min(@as(usize, ThreadPool.max_thread_count), aggregator_zig_workers);
@@ -502,8 +509,8 @@ pub const Node = struct {
         // rayon from Zig workers. Both pools still keep a minimum of one worker
         // so tiny/cgroup-limited systems remain functional.
         //
-        // Operators can override the rayon worker count with `--rayon-threads`
-        // (#899). The automatic split is conservative — it deliberately leaves
+        // Operators can override the rayon worker count with `--rayon-threads`.
+        // The automatic split is conservative — it deliberately leaves
         // half of the post-system-thread budget to the Zig pool because
         // verification and gossip work also enter rayon. On a CPU-rich
         // aggregator that bottleneck is the produce path instead, so giving
@@ -513,9 +520,9 @@ pub const Node = struct {
         // pool is initialized lazily on first use.
         const rayon_threads = if (options.rayon_threads) |override| blk: {
             const requested = @max(@as(usize, 1), @as(usize, override));
-            // Cap explicit overrides to the post-system budget so devnet hosts
+            // Cap explicit overrides to the post-system budget so hosts
             // with `--rayon-threads 12` on 8 vCPUs do not oversubscribe XMSS
-            // prove and inflate worker p50 (#925).
+            // prove and inflate worker p50.
             const effective = @min(requested, desired_workers);
             if (effective < requested) {
                 self.logger.warn(
@@ -531,7 +538,7 @@ pub const Node = struct {
         // One outer aggregate worker at a time on aggregators. Each att_data
         // prove runs sequentially inside that worker (ethlambda-style) so
         // Rayon gets the full CPU budget per job instead of ThreadPool ×
-        // Rayon oversubscription (#925).
+        // Rayon oversubscription.
         const aggregate_max_inflight: u32 = if (options.is_aggregator) 1 else 4;
         const rayon_source: []const u8 = if (options.rayon_threads != null)
             " (--rayon-threads override)"
@@ -539,7 +546,7 @@ pub const Node = struct {
             " (aggregator auto-tune: full post-system budget)"
         else
             " (non-aggregator auto-split)";
-        // Operator-typo guard for --rayon-threads (review feedback on #903).
+        // Operator-typo guard for --rayon-threads.
         // Rayon tolerates over-subscription, but values like `--rayon-threads 160`
         // on a 4-vCPU box silently degrade throughput. Warn (don't reject) so the
         // operator notices in startup logs without blocking deliberate edge cases
@@ -568,8 +575,8 @@ pub const Node = struct {
         // Log the aggregator threshold on startup so operators can see
         // exactly how `--min-aggregation-inputs` was resolved (default vs
         // override). The threshold is enforced by the aggregator-side
-        // pre-filter in `forkchoice.zig:pruneTrivialFromAggregateSnapshot`,
-        // not inside the spec-pure `computeAggregatedSignatures` FFI.
+        // pre-filter in `pruneTrivialFromAggregateSnapshot`,
+        // not inside the core `computeAggregatedSignatures` FFI.
         self.logger.info(
             "aggregator threshold: min_aggregation_inputs={d}{s}",
             .{
@@ -597,7 +604,9 @@ pub const Node = struct {
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
             .min_aggregation_inputs = options.min_aggregation_inputs,
+            .max_aggregation_children = options.max_aggregation_children,
             .aggregate_max_inflight = aggregate_max_inflight,
+            .proposal_deadline_pct = options.proposal_deadline_pct,
         });
         errdefer self.beam_node.deinit();
 
@@ -683,14 +692,20 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        // Start the Rust libp2p network BEFORE BeamNode: since #812,
+        // Start the Rust libp2p network before BeamNode:
         // `BeamNode.run()` calls `gossip.subscribe(...)`, which enqueues
         // `SwarmCommand::SubscribeGossip` on the per-network command channel.
         // That channel only exists after `EthLibp2p.run()` returns from
         // `wait_for_network_ready`. Reversing the order drops every subscribe
-        // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
+        // with `error.GossipMeshSubscribeFailed`. The dev `beam`
         // command already does network-first; this is the matching swap for
         // the production node path.
+        //
+        // Peer + req-resp handlers are subscribed before the network starts so
+        // the one-shot peer-connect event and early STATUS requests are not
+        // lost to a handler-not-yet-registered race; only gossip mesh subscribe
+        // needs the running channel and stays inside `BeamNode.run()`.
+        try self.beam_node.subscribeNetworkEventHandlers();
         try self.network.run();
         try self.beam_node.run();
 
@@ -745,7 +760,7 @@ pub const Node = struct {
         self.logger.info("  ENR: {s}", .{encoded_txt});
         self.logger.info("────────────────────────────────────────────────────────", .{});
 
-        // Spawn the slot-driver stall watchdog (#863) so multi-second
+        // Spawn the slot-driver stall watchdog so multi-second
         // libxev stalls surface in the log + metrics even if the main
         // loop is stuck inside one completion or syscall. Failure to
         // spawn is non-fatal — log and continue without it.
@@ -1147,8 +1162,7 @@ fn downloadCheckpointState(
     logger.info("successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
 
     // Clone the state to move it out of the arena using the proper cloning function
-    var cloned_state: types.BeamState = undefined;
-    try types.sszClone(allocator, types.BeamState, checkpoint_state, &cloned_state);
+    const cloned_state = try zeam_utils.clone(types.BeamState, &checkpoint_state, allocator);
 
     return cloned_state;
 }
@@ -1223,7 +1237,7 @@ fn verifyCheckpointState(
 /// Path suffix that the checkpoint-sync state URL must end with.
 /// Used to derive the block URL (same base, different path tail).
 const FINALIZED_STATE_PATH = "/lean/v0/states/finalized";
-/// Path for the finalized block endpoint (leanSpec FINALIZED_BLOCK_ENDPOINT).
+/// Path for the finalized block endpoint (spec FINALIZED_BLOCK_ENDPOINT).
 const FINALIZED_BLOCK_PATH = "/lean/v0/blocks/finalized";
 
 /// Tries to fetch the real SignedBlock for the checkpoint anchor from the
@@ -1240,7 +1254,7 @@ fn downloadAndStoreCheckpointBlock(
     state_url: []const u8,
     expected_root: types.Root,
     /// hash_tree_root(anchor_state) — required. Block's state_root is checked
-    /// against this for block/state pairing (leanSpec fetch_finalized_anchor).
+    /// against this for block/state pairing (spec fetch_finalized_anchor).
     expected_state_root: types.Root,
     db: *database.Db,
     logger: zeam_utils.ModuleLogger,
@@ -1315,7 +1329,7 @@ fn downloadAndStoreCheckpointBlock(
     }
 
     // Pairing check: block.state_root must equal hash_tree_root(anchor_state).
-    // Mirrors leanSpec fetch_finalized_anchor assertion. Detects server advancing
+    // This is the finalized-anchor assertion: it detects a server advancing
     // finalization between the two requests (state then block).
     if (!std.mem.eql(u8, &block.block.state_root, &expected_state_root)) {
         logger.warn(
@@ -1335,6 +1349,16 @@ fn downloadAndStoreCheckpointBlock(
     };
     defer batch.deinit();
     batch.putBlockSerialized(database.DbBlocksNamespace, expected_root, ssz_data.items);
+    // Also index the checkpoint block in the finalized slot index so that
+    // blocks_by_range can serve it.  Without this, `onReqRespRequest`'s
+    // finalized-range path (slot <= finalized_slot) finds no entry in
+    // DbFinalizedSlotsNamespace and the unfinalized-range walk is skipped
+    // (its guard is `end_slot_exclusive > finalized_slot + 1`, which is false
+    // when start_slot == finalized_slot == checkpoint_slot).  The result is an
+    // empty blocks_by_range response for the checkpoint slot even though the
+    // block is present in DbBlocksNamespace and is served correctly via
+    // blocks_by_root.
+    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, block.block.slot, expected_root);
     db.commit(&batch) catch |err| {
         logger.warn("checkpoint block fetch: DB commit failed: {}", .{err});
         return;

@@ -94,7 +94,7 @@ pub const GossipSub = struct {
     /// Publish a gossip message. Returns `true` if the message was successfully
     /// handed off to the underlying transport (and is therefore expected to
     /// reach the network), `false` if the publish was dropped (e.g. backend
-    /// command channel full, see issue #808). Callers should not log the
+    /// command channel full). Callers should not log the
     /// publish as successful when this returns `false`.
     pub fn publish(self: GossipSub, obj: *const GossipMessage) anyerror!bool {
         return self.publishFn(self.ptr, obj);
@@ -331,28 +331,6 @@ pub const GossipMessage = union(GossipTopicKind) {
         return serialized.toOwnedSlice(allocator);
     }
 
-    pub fn clone(self: *const Self, allocator: Allocator) !*Self {
-        const cloned_data = try allocator.create(Self);
-
-        switch (self.*) {
-            .block => {
-                cloned_data.* = .{ .block = undefined };
-                try types.sszClone(allocator, types.SignedBlock, self.block, &cloned_data.block);
-            },
-            .attestation => {
-                cloned_data.* = .{ .attestation = undefined };
-                cloned_data.attestation.subnet_id = self.attestation.subnet_id;
-                try types.sszClone(allocator, types.SignedAttestation, self.attestation.message, &cloned_data.attestation.message);
-            },
-            .aggregation => {
-                cloned_data.* = .{ .aggregation = undefined };
-                try types.sszClone(allocator, types.SignedAggregatedAttestation, self.aggregation, &cloned_data.aggregation);
-            },
-        }
-
-        return cloned_data;
-    }
-
     pub fn deinit(self: *Self) void {
         switch (self.*) {
             .block => |*block| block.deinit(),
@@ -393,7 +371,7 @@ pub const LeanSupportedProtocol = enum(u32) {
     // try_from (incoming RPC tag) AND Rust enum → u32 (outgoing tag).
     // The Rust side pins both via `#[repr(u32)]` + explicit discriminants;
     // a unit test (`try_from_round_trip_matches_repr` in the Rust file)
-    // guards against future drift. Reported by @ch4r10t33r on PR #824.
+    // guards against future drift.
     blocks_by_root = 0,
     status = 1,
     blocks_by_range = 2,
@@ -451,7 +429,7 @@ pub const LeanSupportedProtocol = enum(u32) {
 ///
 /// Intentionally module-private: this is a wire-shape shim for
 /// `ReqRespRequest.deserialize` only and exists purely to dodge an upstream
-/// SSZ panic surface (see #843). Once the bounds checks land in `ssz.zig`
+/// SSZ panic surface. Once the bounds checks land in `ssz.zig`
 /// itself this whole helper goes away. If a future caller in `pkgs/network/`
 /// needs the same validation, lift it then — don't widen the API now and
 /// invite reuse of a fix that is meant to be temporary.
@@ -855,6 +833,24 @@ pub const OnPeerEventCbHandler = struct {
 pub const PeerEventHandler = struct {
     allocator: Allocator,
     handlers: std.ArrayList(OnPeerEventCbHandler),
+    /// Peers observed connected, tracked independently of `handlers` so a
+    /// connection established before any handler subscribes is not lost.
+    ///
+    /// Defense-in-depth alongside the primary fix (subscribing peer handlers
+    /// before `EthLibp2p.run()` starts the listener — see
+    /// `BeamNode.subscribeNetworkEventHandlers`). If a connect still lands
+    /// before a handler is registered, it would otherwise be dispatched to
+    /// zero handlers and lost forever (libp2p never re-emits "connected" for
+    /// an already-connected peer), leaving `connected_peers` empty → sync
+    /// status `.no_peers` → gossip attestations dropped → no finalization.
+    /// We record connects here and replay them on `subscribe`.
+    ///
+    /// Keys are heap-owned dups of the (ephemeral) bridge-supplied peer id.
+    connected: std.StringHashMap(PeerDirection),
+    /// Guards `handlers` and `connected`: the rust bridge invokes the
+    /// `onPeer*` callbacks from its own thread while `subscribe` runs on the
+    /// node's main thread.
+    mutex: zeam_utils.SyncMutex = .{},
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -865,6 +861,7 @@ pub const PeerEventHandler = struct {
         return Self{
             .allocator = allocator,
             .handlers = .empty,
+            .connected = std.StringHashMap(PeerDirection).init(allocator),
             .networkId = networkId,
             .logger = logger,
             .node_registry = registry,
@@ -872,17 +869,71 @@ pub const PeerEventHandler = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        var it = self.connected.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.connected.deinit();
         self.handlers.deinit(self.allocator);
     }
 
     pub fn subscribe(self: *Self, handler: OnPeerEventCbHandler) !void {
-        try self.handlers.append(self.allocator, handler);
+        // A connected-peer entry captured for replay. Owns a dup of the peer-id
+        // key: the snapshot outlives the lock, and a concurrent onPeerDisconnected
+        // could free the original key once we release the mutex.
+        const ReplayEntry = struct { peer_id: []u8, direction: PeerDirection };
+
+        var snapshot: std.ArrayList(ReplayEntry) = .empty;
+        defer {
+            for (snapshot.items) |entry| self.allocator.free(entry.peer_id);
+            snapshot.deinit(self.allocator);
+        }
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            // Snapshot peers that connected before this handler subscribed so the
+            // replay below runs without holding self.mutex (handler callbacks may
+            // re-enter this PeerEventHandler — see onPeerConnected). Build the
+            // snapshot before registering the handler so a dup failure here can't
+            // leave a handler registered but un-replayed.
+            try snapshot.ensureUnusedCapacity(self.allocator, self.connected.count());
+            var it = self.connected.iterator();
+            while (it.next()) |entry| {
+                snapshot.appendAssumeCapacity(.{
+                    .peer_id = try self.allocator.dupe(u8, entry.key_ptr.*),
+                    .direction = entry.value_ptr.*,
+                });
+            }
+            try self.handlers.append(self.allocator, handler);
+        }
+
+        // Replay outside the lock. A peer in the snapshot may have disconnected
+        // in the meantime, yielding a stale onPeerConnected; this is benign as
+        // downstream handlers are idempotent (connected_peers.connect is get-or-put).
+        for (snapshot.items) |entry| {
+            handler.onPeerConnected(entry.peer_id, entry.direction) catch |e| {
+                self.logger.err("network-{d}:: replay onPeerConnected handler error={any}", .{ self.networkId, e });
+            };
+        }
     }
 
     pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{f} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
-        for (self.handlers.items) |handler| {
+        // Snapshot the handler list under the lock, then dispatch after releasing
+        // it: handlers may re-enter this PeerEventHandler (or schedule work that
+        // does), and self.mutex is non-recursive — dispatching under it deadlocks.
+        const handlers = handlers: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{f} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
+            const gop = try self.connected.getOrPut(peer_id);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.allocator.dupe(u8, peer_id);
+            }
+            gop.value_ptr.* = direction;
+            break :handlers try self.allocator.dupe(OnPeerEventCbHandler, self.handlers.items);
+        };
+        defer self.allocator.free(handlers);
+        for (handlers) |handler| {
             handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
             };
@@ -891,8 +942,18 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{f} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
-        for (self.handlers.items) |handler| {
+        // Snapshot handlers under the lock, dispatch after release — see onPeerConnected.
+        const handlers = handlers: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{f} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
+            if (self.connected.fetchRemove(peer_id)) |kv| {
+                self.allocator.free(kv.key);
+            }
+            break :handlers try self.allocator.dupe(OnPeerEventCbHandler, self.handlers.items);
+        };
+        defer self.allocator.free(handlers);
+        for (handlers) |handler| {
             handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
             };
@@ -900,8 +961,15 @@ pub const PeerEventHandler = struct {
     }
 
     pub fn onPeerConnectionFailed(self: *Self, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void {
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnectionFailed peer_id={s} direction={s} result={s}, handlers={d}", .{ self.networkId, peer_id, @tagName(direction), @tagName(result), self.handlers.items.len });
-        for (self.handlers.items) |handler| {
+        // Snapshot handlers under the lock, dispatch after release — see onPeerConnected.
+        const handlers = handlers: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnectionFailed peer_id={s} direction={s} result={s}, handlers={d}", .{ self.networkId, peer_id, @tagName(direction), @tagName(result), self.handlers.items.len });
+            break :handlers try self.allocator.dupe(OnPeerEventCbHandler, self.handlers.items);
+        };
+        defer self.allocator.free(handlers);
+        for (handlers) |handler| {
             handler.onPeerConnectionFailed(peer_id, direction, result) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnectionFailed handler error={any}", .{ self.networkId, e });
             };
@@ -1022,7 +1090,7 @@ test LeanNetworkTopic {
 
 test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panicking" {
     // Regression test for the Hive `reqresp/blocks_by_root/malformed_request`
-    // failures. The regression test merged with #845 used a hand-crafted
+    // failures. An earlier version of this regression test used a hand-crafted
     // 24-byte approximation; this test pins the real simulator input.
     //
     // The Hive simulator sends `encode_request_raw(&[0xab; 64])`:
@@ -1030,8 +1098,8 @@ test "ReqRespRequest.deserialize rejects malformed BlocksByRoot without panickin
     //   - After zeam's snappy frame decode: 64 bytes all `0xAB`
     //   - SSZ offset field (bytes 0..4 LE): 0xABABABAB = 2880154539
     //
-    // Without the guard added in #845, the ssz.zig container deserializer at
-    // lib.zig:604 sliced `bytes[2880154539..]` on a 64-byte buffer and
+    // Without the guard, the ssz.zig container deserializer
+    // sliced `bytes[2880154539..]` on a 64-byte buffer and
     // panicked, killing the FFI thread and aborting zeam.
     //
     // Scope: this test exercises the post-decompression validation path only.

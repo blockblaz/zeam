@@ -9,6 +9,7 @@ pub const BeamNode = nodeFactory.BeamNode;
 
 const chainFactory = @import("./chain.zig");
 pub const BeamChain = chainFactory.BeamChain;
+pub const default_proposal_deadline_pct = chainFactory.default_proposal_deadline_pct;
 
 pub const fcFactory = @import("./forkchoice.zig");
 pub const testing = @import("./testing.zig");
@@ -41,5 +42,6 @@ test "get tests" {
     _ = @import("./chain_worker.zig");
     _ = @import("./rc_beam_state.zig");
     _ = @import("./slot_driver_watchdog.zig");
+    _ = @import("./invalid_block_cache.zig");
     @import("std").testing.refAllDecls(@This());
 }
