@@ -140,7 +140,7 @@ fn runHealth(allocator: Allocator, ctx: Context, case_obj: std.json.ObjectMap, m
         return FixtureError.FixtureMismatch;
     }
 
-    // Mirror the production handler at pkgs/cli/src/api_server.zig:255.
+    // Mirror the production API handler.
     const status: u16 = 200;
     const content_type = "application/json";
     var body_map: std.json.ObjectMap = .empty;

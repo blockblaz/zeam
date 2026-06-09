@@ -16,9 +16,9 @@ const Context = expect_mod.Context;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// Generic SSZ types exercised by leanSpec's basic-types / xmss-containers
-// fixtures. These are not part of zeam's consensus model; they exist purely
-// to give the SSZ roundtrip runner something to deserialize/reserialize.
+// Generic SSZ types exercised by the basic-types / xmss-containers fixtures.
+// These are not part of zeam's consensus model; they exist purely to give the
+// SSZ roundtrip runner something to deserialize/reserialize.
 // ---------------------------------------------------------------------------
 
 /// Mersenne-31 field element. SSZ-serialized as Uint32 (4 bytes LE).
@@ -43,10 +43,11 @@ const SampleUint64Vector4 = [4]u64;
 const SampleBitlist16 = ssz.utils.Bitlist(16);
 const SampleBytes32List8 = ssz.utils.List([32]u8, 8);
 const SampleUint32List16 = ssz.utils.List(u32, 16);
-const ByteListMiB = xmss.ByteListMiB;
+// The proof-bytes list type used by spec fixtures (keyed as ByteList512KiB).
+const ByteList512KiB = xmss.ByteList512KiB;
 
-// Boundary fixture types (leanSpec test_merkleization_boundaries) — exercise
-// the bit-packed encoding at exactly chunk boundaries and at the byte/bit
+// Boundary fixture types (test_merkleization_boundaries) — exercise the
+// bit-packed encoding at exactly chunk boundaries and at the byte/bit
 // transitions inside a single byte.
 const BoundaryBitvector1 = [1]bool;
 const BoundaryBitvector7 = [7]bool;
@@ -57,7 +58,7 @@ const BoundaryBitvector257 = [257]bool;
 const BoundaryBitlist256 = ssz.utils.Bitlist(256);
 const BoundaryUint64List32 = ssz.utils.List(u64, 32);
 
-// Decode-rejection fixture types (leanSpec test_decode_rejections /
+// Decode-rejection fixture types (test_decode_rejections /
 // test_decode_failure_smoke) — paired with `expectException` in the fixture
 // so the runner can assert that the malformed input is rejected.
 const DecodeBitlist8 = ssz.utils.Bitlist(8);
@@ -120,31 +121,8 @@ const TestSignedAttestation = struct {
     signature: TEST_SIGBYTES,
 };
 
-/// Mirror of types.BlockSignatures with test-sized proposer_signature.
-/// attestation_signatures uses AggregatedSignatureProof (ByteListMiB) which
-/// has no SIGBYTES dependency, so it stays unchanged.
-const TestBlockSignatures = struct {
-    attestation_signatures: types.AttestationSignatures,
-    proposer_signature: TEST_SIGBYTES,
-
-    pub fn deinit(self: *TestBlockSignatures) void {
-        for (self.attestation_signatures.slice()) |*group| {
-            group.deinit();
-        }
-        self.attestation_signatures.deinit();
-    }
-};
-
-/// Mirror of types.SignedBlock with test-sized BlockSignatures.
-const TestSignedBlock = struct {
-    block: types.BeamBlock,
-    signature: TestBlockSignatures,
-
-    pub fn deinit(self: *TestSignedBlock) void {
-        self.block.deinit();
-        self.signature.deinit();
-    }
-};
+// SignedBlock carries a single opaque Type-2 `proof` byte list (no SIGBYTES dependency),
+// so it needs no test-sized mirror — the real types.SignedBlock is used directly below.
 
 // ---------------------------------------------------------------------------
 // SSZ type map — maps fixture `typeName` to Zig types.
@@ -174,14 +152,12 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "State", .zig_type = types.BeamState, .has_deinit = true },
     .{ .name = "Status", .zig_type = types.Status, .has_deinit = false },
     .{ .name = "BlocksByRootRequest", .zig_type = types.BlockByRootRequest, .has_deinit = false },
-    .{ .name = "AggregatedSignatureProof", .zig_type = types.AggregatedSignatureProof, .has_deinit = true },
     .{ .name = "PublicKey", .zig_type = types.Bytes52, .has_deinit = false },
-    .{ .name = "SignedBlock", .zig_type = types.SignedBlock, .has_deinit = true, .test_zig_type = TestSignedBlock, .test_has_deinit = true },
+    .{ .name = "SignedBlock", .zig_type = types.SignedBlock, .has_deinit = true },
     .{ .name = "SignedAttestation", .zig_type = types.SignedAttestation, .has_deinit = false, .test_zig_type = TestSignedAttestation, .test_has_deinit = false },
-    .{ .name = "BlockSignatures", .zig_type = types.BlockSignatures, .has_deinit = true, .test_zig_type = TestBlockSignatures, .test_has_deinit = true },
     .{ .name = "Signature", .zig_type = types.SIGBYTES, .has_deinit = false, .test_zig_type = TEST_SIGBYTES, .test_has_deinit = false },
     .{ .name = "SignedAggregatedAttestation", .zig_type = types.SignedAggregatedAttestation, .has_deinit = true },
-    // SSZ basic scalar types from leanSpec's test_basic_types fixtures.
+    // SSZ basic scalar types from the test_basic_types fixtures.
     .{ .name = "Boolean", .zig_type = bool, .has_deinit = false },
     .{ .name = "Uint8", .zig_type = u8, .has_deinit = false },
     .{ .name = "Uint16", .zig_type = u16, .has_deinit = false },
@@ -205,8 +181,11 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "SampleBitlist16", .zig_type = SampleBitlist16, .has_deinit = true },
     .{ .name = "SampleBytes32List8", .zig_type = SampleBytes32List8, .has_deinit = true },
     .{ .name = "SampleUint32List16", .zig_type = SampleUint32List16, .has_deinit = true },
-    .{ .name = "ByteListMiB", .zig_type = ByteListMiB, .has_deinit = true },
-    // Merkleization-boundary fixtures (leanSpec PR #646).
+    .{ .name = "ByteList512KiB", .zig_type = ByteList512KiB, .has_deinit = true },
+    // XMSS aggregation containers — exercised by ssz test_xmss_containers fixtures.
+    .{ .name = "SingleMessageAggregate", .zig_type = types.SingleMessageAggregate, .has_deinit = true },
+    .{ .name = "MultiMessageAggregate", .zig_type = types.MultiMessageAggregate, .has_deinit = true },
+    // Merkleization-boundary fixtures.
     .{ .name = "BoundaryBitvector1", .zig_type = BoundaryBitvector1, .has_deinit = false },
     .{ .name = "BoundaryBitvector7", .zig_type = BoundaryBitvector7, .has_deinit = false },
     .{ .name = "BoundaryBitvector9", .zig_type = BoundaryBitvector9, .has_deinit = false },
@@ -215,7 +194,7 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "BoundaryBitvector257", .zig_type = BoundaryBitvector257, .has_deinit = false },
     .{ .name = "BoundaryBitlist256", .zig_type = BoundaryBitlist256, .has_deinit = true },
     .{ .name = "BoundaryUint64List32", .zig_type = BoundaryUint64List32, .has_deinit = true },
-    // Decode-rejection fixtures (leanSpec PRs #649 / decode_failure_smoke).
+    // Decode-rejection fixtures (decode_failure_smoke).
     .{ .name = "DecodeBitlist8", .zig_type = DecodeBitlist8, .has_deinit = true },
     .{ .name = "DecodeBitvector16", .zig_type = DecodeBitvector16, .has_deinit = false },
     .{ .name = "SmokeBitlist8", .zig_type = SmokeBitlist8, .has_deinit = true },
@@ -326,8 +305,8 @@ fn runCase(
     const type_name = try expect_mod.expectStringField(FixtureError, case_obj, &.{"typeName"}, ctx, "typeName");
     const lean_env = try expect_mod.expectStringField(FixtureError, case_obj, &.{"leanEnv"}, ctx, "leanEnv");
 
-    // Decode-rejection fixtures (leanSpec PRs #649 / decode_failure_smoke /
-    // test_decode_rejections) ship `expectException` + `rawBytes` instead of
+    // Decode-rejection fixtures (decode_failure_smoke / test_decode_rejections)
+    // ship `expectException` + `rawBytes` instead of
     // a roundtrippable `serialized`. When present, the input is intentionally
     // malformed and the runner asserts that deserialization rejects it.
     const expect_exception_opt = blk: {
@@ -374,7 +353,7 @@ fn runCase(
     try dispatchSszRoundtrip(allocator, ctx, type_name, lean_env, raw_bytes, expect_exception_opt);
 }
 
-/// Types that leanSpec exercises but zeam cannot yet roundtrip:
+/// Types that the spec fixtures exercise but zeam cannot yet roundtrip:
 ///   - SSZ Union (new variadic-selector feature; zeam's SSZ library has
 ///     no `union(enum)` serialization path).
 const skip_type_names = [_][]const u8{
@@ -441,7 +420,7 @@ fn sszRoundtrip(
         // `SSZSerializationError`); zeam's SSZ library raises a single zig
         // error set, so we only assert "rejected" not "rejected with this
         // exact name". On success (deserialize accepted malformed input) we
-        // surface that as a mismatch — the spec says the input must be
+        // surface that as a mismatch — the fixture expects the input to be
         // rejected.
         if (deserialize_result) |_| {
             // Successful decode — drain any heap allocations the deinit path
@@ -455,7 +434,7 @@ fn sszRoundtrip(
             );
             return FixtureError.FixtureMismatch;
         } else |_| {
-            // Rejected as the spec requires.
+            // Rejected as expected.
             return;
         }
     }

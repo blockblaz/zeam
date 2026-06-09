@@ -28,7 +28,7 @@ pub const RootHex = [64]u8;
 pub const ZERO_HASH = [_]u8{0x00} ** 32;
 pub const ZERO_SIGBYTES = [_]u8{0} ** SIGSIZE;
 
-pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidSlotIndex, DuplicateAttestationData };
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidSlotIndex, DuplicateAttestationData, TooManyAttestationData };
 
 const json = std.json;
 
@@ -217,7 +217,7 @@ pub const ChainSpec = struct {
 /// corrupted by ssz.serialize and must not be reused; call `deinit` on the source
 /// to release its heap allocations. Use this when the caller needs to mark the
 /// source consumed before any fallible deserialize or allocation step (see
-/// commitOneAggregateResult in forkchoice.zig).
+/// commitOneAggregateResult in the fork-choice layer).
 pub fn sszSerializeAndGetBytes(allocator: Allocator, comptime T: type, data: T) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(allocator);
@@ -237,23 +237,23 @@ test "sszSerializeAndGetBytes roundtrip" {
     try std.testing.expectEqual(data, cloned);
 }
 
-test "sszSerializeAndGetBytes: AggregatedSignatureProof source deinit after serialize" {
+test "sszSerializeAndGetBytes: SingleMessageAggregate source deinit after serialize" {
     const allocator = std.testing.allocator;
 
-    var proof = try types.AggregatedSignatureProof.init(allocator);
+    var proof = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof.participants, 0, true);
-    try proof.proof_data.append(0xAB);
+    try proof.proof.append(0xAB);
 
-    const bytes = try sszSerializeAndGetBytes(allocator, types.AggregatedSignatureProof, proof);
+    const bytes = try sszSerializeAndGetBytes(allocator, types.SingleMessageAggregate, proof);
     defer allocator.free(bytes);
     proof.deinit();
 
-    var cloned: types.AggregatedSignatureProof = undefined;
-    try ssz.deserialize(types.AggregatedSignatureProof, bytes, &cloned, allocator);
+    var cloned: types.SingleMessageAggregate = undefined;
+    try ssz.deserialize(types.SingleMessageAggregate, bytes, &cloned, allocator);
     defer cloned.deinit();
 
     try std.testing.expect(try cloned.participants.get(0));
-    try std.testing.expectEqual(@as(usize, 1), cloned.proof_data.len());
+    try std.testing.expectEqual(@as(usize, 1), cloned.proof.len());
 }
 
 test "isSlotJustified treats finalized boundary as implicit" {

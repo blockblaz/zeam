@@ -270,7 +270,7 @@ enum SwarmCommand {
     /// backoff. The swarm task is the only place with `&mut swarm`, so the
     /// actual `swarm.dial(...)` happens here. Side-stepped the previous
     /// `RECONNECT_QUEUE: HashMapDelay` polled from arm 3 — that delay-map
-    /// interaction with the swarm select! was the trigger for the #942
+    /// interaction with the swarm select! was the trigger for the
     /// permanent waker loss.
     DialReconnect {
         peer_id: PeerId,
@@ -287,11 +287,11 @@ enum SwarmCommand {
 /// full rather than blocking the calling thread or growing memory without
 /// bound. Sized for short, bursty traffic; tune with care.
 ///
-/// devnet-4 (issue #808) showed the previous 1024-slot bound saturating under
-/// steady-state validator load: ~5 commands/min/node were silently dropped,
-/// causing fork-choice divergence because outbound attestations and req-resp
-/// parent fetches never made it onto the wire. 8192 gives ~8x headroom for the
-/// same workload while still bounding memory.
+/// The previous 1024-slot bound saturated under steady-state validator load:
+/// ~5 commands/min/node were silently dropped, causing fork-choice divergence
+/// because outbound attestations and req-resp parent fetches never made it onto
+/// the wire. 8192 gives ~8x headroom for the same workload while still bounding
+/// memory.
 const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 8192;
 
 /// Maximum number of queued swarm commands the event loop drains in a single
@@ -305,7 +305,7 @@ const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 8192;
 /// monopolize the executor.
 const MAX_SWARM_COMMANDS_PER_TICK: usize = 256;
 
-/// Capacity of the inbound-gossip hand-off channel (issue #942).
+/// Capacity of the inbound-gossip hand-off channel.
 ///
 /// Each slot owns one inbound gossip payload (the compressed bytes moved out
 /// of `gossipsub::Message`). The libp2p event loop `try_send`s onto this
@@ -314,8 +314,8 @@ const MAX_SWARM_COMMANDS_PER_TICK: usize = 256;
 /// `handleMsgFromRustBridge`. The point is to keep that hundreds-of-ms-per-block
 /// work OFF the `new_current_thread` tokio runtime that also drives quinn's
 /// QUIC I/O — that starvation corrupted the QUIC receive path and stalled
-/// gossip (the cross-message byte-bleed pinned in `issue_942_layer.md`, and the
-/// earlier 148 broken QUIC handshakes / 8 Status-RPC timeouts).
+/// gossip (the cross-message byte-bleed, and the earlier 148 broken QUIC
+/// handshakes / 8 Status-RPC timeouts).
 ///
 /// Bounded so a burst of large blocks cannot grow memory without limit. On a
 /// full channel the message is dropped (counted in `INBOUND_GOSSIP_DROPPED_TOTAL`)
@@ -327,10 +327,10 @@ const MAX_SWARM_COMMANDS_PER_TICK: usize = 256;
 const INBOUND_GOSSIP_CHANNEL_CAPACITY: usize = 256;
 
 /// Count of inbound gossip messages dropped because the decode worker's queue
-/// was full (issue #942). Process-wide; surfaced in logs at the drop site.
+/// was full. Process-wide; surfaced in logs at the drop site.
 static INBOUND_GOSSIP_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// #942 diagnosis: count of gossipsub `Message` events DELIVERED to the swarm
+/// Diagnostic: count of gossipsub `Message` events DELIVERED to the swarm
 /// event loop, split by topic kind ([0]=block, [1]=attestation/aggregation,
 /// [2]=other). This counts messages gossipsub handed up *before* our decode
 /// worker runs, so comparing the block vs attestation arrival rates across the
@@ -354,9 +354,9 @@ fn gossip_topic_kind_index(topic: &str) -> usize {
     }
 }
 
-// ===== #942 fix-#5 diagnostic: QUIC inbound recv-stream accounting =====
+// ===== Diagnostic: QUIC inbound recv-stream accounting =====
 //
-// The #942 stall is now pinned to a narrow band: AFTER the catch-up burst,
+// The stall is now pinned to a narrow band: AFTER the catch-up burst,
 // gossipsub delivers zero block-topic messages while attestations keep flowing
 // on the SAME QUIC connections (block-topic mesh stays healthy). The fault is
 // downstream of the QUIC connection and upstream of gossipsub delivery, and is
@@ -416,17 +416,17 @@ static INBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new(
 static OUTBOUND_SUBSTREAMS: Mutex<Vec<Arc<SubstreamStat>>> = Mutex::new(Vec::new());
 
 /// Maximum wall-clock millis taken by ONE iteration of the swarm task's
-/// `tokio::select!` since the last diag emit. Devnet evidence (slot 58→61)
-/// showed both `poll_read` and `poll_write` freeze simultaneously, which can
-/// only happen if the swarm task itself stalled in a synchronous arm body —
-/// this counter is the direct measurement of that.
+/// `tokio::select!` since the last diag emit. We observed both `poll_read`
+/// and `poll_write` freeze simultaneously, which can only happen if the swarm
+/// task itself stalled in a synchronous arm body — this counter is the direct
+/// measurement of that.
 static EVENT_LOOP_MAX_ITER_MS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative count of swarm-task iterations whose body wall-time exceeded
 /// `EVENT_LOOP_SLOW_ITER_THRESHOLD_MS`. Read by the diag emitter.
 static EVENT_LOOP_SLOW_ITERS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Threshold for counting an iteration as "slow". 100 ms is well above the
 /// natural cost of a hot arm (gossip rx, reqresp) but well below the 10 s
-/// pause observed at slot 58→61, so a healthy run reports zero or single
+/// pause observed during the freeze, so a healthy run reports zero or single
 /// digits and a pathological run lights up clearly.
 const EVENT_LOOP_SLOW_ITER_THRESHOLD_MS: u64 = 100;
 
@@ -435,10 +435,10 @@ const EVENT_LOOP_SLOW_ITER_THRESHOLD_MS: u64 = 100;
 /// select! (see `arm_name`). The diag emitter reports this together with the
 /// unix-second timestamp of when it was set, so a stuck swarm task shows up
 /// as `last_arm=X` with a steadily growing `age=Ns` — that pins the wedge
-/// to the body of arm X rather than to "somewhere in the loop". Devnet
-/// evidence on a7779f91 ruled out a long synchronous body (max_iter_ms=0
-/// for 120+ s post-freeze) and pointed at a permanent waker-loss / deadlock
-/// inside one arm's body; this probe identifies which arm.
+/// to the body of arm X rather than to "somewhere in the loop". Observed
+/// evidence ruled out a long synchronous body (max_iter_ms=0 for 120+ s
+/// post-freeze) and pointed at a permanent waker-loss / deadlock inside one
+/// arm's body; this probe identifies which arm.
 static LAST_ARM_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// Unix seconds at which `LAST_ARM_ENTERED` was last updated. Stale value =
 /// the loop hasn't entered any arm body since that timestamp = wedged.
@@ -472,8 +472,8 @@ fn arm_name(idx: u32) -> &'static str {
         0 => "none",
         1 => "shutdown",
         2 => "reqresp_timeout",
-        // Arm id 3 (was `reconnect`) was removed in the #942 fix; ID kept
-        // unused to preserve diagnostic-log compatibility with prior runs.
+        // Arm id 3 (was `reconnect`) was removed; ID kept unused to preserve
+        // diagnostic-log compatibility with prior runs.
         3 => "reconnect_removed",
         4 => "response_channel_timeout",
         5 => "swarm_event",
@@ -621,7 +621,7 @@ fn emit_substream_diag(network_id: u32, label: &str, registry: &Mutex<Vec<Arc<Su
 /// Spawn a dedicated tokio task that emits the per-substream QUIC diag lines
 /// every 10s. Lives outside the swarm task's biased `select!` so it keeps
 /// running even when reqresp-status retries make the mesh_peers_tick arm
-/// permanently starved (which is what kept #942 invisible at the freeze).
+/// permanently starved (which is what kept this stall invisible at the freeze).
 fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -631,8 +631,8 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                 biased;
                 _ = shutdown.notified() => break,
                 _ = tick.tick() => {
-                    emit_substream_diag(network_id, "#942 quic-recv", &INBOUND_SUBSTREAMS);
-                    emit_substream_diag(network_id, "#942 quic-send", &OUTBOUND_SUBSTREAMS);
+                    emit_substream_diag(network_id, "quic-recv", &INBOUND_SUBSTREAMS);
+                    emit_substream_diag(network_id, "quic-send", &OUTBOUND_SUBSTREAMS);
                     // Event-loop iteration latency + message_id_fn cache stats.
                     // `swap(0)` on the max so each tick reports the worst
                     // single-iteration latency since the previous tick;
@@ -647,7 +647,7 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                     logger::rustLogger.debug(
                         network_id,
                         &format!(
-                            "[#942 loop] max_iter_ms={max_iter_ms} slow_iters>={EVENT_LOOP_SLOW_ITER_THRESHOLD_MS}ms_total={slow_total} | msg_id_cache hits={cache_hits} misses={cache_misses} len={cache_len}/{MESSAGE_ID_CACHE_CAPACITY}"
+                            "[loop] max_iter_ms={max_iter_ms} slow_iters>={EVENT_LOOP_SLOW_ITER_THRESHOLD_MS}ms_total={slow_total} | msg_id_cache hits={cache_hits} misses={cache_misses} len={cache_len}/{MESSAGE_ID_CACHE_CAPACITY}"
                         ),
                     );
 
@@ -666,7 +666,7 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                     logger::rustLogger.debug(
                         network_id,
                         &format!(
-                            "[#942 arm] last={}({}) age={age}s | shutdown={} reqresp_to={} reconnect={} resp_ch_to={} swarm_ev={} cmd_rx={} mesh_tick={}",
+                            "[arm] last={}({}) age={age}s | shutdown={} reqresp_to={} reconnect={} resp_ch_to={} swarm_ev={} cmd_rx={} mesh_tick={}",
                             last_arm,
                             arm_name(last_arm),
                             cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], cnt[5], cnt[6],
@@ -687,7 +687,7 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
                     logger::rustLogger.debug(
                         network_id,
                         &format!(
-                            "[#942 sub] swarm_ev_var={}({}) age={sev_age}s | cmd_var={}({}) age={scmd_age}s",
+                            "[sub] swarm_ev_var={}({}) age={sev_age}s | cmd_var={}({}) age={scmd_age}s",
                             sev_var,
                             swarm_event_name(sev_var),
                             scmd_var,
@@ -702,7 +702,7 @@ fn spawn_quic_diag_emitter(network_id: u32, shutdown: Arc<tokio::sync::Notify>) 
 
 /// A `StreamMuxer` wrapper that tags each inbound substream with an
 /// `InboundSubstreamStat`. Outbound substreams are passed through untracked
-/// (the recv path is what #942 concerns). Used only on the QUIC transport.
+/// (the recv path is what this instrumentation concerns). Used only on the QUIC transport.
 struct InstrumentedMuxer<M> {
     inner: M,
 }
@@ -859,15 +859,15 @@ struct InboundGossip {
     data: Vec<u8>,
 }
 
-/// Drain loop for the dedicated inbound-gossip decode worker thread (issue
-/// #942). Blocks on `recv()`; exits once the event loop drops the sender and
+/// Drain loop for the dedicated inbound-gossip decode worker thread.
+/// Blocks on `recv()`; exits once the event loop drops the sender and
 /// the channel is drained. Runs `handleMsgFromRustBridge` — i.e. the full
 /// snappy decompress + SSZ deserialize + `chain.onGossip` dispatch — here, off
 /// the tokio/quinn event-loop thread. A single worker preserves the serial
 /// `onGossip` ordering the chain layer assumed when this ran inline.
 fn run_inbound_gossip_worker(rx: std::sync::mpsc::Receiver<InboundGossip>) {
     while let Ok(msg) = rx.recv() {
-        // #942 forensic: hash the bytes about to cross the FFI boundary into
+        // Forensic: hash the bytes about to cross the FFI boundary into
         // Zig. Moved off the event loop into this worker so the O(len) sha256
         // no longer competes with quinn for event-loop time. Pairs with the
         // Zig-side `sha256_inbound` and the producer's `sha256_compressed` for
@@ -879,7 +879,7 @@ fn run_inbound_gossip_worker(rx: std::sync::mpsc::Receiver<InboundGossip>) {
         logger::rustLogger.debug(
             msg.network_id,
             &format!(
-                "[#942 rx] topic={} len={} sha256_libp2p_ingress={} peer={}",
+                "[gossip rx] topic={} len={} sha256_libp2p_ingress={} peer={}",
                 msg.topic.to_string_lossy(),
                 msg.data.len(),
                 hex::encode(ingress_digest),
@@ -906,18 +906,17 @@ fn run_inbound_gossip_worker(rx: std::sync::mpsc::Receiver<InboundGossip>) {
 
 /// One reqresp FFI dispatch handed off from the swarm task to the dedicated
 /// reqresp worker. Owns every buffer the FFI call reads so the raw pointers
-/// passed to Zig stay valid for the duration of the call. Mirrors
+/// passed to Zig stay valid for the duration of the call. Parallels
 /// `InboundGossip` for the gossip side.
 ///
-/// The 2026-05-30 a7779f91 / 883318f5 devnet probes showed that the swarm
-/// task could spend ~15 s inside one `SwarmEvent::Behaviour(Reqresp(_))`
-/// body — the Zig-side `handleRPCResponseFromRustBridge` synchronously runs
-/// snappy-framed decompress + SSZ deserialize + chain dispatch on the
-/// caller thread (ethlibp2p.zig::handleRPCResponseFromRustBridge:991-1037),
-/// and a single BlocksByRangeV1 response can stack many MB of work.
-/// Moving the call to a worker thread mirrors the existing fix #59 pattern
-/// for inbound gossip and lets quinn + gossipsub keep getting polled while
-/// the chain layer is busy.
+/// Profiling showed that the swarm task could spend ~15 s inside one
+/// `SwarmEvent::Behaviour(Reqresp(_))` body — the Zig-side
+/// `handleRPCResponseFromRustBridge` synchronously runs snappy-framed
+/// decompress + SSZ deserialize + chain dispatch on the caller thread, and a
+/// single BlocksByRangeV1 response can stack many MB of work. Moving the call
+/// to a worker thread follows the same off-event-loop pattern used for
+/// inbound gossip and lets quinn + gossipsub keep getting polled while the
+/// chain layer is busy.
 enum RpcWork {
     Request {
         zig_handler: u64,
@@ -1068,7 +1067,7 @@ enum SwarmCommandDropReason {
 /// Cumulative count of swarm commands dropped before reaching the event loop,
 /// indexed by `SwarmCommandDropReason`. Read via `get_swarm_command_dropped_total`
 /// from Zig on each Prometheus scrape; never reset, so a Zig-side tracker can
-/// compute deltas against its last-seen value (issue #808).
+/// compute deltas against its last-seen value.
 static SWARM_COMMAND_DROPPED_TOTAL: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -1102,13 +1101,12 @@ fn record_mesh_peers(network_id: u32, count: u64) {
 }
 
 // `dump_failed_gossip_payload` / `MAX_FAILED_GOSSIP_DUMPS` / `FAILED_GOSSIP_DUMP_COUNTER`
-// were removed in #942 phase 4. See the long-form rationale at the call site
-// (the `Behaviour::poll`-side comment in the gossipsub `Event::Message` arm):
-// the Rust-side per-failure dump duplicated the Zig-side
-// `failed_snappyz_decode_*.bin` dumps written by `writeFailedBytes`, and the
+// were removed. See the long-form rationale at the call site (the comment in
+// the gossipsub `Event::Message` arm): the Rust-side per-failure dump
+// duplicated the Zig-side failed-decode dumps, and the
 // `Decoder::new().decompress_vec` it gated on was the second synchronous
-// decompress per gossip message — together they jammed the libp2p event
-// loop on broken-snappy bombs on the 2026-05-29 devnet.
+// decompress per gossip message — together they jammed the libp2p event loop
+// on broken-snappy bombs.
 
 /// FFI getter: cumulative count of dropped swarm commands for the given
 /// reason tag (see `SwarmCommandDropReason`). Returns 0 for unknown tags so
@@ -1142,7 +1140,7 @@ pub extern "C" fn get_swarm_command_dropped_total(reason_tag: u32) -> u64 {
 /// distinction becomes load-bearing — see follow-up TODO in the
 /// 1s-tick / event-loop wiring above).
 ///
-/// leanMetrics PR #35 — `lean_gossip_mesh_peers`. The value is updated from
+/// Backs the `lean_gossip_mesh_peers` metric. The value is updated from
 /// inside the swarm task on the gossipsub events that change mesh
 /// membership (Subscribed/Unsubscribed/GossipsubNotSupported/SlowPeer
 /// — not Message), on every connection close, and on a 1s liveness tick.
@@ -1170,12 +1168,11 @@ lazy_static::lazy_static! {
     // panic, so all waiters must park on this one shared instance.
     static ref NETWORK_READY_LOCK: Mutex<()> = Mutex::new(());
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
-    // #942 fix (post-bypass A/B verdict): the reconnect-scheduling
-    // delay map used to live here as `RECONNECT_QUEUE: HashMapDelay`,
-    // polled from arm 3 of the swarm task's biased `select!`. The bypass
-    // build (883318f5) proved that gating both `schedule_reconnection`
-    // call sites converted a deterministic 0/8-zeam-sync failure into
-    // 5/8-success — i.e., this delay-map's interaction with the swarm
+    // The reconnect-scheduling delay map used to live here as
+    // `RECONNECT_QUEUE: HashMapDelay`, polled from arm 3 of the swarm task's
+    // biased `select!`. An A/B test that gated both `schedule_reconnection`
+    // call sites converted a deterministic all-nodes sync failure into a
+    // majority-success run — i.e., this delay-map's interaction with the swarm
     // task was the primary trigger of the permanent waker-loss freeze.
     // Replaced with `tokio::spawn` + `tokio::time::sleep` +
     // `SwarmCommand::DialReconnect`: the delayed action is owned by a
@@ -1186,17 +1183,17 @@ lazy_static::lazy_static! {
     static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::Sender<SwarmCommand>>> = Mutex::new(HashMap::new());
     static ref COMMAND_RECEIVERS: Mutex<HashMap<u32, mpsc::Receiver<SwarmCommand>>> = Mutex::new(HashMap::new());
 
-    // #942 fix: cache message_id_fn results so we don't re-decompress the same
+    // Cache message_id_fn results so we don't re-decompress the same
     // raw-bytes payload on the gossipsub event-loop thread. With ~21 mesh
-    // peers each forwarding the same block, the spec-mandated decompress
+    // peers each forwarding the same block, the required decompress
     // inside `message_id_fn` was running ~21x per block on the same thread
-    // that drives quinn's QUIC poll futures. Devnet evidence pinned a ~10s
-    // simultaneous freeze of every poll_read AND poll_write at slot 58→61,
-    // which fits an accumulated burst of these synchronous decompresses
-    // perfectly. The cache key is `sha2::Sha256(message.data)` (the raw
-    // wire bytes); the value is the spec-conformant content-addressed id we
-    // would otherwise have just recomputed. Bounded FIFO eviction so the
-    // mutex stays small. See `cached_message_id_fn` below.
+    // that drives quinn's QUIC poll futures. We observed a ~10s simultaneous
+    // freeze of every poll_read AND poll_write, which fits an accumulated
+    // burst of these synchronous decompresses perfectly. The cache key is
+    // `sha2::Sha256(message.data)` (the raw wire bytes); the value is the
+    // content-addressed message id we would otherwise have just recomputed.
+    // Bounded FIFO eviction so the mutex stays small. See `cached_message_id_fn`
+    // below.
     static ref MESSAGE_ID_CACHE: Mutex<MessageIdCache> = Mutex::new(MessageIdCache::new(MESSAGE_ID_CACHE_CAPACITY));
 }
 
@@ -1260,7 +1257,7 @@ impl MessageIdCache {
 ///
 /// One fixed-size lock-free slot per network, indexed by `network_id`,
 /// mirroring the `[AtomicU64; 3]` shape used by
-/// `SWARM_COMMAND_DROPPED_TOTAL` (issue #808). The hardcoded slot table
+/// `SWARM_COMMAND_DROPPED_TOTAL`. The hardcoded slot table
 /// at the top of this file (`get_swarm_mut`, `set_swarm`, …) caps live
 /// networks at `MAX_NETWORKS = 3`, so we don't need a `Mutex<HashMap>`
 /// to handle dynamic growth — and avoiding the mutex drops the
@@ -1319,7 +1316,7 @@ pub unsafe extern "C" fn stop_network(network_id: u32) {
         // Reset the mesh-peers slot so repeated start/stop cycles don't show a
         // stale count from the previous run; `get_mesh_peers_total` returns 0
         // for slots that have never been written. The `[AtomicU64; MAX_NETWORKS]`
-        // shape (#818) means there is no entry to remove — just a counter to
+        // shape means there is no entry to remove — just a counter to
         // zero — and no mutex to poison on shutdown.
         if let Some(slot) = MESH_PEERS_TOTAL.get(network_id as usize) {
             slot.store(0, Ordering::Relaxed);
@@ -1524,10 +1521,10 @@ unsafe fn create_and_run_network_inner(
 
     release_params();
 
-    // #942: run the libp2p/quinn stack on a multi-threaded tokio runtime.
+    // Run the libp2p/quinn stack on a multi-threaded tokio runtime.
     //
     // Previously this was `new_current_thread()`, which drove BOTH the swarm
-    // future (which calls the spec-mandated synchronous snappy decompress
+    // future (which calls the required synchronous snappy decompress
     // inside `message_id_fn`) AND quinn's UDP endpoint-driver task on a single
     // thread. A 3.3MB block decompressing for hundreds of ms therefore starved
     // quinn's receive path mid-reassembly -> the cross-copy byte-bleed
@@ -1777,13 +1774,12 @@ unsafe fn send_rpc_request_inner(
 
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     let request_message = RequestMessage::new(protocol_id.clone(), request_bytes);
-    // NOTE: do NOT touch REQUEST_ID_MAP / REQUEST_PROTOCOL_MAP here — both
-    // inserts now happen on the event-loop side (`SendRpcRequest` arm). See
-    // the comment on `SendRpcRequest` for the rationale: `HashMapDelay::insert`
-    // schedules a `tokio::time::sleep` for the entry timeout and panics if
-    // called outside a Tokio runtime, but FFI entry points run on whatever
-    // thread Zig calls in on (typically the libxev event loop), which has no
-    // runtime attached. Issue #837.
+    // Do not touch REQUEST_ID_MAP / REQUEST_PROTOCOL_MAP here — both inserts
+    // now happen on the event-loop side (`SendRpcRequest` arm). See the comment
+    // on `SendRpcRequest` for the rationale: `HashMapDelay::insert` schedules a
+    // `tokio::time::sleep` for the entry timeout and panics if called outside a
+    // Tokio runtime, but FFI entry points run on whatever thread Zig calls in on
+    // (typically the libxev event loop), which has no runtime attached.
     match tx.try_send(SwarmCommand::SendRpcRequest {
         peer_id,
         request_id,
@@ -1869,7 +1865,7 @@ unsafe fn send_rpc_response_chunk_inner(
     // runtime, which is exactly what happens here when Zig's libxev thread
     // calls in. Refreshing on the executor side is also the more accurate
     // semantic — the timeout reflects "still actively serving" and we are
-    // about to call `send_response` over there. #837
+    // about to call `send_response` over there.
     let channel = RESPONSE_CHANNEL_MAP
         .lock_recover()
         .get(&channel_id)
@@ -2123,7 +2119,7 @@ impl Network {
                 ),
             );
             self.peer_addr_map.remove(&peer_id);
-            // RECONNECT_ATTEMPTS cleanup REMOVED here intentionally (#942).
+            // RECONNECT_ATTEMPTS cleanup REMOVED here intentionally.
             //
             // Every caller that can reach this branch already removed the
             // entry from RECONNECT_ATTEMPTS BEFORE calling us (that's how
@@ -2134,11 +2130,10 @@ impl Network {
             //   - DialReconnect cmd_rx handler on dial error: same pattern
             // So re-acquiring the lock here was always a no-op (`.remove(&K)`
             // on a key already absent) AND empirically it wedges the swarm
-            // task — devnet image e6c3c1d3 (commit 03b4ef39) on 2026-05-30
-            // froze zeam_13 at 18:48:14.894, the very first time this branch
-            // was hit: "Max reconnection attempts" warn fires, then zero
-            // further rust-bridge log lines from the swarm task. The
-            // `let`-binding fix in 03b4ef39 SHOULD have released the outer
+            // task — a node froze the very first time this branch was hit:
+            // "Max reconnection attempts" warn fires, then zero further
+            // rust-bridge log lines from the swarm task. Binding the
+            // `.remove()` result to a `let` SHOULD have released the outer
             // guard at the `;` (Rust temporary scope rules say so), but
             // rather than hunt theoretical reasons why it didn't, the
             // cleanest fix is to not take the lock here at all.
@@ -2158,13 +2153,13 @@ impl Network {
             ),
         );
 
-        // #942 fix: the delayed action runs in a detached tokio task —
+        // The delayed action runs in a detached tokio task —
         // sleep + send a `SwarmCommand::DialReconnect`. The previous
         // implementation polled a `HashMapDelay` from arm 3 of the swarm
         // task's biased `select!`; that pollNext + the connection-error
         // body's interaction was the trigger for the permanent waker
-        // loss that wedged 8/8 zeam nodes at slot ~65 on prior runs
-        // (the bypass A/B test in 883318f5 produced 5/8 sync vs 0/8).
+        // loss that wedged every node on prior runs (an A/B test that
+        // bypassed it recovered the majority of nodes versus none).
         // A detached task only touches the per-network swarm command
         // channel, which is the same channel Zig FFI dispatches use, so
         // we re-use the existing back-pressure / drop bookkeeping.
@@ -2275,7 +2270,7 @@ impl Network {
             .lock_recover()
             .insert(self.network_id, cmd_rx);
 
-        // leanMetrics PR #35: with the fixed-size `[AtomicU64;
+        // With the fixed-size `[AtomicU64;
         // MAX_NETWORKS]` shape, slots are always present (default 0). No
         // explicit allocation is required. The 1s mesh-peers tick will
         // overwrite the slot with the real count on its first fire, and
@@ -2338,23 +2333,23 @@ impl Network {
             }
         };
 
-        // leanMetrics PR #35: 1s liveness tick that recomputes the gossipsub
+        // 1s liveness tick that recomputes the gossipsub
         // mesh-peer count even when no swarm/gossipsub events are firing.
         // Gossipsub events should already cover all transitions; the tick is
         // defensive so an idle topic still reports a fresh value on scrape.
         let mut mesh_peers_tick = tokio::time::interval(Duration::from_secs(1));
         mesh_peers_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // #942 fix-#5 follow-up: per-substream QUIC diag lines run in their own
-        // tokio task. The previous in-arm version sat in the LAST arm of this
-        // function's biased select! and devnet evidence (slot 65 onward) showed
-        // it was starved as soon as reqresp-status retries became continuous,
+        // Per-substream QUIC diag lines run in their own tokio task. The
+        // previous in-arm version sat in the LAST arm of this function's
+        // biased select! and observed evidence showed it was starved as soon
+        // as reqresp-status retries became continuous,
         // exactly when the freeze deepened. The spawned task only reads atomic
         // counters from the SUBSTREAMS registries and does not need swarm
         // access, so it keeps emitting through the freeze.
         spawn_quic_diag_emitter(self.network_id, shutdown.clone());
 
-        // #942: hand inbound gossip off to a dedicated decode worker thread so
+        // Hand inbound gossip off to a dedicated decode worker thread so
         // the synchronous snappy-decompress + SSZ-deserialize + chain dispatch
         // does not block this tokio thread, which also drives quinn's QUIC I/O.
         // A single worker keeps `onGossip` serialized exactly as it was when the
@@ -2366,11 +2361,12 @@ impl Network {
             .spawn(move || run_inbound_gossip_worker(gossip_rx))
             .expect("failed to spawn inbound gossip decode worker thread");
 
-        // #942 fix: reqresp FFI dispatch also off the event-loop thread.
-        // The 15 s arm-body spikes observed on the 883318f5 devnet were
+        // Reqresp FFI dispatch also off the event-loop thread.
+        // The 15 s arm-body spikes we observed were
         // SwarmEvent::Behaviour(Reqresp(_)) bodies running synchronous
         // snappy-framed-decompress + SSZ-deserialize + chain dispatch on
-        // the swarm task; mirrors the gossip worker pattern above.
+        // the swarm task; this follows the same off-event-loop pattern as the
+        // gossip worker above.
         let (rpc_tx, rpc_rx) =
             std::sync::mpsc::sync_channel::<RpcWork>(INBOUND_RPC_CHANNEL_CAPACITY);
         let rpc_worker = std::thread::Builder::new()
@@ -2378,16 +2374,16 @@ impl Network {
             .spawn(move || run_inbound_rpc_worker(rpc_rx))
             .expect("failed to spawn inbound reqresp dispatch worker thread");
 
-        // #942 diagnosis: throttle the per-kind gossip-arrival summary to roughly
+        // Diagnostic: throttle the per-kind gossip-arrival summary to roughly
         // every 10th mesh_peers tick (~10s) so the log shows the block/attestation
         // delivery trend without flooding.
         let mut diag_tick_count: u64 = 0;
 
         'eventloop: loop {
             // Measure wall-clock spent inside this iteration's `select!`
-            // (which includes the chosen arm's synchronous body). Devnet
-            // evidence (slot 58→61, simultaneous bidirectional freeze of
-            // every poll_read AND poll_write) implies one arm body ran
+            // (which includes the chosen arm's synchronous body). The
+            // observed simultaneous bidirectional freeze of every poll_read
+            // AND poll_write implies one arm body ran
             // synchronously for ~10 s, since both directions are driven by
             // this single task. The `dt_ms` capture below pins which
             // iteration spent the time.
@@ -2437,7 +2433,7 @@ impl Network {
                                     logger::rustLogger.warn(
                                         self.network_id,
                                         &format!(
-                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Timeout (total={}): {:?}",
+                                            "inbound reqresp dispatch queue full (cap={}); dropped Timeout (total={}): {:?}",
                                             INBOUND_RPC_CHANNEL_CAPACITY,
                                             total,
                                             e,
@@ -2453,7 +2449,7 @@ impl Network {
                 }
             }
 
-            // arm 3 (RECONNECT_QUEUE poll_next) removed in #942 fix: the
+            // arm 3 (RECONNECT_QUEUE poll_next) removed: the
             // delay-map polled here was the trigger of the swarm-task
             // waker loss. Reconnect dials are now driven by
             // `SwarmCommand::DialReconnect` posted by detached
@@ -2559,7 +2555,7 @@ impl Network {
                                 ..
                             } => {
                                 enter_swarm_event(3);
-                                // leanMetrics PR #35: a peer leaving may evict
+                                // A peer leaving may evict
                                 // it from the gossipsub mesh; recompute first
                                 // so the metric reflects the new state even if
                                 // a `continue` below skips out early.
@@ -2689,8 +2685,8 @@ impl Network {
                                 // `schedule_reconnection` re-acquires the same Mutex on the
                                 // `attempt > MAX_RECONNECT_ATTEMPTS` branch — with the guard
                                 // still held, that's a re-entrant std::Mutex deadlock on the
-                                // same thread, which is exactly the wedge that re-appeared
-                                // on the c6cf2241 devnet run (all 8 zeam nodes frozen with
+                                // same thread, which is exactly the wedge we observed
+                                // (every node frozen with
                                 // `swarm_ev_var=4(OutgoingConnectionError) age=1000s+`,
                                 // probabilistic because it only triggers once a peer's
                                 // attempt count climbs past 5).
@@ -2704,7 +2700,7 @@ impl Network {
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub_event)) => {
                             enter_swarm_event(5);
-                            // leanMetrics PR #35: gate the mesh-peer recompute on
+                            // Gate the mesh-peer recompute on
                             // the gossipsub event variants that actually change
                             // mesh membership. `Message` does NOT — a busy node
                             // can deliver hundreds of `Message` events per second
@@ -2748,7 +2744,7 @@ impl Network {
                                 ..
                             } = gossipsub_event
                             {
-                                // #942: do NOT decode here. The full
+                                // Do NOT decode here. The full
                                 // snappy-decompress + SSZ-deserialize + chain
                                 // dispatch (`handleMsgFromRustBridge`) used to
                                 // run inline on this thread, which also drives
@@ -2756,14 +2752,14 @@ impl Network {
                                 // blocked the event loop for hundreds of ms,
                                 // starving the QUIC receive path — the root
                                 // cause of the inbound snappy corruption (the
-                                // cross-message byte-bleed in issue_942_layer.md)
-                                // and the earlier 148 broken QUIC handshakes / 8
-                                // Status-RPC timeouts. We now only build the
+                                // cross-message byte-bleed) and the earlier 148
+                                // broken QUIC handshakes / 8 Status-RPC timeouts.
+                                // We now only build the
                                 // hand-off record (cheap) and pass ownership of
                                 // the payload to the decode worker thread; the
                                 // ingress sha256 forensic log moved there too.
                                 let topic_str = message.topic.as_str();
-                                // #942 diagnosis: count this DELIVERED message by
+                                // Diagnostic: count this DELIVERED message by
                                 // topic kind before any decode work, so the
                                 // periodic log can show whether block-topic
                                 // delivery has gone silent while the mesh is up.
@@ -2822,7 +2818,7 @@ impl Network {
                                             .fetch_add(1, Ordering::Relaxed)
                                             + 1;
                                         logger::rustLogger.warn(self.network_id, &format!(
-                                            "[#942] inbound gossip decode queue full (cap={}); dropped topic={} len={} (dropped_total={}). Missed block recoverable via blocks_by_root/range RPC sync.",
+                                            "inbound gossip decode queue full (cap={}); dropped topic={} len={} (dropped_total={}). Missed block recoverable via blocks_by_root/range RPC sync.",
                                             INBOUND_GOSSIP_CHANNEL_CAPACITY,
                                             dropped.topic.to_string_lossy(),
                                             dropped.data.len(),
@@ -2832,7 +2828,7 @@ impl Network {
                                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                                         logger::rustLogger.error(
                                             self.network_id,
-                                            "[#942] inbound gossip decode worker gone; dropping message",
+                                            "inbound gossip decode worker gone; dropping message",
                                         );
                                     }
                                 }
@@ -2906,7 +2902,7 @@ impl Network {
                                     logger::rustLogger.warn(
                                         self.network_id,
                                         &format!(
-                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Request (total={}): {:?}",
+                                            "inbound reqresp dispatch queue full (cap={}); dropped Request (total={}): {:?}",
                                             INBOUND_RPC_CHANNEL_CAPACITY,
                                             total,
                                             e,
@@ -2954,8 +2950,8 @@ impl Network {
                                 // synchronous Zig handler does snappy-framed
                                 // decompress + SSZ deserialize + chain
                                 // dispatch (handleRPCResponseFromRustBridge);
-                                // on the 883318f5 devnet this stalled the
-                                // swarm task for ~15 s per large response.
+                                // we observed this stall the swarm task for
+                                // ~15 s per large response.
                                 let work = RpcWork::Response {
                                     zig_handler: self.zig_handler,
                                     request_id,
@@ -2969,7 +2965,7 @@ impl Network {
                                     logger::rustLogger.warn(
                                         self.network_id,
                                         &format!(
-                                            "[#942] inbound reqresp dispatch queue full (cap={}); dropped Response (total={}): {:?}",
+                                            "inbound reqresp dispatch queue full (cap={}); dropped Response (total={}): {:?}",
                                             INBOUND_RPC_CHANNEL_CAPACITY,
                                             total,
                                             e,
@@ -3018,7 +3014,7 @@ impl Network {
                                         logger::rustLogger.warn(
                                             self.network_id,
                                             &format!(
-                                                "[#942] inbound reqresp dispatch queue full (cap={}); dropped EndOfStream (total={}): {:?}",
+                                                "inbound reqresp dispatch queue full (cap={}); dropped EndOfStream (total={}): {:?}",
                                                 INBOUND_RPC_CHANNEL_CAPACITY,
                                                 total,
                                                 e,
@@ -3071,7 +3067,7 @@ impl Network {
                                             logger::rustLogger.warn(
                                                 self.network_id,
                                                 &format!(
-                                                    "[#942] inbound reqresp dispatch queue full (cap={}); dropped OutboundError (total={}): {:?}",
+                                                    "inbound reqresp dispatch queue full (cap={}); dropped OutboundError (total={}): {:?}",
                                                     INBOUND_RPC_CHANNEL_CAPACITY,
                                                     total,
                                                     e,
@@ -3140,7 +3136,7 @@ impl Network {
                         // reqresp arms below to match it. The inserts live here
                         // (and not in the FFI entry point) because
                         // `HashMapDelay::insert` requires a live Tokio runtime
-                        // — see the matching note in `send_rpc_request`. #837
+                        // — see the matching note in `send_rpc_request`.
                         REQUEST_ID_MAP.lock_recover().insert(request_id, ());
                         REQUEST_PROTOCOL_MAP
                             .lock_recover()
@@ -3166,7 +3162,7 @@ impl Network {
                         // in `send_rpc_response_chunk`. If the channel was
                         // already torn down (end-of-stream / sweep) between
                         // dispatch and now, `update_timeout` is a no-op,
-                        // which is the desired semantics. #837
+                        // which is the desired semantics.
                         let _ = RESPONSE_CHANNEL_MAP
                             .lock_recover()
                             .update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
@@ -3276,7 +3272,7 @@ impl Network {
                 }
             }
 
-            // leanMetrics PR #35: 1s defensive recompute of the gossipsub
+            // 1s defensive recompute of the gossipsub
             // mesh-peer count. Gossipsub events / connection closes already
             // cover transitions, but this guarantees liveness on idle topics.
             // `all_mesh_peers().count()` is cheap (O(peers)) and the atomic
@@ -3287,7 +3283,7 @@ impl Network {
                 let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
                 record_mesh_peers(self.network_id, mesh_count);
 
-                // #942 diagnosis: every ~10s, log the per-topic-kind count of
+                // Diagnostic: every ~10s, log the per-topic-kind count of
                 // gossipsub Messages delivered so far plus the per-topic mesh
                 // size. If the block counter stops climbing while the block
                 // topic still has mesh peers, blocks have stopped ARRIVING
@@ -3311,15 +3307,15 @@ impl Network {
                     logger::rustLogger.debug(
                         self.network_id,
                         &format!(
-                            "[#942 gossip-recv] delivered_total block={block_recv} attn={attn_recv} other={other_recv} | mesh_peers total={mesh_count}{topic_mesh} | inbound_decode_dropped={}",
+                            "[gossip-recv] delivered_total block={block_recv} attn={attn_recv} other={other_recv} | mesh_peers total={mesh_count}{topic_mesh} | inbound_decode_dropped={}",
                             INBOUND_GOSSIP_DROPPED_TOTAL.load(Ordering::Relaxed),
                         ),
                     );
                     // NOTE: the per-substream QUIC accounting lines
-                    // ([#942 quic-recv] / [#942 quic-send]) are emitted from a
+                    // ([quic-recv] / [quic-send]) are emitted from a
                     // dedicated spawned task (spawn_quic_diag_emitter, started in
                     // run_eventloop). They MUST NOT live in this arm: it is the
-                    // last arm of a biased select! and devnet data showed it
+                    // last arm of a biased select! and observed data showed it
                     // never gets polled once reqresp-status retries become
                     // continuous, so the per-stream signal disappears exactly
                     // when the freeze deepens. The spawned task uses its own
@@ -3330,7 +3326,7 @@ impl Network {
 
             }
 
-            // #942 iteration-latency probe: record how long this iteration
+            // Iteration-latency probe: record how long this iteration
             // of the swarm task's `select!` took. The atomics are read by
             // `spawn_quic_diag_emitter` and reset (max) each tick.
             let dt_ms = iter_start.elapsed().as_millis() as u64;
@@ -3340,7 +3336,7 @@ impl Network {
             }
         }
 
-        // #942: stop the inbound gossip decode worker. Dropping the sender makes
+        // Stop the inbound gossip decode worker. Dropping the sender makes
         // the worker's blocking `recv()` return `Err` once the channel drains,
         // so it finishes any queued messages and exits. Joining here — on the
         // rust-bridge thread, before this function returns and Zig joins it —
@@ -3398,18 +3394,15 @@ impl From<MessageDomain> for [u8; 4] {
 
 impl Behaviour {
     fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
-        // #942 follow-up: restore spec-conformant content-addressed
-        // `message_id` (Ethereum gossipsub convention:
+        // Content-addressed `message_id` (Ethereum gossipsub convention:
         //   `SHA256(domain_tag || topic_len || topic || decompressed_bytes)`).
         //
-        // The raw-bytes form that was here previously caused zeam to assign
-        // distinct message-ids to byte-different but content-identical
-        // copies of the same logical message. On the 2026-05-28/29 devnet
-        // we observed 8 distinct corrupted-snappy encodings of the same
-        // slot=1 block (`data_len=285473`, same `sha256_first32` prefix)
-        // arriving at zeam_8 in 70 s, all from forwarder peers' mcaches
-        // (gean_1, zeam_13, _14, _15). Under raw-bytes hashing zeam
-        // computed 8 distinct ids, attempted to decode all 8, failed all 8.
+        // A raw-bytes form assigns distinct message-ids to byte-different but
+        // content-identical copies of the same logical message. We observed 8
+        // distinct corrupted-snappy encodings of the same slot=1 block
+        // (`data_len=285473`, same `sha256_first32` prefix) arriving at a node
+        // in 70 s, all from forwarder peers' mcaches. Under raw-bytes hashing a
+        // node computes 8 distinct ids, attempts to decode all 8, fails all 8.
         // Under content-addressed hashing, the first clean copy wins; all
         // subsequent copies with the same decompressed content dedupe to
         // the same id and are dropped by gossipsub before the application
@@ -3418,8 +3411,8 @@ impl Behaviour {
         // Cost: synchronous decompress on the gossipsub event loop. With
         // ~21 mesh peers each forwarding the same block, this used to run
         // ~21x per block on the same thread that drives quinn's QUIC poll
-        // futures; devnet evidence (slot 58→61 simultaneous freeze of every
-        // poll_read AND poll_write) pinned that accumulation as the proximal
+        // futures; the observed simultaneous freeze of every poll_read AND
+        // poll_write pinned that accumulation as the proximal
         // cause of the libp2p event-loop stall. Mitigated below by an FIFO
         // cache keyed on the raw-bytes SHA256: identical-bytes re-forwards
         // skip the decompress entirely.
@@ -3499,7 +3492,7 @@ impl Behaviour {
 }
 
 fn new_swarm(local_keypair: Keypair, network_id: u32) -> libp2p::swarm::Swarm<Behaviour> {
-    // #942 transport bisection: the inbound snappy corruption is provably
+    // Transport bisection: the inbound snappy corruption is provably
     // introduced on zeam's receive path after AEAD decryption (ingress hash
     // differs from the producer's publish hash, and both QUIC and TCP+noise
     // are integrity-protected, ruling out the wire). To split the search
@@ -3514,7 +3507,7 @@ fn new_swarm(local_keypair: Keypair, network_id: u32) -> libp2p::swarm::Swarm<Be
     );
     logger::rustLogger.info(
         network_id,
-        &format!("[#942 transport] quic_support={quic_support} (set ZEAM_DISABLE_QUIC=1 to force TCP+yamux+noise only)"),
+        &format!("[transport] quic_support={quic_support} (set ZEAM_DISABLE_QUIC=1 to force TCP+yamux+noise only)"),
     );
     let transport = build_transport(local_keypair.clone(), quic_support).unwrap();
     logger::rustLogger.debug(network_id, "build the transport");
@@ -3537,12 +3530,12 @@ fn build_transport(
     local_private_key: Keypair,
     quic_support: bool,
 ) -> std::io::Result<BoxedTransport> {
-    // #942: yamux-only on the TCP side. Previously this transport also
+    // Yamux-only on the TCP side. Previously this transport also
     // negotiated `libp2p-mplex` via `SelectUpgrade::new(yamux, mplex)`, which
     // caused gossip messages larger than ~100 KB to arrive corrupted at the
     // gossipsub layer — `snap::raw::Decoder` rejected 38 of 72 incoming
-    // blocks and 28 of 402 incoming aggregations on the 2026-05-28 devnet
-    // while ream / grandine on the same network saw zero gossip decode
+    // blocks and 28 of 402 incoming aggregations, while ream / grandine on the
+    // same network saw zero gossip decode
     // failures. mplex is deprecated upstream and is the only differing
     // transport feature between zeam and the clients that worked. Dropping
     // it means TCP connections use yamux exclusively, QUIC keeps its native
@@ -3558,7 +3551,7 @@ fn build_transport(
     let transport = if quic_support {
         // Enables Quic
         //
-        // #942 fix #4 — QUIC receive flow-control windows.
+        // QUIC receive flow-control windows.
         //
         // libp2p-quic's defaults are max_stream_data = 10 MB and
         // max_connection_data = 15 MB. Two problems on this gossip workload:
@@ -3576,7 +3569,7 @@ fn build_transport(
         //    flow control then blocks new STREAM_DATA frames. Small
         //    attestation streams that already arrived still complete and get
         //    delivered, but new LARGE block streams wedge mid-reassembly —
-        //    exactly the pinned #942 signature (block-topic delivery goes
+        //    exactly the pinned failure signature (block-topic delivery goes
         //    silent after the burst while attestations keep flowing on the
         //    same healthy connections).
         //
@@ -3593,7 +3586,7 @@ fn build_transport(
             .or_transport(quic)
             .map(|either_output, _| match either_output {
                 Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-                // #942 fix-#5 diagnostic: wrap the QUIC muxer so inbound
+                // Diagnostic: wrap the QUIC muxer so inbound
                 // substream byte flow is accounted at the quinn boundary.
                 Either::Right((peer_id, muxer)) => (
                     peer_id,
@@ -3802,7 +3795,7 @@ mod tests {
 
     #[test]
     fn test_send_rpc_request_does_not_panic_outside_tokio_runtime() {
-        // Regression test for #837. Before the fix, `send_rpc_request`
+        // Regression test: before the fix, `send_rpc_request`
         // called `REQUEST_ID_MAP.lock().insert(...)` on whatever thread the
         // FFI was invoked from. `HashMapDelay::insert` schedules a
         // `tokio::time::sleep` for the entry timeout and panics with
@@ -3835,7 +3828,7 @@ mod tests {
             )
         })
         .join()
-        .expect("send_rpc_request panicked outside Tokio runtime — #837 regression");
+        .expect("send_rpc_request panicked outside Tokio runtime — regression");
 
         assert!(
             request_id > 0,
@@ -3852,7 +3845,7 @@ mod tests {
 
     #[test]
     fn test_send_rpc_request_does_not_burn_id_on_uninitialized_network() {
-        // Regression test for the comment on PR #789: when the per-network
+        // Regression test: when the per-network
         // command channel is missing, `send_rpc_request` must not advance
         // `REQUEST_ID_COUNTER`. Otherwise every failed FFI call permanently
         // leaks a request id and successive ids skip values.
@@ -3885,7 +3878,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_notify_installed_before_mark_ready() {
-        // Regression test for the review comment on PR #819: previously
+        // Regression test: previously
         // `start_network` called `mark_network_ready` *before* the event loop
         // had installed `shutdown_notify` on the slot. Any `stop_network`
         // racing the start→eventloop handoff therefore saw `ready == true`
@@ -3939,7 +3932,7 @@ mod tests {
 
     #[test]
     fn test_publish_msg_to_rust_bridge_returns_false_when_uninitialized() {
-        // Regression test for issue #808: publish_msg_to_rust_bridge must
+        // Regression test: publish_msg_to_rust_bridge must
         // return false when the per-network swarm command channel does not
         // exist (i.e. the network was never started or has been torn down),
         // so the Zig-side caller can stop logging "published" for messages
@@ -3961,7 +3954,7 @@ mod tests {
     fn test_publish_msg_to_rust_bridge_returns_false_on_null_topic() {
         // Defensive check: the FFI guard against a null topic pointer must
         // also surface as `false` so the Zig caller treats it as a dropped
-        // publish (issue #808).
+        // publish.
         let network_id = next_test_network_id();
         let payload = b"hello";
         let ok = unsafe {
@@ -4004,7 +3997,7 @@ mod tests {
 
     #[test]
     fn test_swarm_command_drop_counter_increments_on_uninitialized() {
-        // Issue #808: every dropped swarm command must bump the per-reason
+        // Every dropped swarm command must bump the per-reason
         // counter exposed via `get_swarm_command_dropped_total` so the Zig
         // metrics layer can publish it as `zeam_libp2p_swarm_command_dropped_total`.
         // Tests run in-process so the counter is shared; assert *delta*, not absolute.
@@ -4042,7 +4035,7 @@ mod tests {
 
     #[test]
     fn test_swarm_command_full_channel_drops_and_counts() {
-        // Issue #808 review point #3: exercise the actual full-channel path
+        // Exercise the actual full-channel path
         // by installing a bounded sender into COMMAND_SENDERS without a
         // matching drainer, pushing past capacity, and asserting the
         // overflow returns false and bumps the Full counter.
