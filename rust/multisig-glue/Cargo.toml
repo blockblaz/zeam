@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 # leanMultisig prover crates, pinned to the upstream rev carrying the merge/split multi-signature API.
-rec_aggregation = { git = "https://github.com/leanEthereum/leanVM.git", rev = "0520822dc64df67886f4a053b60b4de14b181348" }
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanVM.git", rev = "0520822dc64df67886f4a053b60b4de14b181348" }
-backend = { git = "https://github.com/leanEthereum/leanVM.git", rev = "0520822dc64df67886f4a053b60b4de14b181348" }
+rec_aggregation = { git = "https://github.com/leanEthereum/leanVM.git", rev = "e2592df4e30fdddbbf8ae26a333116c68cec7026" }
+leansig_wrapper = { git = "https://github.com/leanEthereum/leanVM.git", rev = "e2592df4e30fdddbbf8ae26a333116c68cec7026" }
+backend = { git = "https://github.com/leanEthereum/leanVM.git", rev = "e2592df4e30fdddbbf8ae26a333116c68cec7026" }
 rayon = "1"
 
 [lib]

@@ -1,7 +1,9 @@
 use leansig_wrapper::{XmssPublicKey, XmssSignature};
 use rec_aggregation::{
-    aggregate_type_1, init_aggregation_bytecode, merge_many_type_1, split_type_2_by_msg,
-    verify_type_1, verify_type_2, TypeOneMultiSignature, TypeTwoMultiSignature,
+    aggregate_single_message_signatures, init_aggregation_bytecode,
+    merge_single_message_aggregates, split_multi_message_aggregate_by_message,
+    verify_multi_message_aggregate, verify_single_message_aggregate,
+    MultiMessageAggregateSignature, SingleMessageAggregateSignature,
 };
 use std::panic::AssertUnwindSafe;
 use std::slice;
@@ -178,7 +180,7 @@ pub unsafe extern "C" fn xmss_aggregate_type_1(
     }
 
     // Child Type-1 proofs: reconstruct each from (pubkeys, no-pubkeys wire).
-    let mut children: Vec<TypeOneMultiSignature> = Vec::with_capacity(num_children);
+    let mut children: Vec<SingleMessageAggregateSignature> = Vec::with_capacity(num_children);
     if num_children > 0 {
         let counts = slice::from_raw_parts(child_num_keys, num_children);
         let proof_ptrs = slice::from_raw_parts(child_proof_ptrs, num_children);
@@ -200,17 +202,17 @@ pub unsafe extern "C" fn xmss_aggregate_type_1(
                 return -1;
             }
             let wire = slice::from_raw_parts(proof_ptrs[i], proof_lens[i]);
-            match TypeOneMultiSignature::decompress_without_pubkeys(wire, pks) {
+            match SingleMessageAggregateSignature::decompress_without_pubkeys(wire, pks) {
                 Some(t1) => children.push(t1),
                 None => return -1,
             }
         }
     }
 
-    // `aggregate_type_1` contains debug asserts (matching message/slot, size bounds); wrap so a
-    // violation returns -1 instead of unwinding across the FFI boundary.
+    // `aggregate_single_message_signatures` contains debug asserts (matching message/slot, size
+    // bounds); wrap so a violation returns -1 instead of unwinding across the FFI boundary.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        aggregate_type_1(&children, raw_xmss, message, slot, log_inv_rate)
+        aggregate_single_message_signatures(&children, raw_xmss, message, slot, log_inv_rate)
     }));
     let t1 = match result {
         Ok(Ok(t1)) => t1,
@@ -225,8 +227,8 @@ pub unsafe extern "C" fn xmss_aggregate_type_1(
 }
 
 /// Verify a Type-1 multi-signature against a resolved pubkey set, message, and slot.
-/// `verify_type_1` checks only the SNARK; the (message, slot) binding is enforced here by
-/// comparing the decoded proof's bound message/slot to the caller-supplied expected values.
+/// `verify_single_message_aggregate` checks only the SNARK; the (message, slot) binding is enforced
+/// here by comparing the decoded proof's bound message/slot to the caller-supplied expected values.
 ///
 /// # Safety
 /// - `public_keys` is an array of `num_keys` non-null pointers (when num_keys > 0).
@@ -256,15 +258,18 @@ pub unsafe extern "C" fn xmss_verify_type_1(
         None => return false,
     };
     let wire = slice::from_raw_parts(type_1_bytes, type_1_len);
-    let sig = match TypeOneMultiSignature::decompress_without_pubkeys(wire, pks) {
+    let sig = match SingleMessageAggregateSignature::decompress_without_pubkeys(wire, pks) {
         Some(s) => s,
         None => return false,
     };
-    // Message + slot binding: verify_type_1 only proves the SNARK, not what was signed.
+    // Message + slot binding: verify_single_message_aggregate only proves the SNARK, not what was signed.
     if sig.info.without_pubkeys.message != message || sig.info.without_pubkeys.slot != slot {
         return false;
     }
-    std::panic::catch_unwind(AssertUnwindSafe(|| verify_type_1(&sig).is_ok())).unwrap_or(false)
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        verify_single_message_aggregate(&sig).is_ok()
+    }))
+    .unwrap_or(false)
 }
 
 /// Merge N Type-1 proofs (each over a distinct message) into one Type-2 multi-message proof.
@@ -300,7 +305,7 @@ pub unsafe extern "C" fn xmss_merge_type_1_to_type_2(
     let proof_ptrs = slice::from_raw_parts(type_1_proof_ptrs, num_parts);
     let proof_lens = slice::from_raw_parts(type_1_proof_lens, num_parts);
     let counts = slice::from_raw_parts(pks_per_part_counts, num_parts);
-    let mut parts: Vec<TypeOneMultiSignature> = Vec::with_capacity(num_parts);
+    let mut parts: Vec<SingleMessageAggregateSignature> = Vec::with_capacity(num_parts);
     let mut offset = 0usize;
     for i in 0..num_parts {
         let n = counts[i];
@@ -317,13 +322,14 @@ pub unsafe extern "C" fn xmss_merge_type_1_to_type_2(
             return -1;
         }
         let wire = slice::from_raw_parts(proof_ptrs[i], proof_lens[i]);
-        match TypeOneMultiSignature::decompress_without_pubkeys(wire, pks) {
+        match SingleMessageAggregateSignature::decompress_without_pubkeys(wire, pks) {
             Some(t1) => parts.push(t1),
             None => return -1,
         }
     }
-    let result =
-        std::panic::catch_unwind(AssertUnwindSafe(|| merge_many_type_1(parts, log_inv_rate)));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        merge_single_message_aggregates(parts, log_inv_rate)
+    }));
     let t2 = match result {
         Ok(Ok(t2)) => t2,
         _ => return -1,
@@ -385,12 +391,12 @@ pub unsafe extern "C" fn xmss_split_type_2_by_msg(
         per_msg.push(pks);
     }
     let wire = slice::from_raw_parts(type_2_bytes, type_2_len);
-    let type_2 = match TypeTwoMultiSignature::decompress_without_pubkeys(wire, per_msg) {
+    let type_2 = match MultiMessageAggregateSignature::decompress_without_pubkeys(wire, per_msg) {
         Some(t) => t,
         None => return -1,
     };
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        split_type_2_by_msg(type_2, target, log_inv_rate)
+        split_multi_message_aggregate_by_message(type_2, target, log_inv_rate)
     }));
     let t1 = match result {
         Ok(Ok(t1)) => t1,
@@ -404,7 +410,7 @@ pub unsafe extern "C" fn xmss_split_type_2_by_msg(
     )
 }
 
-/// Verify a Type-2 multi-message proof. `verify_type_2` checks only the SNARK; the per-component
+/// Verify a Type-2 multi-message proof. `verify_multi_message_aggregate` checks only the SNARK; the per-component
 /// (message, slot) binding is enforced here by comparing each decoded component's bound
 /// message/slot to the caller-supplied parallel arrays. Without this binding, a proposer could
 /// pair honest signatures with attacker-chosen attestation data that resolves to the same pubkeys.
@@ -446,7 +452,7 @@ pub unsafe extern "C" fn xmss_verify_type_2(
         per_msg.push(pks);
     }
     let wire = slice::from_raw_parts(type_2_bytes, type_2_len);
-    let sig = match TypeTwoMultiSignature::decompress_without_pubkeys(wire, per_msg) {
+    let sig = match MultiMessageAggregateSignature::decompress_without_pubkeys(wire, per_msg) {
         Some(s) => s,
         None => return false,
     };
@@ -466,7 +472,10 @@ pub unsafe extern "C" fn xmss_verify_type_2(
             return false;
         }
     }
-    std::panic::catch_unwind(AssertUnwindSafe(|| verify_type_2(&sig).is_ok())).unwrap_or(false)
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        verify_multi_message_aggregate(&sig).is_ok()
+    }))
+    .unwrap_or(false)
 }
 
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
