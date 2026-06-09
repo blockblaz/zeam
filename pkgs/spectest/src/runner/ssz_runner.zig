@@ -152,7 +152,6 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "State", .zig_type = types.BeamState, .has_deinit = true },
     .{ .name = "Status", .zig_type = types.Status, .has_deinit = false },
     .{ .name = "BlocksByRootRequest", .zig_type = types.BlockByRootRequest, .has_deinit = false },
-    .{ .name = "AggregatedSignatureProof", .zig_type = types.AggregatedSignatureProof, .has_deinit = true },
     .{ .name = "PublicKey", .zig_type = types.Bytes52, .has_deinit = false },
     .{ .name = "SignedBlock", .zig_type = types.SignedBlock, .has_deinit = true },
     .{ .name = "SignedAttestation", .zig_type = types.SignedAttestation, .has_deinit = false, .test_zig_type = TestSignedAttestation, .test_has_deinit = false },

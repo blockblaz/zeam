@@ -51,7 +51,7 @@ const MAX_RPC_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 /// Gossip block message size limit.
 ///
 /// XMSS/post-quantum signatures are substantially larger than BLS: a single
-/// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
+/// SingleMessageAggregate can be hundreds of KB, and blocks carry up to
 /// MAX_ATTESTATIONS_DATA (8) attestations each with such a proof. A legitimate
 /// block has been observed at ~9.37 MB, exceeding the 4 MB RPC limit and
 /// triggering error.TooLarge.

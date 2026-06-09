@@ -6896,13 +6896,13 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     };
 
     // Create mock proofs with all 4 validators participating
-    var proof_unseen = try types.AggregatedSignatureProof.init(allocator);
+    var proof_unseen = try types.SingleMessageAggregate.init(allocator);
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_unseen.participants, i, true);
     }
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true);
 
-    var proof_known = try types.AggregatedSignatureProof.init(allocator);
+    var proof_known = try types.SingleMessageAggregate.init(allocator);
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_known.participants, i, true);
     }
@@ -7074,7 +7074,7 @@ test "produceBlock - older-but-justified source is accepted" {
         .source = .{ .root = older_source_root, .slot = older_justified_slot },
     };
     const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
-    var proof = try types.AggregatedSignatureProof.init(allocator);
+    var proof = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true);
 
@@ -7153,10 +7153,10 @@ test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (
     // att_data IS gathered when not deadline-bounded — so the 0 here is the cutoff's doing, not
     // filtering. (One produceBlock call: getProposalHead mutates fork-choice, so it is not
     // idempotent across calls.)
-    var proof_a = try types.AggregatedSignatureProof.init(allocator);
+    var proof_a = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_a.participants, 0, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true);
-    var proof_b = try types.AggregatedSignatureProof.init(allocator);
+    var proof_b = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_b.participants, 1, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true);
 
@@ -7210,7 +7210,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
         .target = .{ .root = parent_root, .slot = 4 },
         .source = .{ .root = types.ZERO_HASH, .slot = justified_slot },
     };
-    var proof_zs = try types.AggregatedSignatureProof.init(allocator);
+    var proof_zs = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zs.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true);
 
@@ -7221,7 +7221,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
         .target = .{ .root = types.ZERO_HASH, .slot = 4 },
         .source = .{ .root = justified_root, .slot = justified_slot },
     };
-    var proof_zt = try types.AggregatedSignatureProof.init(allocator);
+    var proof_zt = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zt.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true);
 
@@ -7233,7 +7233,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
         .target = .{ .root = parent_root, .slot = 4 },
         .source = .{ .root = justified_root, .slot = justified_slot },
     };
-    var proof_valid = try types.AggregatedSignatureProof.init(allocator);
+    var proof_valid = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_valid.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true);
 
@@ -7304,7 +7304,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
         .target = .{ .root = justified_root, .slot = already_justified_slot },
         .source = .{ .root = mock_chain.blockRoots[1], .slot = 1 },
     };
-    var proof_aj = try types.AggregatedSignatureProof.init(allocator);
+    var proof_aj = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
 
@@ -7319,7 +7319,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
         .target = .{ .root = genesis_root, .slot = 0 },
         .source = .{ .root = genesis_root, .slot = 0 },
     };
-    var proof_gsv = try types.AggregatedSignatureProof.init(allocator);
+    var proof_gsv = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_gsv.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true);
 

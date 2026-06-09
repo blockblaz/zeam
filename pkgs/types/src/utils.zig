@@ -237,19 +237,19 @@ test "sszSerializeAndGetBytes roundtrip" {
     try std.testing.expectEqual(data, cloned);
 }
 
-test "sszSerializeAndGetBytes: AggregatedSignatureProof source deinit after serialize" {
+test "sszSerializeAndGetBytes: SingleMessageAggregate source deinit after serialize" {
     const allocator = std.testing.allocator;
 
-    var proof = try types.AggregatedSignatureProof.init(allocator);
+    var proof = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof.participants, 0, true);
     try proof.proof.append(0xAB);
 
-    const bytes = try sszSerializeAndGetBytes(allocator, types.AggregatedSignatureProof, proof);
+    const bytes = try sszSerializeAndGetBytes(allocator, types.SingleMessageAggregate, proof);
     defer allocator.free(bytes);
     proof.deinit();
 
-    var cloned: types.AggregatedSignatureProof = undefined;
-    try ssz.deserialize(types.AggregatedSignatureProof, bytes, &cloned, allocator);
+    var cloned: types.SingleMessageAggregate = undefined;
+    try ssz.deserialize(types.SingleMessageAggregate, bytes, &cloned, allocator);
     defer cloned.deinit();
 
     try std.testing.expect(try cloned.participants.get(0));

@@ -14,7 +14,7 @@ const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const constants = @import("./constants.zig");
 
-const AggregatedSignatureProof = types.AggregatedSignatureProof;
+const SingleMessageAggregate = types.SingleMessageAggregate;
 const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
@@ -1270,7 +1270,7 @@ pub const ForkChoice = struct {
                 defer covered.deinit();
 
                 while (true) {
-                    var best_proof: ?*const types.AggregatedSignatureProof = null;
+                    var best_proof: ?*const types.SingleMessageAggregate = null;
                     var best_new_coverage: usize = 0;
 
                     for (payloads.items) |*stored| {
@@ -1290,7 +1290,7 @@ pub const ForkChoice = struct {
 
                     if (best_proof == null or best_new_coverage == 0) break;
 
-                    var cloned_proof = try zeam_utils.clone(types.AggregatedSignatureProof, best_proof.?, self.allocator);
+                    var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, best_proof.?, self.allocator);
                     errdefer cloned_proof.deinit();
 
                     var att_bits = try zeam_utils.clone(types.AggregationBits, &cloned_proof.participants, self.allocator);
@@ -1809,10 +1809,10 @@ pub const ForkChoice = struct {
     pub fn storeAggregatedPayload(
         self: *Self,
         attestation_data: *const types.AttestationData,
-        proof: types.AggregatedSignatureProof,
+        proof: types.SingleMessageAggregate,
         is_from_block: bool,
     ) !void {
-        var cloned_proof = try zeam_utils.clone(types.AggregatedSignatureProof, &proof, self.allocator);
+        var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, &proof, self.allocator);
         var cloned_proof_owned = true;
         errdefer if (cloned_proof_owned) cloned_proof.deinit();
 
@@ -1843,7 +1843,7 @@ pub const ForkChoice = struct {
                     self.latest_block_aggregated_payloads_slot = attestation_data.slot;
                 }
 
-                var block_proof = try zeam_utils.clone(types.AggregatedSignatureProof, &proof, self.allocator);
+                var block_proof = try zeam_utils.clone(types.SingleMessageAggregate, &proof, self.allocator);
                 var block_proof_owned = true;
                 errdefer if (block_proof_owned) block_proof.deinit();
 
@@ -2125,7 +2125,7 @@ pub const ForkChoice = struct {
     fn buildAggregateSourceAttribution(
         self: *Self,
         att_data: types.AttestationData,
-        proof: *const types.AggregatedSignatureProof,
+        proof: *const types.SingleMessageAggregate,
         source_payload_bits: *types.AggregationBits,
         source_gossip_bits: *types.AggregationBits,
     ) !void {
@@ -2273,7 +2273,7 @@ pub const ForkChoice = struct {
         self: *Self,
         snap: *AggregateSnapshot,
         att_data: types.AttestationData,
-        signature: types.AggregatedSignatureProof,
+        signature: types.SingleMessageAggregate,
     ) !?types.SignedAggregatedAttestation {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
@@ -2300,18 +2300,18 @@ pub const ForkChoice = struct {
         // ssz.serialize corrupts the source value; serialize once, deinit the
         // worker proof, then deserialize separate copies for store and publish
         // so no fallible step runs while signature_live is true.
-        var stored_proof: types.AggregatedSignatureProof = undefined;
+        var stored_proof: types.SingleMessageAggregate = undefined;
         var stored_proof_owned = false;
         errdefer if (stored_proof_owned) stored_proof.deinit();
         const proof_bytes = try types.sszSerializeAndGetBytes(
             self.allocator,
-            types.AggregatedSignatureProof,
+            types.SingleMessageAggregate,
             owned_signature,
         );
         signature_live = false;
         owned_signature.deinit();
         defer self.allocator.free(proof_bytes);
-        try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &stored_proof, self.allocator);
+        try ssz.deserialize(types.SingleMessageAggregate, proof_bytes, &stored_proof, self.allocator);
         stored_proof_owned = true;
 
         try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
@@ -2407,8 +2407,8 @@ pub const ForkChoice = struct {
             },
         );
 
-        var publish_proof: types.AggregatedSignatureProof = undefined;
-        try ssz.deserialize(types.AggregatedSignatureProof, proof_bytes, &publish_proof, self.allocator);
+        var publish_proof: types.SingleMessageAggregate = undefined;
+        try ssz.deserialize(types.SingleMessageAggregate, proof_bytes, &publish_proof, self.allocator);
         return .{ .data = att_data, .proof = publish_proof };
     }
 
@@ -3731,7 +3731,7 @@ fn stageAggregatedAttestation(
 ) !void {
     try fork_choice.onSignedAttestation(signed_attestation, true);
 
-    var proof = try types.AggregatedSignatureProof.init(allocator);
+    var proof = try types.SingleMessageAggregate.init(allocator);
     defer proof.deinit();
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
@@ -3854,7 +3854,7 @@ fn cloneAggregatedPayloadsEntry(
 
     try gop.value_ptr.ensureTotalCapacityPrecise(allocator, src_list.items.len);
     for (src_list.items) |*stored| {
-        var cloned_proof = try zeam_utils.clone(types.AggregatedSignatureProof, &stored.proof, allocator);
+        var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, &stored.proof, allocator);
         errdefer cloned_proof.deinit();
 
         var cloned_source_payload: ?types.AggregationBits = null;
@@ -3880,7 +3880,7 @@ fn cloneAggregatedPayloadsEntry(
 }
 
 /// Deep-clone an `AggregatedPayloadsMap`. Each stored
-/// `AggregatedSignatureProof` is deep-cloned so the destination owns
+/// `SingleMessageAggregate` is deep-cloned so the destination owns
 /// its own Rust XMSS handle (independent refcount). Caller releases
 /// via `deinitAggregatedPayloadsMap`.
 fn cloneAggregatedPayloadsMap(
@@ -4433,7 +4433,7 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
         .source = .{ .root = fork_choice.head.blockRoot, .slot = 0 },
     };
 
-    var signature = try types.AggregatedSignatureProof.init(allocator);
+    var signature = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&signature.participants, 0, true);
     try signature.proof.append(0xAB);
 
@@ -4451,10 +4451,10 @@ test "commitOneAggregateResult: stored and publish proofs are independent SSZ co
     const payloads = fork_choice.latest_new_aggregated_payloads.get(att_data) orelse return error.TestExpectedSome;
     try std.testing.expectEqual(@as(usize, 1), payloads.items.len);
 
-    var cloned_stored = try zeam_utils.clone(types.AggregatedSignatureProof, &payloads.items[0].proof, allocator);
+    var cloned_stored = try zeam_utils.clone(types.SingleMessageAggregate, &payloads.items[0].proof, allocator);
     defer cloned_stored.deinit();
 
-    var cloned_publish = try zeam_utils.clone(types.AggregatedSignatureProof, &signed.proof, allocator);
+    var cloned_publish = try zeam_utils.clone(types.SingleMessageAggregate, &signed.proof, allocator);
     defer cloned_publish.deinit();
 
     try std.testing.expect(try cloned_stored.participants.get(0));

@@ -785,7 +785,7 @@ fn processBlockStep(
         };
         defer indices.deinit(ctx.allocator);
 
-        var proof_template = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+        var proof_template = types.SingleMessageAggregate.init(ctx.allocator) catch |err| {
             std.debug.print(
                 "fixture {s} case {s}{f}: failed to init proof template ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -1046,7 +1046,7 @@ fn processGossipAggregatedAttestationStep(
     }
 
     // Build a proof with participant bits for storage.
-    var proof = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+    var proof = types.SingleMessageAggregate.init(ctx.allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: failed to init proof ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },

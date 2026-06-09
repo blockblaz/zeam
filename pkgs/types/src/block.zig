@@ -163,7 +163,7 @@ pub const SignaturesMap = struct {
 /// Stored aggregated payload entry
 pub const StoredAggregatedPayload = struct {
     slot: Slot,
-    proof: aggregation.AggregatedSignatureProof,
+    proof: aggregation.SingleMessageAggregate,
     /// Validators in `proof` that entered this aggregate through child payloads.
     /// Null for externally supplied/legacy payloads where source attribution is unknown.
     source_payload_participants: ?attestation.AggregationBits = null,
@@ -175,7 +175,7 @@ pub const StoredAggregatedPayload = struct {
 /// List of aggregated payloads for a single key
 pub const AggregatedPayloadsList = std.ArrayList(StoredAggregatedPayload);
 
-/// Map type for aggregated payloads: AttestationData -> list of AggregatedSignatureProof.
+/// Map type for aggregated payloads: AttestationData -> list of SingleMessageAggregate.
 pub const AggregatedPayloadsMap = std.AutoHashMap(attestation.AttestationData, AggregatedPayloadsList);
 
 /// Aggregate all individual gossip signatures in an inner map into a single proof.
@@ -185,7 +185,7 @@ pub fn AggregateInnerMap(
     inner_map: *const SignaturesMap.InnerMap,
     att_data: attestation.AttestationData,
     validators: *const Validators,
-) !aggregation.AggregatedSignatureProof {
+) !aggregation.SingleMessageAggregate {
     var message_hash: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data, &message_hash, allocator);
 
@@ -249,10 +249,10 @@ pub fn AggregateInnerMap(
     for (sigs.items, 0..) |*sig, i| sig_handles[i] = sig.handle;
     for (pks.items, 0..) |*pk, i| pk_handles[i] = pk.handle;
 
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
 
-    try aggregation.AggregatedSignatureProof.aggregate(
+    try aggregation.SingleMessageAggregate.aggregate(
         allocator,
         participants,
         &.{},
@@ -799,7 +799,7 @@ fn extendProofsGreedily(
     allocator: Allocator,
     payloads_map: ?*const AggregatedPayloadsMap,
     att_data: attestation.AttestationData,
-    selected: *std.ArrayList(aggregation.AggregatedSignatureProof),
+    selected: *std.ArrayList(aggregation.SingleMessageAggregate),
     covered: *std.DynamicBitSet,
     gossip_available: *const std.DynamicBitSet,
 ) !void {
@@ -843,7 +843,7 @@ fn extendProofsGreedily(
 
         // Clone and select the best proof
         used[best_idx.?] = true;
-        var cloned = try zeam_utils.clone(aggregation.AggregatedSignatureProof, &candidates.items[best_idx.?].proof, allocator);
+        var cloned = try zeam_utils.clone(aggregation.SingleMessageAggregate, &candidates.items[best_idx.?].proof, allocator);
         errdefer cloned.deinit();
         try selected.append(allocator, cloned);
 
@@ -873,7 +873,7 @@ const CompactGroupEntry = struct {
 
 const CompactGroupResult = struct {
     attestation: AggregatedAttestation,
-    signature: aggregation.AggregatedSignatureProof,
+    signature: aggregation.SingleMessageAggregate,
 };
 
 /// Returns true if every bit set in `subset` is also set in `superset`,
@@ -914,7 +914,7 @@ pub fn participantsContainsAll(superset: attestation.AggregationBits, subset: at
 /// Tie-break for equal sets: keep the lower-indexed entry (which comes from
 /// `new_payloads` first, then `known_payloads`) so behaviour is stable.
 fn pruneSubsumedChildren(
-    selected_children: *std.ArrayList(aggregation.AggregatedSignatureProof),
+    selected_children: *std.ArrayList(aggregation.SingleMessageAggregate),
 ) void {
     if (selected_children.items.len < 2) return;
     var i: usize = 0;
@@ -1063,7 +1063,7 @@ const AggregateAttDataFfiArgs = struct {
     message_hash: [32]u8,
     epoch: u64,
     xmss_participants: ?attestation.AggregationBits,
-    selected_children: []aggregation.AggregatedSignatureProof,
+    selected_children: []aggregation.SingleMessageAggregate,
     child_pk_slices: []const []*const xmss.HashSigPublicKey,
     pk_handles: []*const xmss.HashSigPublicKey,
     sig_handles: []*const xmss.HashSigSignature,
@@ -1145,7 +1145,7 @@ fn prepareAggregateAttData(
         }
     }
 
-    var selected_children: std.ArrayList(aggregation.AggregatedSignatureProof) = .empty;
+    var selected_children: std.ArrayList(aggregation.SingleMessageAggregate) = .empty;
     errdefer {
         for (selected_children.items) |*child| child.deinit();
         selected_children.deinit(allocator);
@@ -1226,7 +1226,7 @@ fn prepareAggregateAttData(
         var att_bits = try zeam_utils.clone(attestation.AggregationBits, &child.participants, allocator);
         errdefer att_bits.deinit();
 
-        var cloned_child = try zeam_utils.clone(aggregation.AggregatedSignatureProof, child, allocator);
+        var cloned_child = try zeam_utils.clone(aggregation.SingleMessageAggregate, child, allocator);
         errdefer cloned_child.deinit();
 
         selected_children.items[0].deinit();
@@ -1419,11 +1419,11 @@ fn runAggregateAttDataFfi(
     data: attestation.AttestationData,
     args: *AggregateAttDataFfiArgs,
 ) !CompactGroupResult {
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
 
     const pq_sig_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
-    try aggregation.AggregatedSignatureProof.aggregate(
+    try aggregation.SingleMessageAggregate.aggregate(
         allocator,
         args.xmss_participants,
         args.selected_children,
@@ -1492,9 +1492,9 @@ const CompactGroupPrep = struct {
 fn compactSingleProof(
     allocator: Allocator,
     att_data: attestation.AttestationData,
-    sig: *const aggregation.AggregatedSignatureProof,
+    sig: *const aggregation.SingleMessageAggregate,
 ) !CompactGroupResult {
-    var cloned_proof = try zeam_utils.clone(aggregation.AggregatedSignatureProof, sig, allocator);
+    var cloned_proof = try zeam_utils.clone(aggregation.SingleMessageAggregate, sig, allocator);
     errdefer cloned_proof.deinit();
 
     var att_bits = try zeam_utils.clone(attestation.AggregationBits, &cloned_proof.participants, allocator);
@@ -1513,26 +1513,26 @@ fn compactMultiProofWithPrep(
     allocator: Allocator,
     att_data: attestation.AttestationData,
     indices: []const usize,
-    sig_slice: []const aggregation.AggregatedSignatureProof,
+    sig_slice: []const aggregation.SingleMessageAggregate,
     child_pk_slices: []const []*const xmss.HashSigPublicKey,
 ) !CompactGroupResult {
     const epoch: u64 = att_data.slot;
     var message_hash: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data, &message_hash, allocator);
 
-    const children = try allocator.alloc(aggregation.AggregatedSignatureProof, indices.len);
+    const children = try allocator.alloc(aggregation.SingleMessageAggregate, indices.len);
     defer allocator.free(children);
     for (indices, 0..) |idx, i| {
         children[i] = sig_slice[idx];
     }
 
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
 
     const empty_pks: []*const xmss.HashSigPublicKey = &.{};
     const empty_sigs: []*const xmss.HashSigSignature = &.{};
 
-    try aggregation.AggregatedSignatureProof.aggregate(
+    try aggregation.SingleMessageAggregate.aggregate(
         allocator,
         null, // no raw XMSS participants
         children,
@@ -1556,7 +1556,7 @@ fn compactMultiProofWithPrep(
 fn runCompactGroupPrep(
     allocator: Allocator,
     prep: CompactGroupPrep,
-    sig_slice: []const aggregation.AggregatedSignatureProof,
+    sig_slice: []const aggregation.SingleMessageAggregate,
 ) !CompactGroupResult {
     if (prep.entry.indices.len == 1) {
         return compactSingleProof(allocator, prep.entry.att_data, &sig_slice[prep.entry.indices[0]]);
@@ -1751,7 +1751,7 @@ pub fn compactAttestations(
         fn runScope(
             scope: anytype,
             preps_in: []const CompactGroupPrep,
-            sigs: []const aggregation.AggregatedSignatureProof,
+            sigs: []const aggregation.SingleMessageAggregate,
             alloc: Allocator,
             out_slots: []CompactGroupSlot,
             any_err: *std.atomic.Value(bool),
@@ -1765,7 +1765,7 @@ pub fn compactAttestations(
         fn runOne(
             alloc: Allocator,
             prep: CompactGroupPrep,
-            sigs: []const aggregation.AggregatedSignatureProof,
+            sigs: []const aggregation.SingleMessageAggregate,
             out_slot: *CompactGroupSlot,
             any_err: *std.atomic.Value(bool),
             deadline: ?i64,
@@ -1960,7 +1960,7 @@ fn testDeinitPayloadsMap(allocator: Allocator, payloads: *AggregatedPayloadsMap)
 }
 
 fn testPutSingleChildPayload(allocator: Allocator, payloads: *AggregatedPayloadsMap, data: attestation.AttestationData, validator_index: usize) !void {
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     errdefer proof.deinit();
     try attestation.aggregationBitsSet(&proof.participants, validator_index, true);
 
@@ -2202,7 +2202,7 @@ test "encode decode signed block with non-empty proof" {
     try std.testing.expect(std.mem.eql(u8, decoded.proof.proof.constSlice(), &proof_payload));
 }
 
-// Regression: an AggregatedSignatureProof whose `participants` bitlist
+// Regression: an SingleMessageAggregate whose `participants` bitlist
 // has trailing zero bits (i.e., len() > highest_set_bit + 1) must still
 // produce an `aggregation_bits` that is byte-for-byte identical to
 // `participants`. Rebuilding `aggregation_bits` by re-setting only the
@@ -2212,7 +2212,7 @@ test "encode decode signed block with non-empty proof" {
 test "compactSingleProof: aggregation_bits matches participants when participants has trailing zeros" {
     const allocator = std.testing.allocator;
 
-    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    var proof = try aggregation.SingleMessageAggregate.init(allocator);
     defer proof.deinit();
 
     // Force participants.len() == 6 with bits set only at {0, 2}.
@@ -2302,7 +2302,7 @@ test "computeSingleAggregatedSignature: single-child passthrough survives prep d
         result.signature.deinit();
     }
 
-    var cloned = try zeam_utils.clone(aggregation.AggregatedSignatureProof, &result.signature, allocator);
+    var cloned = try zeam_utils.clone(aggregation.SingleMessageAggregate, &result.signature, allocator);
     defer cloned.deinit();
 
     try std.testing.expect(cloned.participants.len() > 0);
@@ -2347,7 +2347,7 @@ test "compactAttestations: elapsed deadline returns empty prefix" {
         const bits = try attestation.AggregationBits.init(allocator);
         try attestations.append(.{ .aggregation_bits = bits, .data = att_data });
 
-        const proof = try aggregation.AggregatedSignatureProof.init(allocator);
+        const proof = try aggregation.SingleMessageAggregate.init(allocator);
         try signatures.append(proof);
     }
 

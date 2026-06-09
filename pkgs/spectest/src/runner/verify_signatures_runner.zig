@@ -319,7 +319,7 @@ fn verifyBodyAttestations(
         // list — scheme-agnostic at the wire level). Use the same helper the
         // state-transition runner uses so we benefit from any future format
         // tightening.
-        var proof = try parseAggregatedSignatureProof(allocator, ctx, sig_value, idx);
+        var proof = try parseSingleMessageAggregate(allocator, ctx, sig_value, idx);
         defer proof.deinit();
 
         var message_hash: [32]u8 = undefined;
@@ -337,12 +337,12 @@ fn verifyBodyAttestations(
     return any_failed;
 }
 
-fn parseAggregatedSignatureProof(
+fn parseSingleMessageAggregate(
     allocator: Allocator,
     ctx: Context,
     value: JsonValue,
     idx: usize,
-) FixtureError!types.AggregatedSignatureProof {
+) FixtureError!types.SingleMessageAggregate {
     var label_buf: [64]u8 = undefined;
     const label = std.fmt.bufPrint(&label_buf, "attestationSignatures[{d}]", .{idx}) catch "attestationSignatures[]";
 
@@ -368,7 +368,7 @@ fn parseAggregatedSignatureProof(
         proof_data.append(b) catch return FixtureError.InvalidFixture;
     }
 
-    return types.AggregatedSignatureProof{
+    return types.SingleMessageAggregate{
         .participants = participants,
         .proof = proof_data,
     };

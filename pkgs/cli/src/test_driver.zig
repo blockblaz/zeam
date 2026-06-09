@@ -686,7 +686,7 @@ fn processBlockStep(
 
     // Store block body attestations as known aggregated payloads
     for (aggregated_attestations) |agg_att| {
-        var proof_template = types.AggregatedSignatureProof.init(driver.allocator) catch continue;
+        var proof_template = types.SingleMessageAggregate.init(driver.allocator) catch continue;
         defer proof_template.deinit();
 
         const bits_len = agg_att.aggregation_bits.len();
@@ -848,7 +848,7 @@ fn processGossipAggregatedAttestationStep(
     }
 
     // Build proof template for storeAggregatedPayload
-    var proof_template = types.AggregatedSignatureProof.init(driver.allocator) catch return error.OutOfMemory;
+    var proof_template = types.SingleMessageAggregate.init(driver.allocator) catch return error.OutOfMemory;
     defer proof_template.deinit();
     const bits_len = aggregation_bits.len();
     for (0..bits_len) |i| {
@@ -1338,8 +1338,8 @@ fn verifyAttestationSignatures(
     return any_failed;
 }
 
-/// Parse an AggregatedSignatureProof from a JSON value (test driver format).
-fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.AggregatedSignatureProof {
+/// Parse an SingleMessageAggregate from a JSON value (test driver format).
+fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.SingleMessageAggregate {
     const obj = switch (value) {
         .object => |m| m,
         else => return error.InvalidField,
@@ -1383,7 +1383,7 @@ fn parseAggSigProofFromJson(allocator: Allocator, value: JsonValue) !types.Aggre
         proof_data.append(b) catch return error.InvalidField;
     }
 
-    return types.AggregatedSignatureProof{
+    return types.SingleMessageAggregate{
         .participants = participants,
         .proof = proof_data,
     };
