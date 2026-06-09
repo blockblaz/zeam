@@ -8,8 +8,7 @@ pub const shadow_cost = @import("shadow_cost.zig");
 pub const AggregationError = error{
     PublicKeysSignatureLengthMismatch,
     ProofTooLarge,
-    ProverSetupFailed,
-    VerifierSetupFailed,
+    AggregationSetupFailed,
     Type1AggregateFailed,
     Type1VerifyFailed,
     Type2MergeFailed,
@@ -36,11 +35,9 @@ pub const MessageBinding = struct {
 // drives the leanMultisig zk prover/verifier — they are heavy and must not be called from the
 // libxev thread. Run them on the chain worker / Io.Threaded pool instead.
 
-/// Returns 0 on success, -1 if the prover bytecode is missing or init failed (never panics).
-extern fn xmss_setup_prover() callconv(.c) c_int;
-/// Returns 0 on success, -1 on failure.
-extern fn xmss_setup_verifier() callconv(.c) c_int;
-/// Configure the global rayon pool. Must be called before xmss_setup_prover. Returns 0.
+/// Returns 0 on success, -1 if the aggregation bytecode is missing or init failed (never panics).
+extern fn xmss_setup_aggregation() callconv(.c) c_int;
+/// Configure the global rayon pool. Must be called before xmss_setup_aggregation. Returns 0.
 extern fn xmss_set_rayon_threads(num_threads: usize) callconv(.c) c_int;
 
 /// Aggregate raw XMSS sigs + child Type-1 proofs into one Type-1. Output via the
@@ -113,42 +110,17 @@ extern fn xmss_verify_type_2(
     message_slots: [*]const u32,
 ) callconv(.c) bool;
 
-/// Cached after first successful init; Rust side uses OnceLock as well.
-var prover_ready = std.atomic.Value(bool).init(false);
-
-/// Idempotent prover init for aggregators. Calls `setupProver` once and sets
-/// `prover_ready` so the first `aggregateSignatures` does not pay setup on the
-/// hot path. Safe to call at startup before the first slot trigger.
-pub fn ensureProverReady() !void {
-    if (prover_ready.load(.acquire)) return;
-    try setupProver();
-    prover_ready.store(true, .release);
-}
-
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
 /// `num_threads = 0` means rayon default. Silently no-ops if the pool is already initialized.
 pub fn setRayonThreads(num_threads: usize) void {
     _ = xmss_set_rayon_threads(num_threads);
 }
 
-/// Initialize the XMSS prover (idempotent). Hard error on failure — the caller (block production
-/// / aggregation) must surface it rather than silently skip.
-pub fn setupProver() AggregationError!void {
-    if (xmss_setup_prover() != 0) return AggregationError.ProverSetupFailed;
-}
-
-/// Initialize the XMSS verifier (idempotent). Hard error on failure — a node that cannot verify
-/// cannot safely import blocks.
-pub fn setupVerifier() AggregationError!void {
-    if (xmss_setup_verifier() != 0) return AggregationError.VerifierSetupFailed;
-}
-
-/// Compat wrapper: XMSS setup is now split into separate `setupProver`/`setupVerifier`. Older
-/// call sites (CLI startup, test helpers) did one combined setup — this preserves that so they
-/// compile unchanged.
+/// Initialize XMSS aggregation (idempotent — the Rust side caches via OnceLock). Covers both
+/// proving and verifying. Hard error on failure: a node that cannot set up cannot safely produce
+/// or import blocks. Call once at node start; aggregate/verify/merge/split assume it has run.
 pub fn setupXmssAggregation() AggregationError!void {
-    try setupProver();
-    try setupVerifier();
+    if (xmss_setup_aggregation() != 0) return AggregationError.AggregationSetupFailed;
 }
 
 /// Copy `buf` into the (init'd, empty) `out` ByteList512KiB.
@@ -175,8 +147,6 @@ pub fn aggregateType1(
 ) AggregationError!void {
     if (raw_pks.len != raw_sigs.len) return AggregationError.PublicKeysSignatureLengthMismatch;
     if (children_pks.len != children_proofs.len) return AggregationError.Type1AggregateFailed;
-
-    try ensureProverReady();
 
     const allocator = std.heap.c_allocator;
     const num_children = children_pks.len;
@@ -258,7 +228,6 @@ pub fn verifyType1(
     slot: u32,
     proof: *const ByteList512KiB,
 ) AggregationError!void {
-    try setupVerifier();
     const wire = proof.constSlice();
     const ok = xmss_verify_type_1(pks.ptr, pks.len, message_hash, slot, wire.ptr, wire.len);
     if (!ok) return AggregationError.Type1VerifyFailed;
@@ -283,8 +252,6 @@ pub fn mergeType1ToType2(
 ) AggregationError!void {
     if (parts.len != pks_per_part.len) return AggregationError.Type2MergeFailed;
     if (parts.len == 0) return AggregationError.Type2MergeFailed;
-
-    try ensureProverReady();
 
     const allocator = std.heap.c_allocator;
     const num_parts = parts.len;
@@ -353,8 +320,6 @@ pub fn splitType2ByMessage(
     log_inv_rate: usize,
     out: *ByteList512KiB,
 ) AggregationError!void {
-    try ensureProverReady();
-
     const allocator = std.heap.c_allocator;
     const num_messages = pks_per_message.len;
 
@@ -410,8 +375,6 @@ pub fn verifyType2(
     if (pks_per_message.len != messages.len) return AggregationError.Type2VerifyFailed;
     if (messages.len == 0) return AggregationError.Type2VerifyFailed;
 
-    try setupVerifier();
-
     const allocator = std.heap.c_allocator;
     const num_messages = messages.len;
 
@@ -453,6 +416,8 @@ pub fn verifyType2(
 // --- Tests (prod scheme; require the prover bytecode) ---
 
 test "Type-1 aggregate then verify round-trips; wrong key/message/slot rejected" {
+    // Prover bytecode is set up once at node start in production; tests init it explicitly.
+    try setupXmssAggregation();
     const allocator = std.testing.allocator;
 
     var keypair = try hashsig.KeyPair.generate(allocator, "t1_keypair", 0, 10);
@@ -491,6 +456,8 @@ test "Type-1 aggregate then verify round-trips; wrong key/message/slot rejected"
 }
 
 test "Type-1 children-only aggregation verifies with combined keys" {
+    // Prover bytecode is set up once at node start in production; tests init it explicitly.
+    try setupXmssAggregation();
     const allocator = std.testing.allocator;
     const message_hash = [_]u8{7} ** 32;
     const slot: u32 = 3;
@@ -531,6 +498,8 @@ test "Type-1 children-only aggregation verifies with combined keys" {
 }
 
 test "Type-2 merge of two Type-1s verifies with both message bindings; split recovers a component" {
+    // Prover bytecode is set up once at node start in production; tests init it explicitly.
+    try setupXmssAggregation();
     const allocator = std.testing.allocator;
     const slot: u32 = 5;
     const msg_a = [_]u8{0xAA} ** 32;

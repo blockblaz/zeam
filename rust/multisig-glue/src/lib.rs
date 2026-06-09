@@ -21,45 +21,27 @@ pub struct Signature {
 
 const MESSAGE_LEN: usize = 32;
 
-// Cached init results: true = succeeded, false = failed.
+// Cached init result: true = succeeded, false = failed.
 // Using OnceLock<bool> instead of Once so we can distinguish "succeeded" from "panicked"
 // without poisoning the guard. The closure is called exactly once; subsequent calls return
 // the cached result without any computation.
-static PROVER_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static VERIFIER_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static AGGREGATION_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Initialize the prover (idempotent - only runs once).
+/// Initialize XMSS aggregation once at node start (idempotent). Covers both proving and
+/// verifying — the verifier only needs the aggregation bytecode, which this init also loads.
 ///
 /// Returns 0 on success, -1 on failure.
 ///
 /// `init_aggregation_bytecode()` may panic (e.g. when the compiled prover bytecode file is
 /// missing — ENOENT). A Rust panic through an `extern "C"` boundary is UB, so we wrap the
 /// init body in `catch_unwind` and cache the boolean result in a `OnceLock`. The caller (Zig)
-/// checks the return code and surfaces a hard error instead of crashing.
+/// checks the return code and surfaces a hard error at startup instead of crashing.
 #[no_mangle]
-pub extern "C" fn xmss_setup_prover() -> i32 {
-    let ready = PROVER_READY.get_or_init(|| {
+pub extern "C" fn xmss_setup_aggregation() -> i32 {
+    let ready = AGGREGATION_READY.get_or_init(|| {
         std::panic::catch_unwind(|| {
             init_aggregation_bytecode();
             backend::precompute_dft_twiddles::<backend::KoalaBear>(1 << 24);
-        })
-        .is_ok()
-    });
-    if *ready {
-        0
-    } else {
-        -1
-    }
-}
-
-/// Initialize the verifier (idempotent - only runs once).
-///
-/// Returns 0 on success, -1 on failure. Same panic-safety rationale as `xmss_setup_prover`.
-#[no_mangle]
-pub extern "C" fn xmss_setup_verifier() -> i32 {
-    let ready = VERIFIER_READY.get_or_init(|| {
-        std::panic::catch_unwind(|| {
-            init_aggregation_bytecode();
         })
         .is_ok()
     });
@@ -480,7 +462,7 @@ pub unsafe extern "C" fn xmss_verify_type_2(
 
 /// Configure the global rayon thread pool used by the XMSS aggregate prover.
 ///
-/// Must be called **before** `xmss_setup_prover` and before any aggregation work begins. The
+/// Must be called **before** `xmss_setup_aggregation` and before any aggregation work begins. The
 /// rayon global pool can only be configured once; subsequent calls are silently ignored.
 ///
 /// `num_threads = 0` means "use rayon's default" (one thread per logical CPU). Typical caller:
