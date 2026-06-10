@@ -3345,113 +3345,6 @@ fn createTestRoot(fill_byte: u8) types.Root {
     return root;
 }
 
-fn makeProposalSelectionTestAttData(slot: types.Slot, target_slot: types.Slot, root_byte: u8) types.AttestationData {
-    const root = createTestRoot(root_byte);
-    const source_root = createTestRoot(0x01);
-    return .{
-        .slot = slot,
-        .head = .{ .root = root, .slot = slot },
-        .target = .{ .root = root, .slot = target_slot },
-        .source = .{ .root = source_root, .slot = 1 },
-    };
-}
-
-fn appendProposalSelectionPayloads(
-    allocator: Allocator,
-    list: *AggregatedPayloadsList,
-    count: usize,
-) !void {
-    for (0..count) |i| {
-        var proof = try types.SingleMessageAggregate.init(allocator);
-        errdefer proof.deinit();
-        try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
-        try list.append(allocator, .{ .slot = @intCast(i), .proof = proof });
-    }
-}
-
-test "proposal attestation selection: high target beats stale low target even if low key is newer" {
-    var high = makeProposalSelectionTestAttData(90, 100, 0xA0);
-    var stale = makeProposalSelectionTestAttData(120, 10, 0xB0);
-    var high_payloads: AggregatedPayloadsList = .empty;
-    var stale_payloads: AggregatedPayloadsList = .empty;
-
-    var candidates = [_]ProposalAttestationCandidate{
-        .{ .att_data = &stale, .payloads = &stale_payloads },
-        .{ .att_data = &high, .payloads = &high_payloads },
-    };
-    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
-
-    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.target.slot);
-    try std.testing.expectEqual(@as(types.Slot, 10), candidates[1].att_data.target.slot);
-}
-
-test "proposal attestation selection: payload count wins before attestation slot when target ties" {
-    const allocator = std.testing.allocator;
-    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
-    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
-    var previous_payloads: AggregatedPayloadsList = .empty;
-    defer deinitAggregatedPayloadsList(allocator, &previous_payloads);
-    var current_payloads: AggregatedPayloadsList = .empty;
-    defer deinitAggregatedPayloadsList(allocator, &current_payloads);
-
-    try appendProposalSelectionPayloads(allocator, &previous_payloads, 3);
-    try appendProposalSelectionPayloads(allocator, &current_payloads, 1);
-
-    var candidates = [_]ProposalAttestationCandidate{
-        .{ .att_data = &current_slot, .payloads = &current_payloads },
-        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
-    };
-    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
-
-    try std.testing.expectEqual(@as(types.Slot, 99), candidates[0].att_data.slot);
-    try std.testing.expectEqual(@as(types.Slot, 100), candidates[1].att_data.slot);
-}
-
-test "proposal attestation selection: newest attestation slot wins after equal target and payload count" {
-    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
-    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
-    var previous_payloads: AggregatedPayloadsList = .empty;
-    var current_payloads: AggregatedPayloadsList = .empty;
-
-    var candidates = [_]ProposalAttestationCandidate{
-        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
-        .{ .att_data = &current_slot, .payloads = &current_payloads },
-    };
-    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
-
-    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.slot);
-    try std.testing.expectEqual(@as(types.Slot, 99), candidates[1].att_data.slot);
-}
-
-test "proposal attestation selection: 8-key cap is not filled exclusively by stale low targets" {
-    var att_data: [12]types.AttestationData = undefined;
-    var payloads: [12]AggregatedPayloadsList = undefined;
-    var candidates: [12]ProposalAttestationCandidate = undefined;
-
-    for (&payloads) |*list| list.* = .empty;
-
-    // Eight stale keys would have filled the old ascending-target cap first.
-    for (0..8) |i| {
-        att_data[i] = makeProposalSelectionTestAttData(@intCast(10 + i), @intCast(20 + i), @intCast(0x20 + i));
-    }
-    // Four fresh high-target keys must lead the sorted candidate list.
-    for (8..12) |i| {
-        att_data[i] = makeProposalSelectionTestAttData(@intCast(90 + i), @intCast(100 + i), @intCast(0x40 + i));
-    }
-    for (0..12) |i| {
-        candidates[i] = .{ .att_data = &att_data[i], .payloads = &payloads[i] };
-    }
-
-    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
-
-    var high_target_count_in_cap: usize = 0;
-    for (candidates[0..8]) |candidate| {
-        if (candidate.att_data.target.slot >= 100) high_target_count_in_cap += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 4), high_target_count_in_cap);
-    try std.testing.expect(candidates[0].att_data.target.slot > candidates[7].att_data.target.slot);
-}
-
 // Helper function to create a ProtoBlock for testing
 fn createTestProtoBlock(slot: types.Slot, block_root_byte: u8, parent_root_byte: u8) ProtoBlock {
     return ProtoBlock{
@@ -5485,6 +5378,113 @@ test "getProposalAttestations: high-target keys survive cap with stale low-targe
         if (att.data.target.slot >= 100) high_target_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 4), high_target_count);
+}
+
+fn makeProposalSelectionTestAttData(slot: types.Slot, target_slot: types.Slot, root_byte: u8) types.AttestationData {
+    const root = createTestRoot(root_byte);
+    const source_root = createTestRoot(0x01);
+    return .{
+        .slot = slot,
+        .head = .{ .root = root, .slot = slot },
+        .target = .{ .root = root, .slot = target_slot },
+        .source = .{ .root = source_root, .slot = 1 },
+    };
+}
+
+fn appendProposalSelectionPayloads(
+    allocator: Allocator,
+    list: *AggregatedPayloadsList,
+    count: usize,
+) !void {
+    for (0..count) |i| {
+        var proof = try types.SingleMessageAggregate.init(allocator);
+        errdefer proof.deinit();
+        try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
+        try list.append(allocator, .{ .slot = @intCast(i), .proof = proof });
+    }
+}
+
+test "proposal attestation selection: high target beats stale low target even if low key is newer" {
+    var high = makeProposalSelectionTestAttData(90, 100, 0xA0);
+    var stale = makeProposalSelectionTestAttData(120, 10, 0xB0);
+    var high_payloads: AggregatedPayloadsList = .empty;
+    var stale_payloads: AggregatedPayloadsList = .empty;
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &stale, .payloads = &stale_payloads },
+        .{ .att_data = &high, .payloads = &high_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.target.slot);
+    try std.testing.expectEqual(@as(types.Slot, 10), candidates[1].att_data.target.slot);
+}
+
+test "proposal attestation selection: payload count wins before attestation slot when target ties" {
+    const allocator = std.testing.allocator;
+    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
+    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
+    var previous_payloads: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &previous_payloads);
+    var current_payloads: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &current_payloads);
+
+    try appendProposalSelectionPayloads(allocator, &previous_payloads, 3);
+    try appendProposalSelectionPayloads(allocator, &current_payloads, 1);
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &current_slot, .payloads = &current_payloads },
+        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 99), candidates[0].att_data.slot);
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[1].att_data.slot);
+}
+
+test "proposal attestation selection: newest attestation slot wins after equal target and payload count" {
+    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
+    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
+    var previous_payloads: AggregatedPayloadsList = .empty;
+    var current_payloads: AggregatedPayloadsList = .empty;
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
+        .{ .att_data = &current_slot, .payloads = &current_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.slot);
+    try std.testing.expectEqual(@as(types.Slot, 99), candidates[1].att_data.slot);
+}
+
+test "proposal attestation selection: 8-key cap is not filled exclusively by stale low targets" {
+    var att_data: [12]types.AttestationData = undefined;
+    var payloads: [12]AggregatedPayloadsList = undefined;
+    var candidates: [12]ProposalAttestationCandidate = undefined;
+
+    for (&payloads) |*list| list.* = .empty;
+
+    // Eight stale keys would have filled the old ascending-target cap first.
+    for (0..8) |i| {
+        att_data[i] = makeProposalSelectionTestAttData(@intCast(10 + i), @intCast(20 + i), @intCast(0x20 + i));
+    }
+    // Four fresh high-target keys must lead the sorted candidate list.
+    for (8..12) |i| {
+        att_data[i] = makeProposalSelectionTestAttData(@intCast(90 + i), @intCast(100 + i), @intCast(0x40 + i));
+    }
+    for (0..12) |i| {
+        candidates[i] = .{ .att_data = &att_data[i], .payloads = &payloads[i] };
+    }
+
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    var high_target_count_in_cap: usize = 0;
+    for (candidates[0..8]) |candidate| {
+        if (candidate.att_data.target.slot >= 100) high_target_count_in_cap += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), high_target_count_in_cap);
+    try std.testing.expect(candidates[0].att_data.target.slot > candidates[7].att_data.target.slot);
 }
 
 test "rebase: parent pointer integrity after pruning" {
