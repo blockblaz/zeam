@@ -2221,6 +2221,19 @@ pub const ForkChoice = struct {
         // slot and starve justification — the same goal the deadline loop had.
         const latest_justified = self.fcStore.latest_justified;
         if (selectJustificationAdvancingKey(&snap, att_data_keys, latest_justified)) |data| {
+            // #985 selection observability: which key won this tick relative
+            // to the clock slot. A sustained "prev" rate means current-slot
+            // aggregates are being deferred a full slot (the ~4 s tail).
+            {
+                const clock_slot = self.fcStore.slot_clock.timeSlots.load(.monotonic);
+                const lag_label: []const u8 = if (data.slot >= clock_slot)
+                    "current"
+                else if (clock_slot - data.slot == 1)
+                    "prev"
+                else
+                    "older";
+                zeam_metrics.metrics.zeam_aggregate_selected_key_lag_total.incr(.{ .lag = lag_label }) catch {};
+            }
             var maybe_result = try types.computeSingleAggregatedSignature(
                 self.allocator,
                 validators,
@@ -2379,6 +2392,20 @@ pub const ForkChoice = struct {
 
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
         zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
+
+        // #985 publish-timing observability: how far past the att_data's
+        // slot start this commit landed, in slot-clock intervals. The duty
+        // fires at interval 2, so on-time commits observe <=3; >=5 means the
+        // aggregate landed in the next slot.
+        {
+            const now_intervals = self.fcStore.slot_clock.time.load(.monotonic);
+            const slot_start_intervals = att_data.slot * constants.INTERVALS_PER_SLOT;
+            const lag_intervals: u64 = if (now_intervals >= slot_start_intervals)
+                now_intervals - slot_start_intervals
+            else
+                0;
+            zeam_metrics.metrics.zeam_aggregate_commit_lag_intervals.observe(@floatFromInt(lag_intervals));
+        }
 
         // Emit a one-line summary per committed aggregate so operators can
         // see what the aggregator just published from structured logs alone
@@ -3979,15 +4006,90 @@ fn snapshotInputCount(snap: *const AggregateSnapshot, key: types.AttestationData
     return n;
 }
 
+/// True when one stored proof in `maybe_list` covers every raw vid in `inner`.
+/// Same one-proof-covers-all rule as `types.anyStoredProofCoversAll` /
+/// `shouldSuppressDuplicateAggregateCommit` — per-vid coverage spread across
+/// MULTIPLE proofs does not count (merging those proofs would still add value).
+fn coveredByAnyProofIn(
+    maybe_list: ?types.AggregatedPayloadsList,
+    inner: *const types.SignaturesMap.InnerMap,
+) bool {
+    const list = maybe_list orelse return false;
+    for (list.items) |*stored| {
+        const p = &stored.proof.participants;
+        var all_covered = true;
+        var it = inner.keyIterator();
+        while (it.next()) |vid_ptr| {
+            const vid: usize = @intCast(vid_ptr.*);
+            const covered = vid < p.len() and (p.get(vid) catch false);
+            if (!covered) {
+                all_covered = false;
+                break;
+            }
+        }
+        if (all_covered) return true;
+    }
+    return false;
+}
+
+/// True when proving `key` this tick is guaranteed wasted work (#985):
+///
+///   * it has raw gossip signatures and ONE stored proof (new or known
+///     payloads) already covers every raw vid — the prove result would be
+///     duplicate-suppressed at commit; or
+///   * it has no raw signatures and exactly one stored payload — re-proving
+///     a single child proof reproduces the same participant set.
+///
+/// Keys with no raws but ≥2 stored payloads are NOT covered: merging child
+/// proofs can produce a strictly larger participant set. Keys with no
+/// snapshot inputs at all are also NOT covered — the prove no-ops on them
+/// exactly as it did before this guard, preserving the selector's previous
+/// behaviour for keys outside the snapshot.
+///
+/// Selecting a covered key burns the slot's single interval-2 prove on a
+/// no-op and defers the current slot's aggregate to the next slot — the
+/// direct cause of the ~4 s bimodal publish tail in #985.
+fn snapshotKeyFullyCovered(snap: *const AggregateSnapshot, key: types.AttestationData) bool {
+    const n_payloads = blk: {
+        var n: usize = 0;
+        if (snap.new_payloads.get(key)) |list| n += list.items.len;
+        if (snap.known_payloads.get(key)) |list| n += list.items.len;
+        break :blk n;
+    };
+
+    const inner = snap.signatures.get(key) orelse return n_payloads == 1;
+    if (inner.count() == 0) return n_payloads == 1;
+
+    return coveredByAnyProofIn(snap.new_payloads.get(key), &inner) or
+        coveredByAnyProofIn(snap.known_payloads.get(key), &inner);
+}
+
 /// Picks the single AttestationData this aggregator tick should aggregate,
 /// favouring keys whose votes would advance `latest_justified`.
 ///
+/// Keys that are already fully covered by a committed aggregate
+/// (`snapshotKeyFullyCovered`) are skipped entirely: proving them is a
+/// guaranteed duplicate-suppress, and selecting one burns the slot's single
+/// interval-2 prove while the current slot's aggregate slips a full slot —
+/// the ~4 s bimodal publish tail of #985. When every candidate is covered
+/// the function returns null and the caller skips the tick.
+///
 /// Selection tiers (preferred always wins over fallback, regardless of weight):
 ///   1. preferred: `source == latest_justified` AND `target.slot >= latest_justified.slot`
-///      Ranked by deepest `target.slot`, then max snapshot input count.
+///      Ranked by deepest `target.slot`, then newest `key.slot`, then max
+///      snapshot input count.
 ///   2. fallback:  `source.slot >= latest_justified.slot` (any target).
-///      Ranked by deepest `source.slot`, then max snapshot input count.
+///      Ranked by deepest `source.slot`, then newest `key.slot`, then max
+///      snapshot input count.
 ///   3. neither populated -> null (caller skips the tick entirely)
+///
+/// The `key.slot` tiebreak (#985) runs BEFORE input count: when the previous
+/// and current slot's att_data tie on justification value, the current slot
+/// must win its own interval-2 tick — its aggregate is what the next slot's
+/// proposer collects at interval 0. The previous slot's key typically has
+/// more accumulated inputs (a full slot of gossip vs ~one interval), so an
+/// inputs-first tiebreak systematically deferred the current slot's publish
+/// to the next tick, one slot late.
 ///
 /// The comparisons are `>=`, not `>`: the caller passes the genesis anchor's
 /// `latest_justified` (slot 0), so genesis-sourced bootstrap votes
@@ -4010,12 +4112,15 @@ fn selectJustificationAdvancingKey(
     var best_fallback_inputs: usize = 0;
 
     for (att_data_keys) |key| {
+        if (snapshotKeyFullyCovered(snap, key)) continue;
+
         const inputs = snapshotInputCount(snap, key);
 
         if (checkpointsEqual(key.source, latest_justified) and key.target.slot >= latest_justified.slot) {
             const replace = if (best_preferred) |cur|
                 (key.target.slot > cur.target.slot or
-                    (key.target.slot == cur.target.slot and inputs > best_preferred_inputs))
+                    (key.target.slot == cur.target.slot and key.slot > cur.slot) or
+                    (key.target.slot == cur.target.slot and key.slot == cur.slot and inputs > best_preferred_inputs))
             else
                 true;
             if (replace) {
@@ -4028,7 +4133,8 @@ fn selectJustificationAdvancingKey(
         if (key.source.slot >= latest_justified.slot) {
             const replace = if (best_fallback) |cur|
                 (key.source.slot > cur.source.slot or
-                    (key.source.slot == cur.source.slot and inputs > best_fallback_inputs))
+                    (key.source.slot == cur.source.slot and key.slot > cur.slot) or
+                    (key.source.slot == cur.source.slot and key.slot == cur.slot and inputs > best_fallback_inputs))
             else
                 true;
             if (replace) {
@@ -4237,6 +4343,225 @@ test "selectJustificationAdvancingKey: deepest source wins within fallback tier"
     const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
     try std.testing.expect(picked != null);
     try std.testing.expectEqual(deep, picked.?);
+}
+
+/// Test helper (#985): build a StoredAggregatedPayload whose proof covers
+/// exactly `covered_vids`. Caller owns the returned payload's interior
+/// allocations via the snapshot's deinit (insert into a payloads map).
+fn testMakeStoredPayload(allocator: Allocator, slot: types.Slot, covered_vids: []const usize) !types.StoredAggregatedPayload {
+    var proof = try types.SingleMessageAggregate.init(allocator);
+    errdefer proof.deinit();
+    for (covered_vids) |vid| {
+        try types.aggregationBitsSet(&proof.participants, vid, true);
+    }
+    return .{ .slot = slot, .proof = proof };
+}
+
+test "selectJustificationAdvancingKey (#985): tie on target.slot -> newer key.slot beats heavier inputs" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xDD;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    // Previous slot's key: a full slot of accumulated gossip (3 raws).
+    const prev_key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+    // Current slot's key: same justification value, fewer raws so far.
+    const current_key = types.AttestationData{
+        .slot = 9,
+        .head = .{ .root = alt_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var prev_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try prev_inner.put(0, stored_sig);
+    try prev_inner.put(1, stored_sig);
+    try prev_inner.put(2, stored_sig);
+    try snap.signatures.put(prev_key, prev_inner);
+    var current_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try current_inner.put(3, stored_sig);
+    try snap.signatures.put(current_key, current_inner);
+
+    // Pre-#985 the inputs tiebreak picked prev_key (3 inputs vs 1), deferring
+    // the current slot's aggregate a full slot. Newer key.slot must win.
+    const keys = [_]types.AttestationData{ prev_key, current_key };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(current_key, picked.?);
+}
+
+test "selectJustificationAdvancingKey (#985): fully-covered key is skipped" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xEE;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    // Covered key has the DEEPER target, so absent the coverage guard it
+    // would win the tier outright.
+    const covered_key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 8 },
+        .source = latest_justified,
+    };
+    const fresh_key = types.AttestationData{
+        .slot = 9,
+        .head = .{ .root = alt_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var covered_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try covered_inner.put(0, stored_sig);
+    try covered_inner.put(1, stored_sig);
+    try snap.signatures.put(covered_key, covered_inner);
+    var fresh_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try fresh_inner.put(2, stored_sig);
+    try snap.signatures.put(fresh_key, fresh_inner);
+
+    // Stored proof for covered_key spans vids {0,1} — every raw covered, so
+    // re-proving it would be duplicate-suppressed at commit.
+    var covered_list: types.AggregatedPayloadsList = .empty;
+    try covered_list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{ 0, 1 }));
+    try snap.new_payloads.put(covered_key, covered_list);
+
+    const keys = [_]types.AttestationData{ covered_key, fresh_key };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(fresh_key, picked.?);
+}
+
+test "selectJustificationAdvancingKey (#985): all candidates covered -> null (tick skipped)" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xF0;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var inner = types.SignaturesMap.InnerMap.init(allocator);
+    try inner.put(0, stored_sig);
+    try snap.signatures.put(key, inner);
+
+    var list: types.AggregatedPayloadsList = .empty;
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{0}));
+    try snap.known_payloads.put(key, list);
+
+    const keys = [_]types.AttestationData{key};
+    try std.testing.expect(selectJustificationAdvancingKey(&snap, &keys, latest_justified) == null);
+}
+
+test "snapshotKeyFullyCovered (#985): payload-only key with two payloads is mergeable, not covered" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = zero_root, .slot = 7 },
+        .source = .{ .root = zero_root, .slot = 5 },
+    };
+
+    var list: types.AggregatedPayloadsList = .empty;
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{0}));
+    try snap.new_payloads.put(key, list);
+
+    // One payload, no raws: nothing to merge — covered.
+    try std.testing.expect(snapshotKeyFullyCovered(&snap, key));
+
+    var second_list = snap.new_payloads.getPtr(key).?;
+    try second_list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{1}));
+
+    // Two payloads: merging them adds coverage — not covered.
+    try std.testing.expect(!snapshotKeyFullyCovered(&snap, key));
+}
+
+test "snapshotKeyFullyCovered (#985): coverage split across two proofs does not count" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = zero_root, .slot = 7 },
+        .source = .{ .root = zero_root, .slot = 5 },
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var inner = types.SignaturesMap.InnerMap.init(allocator);
+    try inner.put(0, stored_sig);
+    try inner.put(1, stored_sig);
+    try snap.signatures.put(key, inner);
+
+    // vid 0 covered by one proof, vid 1 by another — no SINGLE proof covers
+    // both, so a merge prove still adds value. Must not be treated covered.
+    var list: types.AggregatedPayloadsList = .empty;
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{0}));
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{1}));
+    try snap.new_payloads.put(key, list);
+
+    try std.testing.expect(!snapshotKeyFullyCovered(&snap, key));
 }
 
 /// Returns true when an `att_data` in the aggregator's snapshot is
