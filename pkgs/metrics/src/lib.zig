@@ -248,6 +248,16 @@ const Metrics = struct {
     zeam_aggregate_coalesced_total: AggregateCoalescedCounter,
     /// Histogram for the wall-clock duration of the aggregate FFI worker.
     zeam_aggregate_worker_duration_seconds: AggregateWorkerDurationHistogram,
+    /// Lag, in slot-clock intervals, between an aggregate's att_data slot
+    /// start and the moment the aggregate was committed/published (#985).
+    /// On-time = bucket ≤3 (duty fires at interval 2); ≥5 = landed in the
+    /// next slot. See `AggregateCommitLagIntervalsHistogram` doc.
+    zeam_aggregate_commit_lag_intervals: AggregateCommitLagIntervalsHistogram,
+    /// Which key the aggregator tick selected, relative to the clock slot
+    /// (#985): lag="current" (key.slot == clock slot), "prev" (one behind),
+    /// "older" (≥2 behind). A high "prev" rate means current-slot aggregates
+    /// are being deferred — the selection pathology behind the ~4 s tail.
+    zeam_aggregate_selected_key_lag_total: AggregateSelectedKeyLagCounter,
     /// Counter for SignedAggregatedAttestation messages published by the local
     /// aggregator worker (after the FFI returned), labeled by attestation subnet.
     /// Separate from the standard `lean_pq_sig_aggregated_signatures_total`
@@ -679,6 +689,16 @@ const Metrics = struct {
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
     const AggregateCoalescedCounter = metrics_lib.Counter(u64);
     const AggregateWorkerDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
+    // Aggregation publish-timing instrumentation (#985). Lag is measured in
+    // INTERVALS (the slot clock's native unit; INTERVALS_PER_SLOT=5 at
+    // SECONDS_PER_SLOT=4 → 800 ms each): commit-time clock intervals minus
+    // att_data.slot * INTERVALS_PER_SLOT. The aggregation duty fires at
+    // interval 2, so an on-time commit lands in bucket ≤3; ≥5 means the
+    // aggregate for that att_data landed in the NEXT slot — the ~4 s tail of
+    // #985, invisible to the worker-duration histogram because the worker
+    // itself is fast; the att_data just wasn't selected on its own tick.
+    const AggregateCommitLagIntervalsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 3, 4, 5, 6, 8, 10, 15 });
+    const AggregateSelectedKeyLagCounter = metrics_lib.CounterVec(u64, struct { lag: []const u8 });
     const AggregatorPublishAggregationsCounter = metrics_lib.CounterVec(u64, struct { subnet: []const u8 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
@@ -1180,6 +1200,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_aggregator_skipped_total = try Metrics.AggregateSkipCounter.init(allocator, io, "lean_aggregator_skipped_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed, other. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
         .zeam_aggregate_coalesced_total = Metrics.AggregateCoalescedCounter.init("zeam_aggregate_coalesced_total", .{ .help = "Aggregation slot triggers coalesced while a worker was in flight; one catch-up run is scheduled when the worker finishes." }, .{}),
         .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of one aggregate worker run (snapshot through publishProducedAggregations), including all XMSS recursive STARK FFI inside computeAggregatedSignatures. Primary latency signal for aggregator slot budget (issue #907)." }, .{}),
+        .zeam_aggregate_commit_lag_intervals = Metrics.AggregateCommitLagIntervalsHistogram.init("zeam_aggregate_commit_lag_intervals", .{ .help = "Lag in slot-clock intervals (800 ms each at 4 s slots) between an aggregate's att_data slot start and its commit/publish. Duty fires at interval 2, so on-time commits land in buckets <=3; values >=5 mean the aggregate landed in the NEXT slot (the ~4 s publish tail of #985)." }, .{}),
+        .zeam_aggregate_selected_key_lag_total = try Metrics.AggregateSelectedKeyLagCounter.init(allocator, io, "zeam_aggregate_selected_key_lag_total", .{ .help = "Which att_data key each aggregator tick selected, relative to the clock slot (#985): lag=\"current\" (key.slot == clock slot), \"prev\" (one slot behind), \"older\" (>=2 behind). A high prev rate means current-slot aggregates are systematically deferred one slot." }, .{}),
         .zeam_aggregator_publish_aggregations_total = try Metrics.AggregatorPublishAggregationsCounter.init(allocator, io, "zeam_aggregator_publish_aggregations_total", .{ .help = "SignedAggregatedAttestation messages published by the local aggregator worker, labeled by attestation subnet. Distinct from lean_pq_sig_aggregated_signatures_total (block-proposal path only) so cross-client dashboards keep the standard metric's semantics intact." }, .{}),
         // BeamNode mutex contention metrics.
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
