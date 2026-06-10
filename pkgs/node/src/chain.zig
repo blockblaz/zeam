@@ -456,7 +456,7 @@ pub const BeamChain = struct {
 
     /// The block proof is a recursive-STARK Type-2 merge that takes seconds at the
     /// prod scheme — far longer than an 800ms interval. Running it on the libxev slot loop would
-    /// freeze gossip/tick handling, so `submitProposeOnInterval` offloads the whole propose
+    /// freeze gossip/tick handling, so `submitPropose` offloads the whole propose
     /// (produceBlock + buildBlockProof + publishBlock) to a `thread_pool` worker, mirroring the
     /// aggregate worker. At most one propose runs at a time; a second trigger is dropped (the next
     /// slot re-proposes). `proposeImpl` decrements on exit.
@@ -3636,6 +3636,88 @@ pub const BeamChain = struct {
             return BlockProcessingError.KnownInvalidBlock;
         }
 
+        // ── Locally-produced / already-imported fast path ──────────────────
+        // produceBlock has already run the state transition for this block,
+        // cached the post state (`statesPutExclusive`) and inserted the block
+        // into fork choice; the publish hop previously re-cloned the parent,
+        // re-verified AND re-ran the whole transition here, only for
+        // `statesCommitKeepExisting` below to discard the recomputed state.
+        // None of that was designed: before the per-resource locking
+        // migration, publishBlock handed the cached post state to onBlock and
+        // this entire recompute (verify included) was skipped for locally
+        // produced blocks. This path restores those semantics: a proof this
+        // node just built is not re-verified against itself — preventing a
+        // corrupt proof from being built is the build path's job — and the
+        // transition result is not recomputed only to be discarded.
+        //
+        // The two probes make the path self-validating: it activates only when
+        // BOTH the fork-choice block and the cached post state already exist
+        // (which also covers duplicate re-imports, whose first import already
+        // verified them). Any miss falls through to the full path below.
+        fastpath: {
+            if (self.forkChoice.getBlock(block_root) == null) break :fastpath;
+            {
+                var probe = self.statesGet(block_root) orelse break :fastpath;
+                probe.deinit();
+            }
+
+            // Same cache-sync step as the full path (idempotent re-put for
+            // duplicate imports).
+            {
+                var t_rts = LockTimer.start("root_to_slot", "onBlock.cachePut");
+                locking.assertNoTier5SiblingHeld("onBlock.cachePut");
+                self.root_to_slot_lock.lock();
+                locking.enterTier5();
+                t_rts.acquired();
+                defer {
+                    self.root_to_slot_lock.unlock();
+                    locking.leaveTier5();
+                    t_rts.released();
+                }
+                try self.root_to_slot_cache.put(block_root, block.slot);
+            }
+
+            // SSZ bytes for persistence — same live-serialize caveat as the
+            // full path: never pass the live SignedBlock to ssz.serialize.
+            var fp_fallback_ssz: std.ArrayList(u8) = .empty;
+            defer fp_fallback_ssz.deinit(self.allocator);
+            var fp_clone: types.SignedBlock = undefined;
+            var fp_clone_initialized = false;
+            defer if (fp_clone_initialized) fp_clone.deinit();
+            const fp_ssz_for_db: []const u8 = if (blockInfo.sszBytes) |precomputed| precomputed else blk: {
+                fp_clone = try zeam_utils.clone(types.SignedBlock, &signedBlock, self.allocator);
+                fp_clone_initialized = true;
+                try ssz.serialize(types.SignedBlock, fp_clone, &fp_fallback_ssz, self.allocator);
+                step_watch.lap("ssz_serialize_fallback");
+                break :blk fp_fallback_ssz.items;
+            };
+
+            // Persist using the cached post state (re-borrowed after the
+            // verify; if it was pruned in between, fall back to the full
+            // path which recomputes it).
+            var post_borrow = self.statesGet(block_root) orelse break :fastpath;
+            defer post_borrow.assertReleasedOrPanic();
+            const processing_time = onblock_timer.observe();
+            {
+                defer post_borrow.deinit();
+                self.updateBlockDb(fp_ssz_for_db, block_root, post_borrow.state.*, block.slot) catch |err| {
+                    self.logger.err("failed to update block database for block root=0x{x}: {any}", .{
+                        &block_root,
+                        err,
+                    });
+                };
+            }
+            try self.forkChoice.confirmBlock(block_root);
+            step_watch.lap("db_persist");
+
+            self.logger.info("processed block with root=0x{x} slot={d} processing time={d} (cached post state, verify+transition skipped)", .{
+                &block_root,
+                block.slot,
+                processing_time,
+            });
+            return try self.allocator.alloc(types.Root, 0);
+        }
+
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. Snapshot parent state under `states_lock.shared`, then
@@ -4996,19 +5078,16 @@ pub const BeamChain = struct {
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
-    /// Trigger off-loop block production for `time_intervals` if this node is the
-    /// proposer for the slot. Called from the libxev interval tick at interval-in-slot 0; returns
-    /// within microseconds. The whole propose (produceBlock + Type-2 merge + publishBlock) runs on
-    /// a `thread_pool` worker so the multi-second prod-scheme merge never freezes the slot loop.
-    /// At most one propose is in flight; a second trigger is dropped (the next slot re-proposes).
-    pub fn submitProposeOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
-        if (time_intervals % constants.INTERVALS_PER_SLOT != 0) return;
-        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-
-        // Only the node running this slot's proposer does anything.
-        const validator = if (node.validator) |*v| v else return;
-        const proposer_id = validator.getSlotProposer(slot) orelse return;
-
+    /// Trigger off-loop block production for an already-resolved proposer duty.
+    /// The "am I proposer this slot?" decision is the validator client's
+    /// (`ValidatorClient.onInterval` resolves `proposer_id` via `getSlotProposer`
+    /// and calls this at interval-in-slot 0); this function owns only the
+    /// chain-state gating (sync status) and the off-loop dispatch, and returns
+    /// within microseconds. The whole propose (produceBlock + Type-2 merge +
+    /// publishBlock) runs on a `thread_pool` worker so the multi-second
+    /// prod-scheme merge never freezes the slot loop. At most one propose is in
+    /// flight; a second trigger is dropped (the next slot re-proposes).
+    pub fn submitPropose(self: *Self, node: *@import("./node.zig").BeamNode, slot: usize, proposer_id: usize) void {
         // Sync gating (the checks the old on-loop maybeDoProposal performed).
         switch (self.getSyncStatus()) {
             .synced => {},
