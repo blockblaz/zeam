@@ -949,11 +949,16 @@ pub const ForkChoice = struct {
                 const cc_u32 = self.config.spec.attestation_committee_count;
                 if (vc > 0 and cc_u32 > 0) {
                     const cc: usize = @intCast(cc_u32);
-                    // Determine slot from the first entry key.
+                    // Stamp the snapshot with the NEWEST data slot present.
+                    // Map iteration order is arbitrary and mixed data slots are
+                    // normal (aggregates mature over several slots), so taking
+                    // the first key would stamp a random slot.
                     var payload_slot: types.Slot = 0;
                     {
                         var it_s = self.latest_new_aggregated_payloads.iterator();
-                        if (it_s.next()) |first| payload_slot = first.key_ptr.slot;
+                        while (it_s.next()) |e| {
+                            if (e.key_ptr.slot > payload_slot) payload_slot = e.key_ptr.slot;
+                        }
                     }
                     const new_seen = try self.allocator.alloc(bool, vc);
                     var coverage_saved = false;
@@ -1892,9 +1897,13 @@ pub const ForkChoice = struct {
     ///
     /// Sections:
     ///   prev_new  – coverage saved just before the last acceptNewAttestationsUnlocked merge
-    ///               (represents the previous slot's new payloads that were accepted)
-    ///   late      – current latest_new_aggregated_payloads for `slot`
+    ///               (represents the previous round's new payloads that were accepted)
+    ///   late      – current latest_new_aggregated_payloads near `slot`
     ///               (payloads that arrived after the last merge — late arrivals)
+    ///
+    /// All sections match data slots in the window (slot - WINDOW, slot] rather
+    /// than exactly `slot`: aggregation matures payloads 2-3 slots after the
+    /// attestation slot, so an exact-slot report is permanently empty.
     ///   block     – payloads observed in the most-recently processed block
     ///   combined  – union of all three
     ///   diff      – validator-coverage delta between block and prev_new
@@ -1939,7 +1948,8 @@ pub const ForkChoice = struct {
 
         // Fill prev_new from the coverage saved before the last merge (if slot matches).
         if (self.saved_pre_merge_new_coverage) |*cov| {
-            if (cov.slot == slot) {
+            // Window match, mirroring collectCoverageFromPayloads.
+            if (cov.slot <= slot and cov.slot +| COVERAGE_REPORT_WINDOW_SLOTS > slot) {
                 const vlen = @min(cov.seen.len, validator_count);
                 @memcpy(prev_new_seen[0..vlen], cov.seen[0..vlen]);
                 const slen = @min(cov.has_subnet.len, committee_count);
@@ -4527,6 +4537,13 @@ fn pruneTrivialFromAggregateSnapshot(
     );
 }
 
+/// Coverage-report slot window. Aggregated payloads for attestation data made
+/// at slot S mature through the pipeline (gossip aggregate -> latest_new ->
+/// rotation -> latest_known / block inclusion) over the following ~2-3 slots,
+/// so a "last round" report keyed to a single exact data slot never matches
+/// anything; it must look back a few data slots.
+const COVERAGE_REPORT_WINDOW_SLOTS: types.Slot = 4;
+
 fn collectCoverageFromPayloads(
     map: *AggregatedPayloadsMap,
     slot: types.Slot,
@@ -4538,9 +4555,10 @@ fn collectCoverageFromPayloads(
 ) void {
     var it = map.iterator();
     while (it.next()) |entry| {
-        if (entry.key_ptr.slot != slot) continue;
+        // Window match (slot - WINDOW, slot]: see COVERAGE_REPORT_WINDOW_SLOTS.
+        if (entry.key_ptr.slot > slot or entry.key_ptr.slot +| COVERAGE_REPORT_WINDOW_SLOTS <= slot) continue;
         for (entry.value_ptr.items) |*stored| {
-            if (stored.slot != slot) continue;
+            if (stored.slot > slot or stored.slot +| COVERAGE_REPORT_WINDOW_SLOTS <= slot) continue;
             for (0..stored.proof.participants.len()) |validator_index| {
                 if (validator_index >= seen.len) continue;
                 if (!(stored.proof.participants.get(validator_index) catch false)) continue;
@@ -6100,4 +6118,77 @@ test "rebase: to fork branch node (G) removes previous canonical chain" {
     try std.testing.expect(ctx.fork_choice.attestations.get(2).?.latestKnown.?.index == 1);
     // I: 8 -> 2
     try std.testing.expect(ctx.fork_choice.attestations.get(3).?.latestKnown.?.index == 2);
+}
+
+test "collectCoverageFromPayloads matches data slots within the report window" {
+    const allocator = std.testing.allocator;
+    const data_slot: types.Slot = 100;
+
+    var map = AggregatedPayloadsMap.init(allocator);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |*stored| stored.proof.deinit();
+            entry.value_ptr.deinit(allocator);
+        }
+        map.deinit();
+    }
+
+    // One stored payload for attestation data made at `data_slot`, with
+    // validators 1 and 3 as participants.
+    var proof = try types.SingleMessageAggregate.init(allocator);
+    errdefer proof.deinit();
+    try types.aggregationBitsSet(&proof.participants, 1, true);
+    try types.aggregationBitsSet(&proof.participants, 3, true);
+
+    const att_data = types.AttestationData{
+        .slot = data_slot,
+        .head = .{ .root = [_]u8{0} ** 32, .slot = data_slot },
+        .target = .{ .root = [_]u8{0} ** 32, .slot = data_slot },
+        .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+    };
+    const gop = try map.getOrPut(att_data);
+    gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(allocator, .{ .slot = data_slot, .proof = proof });
+
+    const validator_count = 8;
+    const committee_count: types.SubnetId = 1;
+    var seen: [validator_count]bool = undefined;
+    var combined_seen: [validator_count]bool = undefined;
+    var has_subnet: [1]bool = undefined;
+    var combined_has: [1]bool = undefined;
+
+    const reset = struct {
+        fn run(s: []bool, cs: []bool, h: []bool, ch: []bool) void {
+            @memset(s, false);
+            @memset(cs, false);
+            @memset(h, false);
+            @memset(ch, false);
+        }
+    }.run;
+
+    // Report asked 2 slots after the data slot (the realistic aggregation
+    // pipeline lag): must match through the window.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot + 2, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(seen[1]);
+    try std.testing.expect(seen[3]);
+    try std.testing.expect(!seen[0]);
+    try std.testing.expect(has_subnet[0]);
+
+    // Exact-slot report still matches (window upper bound is inclusive).
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(seen[1]);
+
+    // Past the window: no match.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot + COVERAGE_REPORT_WINDOW_SLOTS, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(!seen[1]);
+    try std.testing.expect(!has_subnet[0]);
+
+    // Future data (report slot BEFORE the data slot): no match.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot - 1, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(!seen[1]);
 }
