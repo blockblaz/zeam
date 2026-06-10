@@ -5442,11 +5442,24 @@ pub const BeamChain = struct {
         // `shouldCatchUpFromPeerStatus` directly so a peer that reports
         // a higher head triggers catch-up without a state transition.
 
-        // Our head or finalization is behind peer finalization.
+        // Our head or finalization is MATERIALLY behind peer finalization.
         // Include the exact peers whose finalized slots make this node report
         // `peers_materially_ahead`, so logs can name the source of the decision.
-        const behind_peer_finalization = our_head_slot < max_peer_finalized_slot or our_finalized_slot < max_peer_finalized_slot;
-        if (behind_peer_finalization) {
+        //
+        // The tolerance matters for liveness: a 1-2 slot peer finalized lead is a
+        // normal transient (a peer that imports or justifies a beat earlier reports
+        // a higher finalized slot until the next import lands here). Reporting
+        // `peers_materially_ahead` on any >=1-slot lead silences attestation,
+        // aggregation AND proposal on this node; if a supermajority of nodes sees
+        // the same small lead (e.g. one node privately advanced its checkpoint on a
+        // block that was never published), they all go silent, no block is ever
+        // produced, finalization never advances, and the gate can never lift — a
+        // permanent network-wide freeze. With the tolerance the supermajority keeps
+        // building, out-justifies the lone leader within a couple of slots, and the
+        // situation self-heals. Small gaps are still caught up: the `.synced` arms
+        // of `shouldRefreshPeerStatus` / `shouldCatchUpFromPeerStatus` trigger
+        // status refresh and range sync without flipping the duty-gating state.
+        if (peerFinalizationMateriallyAhead(our_head_slot, our_finalized_slot, max_peer_finalized_slot)) {
             var info = self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
             var cause_guard = self.connected_peers.iterateLocked();
             defer cause_guard.deinit();
@@ -5454,7 +5467,7 @@ pub const BeamChain = struct {
             while (cause_iter.next()) |entry| {
                 const peer_info = entry.value_ptr;
                 if (peer_info.latest_status) |status| {
-                    if (status.finalized_slot > our_head_slot or status.finalized_slot > our_finalized_slot) {
+                    if (peerFinalizationMateriallyAhead(our_head_slot, our_finalized_slot, status.finalized_slot)) {
                         info.peers_materially_ahead.addPeer(peer_info.peer_id, status.finalized_slot);
                     }
                 }
@@ -5463,6 +5476,25 @@ pub const BeamChain = struct {
         }
 
         return .synced;
+    }
+
+    /// Pure decision: is a peer-reported finalized slot far enough ahead of our
+    /// head/finalized checkpoint to treat the network as materially ahead of us
+    /// (and silence local duties while range sync catches up)?
+    ///
+    /// Leads within `BLOCKS_BY_RANGE_SYNC_THRESHOLD` slots are treated as normal
+    /// propagation transients, not a sync deficit; see `getSyncStatus` for the
+    /// liveness rationale.
+    pub fn peerFinalizationMateriallyAhead(
+        our_head_slot: types.Slot,
+        our_finalized_slot: types.Slot,
+        peer_finalized_slot: types.Slot,
+    ) bool {
+        const tolerance: types.Slot = constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD;
+        // Saturating adds: slot values never approach the u64 ceiling in practice,
+        // but keep the predicate total for fuzzed/boundary inputs.
+        return peer_finalized_slot > our_head_slot +| tolerance or
+            peer_finalized_slot > our_finalized_slot +| tolerance;
     }
 
     fn behindPeersStatus(
@@ -9574,4 +9606,30 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
     // The reader's borrow is still valid even after the writer mutated
     // the map: refcount kept the underlying state alive.
     try std.testing.expectEqual(mock_chain.genesis_state.slot, borrow.state.slot);
+}
+
+test "peerFinalizationMateriallyAhead tolerates small finalization leads" {
+    // The incident shape: one peer's finalized checkpoint one step ahead of ours
+    // (it privately advanced on a block that never reached the network). A 1-slot
+    // lead must NOT silence local duties, or a supermajority sharing our view
+    // freezes the chain permanently.
+    try std.testing.expect(!BeamChain.peerFinalizationMateriallyAhead(463, 460, 461));
+
+    // Leads up to and including the tolerance are normal propagation transients.
+    try std.testing.expect(!BeamChain.peerFinalizationMateriallyAhead(100, 100, 104));
+    try std.testing.expect(!BeamChain.peerFinalizationMateriallyAhead(100, 98, 102));
+
+    // One slot past the tolerance is material.
+    try std.testing.expect(BeamChain.peerFinalizationMateriallyAhead(100, 100, 105));
+
+    // A genuinely-behind node (late joiner) is material on both terms.
+    try std.testing.expect(BeamChain.peerFinalizationMateriallyAhead(10, 5, 200));
+
+    // Finalization-perception lag alone (head fine, finalized behind by more than
+    // the tolerance) still reports materially ahead, matching the pre-tolerance
+    // semantics for real gaps.
+    try std.testing.expect(BeamChain.peerFinalizationMateriallyAhead(100, 50, 56));
+
+    // Equal views: never material.
+    try std.testing.expect(!BeamChain.peerFinalizationMateriallyAhead(100, 100, 100));
 }
