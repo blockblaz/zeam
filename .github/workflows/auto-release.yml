@@ -537,20 +537,20 @@ jobs:
         MESSAGE="🚀 *Zeam $GITHUB_TAG Release SUCCESS*
 
         *Release Details:*
-        • Version: `$VERSION`
-        • Network: `$GITHUB_TAG`
+        • Version: \`$VERSION\`
+        • Network: \`$GITHUB_TAG\`
         • Repository: [${{ github.repository }}]($REPO_URL)
 
         *🐋 Docker Images Available:*
-        • Multi-arch: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG`
-        • AMD64: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-amd64`
-        • ARM64: `$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-arm64`
+        • Multi-arch: \`$REGISTRY/$IMAGE_NAME:$DOCKER_TAG\`
+        • AMD64: \`$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-amd64\`
+        • ARM64: \`$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-arm64\`
 
         *🔗 Quick Links:*
         • [GitHub Release]($REPO_URL/releases/tag/$GITHUB_TAG)
 
         *🌿 Deployment:*
-        • Code pushed to `$DOCKER_TAG` branch
+        • Code pushed to \`$DOCKER_TAG\` branch
         • Shadow branch: $SHADOW_STATUS
 
         _🤖 Automated release notification_"
