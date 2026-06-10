@@ -23,7 +23,7 @@ const LEAN_STATUS_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 /// `#[repr(u32)]` plus explicit discriminants pin the round-trip and
 /// kill the foot-gun where Rust's default fieldless-enum `as u32` follows
 /// declaration order while a hand-rolled `TryFrom` uses a different
-/// mapping. Reported by @ch4r10t33r on PR #824.
+/// mapping.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeanSupportedProtocol {
@@ -169,7 +169,7 @@ mod tests {
     /// `TryFrom<u32>` mapping silently disagrees with Rust's default
     /// fieldless-enum `as u32` (declaration-order).
     ///
-    /// Reported by @ch4r10t33r on PR #824 — prior to the
+    /// Prior to the
     /// `#[repr(u32)]` + explicit-discriminant fix, `StatusV1 as u32`
     /// returned 2 (declaration ord) while `try_from(2)` returned
     /// `BlocksByRangeV1`, so a Rust→u32 emission followed by a

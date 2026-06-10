@@ -18,12 +18,12 @@ const snappyz = @import("snappyz");
 const snappyframesz = @import("snappyframesz");
 const node_registry = @import("./node_registry.zig");
 const NodeNameRegistry = node_registry.NodeNameRegistry;
-// #942 follow-up: publish-side forensic logging includes the build git SHA so
+// Publish-side forensic logging includes the build git SHA so
 // receivers across the fleet can correlate broken-byte receipts back to the
 // exact producer binary.
 const build_options = @import("build_options");
 
-// Gossipsub spec message-id domain (matches Rust libp2p-glue / leanSpec).
+// Gossipsub message-id domain (matches the Rust libp2p-glue implementation).
 const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = .{ 0x01, 0x00, 0x00, 0x00 };
 
 const ServerStreamError = error{
@@ -38,34 +38,34 @@ const ServerStreamError = error{
 /// Sized to match `MAX_GOSSIP_BLOCK_SIZE`: `blocks_by_range` and
 /// `blocks_by_root` carry the same XMSS-heavy blocks as the gossip block
 /// topic, so the RPC cap must accommodate the same per-block payload. A
-/// lower RPC cap (was 4 MB before #960) caused `error.PayloadTooLarge`
+/// lower RPC cap (previously 4 MB) caused `error.PayloadTooLarge`
 /// during `buildResponseFrame` for every legitimately-sized block that
 /// fit in gossip but not in the RPC frame check, breaking blocks_by_range
 /// catch-up across all peer clients and preventing finalisation.
 ///
-/// TODO(#855 review #9 follow-up): split into per-protocol caps so
-/// attestations / aggregations / Status / Goodbye can keep a tighter
-/// ceiling than block-carrying responses. Tracked separately.
+/// TODO: split into per-protocol caps so attestations / aggregations /
+/// Status / Goodbye can keep a tighter ceiling than block-carrying
+/// responses. Tracked separately.
 const MAX_RPC_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Gossip block message size limit.
 ///
 /// XMSS/post-quantum signatures are substantially larger than BLS: a single
-/// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
-/// MAX_ATTESTATIONS_DATA (16) attestations each with such a proof.  On devnet4
-/// a legitimate block reached ~9.37 MB, exceeding the 4 MB RPC limit and
-/// triggering error.TooLarge (issue #723).
+/// SingleMessageAggregate can be hundreds of KB, and blocks carry up to
+/// MAX_ATTESTATIONS_DATA (8) attestations each with such a proof. A legitimate
+/// block has been observed at ~9.37 MB, exceeding the 4 MB RPC limit and
+/// triggering error.TooLarge.
 ///
-/// Set to 50 MB to accommodate current devnet block sizes with room to grow.
-/// Revisit once the leanSpec formalises a MAX_GOSSIP_BLOCK_SIZE constant.
+/// Set to 50 MB to accommodate current block sizes with room to grow.
+/// Revisit once a MAX_GOSSIP_BLOCK_SIZE constant is formalised.
 ///
-/// TODO(#855 review #14): 50 MB × N peers is a real memory-pressure surface.
-/// Track in a follow-up issue once the spec lands and we can lower this.
+/// TODO: 50 MB × N peers is a real memory-pressure surface; lower it once
+/// the limit is formalised.
 const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
 /// Maximum number of leading bytes inlined into gossip-decode-failure log
-/// lines for the #942 diagnostic preview. 32 bytes is enough to cover any
+/// lines for the diagnostic preview. 32 bytes is enough to cover any
 /// reasonable framing-magic prefix (snappy-frames magic is 10 bytes; common
 /// snappy-block varint headers are 1–3 bytes plus body tags) while keeping
 /// the log line readable and bounded.
@@ -84,7 +84,7 @@ const BytePreview = struct {
 };
 
 /// Build a `"aa bb cc ..."` hex preview of the first `max_bytes` of `data`
-/// for #942 gossip-decode-failure logs. Returns an empty slice when `data`
+/// for gossip-decode-failure logs. Returns an empty slice when `data`
 /// is empty. Pure / stack-only; safe to call from FFI gossip ingress
 /// without heap allocation.
 fn byteHexPreview(data: []const u8, max_bytes: usize) BytePreview {
@@ -194,8 +194,8 @@ fn validateSnappyHeader(
 
 /// RPC frame snappy-header validator. Used by `parseRequestFrame` and
 /// `parseResponseFrame` to bound declared sizes before snappy-frame decode.
-/// (Renamed from `validateGossipSnappyHeader` in PR #855: the original
-/// name was inverted — it was always RPC, never gossip.)
+/// (Renamed from `validateGossipSnappyHeader`: the original name was
+/// inverted — it was always RPC, never gossip.)
 fn validateRpcSnappyHeader(message_bytes: []const u8) FrameDecodeError!SnappyHeader {
     return validateSnappyHeader(message_bytes, MAX_RPC_MESSAGE_SIZE) catch |e| switch (e) {
         error.EmptyMessage => return error.EmptyFrame,
@@ -218,8 +218,8 @@ fn validateRpcSnappyHeader(message_bytes: []const u8) FrameDecodeError!SnappyHea
 /// sizes; it does not (and cannot) verify body integrity — that's the
 /// decoder's job.
 ///
-/// Two-layer defense exit criteria (PR #855 review #6): keep this guard
-/// permanently. It serves three purposes the upstream zig-snappy library
+/// Two-layer defense: keep this guard permanently. It serves three purposes
+/// the upstream zig-snappy library
 /// can't: (a) rejects oversized declared sizes pre-allocation using zeam's
 /// per-topic limits, (b) gives callers a typed error so we can attribute
 /// attacker shapes in logs/metrics, (c) acts as a safety net if a future
@@ -372,7 +372,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
 
 /// Snappy-frame an RPC error `message`, prepend the `code` result byte and the
 /// uncompressed-size varint, and relay the finished frame to the Rust bridge.
-/// Mirrors the framing `serverStreamSendResponse` applies to success chunks: the
+/// Uses the same framing `serverStreamSendResponse` applies to success chunks: the
 /// Rust side only relays the bytes (and closes the stream). A peer must be able
 /// to snappy-decode the payload, so the framing cannot be skipped.
 fn sendRpcErrorFramed(zigHandler: *EthLibp2p, channel_id: u64, code: u8, message: []const u8) void {
@@ -433,16 +433,16 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
 
 /// 1-of-N sample counter for malformed-message debug dumps. Without this gate,
 /// a peer spamming garbage gossip (e.g. sustained 1k msg/s) would fill the
-/// disk with one debug file per message (PR #855 review #5). We only persist
+/// disk with one debug file per message. We only persist
 /// `1` of every `MALFORMED_DUMP_SAMPLE_RATE` rejections; the rest are logged
 /// inline. The counter is process-local and racy across threads, which is
 /// fine — the goal is *not* exact 1:N sampling, just bounded disk pressure.
 ///
-/// Lowered 1024 → 32 for the #942 in-transit-corruption investigation
-/// (2026-05-29 devnet). Worst-case observed failure rate was ~30 dumps/min
+/// Lowered 1024 → 32 for an in-transit-corruption investigation.
+/// Worst-case observed failure rate was ~30 dumps/min
 /// on a single node, at <300 KB per dump → ~9 MB/min on disk, bounded by
 /// the rolling `deserialization_dumps/` cleanup in the ops playbook.
-/// Restore to 1024 once the libp2p-layer corruption is fixed (issue #942).
+/// Restore to 1024 once the libp2p-layer corruption is fixed.
 const MALFORMED_DUMP_SAMPLE_RATE: usize = 32;
 var malformed_dump_counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
@@ -460,7 +460,7 @@ fn shouldPersistMalformedDump() bool {
 /// Previously returned `?[]const u8` (the allocated filename) while also doing
 /// `defer allocator.free(filename)` — so callers received a dangling pointer and
 /// segfaulted when logging it.  The fix: log from inside this function and return
-/// a plain bool; callers no longer touch the filename string at all (#725).
+/// a plain bool; callers no longer touch the filename string at all.
 fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
     const io = std.Io.Threaded.global_single_threaded.io();
     // Create dumps directory if it doesn't exist
@@ -547,7 +547,7 @@ fn rejectMalformedGossip(
         error.HeaderWithoutBody => "snappy_truncated",
     };
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
-    // #942: include the first 32 bytes hex inline so operators can diagnose
+    // Include the first 32 bytes hex inline so operators can diagnose
     // framing-format mismatches (e.g. snappy-frames magic `ff 06 00 00 73 4e
     // 61 50 70 59`) from logs without needing the sample-rate-gated dump file.
     const preview = byteHexPreview(message_bytes, 32);
@@ -555,7 +555,7 @@ fn rejectMalformedGossip(
         "Rejecting gossip message: {s} (topic={s}, len={d}, peer={s}{f}, first32={s})",
         .{ reason, topic_slice, message_bytes.len, sender_peer_id_slice, node_name, preview.slice() },
     );
-    // #942: dashboard-visible counter so a stuck zeam fleet shows up via
+    // Dashboard-visible counter so a stuck zeam fleet shows up via
     // metrics before head_slot drifts off wall-clock.
     zeam_metrics.incrGossipDecodeFailure(topic_kind, dump_label);
     if (shouldPersistMalformedDump()) {
@@ -576,15 +576,15 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     const topic_slice = std.mem.span(topic_str);
 
     // Block gossip messages carry XMSS/post-quantum aggregated signatures and
-    // can reach tens of MB (devnet4 saw ~9.37 MB — issue #723). Use
-    // MAX_GOSSIP_BLOCK_SIZE for block topics and MAX_RPC_MESSAGE_SIZE for the
-    // smaller-message topics; both are 50 MB today (see #960), so this
-    // distinction is currently a no-op but kept for the per-kind tightening
-    // TODO below.
+    // can be large (observed around 9 MB). Block topics decode under
+    // MAX_GOSSIP_BLOCK_SIZE; the smaller-message topics (attestations,
+    // aggregations) decode under MAX_RPC_MESSAGE_SIZE. Both ceilings are
+    // currently equal, so this per-kind switch is presently a no-op — it is
+    // kept as the seam for the tighter per-kind ceilings described below.
     //
-    // TODO(#855 review #9): attestations/aggregations rarely approach
-    // MAX_RPC_MESSAGE_SIZE. Tighter per-kind ceilings would let us
-    // reject earlier and reduce attacker amplification. Track separately.
+    // TODO: attestations/aggregations rarely approach these limits. Tighter
+    // per-kind ceilings would let us reject earlier and reduce attacker
+    // amplification. Track separately.
     const decode_limit: usize = switch (topic.gossip_topic.kind) {
         .block => MAX_GOSSIP_BLOCK_SIZE,
         else => MAX_RPC_MESSAGE_SIZE,
@@ -596,7 +596,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     // typed errors so we can attribute attacker shapes (corrupt varint vs.
     // oversized claim vs. truncated body) in logs and — eventually — metrics.
     //
-    // Note (PR #855 review #8): this decodes the leading varint, and so does
+    // Note: this decodes the leading varint, and so does
     // `snappyz.decodeWithMax` further down. The duplication is intentional and
     // worth O(10ns) per gossip message; both decoders MUST agree on the same
     // size-limit comparison (strict `>`, see `SnappyHeaderValidationError`).
@@ -610,23 +610,22 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     _ = validateGossipSnappyHeader(message_bytes, decode_limit) catch |e| {
         rejectMalformedGossip(zigHandler, e, topic_kind_label, topic_slice, sender_peer_id_slice, message_bytes);
-        // TODO(#855 review #4): apply a libp2p gossipsub score penalty here
-        // so a peer spamming malformed gossip is ejected by the protocol
-        // instead of getting unlimited free retries. Out of scope for the
-        // panic fix; tracked separately.
+        // TODO: apply a libp2p gossipsub score penalty here so a peer spamming
+        // malformed gossip is ejected by the protocol instead of getting unlimited
+        // free retries. Out of scope for the panic fix; tracked separately.
         return;
     };
 
     const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
-        // #942: inline first-bytes preview + per-failure counter so a stalled
+        // Inline first-bytes preview + per-failure counter so a stalled
         // zeam fleet shows up on dashboards (`zeam_gossip_decode_failures_total`)
         // and the framing format on the wire is diagnosable from logs alone.
         //
-        // #942 producer attribution: sha256(compressed) of the inbound bytes
+        // Producer attribution: sha256(compressed) of the inbound bytes
         // is the byte-exact fingerprint to look up against the publish-side
-        // `[#942 publish]` log line's `sha256_compressed`. Length alone has
-        // been observed to collide (devnet 2026-05-29 dump showed length
-        // 284553 match between ethlambda publish and zeam_8 inbound, but
+        // `[publish]` log line's `sha256_compressed`. Length alone has
+        // been observed to collide (a captured dump showed length
+        // 284553 match between an ethlambda publish and a zeam inbound, but
         // sha256 differed — proving in-transit byte mutation rather than
         // codec interop bug). Adding the hash lets correlation become a
         // single fleet-wide grep.
@@ -1264,9 +1263,9 @@ pub extern fn wait_for_network_ready(
 pub extern fn stop_network(network_id: u32) callconv(.c) void;
 /// Returns `true` when the publish was successfully enqueued onto the Rust-side
 /// swarm command channel, `false` when the command was dropped (network not
-/// initialized, channel full / closed, or null topic). See issue #808 — under
-/// load the bounded command channel can drop our own attestations and the
-/// caller needs to know rather than logging "published" unconditionally.
+/// initialized, channel full / closed, or null topic). Under load the bounded
+/// command channel can drop our own attestations and the caller needs to know
+/// rather than logging "published" unconditionally.
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
@@ -1303,8 +1302,8 @@ pub extern fn send_rpc_error_response(
     frame_len: usize,
 ) callconv(.c) void;
 
-/// Issue #808: tag space for `get_swarm_command_dropped_total`. Mirrors the
-/// `SwarmCommandDropReason` enum on the Rust side. **Stable wire contract** —
+/// Tag space for `get_swarm_command_dropped_total`. Matches the
+/// `SwarmCommandDropReason` enum on the Rust side. Stable wire contract:
 /// these tags are passed by value across FFI; do not renumber. Adding a new
 /// reason is fine; existing reasons must keep their tag.
 pub const SwarmCommandDropReason = enum(u32) {
@@ -1317,7 +1316,7 @@ pub const SwarmCommandDropReason = enum(u32) {
 /// Rust event loop, for the given reason tag. Counts are global across all
 /// networks; the metrics layer scrapes once per Prometheus hit and turns the
 /// monotonic count into a labeled `zeam_libp2p_swarm_command_dropped_total`
-/// counter via deltas (see `pkgs/metrics`).
+/// counter via deltas.
 pub extern fn get_swarm_command_dropped_total(reason_tag: u32) callconv(.c) u64;
 
 /// Last cumulative drop count we observed from the Rust side, per reason
@@ -1341,13 +1340,13 @@ fn refreshSwarmCommandDropMetric() void {
     }
 }
 
-/// leanMetrics PR #35: current number of remote peers in this node's
-/// gossipsub mesh, across all subscribed topics. Kept fresh from inside the
+/// Current number of remote peers in this node's gossipsub mesh, across all
+/// subscribed topics. Kept fresh from inside the
 /// rust-libp2p swarm task (gossipsub events, connection closes, 1s tick) and
 /// read here on every Prometheus scrape — "on scrape" semantics.
 pub extern fn get_mesh_peers_total(network_id: u32) callconv(.c) u64;
 
-/// leanMetrics PR #35 — `lean_gossip_mesh_peers`.
+/// `lean_gossip_mesh_peers`.
 ///
 /// The Rust glue keeps `MESH_PEERS_TOTAL` as a fixed-size
 /// `[AtomicU64; MAX_NETWORKS]` (slots for `network_id` 0…MAX_NETWORKS-1,
@@ -1379,7 +1378,7 @@ fn refreshMeshPeersMetric() void {
 /// `registerScrapeRefresher` stored a single callback, so this fan-out
 /// existed because registering each refresher individually would silently
 /// overwrite the previous one. The metrics module now keeps an append-only
-/// list of refreshers (see `pkgs/metrics/src/lib.zig`), so individual
+/// list of refreshers, so individual
 /// registration would also be safe — but we keep the fan-out for two
 /// reasons:
 ///   * one callback per module makes the registration site (below) easier
@@ -1436,7 +1435,7 @@ pub const EthLibp2p = struct {
     /// thread (status refresh, block fetch dispatch) and the rust-bridge
     /// thread (response / EOS / error delivery). Unsynchronized access
     /// corrupts callback entries and has produced GPEs in onReqRespResponse
-    /// during status RPC bursts (#933).
+    /// during status RPC bursts.
     rpc_callbacks_lock: zeam_utils.SyncMutex = .{},
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -1532,12 +1531,12 @@ pub const EthLibp2p = struct {
         const owned_fork_digest = try allocator.dupe(u8, params.fork_digest);
         errdefer allocator.free(owned_fork_digest);
 
-        // Issue #808: hand the metrics layer a callback so every Prometheus
+        // Hand the metrics layer a callback so every Prometheus
         // scrape pulls the latest cumulative drop counts from the Rust side
         // and turns them into deltas on `zeam_libp2p_swarm_command_dropped_total`.
         // Counts are global; registering once is enough even with multiple
         // EthLibp2p instances (the call is idempotent).
-        // leanMetrics PR #35: register the network-layer scrape
+        // Register the network-layer scrape
         // refresher. `registerScrapeRefresher` is now append-only (the
         // metrics module keeps a bounded list); we still register a
         // single network-layer fan-out (`refreshNetworkMetrics`) for
@@ -1630,9 +1629,7 @@ pub const EthLibp2p = struct {
         // mesh to every subnet on every node and defeated the bandwidth
         // savings of attestation subnets; the intermediate fix (read the
         // handler map after BeamNode.run()) required a strict startup order
-        // and did not surface late changes to the subscription set. See
-        // https://github.com/leanEthereum/leanSpec/blob/main/src/lean_spec/__main__.py
-        // for the spec-conformant selective subscribe.
+        // and did not surface late changes to the subscription set.
         self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetworkThread, .{CreateNetworkThreadArgs{
             .network_id = self.params.networkId,
             .handle = self,
@@ -1669,7 +1666,7 @@ pub const EthLibp2p = struct {
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
 
-        // #942 publish-side forensic log. If a peer reports
+        // Publish-side forensic log. If a peer reports
         // `snappy.error.Corrupt` on bytes whose sha256 matches the
         // `sha256_compressed` field below, the producer of those bytes is the
         // node that emitted this line (identified by `git_sha`). Conversely,
@@ -1682,8 +1679,8 @@ pub const EthLibp2p = struct {
     }
 
     /// Emit a single structured log line capturing the pre-snappy and
-    /// post-snappy hashes of an outbound gossip message plus the spec
-    /// message-id. Intended for cross-fleet log correlation under #942.
+    /// post-snappy hashes of an outbound gossip message plus the gossipsub
+    /// message-id. Intended for cross-fleet log correlation.
     /// Failures here are swallowed: instrumentation must not block publish.
     fn emitPublishForensicLog(
         self: *Self,
@@ -1698,9 +1695,9 @@ pub const EthLibp2p = struct {
         var compressed_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(compressed, &compressed_hash, .{});
 
-        // Spec gossipsub message_id:
+        // Gossipsub message_id:
         //   SHA256(MESSAGE_DOMAIN_VALID_SNAPPY || u64_le(topic_len) || topic || ssz_bytes)[:20]
-        // Mirrors the formula in `rust/libp2p-glue/src/lib.rs` so a producer's
+        // Uses the same formula as the Rust libp2p-glue side so a producer's
         // message_id matches what any receiver computes from the same payload.
         var msg_id_20: [20]u8 = undefined;
         {
@@ -1747,11 +1744,10 @@ pub const EthLibp2p = struct {
         };
 
         // Periodic publish-side forensic. Kept at debug now that the
-        // upstream snappy / cross-copy investigation is closed (commits
-        // 71f24084 + c6cf2241 verified on devnet 2026-05-30). Switch
-        // the network log scope to debug to revive these for triage.
+        // upstream snappy / cross-copy investigation is closed and verified.
+        // Switch the network log scope to debug to revive these for triage.
         self.logger.debug(
-            "[#942 publish] net={d} kind={s} topic={s} slot={d} proposer={d} block_root={x} sha256_ssz={x} sha256_compressed={x} compressed_len={d} self_decode_ok={any} msg_id={x} git_sha={s} snappy_lib=zig-snappy-0.0.5",
+            "[publish] net={d} kind={s} topic={s} slot={d} proposer={d} block_root={x} sha256_ssz={x} sha256_compressed={x} compressed_len={d} self_decode_ok={any} msg_id={x} git_sha={s} snappy_lib=zig-snappy-0.0.5",
             .{
                 self.params.networkId,
                 kind_label,
@@ -1893,7 +1889,7 @@ pub const EthLibp2p = struct {
         );
 
         if (request_id == 0) {
-            // Issue #808: send_rpc_request returns 0 when the Rust-side swarm
+            // send_rpc_request returns 0 when the Rust-side swarm
             // command channel is uninitialized / full / closed, i.e. the
             // request never reached the wire. The Rust layer already logs
             // the specific reason and bumps `get_swarm_command_dropped_total`,
@@ -2120,7 +2116,7 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
     // node became unreachable.
     //
     // Each sub-case asserts both the rejection AND its specific error variant
-    // so log/metric attribution stays distinct (PR #855 review #2).
+    // so log/metric attribution stays distinct.
 
     // 1024 bytes of 0xef: the original Hive panic payload. Rejected as
     // InvalidVarint (every byte is a continuation byte; no terminator).
@@ -2157,7 +2153,7 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
 
     // Header-only buffer for a non-zero declared size: header is valid, body
     // is missing. Distinct error so callers can attribute truncated streams
-    // separately from corrupt headers (PR #855 review #7).
+    // separately from corrupt headers.
     var header_only_buf: [MAX_VARINT_BYTES]u8 = undefined;
     const header_only = uvarint.encode(usize, 32, &header_only_buf);
     try std.testing.expectError(
@@ -2168,7 +2164,7 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
     // Well-formed header followed by at least one payload byte: accepted.
     // The validator does *not* check that the body length matches the
     // declared uncompressed size — that's the decoder's job. See doc comment
-    // on `validateSnappyHeader` (PR #855 review #12).
+    // on `validateSnappyHeader`.
     var ok_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
     const ok_header = uvarint.encode(usize, 32, ok_buf[0..MAX_VARINT_BYTES]);
     ok_buf[ok_header.len] = 0x00;
@@ -2196,8 +2192,8 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
 
     // Boundary: declared == max_size is accepted (strict `>`); declared ==
     // max_size + 1 is rejected. Pinned to match upstream
-    // `snappyz.decodeWithMax`'s `if (block.blockLen > max_size)` contract
-    // (PR #855 review #13). If upstream ever flips to `>=` this test will
+    // `snappyz.decodeWithMax`'s `if (block.blockLen > max_size)` contract.
+    // If upstream ever flips to `>=` this test will
     // fail loudly instead of the validator silently disagreeing across a
     // 1-byte gap.
     var boundary_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
@@ -2210,12 +2206,11 @@ test "validateGossipSnappyHeader returns typed errors for each rejection class" 
     try std.testing.expectEqual(@as(usize, MAX_GOSSIP_BLOCK_SIZE), at_limit_ok.value);
 }
 
-test "issue_942 inbound corruption: real on-the-wire bytes captured from devnet must surface as error.Corrupt" {
-    // Captured 2026-05-29 from zeam_8 (root@77.42.121.211) during devnet run
-    // with PR #953 deployed. The byte stream arrived at zeam_8's gossipsub
-    // ingress with `compressed_len=284553` (matching ethlambda_8's slot-1
-    // block publish at 18:18:19.929 UTC, length 284553) but with a DIFFERENT
-    // sha256 than ethlambda's published `compressed_sha256=0c83964d…`.
+test "inbound corruption: real on-the-wire bytes must surface as error.Corrupt" {
+    // Captured from a node during a live run. The byte stream arrived at the
+    // receiving node's gossipsub ingress with `compressed_len=284553`
+    // (matching a peer's slot-1 block publish, length 284553) but with a
+    // DIFFERENT sha256 than the peer's published `compressed_sha256=0c83964d…`.
     //
     // sha256(this file) = c8700b167c3550add606cdef67ab385d061165c141fd76718bc2a35ff13a496e
     //
@@ -2223,9 +2218,8 @@ test "issue_942 inbound corruption: real on-the-wire bytes captured from devnet 
     // ethlambda, ream, and grandine all use) also fails to decode these
     // bytes with `Offset { offset: 2265232849, dst_pos: 98776 }`. That rules
     // out a zig-snappy ↔ rust-snap interop bug and pins the corruption to
-    // somewhere between ethlambda's publish and zeam_8's receive — almost
-    // certainly inside the libp2p framing / muxer layer (echoes #39 +
-    // ruled out by #37 for mplex specifically).
+    // somewhere between the peer's publish and this node's receive — almost
+    // certainly inside the libp2p framing / muxer layer.
     //
     // Locking the symptom in as a test means any future "fix" to snappyz
     // that starts accepting these mangled bytes goes through a deliberate
@@ -2237,7 +2231,7 @@ test "issue_942 inbound corruption: real on-the-wire bytes captured from devnet 
 }
 
 test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic" {
-    // REGRESSION CANARY (PR #855 review #11): if this test ever panics the
+    // Regression canary: if this test ever panics the
     // whole test binary instead of returning `error.Corrupt`, the upstream
     // `zig-snappy` dependency has been downgraded below v0.0.5 and the
     // uvarint integer-overflow fix is gone. Restore the pin in `build.zig.zon`
@@ -2253,7 +2247,7 @@ test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic
 }
 
 test "byteHexPreview: formats bytes with single-space separator" {
-    // #942 diagnostic: gossip-decode failure logs include the leading bytes
+    // Diagnostic: gossip-decode failure logs include the leading bytes
     // hex so operators can spot framing-format mismatches (snappy-frames
     // magic `ff 06 00 00 73 4e 61 50 70 59` vs snappy-block leading varint)
     // directly from the log line, without needing the sample-rate-gated
@@ -2285,10 +2279,10 @@ test "byteHexPreview: hard cap at GOSSIP_PREVIEW_MAX_BYTES even if caller asks m
     try std.testing.expectEqual(GOSSIP_PREVIEW_MAX_BYTES, p.slice().len / 3 + 1);
 }
 
-test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
-    // Reproduce the #942 gossip-decode-failure pattern in a unit test.
+test "snappyz roundtrip: high-entropy 280KB payload (corruption reproduction)" {
+    // Reproduce the gossip-decode-failure pattern in a unit test.
     //
-    // Observation from the live devnet under PR #945 instrumentation:
+    // Observation from the live network under instrumentation:
     // - Both Zig `snappyz.decodeWithMax` AND Rust `snap::raw::Decoder` reject
     //   the same gossip payloads with `error.Corrupt` / `Offset { offset:
     //   62376420, dst_pos: 65866 }`.
@@ -2300,7 +2294,7 @@ test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
     //   the same payload classes fine. Working hypothesis: `snappyz.encode`
     //   produces non-standard snappy output for inputs that combine
     //   high-entropy content with the chunking boundary at
-    //   `maxBlockSize = 65536` (snappy.zig:17).
+    //   `maxBlockSize = 65536`.
     //
     // The existing snappyz "encode larger than maxBlockSize" test uses a
     // sequential `b.* = i & 0xff` pattern which is highly compressible and
@@ -2308,16 +2302,16 @@ test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
     // input has STARK-proof-like entropy (≈1.0 byte/byte) at sizes that
     // straddle the 64 KB chunk boundary multiple times.
     //
-    // If this test FAILS, we have local reproduction of #942 and can debug
-    // `encodeBlock` (snappy.zig:400) without devnet round-trips. If it
+    // If this test FAILS, we have local reproduction and can debug
+    // `encodeBlock` without network round-trips. If it
     // PASSES, the wire-side corruption originates elsewhere (peer encoder
     // outside zeam, or a gossipsub-layer mutation) and we need to capture
     // a real payload from the wire to drill further.
     const allocator = std.testing.allocator;
 
     // 280 KB: crosses the 65536-byte maxBlockSize boundary 4 times, in the
-    // size range of the failing devnet payloads (`data_len=287149` was a
-    // recurring victim in PR #945's live capture).
+    // size range of the failing payloads (`data_len=287149` was a
+    // recurring victim in the live capture).
     const input_size: usize = 280 * 1024;
     const input = try allocator.alloc(u8, input_size);
     defer allocator.free(input);
@@ -2343,7 +2337,7 @@ test "snappyz roundtrip: high-entropy 280KB payload (#942 reproduction)" {
     try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "snappyz roundtrip: high-entropy 64KB-boundary spans (#942)" {
+test "snappyz roundtrip: high-entropy 64KB-boundary spans" {
     // Targeted variant of the test above: try several input sizes just below,
     // exactly at, and just above `maxBlockSize = 65536` (and 2× / 3× that)
     // so a failure modes that's specific to a single boundary crossing

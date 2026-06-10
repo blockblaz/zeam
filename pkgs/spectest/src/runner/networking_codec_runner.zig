@@ -1,4 +1,4 @@
-// Unified networking_codec runner. leanSpec emits a flat fixture format —
+// Unified networking_codec runner. The spec emits a flat fixture format —
 // each case carries a `codecName` plus codec-specific `input`/`output` —
 // so the runner dispatches on the codec name and skips families it doesn't
 // yet cover (RLP-bound, secp256k1-bound, protobuf-bound). The handlers
@@ -272,7 +272,7 @@ fn runLog2Distance(allocator: Allocator, ctx: Context, input_obj: std.json.Objec
         return FixtureError.InvalidFixture;
     }
 
-    // leanSpec log2_distance(a, b) = 0 if a == b, else
+    // log2_distance(a, b) = 0 if a == b, else
     // (256 - leading-zero-bits-of-XOR). Iterate from MSB.
     var lz: u64 = 0;
     var found = false;
@@ -309,7 +309,7 @@ fn runXorDistance(allocator: Allocator, ctx: Context, input_obj: std.json.Object
     var distance_bytes: [32]u8 = undefined;
     for (a, b, 0..) |x, y, i| distance_bytes[i] = x ^ y;
 
-    // leanSpec emits xor_distance as a minimal hex string (leading zeros
+    // The spec emits xor_distance as a minimal hex string (leading zeros
     // stripped, but at least a single "0").
     const expected_min = try parseHexMinimal(allocator, ctx, expected_hex, "output.distance");
     const actual_min = stripLeadingZeros(distance_bytes[0..]);
@@ -359,7 +359,7 @@ fn runSnappyBlock(allocator: Allocator, ctx: Context, input_obj: std.json.Object
 
     // Snappy block compression is non-canonical: implementations are free
     // to pick between equivalent literal/copy tag sequences. Verify
-    // wire-format interop by decoding leanSpec's output and round-tripping
+    // wire-format interop by decoding the spec's output and round-tripping
     // zeam's own encode/decode pair, instead of demanding byte equality.
     const decoded_expected = snappyz.decode(allocator, expected) catch {
         std.debug.print(

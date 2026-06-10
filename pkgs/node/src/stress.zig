@@ -1,11 +1,9 @@
-// Single-node ingestion stress harness — issue #803 slice (b).
+// Single-node ingestion stress harness.
 //
-// Per the design doc (`docs/threading_refactor_slice_a.md` §"Stress test
-// plan", merge gate for slice a-3 / absorbed into slice b):
-//
-//   "Synthetic gossip-block flood + concurrent `blocks_by_root` RPC against
-//    the same node. Run 30+ minutes; assert no `state-map-key-not-found`
-//    panics, no assertion failures, no `MissingPreState`."
+// Goal: synthetic gossip-block flood + concurrent `blocks_by_root` RPC
+// against the same node. Run 30+ minutes; assert no
+// `state-map-key-not-found` panics, no assertion failures, no
+// `MissingPreState`.
 //
 // What this harness does:
 //
@@ -16,8 +14,8 @@
 //      events / block_cache) under realistic concurrent contention. The
 //      libp2p bridge thread's role is purely an FFI invoker of the same
 //      `chain.onGossip*` / `chain.onBlock` / `chain.onGossipAttestation`
-//      entry points exercised here directly. End-to-end devnet smoke is
-//      covered separately by the existing devnet runner; this harness is
+//      entry points exercised here directly. End-to-end network smoke is
+//      covered separately by the existing network runner; this harness is
 //      the lock-correctness merge gate.
 //
 //   2. Pre-imports the chain serially so `states`, `forkChoice`, `db` are
@@ -27,15 +25,15 @@
 //        * gossip-flood threads: re-call `chain.onBlock(block_i)` cycling
 //          through the chain, exercising the kept_existing path on
 //          `statesCommitKeepExisting` (the long-hold-across-DB-write site
-//          issue #821 cares about).
+//          we care about).
 //        * rpc-reader threads: call `chain.db.loadBlock(...)` for known
 //          and random unknown roots — mirrors the lock-free
-//          `onReqRespRequest{blocks_by_root}` path (slice a-3 PR #820).
+//          `onReqRespRequest{blocks_by_root}` path.
 //        * attestation-spammer threads: build attestations and call
 //          `chain.onGossipAttestation`, exercising `events_lock`.
 //        * borrow-reader threads: call `chain.statesGet(root)` +
 //          `cloneAndRelease` — mirrors the HTTP-API-shaped reader pattern
-//          and the BorrowedState long-hold path (#820).
+//          and the BorrowedState long-hold path.
 //        * block-cache-churner: insert/remove fake-rooted blocks via
 //          `BlockCache` directly, exercising the network-side cache that
 //          `onReqRespRequest` reads.
@@ -49,18 +47,18 @@
 //
 // What this harness does NOT do:
 //
-//   * It does not start a libp2p backend. The slice (a-3) lock-free
+//   * It does not start a libp2p backend. The lock-free
 //     `onReqRespRequest` path is exercised via direct DB reads since the
 //     RPC handler body is a pure DB read after the lock-free conversion.
 //   * It does not exercise multi-node gossip propagation. That's the
-//     10-node devnet under jitter scenario — separate, runs in nightly.
+//     10-node-under-jitter scenario — separate, runs in nightly.
 //   * It does not exercise XMSS proposer-signature verification at full
 //     volume — `chain.onBlock` does verify proposer signature each call,
 //     but we cycle through a fixed set of pre-signed blocks rather than
 //     producing fresh signatures every iteration (which would be ~700ms
 //     per block and dominate runtime). The XMSS verify path is hit
 //     enough at this volume to validate the lock interactions; the slow
-//     XMSS path is covered by the existing `pkgs/xmss` stress tests.
+//     XMSS path is covered by the existing XMSS stress tests.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -245,8 +243,7 @@ fn gossipFloodWorker(ctx: *StressCtx, thread_id: usize) void {
         const block = ctx.blocks[block_idx];
 
         const missing = ctx.chain.onBlock(block, .{ .pruneForkchoice = false, .skipVerify = ctx.skip_verify }) catch |err| {
-            // The design doc (`docs/threading_refactor_slice_a.md`
-            // §Stress test plan) names the merge-gate invariants:
+            // The merge-gate invariants:
             //   * no `MissingPreState` (state-map race)
             //   * no assertion failures / panics
             //   * no UAF / deadlock
@@ -471,7 +468,9 @@ fn cacheChurnWorker(ctx: *StressCtx, thread_id: usize) void {
                 _ = ctx.cache_ops.fetchAdd(1, .monotonic);
                 continue;
             };
-            block.deinit();
+            // On success insertBlockPtr moved block's interior into the cache, so
+            // the cache owns it now — do not deinit here (that would free the
+            // cache's storage and dangle it for the reader path below).
         } else {
             // Try to remove a recently-inserted root.
             var root: types.Root = std.mem.zeroes(types.Root);
@@ -564,7 +563,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 
@@ -762,7 +761,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
 }
 
 // =====================================================================
-// Saturation mode — slice (c-2c) commit 6 of #803.
+// Saturation mode.
 //
 // The default mode above (`runStress`) drives `chain.onBlock` /
 // `chain.onGossipAttestation` directly on producer threads, exercising
@@ -782,11 +781,11 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
 //   * No panic / UAF (DebugAllocator + testing.allocator-grade
 //     bookkeeping in the chain).
 //
-// This is the c-2c part-1 deliverable. Part-2 is the devnet4 burn-in,
-// which is NOT gated on this PR.
+// This is the part-1 deliverable. Part-2 is the multi-node burn-in,
+// which is not gated here.
 //
 // Producers that observe `error.QueueFull` retain ownership of their
-// payload (per the c-2b commit-3 contract on `submitBlock` /
+// payload (per the contract on `submitBlock` /
 // `submitGossipAttestation`) and must `deinit()` the payload. The
 // success path transfers ownership to the worker (which calls
 // `Message.deinit` after dispatch) so the producer must NOT also free
@@ -806,8 +805,8 @@ const SaturationConfig = struct {
             .duration_secs = StressConfig.readEnvU64("ZEAM_STRESS_DURATION_SECS", 30),
             .num_blocks = StressConfig.readEnvUsize("ZEAM_STRESS_NUM_BLOCKS", 6),
             // 4 producers per queue is enough to outpace the single
-            // worker on every devnet-class machine we've measured. The
-            // env knobs let CI dial down on slower runners.
+            // worker on every machine we've measured. The env knobs let
+            // CI dial down on slower runners.
             .block_producer_threads = StressConfig.readEnvUsize("ZEAM_STRESS_SAT_BLOCK_PRODUCERS", 4),
             .attestation_producer_threads = StressConfig.readEnvUsize("ZEAM_STRESS_SAT_ATTN_PRODUCERS", 4),
             .watchdog_stall_secs = StressConfig.readEnvU64("ZEAM_STRESS_WATCHDOG_SECS", 60),
@@ -900,8 +899,8 @@ fn saturationBlockProducerWorker(ctx: *SaturationCtx, thread_id: usize) void {
         };
 
         _ = ctx.block_attempts.fetchAdd(1, .monotonic);
-        // Slice (e) of #803: pass `null` for `block_root` so the
-        // worker recomputes — the stress harness deliberately
+        // Pass `null` for `block_root` so the worker recomputes —
+        // the stress harness deliberately
         // exercises the fallback path. Real producers always pass
         // a precomputed root.
         ctx.chain.submitBlock(cloned, false, null) catch |err| {
@@ -1070,7 +1069,7 @@ fn runStressSaturation(allocator: Allocator, cfg: SaturationConfig) !SaturationS
             .name = spec_name,
             .fork_digest = fork_digest,
             .attestation_committee_count = 1,
-            .max_attestations_data = 16,
+            .max_attestations_data = 8,
         },
     };
 

@@ -26,12 +26,60 @@ jobs:
       docker_tag: ${{ steps.get_tags_labels.outputs.docker_tag }}
       github_tag: ${{ steps.get_tags_labels.outputs.github_tag }}
       has_devnet_tag: ${{ steps.get_tags_labels.outputs.has_devnet_tag }}
+      release_sha: ${{ steps.resolve_release.outputs.release_sha }}
+      release_short_sha: ${{ steps.resolve_release.outputs.release_short_sha }}
+      publish_latest: ${{ steps.resolve_release.outputs.publish_latest }}
 
     steps:
-    - name: Checkout code
+    - name: Checkout release PR head
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Resolve release commit
+      id: resolve_release
+      run: |
+        git fetch origin main --prune --tags --force
+
+        PR_HEAD_SHA=$(git rev-parse HEAD)
+        PR_HEAD_TREE=$(git rev-parse HEAD^{tree})
+        MAIN_TREE=$(git rev-parse origin/main^{tree})
+        RELEASE_SHA="$PR_HEAD_SHA"
+
+        # Empty release commits are only a PR vehicle. If the release PR head is
+        # an empty single-parent commit, publish the parent commit instead so
+        # git tags, Docker metadata, and devnet branches point at the code that
+        # is actually being released.
+        if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 2 ]; then
+          PARENT_SHA=$(git rev-parse HEAD^)
+          PARENT_TREE=$(git rev-parse HEAD^^{tree})
+          if [ "$PR_HEAD_TREE" = "$PARENT_TREE" ]; then
+            RELEASE_SHA="$PARENT_SHA"
+            echo "ℹ️ Release PR head is an empty commit; publishing parent ${RELEASE_SHA:0:8}"
+          fi
+        fi
+
+        RELEASE_SHORT_SHA=$(git rev-parse --short "$RELEASE_SHA")
+        RELEASE_TREE=$(git rev-parse "$RELEASE_SHA^{tree}")
+
+        echo "release_sha=$RELEASE_SHA" >> $GITHUB_OUTPUT
+        echo "release_short_sha=$RELEASE_SHORT_SHA" >> $GITHUB_OUTPUT
+
+        if [ "$RELEASE_TREE" = "$MAIN_TREE" ]; then
+          echo "publish_latest=true" >> $GITHUB_OUTPUT
+          echo "✅ Release tree matches current main; latest Docker tag will be published"
+        else
+          echo "publish_latest=false" >> $GITHUB_OUTPUT
+          echo "ℹ️ Release tree differs from current main; skipping latest Docker tag for pinned release"
+        fi
+
+        if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main; then
+          echo "❌ Release commit must be reachable from main history"
+          exit 1
+        fi
+
+        echo "✅ Release commit: $RELEASE_SHORT_SHA"
 
     - name: Extract tags from PR labels
       id: get_tags_labels
@@ -106,14 +154,14 @@ jobs:
 
         # Create version tag if needed
         if [ "$CREATE_VERSION_TAG" = "true" ]; then
-          git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
+          git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" "${{ steps.resolve_release.outputs.release_sha }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
           git push origin "${{ steps.get_tags_labels.outputs.git_tag }}"
           echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
         fi
 
         # Create devnet git tag (DevnetX)
         if [ "$CREATE_DEVNET_TAG" = "true" ]; then
-          git tag -a "$DEVNET_GIT_TAG" -m "Devnet release for $DEVNET_GIT_TAG"
+          git tag -a "$DEVNET_GIT_TAG" "${{ steps.resolve_release.outputs.release_sha }}" -m "Devnet release for $DEVNET_GIT_TAG"
           git push origin "$DEVNET_GIT_TAG"
           echo "✅ Created devnet git tag $DEVNET_GIT_TAG"
         fi
@@ -132,10 +180,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-    - name: Checkout code
+    - name: Checkout release commit
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        ref: ${{ needs.create-tags.outputs.release_sha }}
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -153,7 +202,7 @@ jobs:
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
-          type=raw,value=latest-${{ matrix.arch }}
+          type=raw,value=latest-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.publish_latest == 'true' }}
           type=raw,value=${{ needs.create-tags.outputs.version }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.version != 'null' }}
           type=raw,value=${{ needs.create-tags.outputs.docker_tag }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
 
@@ -200,8 +249,8 @@ jobs:
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         build-args: |
-          GIT_COMMIT=${{ github.sha }}
-          GIT_BRANCH=${{ github.ref_name }}
+          GIT_COMMIT=${{ needs.create-tags.outputs.release_sha }}
+          GIT_BRANCH=${{ needs.create-tags.outputs.docker_tag || github.event.pull_request.head.ref }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         provenance: false
@@ -222,6 +271,7 @@ jobs:
         password: ${{ secrets.DOCKER_PASSWORD }}
 
     - name: Create and push multi-arch manifest for latest
+      if: ${{ needs.create-tags.outputs.publish_latest == 'true' }}
       run: |
         docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-amd64 \
@@ -241,16 +291,80 @@ jobs:
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.docker_tag }}-amd64 \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.docker_tag }}-arm64
 
-  create-github-release:
-    needs: [ create-tags, build-and-push, create-manifest ]
+  rebase-shadow:
+    needs: create-tags
     runs-on: ubuntu-latest
     if: ${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
+    outputs:
+      shadow_status: ${{ steps.rebase.outputs.shadow_status }}
+      shadow_sha: ${{ steps.rebase.outputs.shadow_sha }}
+      shadow_failed: ${{ steps.rebase.outputs.shadow_failed }}
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Configure git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Fetch all branches
+      run: git fetch origin
+
+    - name: Rebase shadow onto main and push
+      id: rebase
+      run: |
+        if git ls-remote --heads origin shadow | grep -q 'refs/heads/shadow'; then
+          echo "🔄 Rebasing shadow onto main..."
+          git checkout -B shadow origin/shadow
+          if git rebase origin/main; then
+            if git push origin shadow --force-with-lease; then
+              NEW_SHA=$(git rev-parse --short HEAD)
+              echo "shadow_status=✅ rebased to $NEW_SHA" >> $GITHUB_OUTPUT
+              echo "shadow_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+              echo "shadow_failed=false" >> $GITHUB_OUTPUT
+              echo "✅ Shadow rebase succeeded: $NEW_SHA"
+            else
+              echo "shadow_status=❌ push failed — force-with-lease mismatch" >> $GITHUB_OUTPUT
+              echo "shadow_sha=" >> $GITHUB_OUTPUT
+              echo "shadow_failed=true" >> $GITHUB_OUTPUT
+              echo "❌ Shadow push failed"
+              exit 1
+            fi
+          else
+            git rebase --abort || true
+            echo "shadow_status=❌ rebase conflict — manual fix needed" >> $GITHUB_OUTPUT
+            echo "shadow_sha=" >> $GITHUB_OUTPUT
+            echo "shadow_failed=true" >> $GITHUB_OUTPUT
+            echo "❌ Shadow rebase failed; release will continue after notifying Telegram"
+            exit 1 
+          fi
+        else
+          echo "shadow_status=⚠️ shadow branch not found" >> $GITHUB_OUTPUT
+          echo "shadow_sha=" >> $GITHUB_OUTPUT
+          echo "shadow_failed=false" >> $GITHUB_OUTPUT
+        fi
+
+  create-github-release:
+    needs: [ create-tags, build-and-push, create-manifest, rebase-shadow ]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.create-tags.result == 'success' &&
+      needs.build-and-push.result == 'success' &&
+      needs.create-manifest.result == 'success' &&
+      needs.create-tags.outputs.has_devnet_tag == 'true'
+
+    steps:
+    - name: Checkout release commit
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ needs.create-tags.outputs.release_sha }}
 
     - name: Delete existing devnet release if exists
       run: |
@@ -272,9 +386,39 @@ jobs:
       run: |
         DEVNET_TAG="${{ needs.create-tags.outputs.github_tag }}"
         VERSION="${{ needs.create-tags.outputs.version }}"
-        PREVIOUS_TAG=$(git tag -l | grep -iE "^[Dd]evnet[0-9]+" | sort -V -r | grep -v "^$DEVNET_TAG$" | head -1)
+        VERSION_TAG="v$VERSION"
+        PREVIOUS_TAG=""
 
-        if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$DEVNET_TAG" ]; then
+        # For devnet releases, compare against the previous devnet tag for the
+        # same network sequence: DevnetN -> DevnetN-1. This keeps Devnet5
+        # changelogs anchored to Devnet4, even if version numbering is not a
+        # perfect proxy for network transitions. For non-devnet releases, fall
+        # back to the nearest lower vX.Y.Z version tag.
+        if [ -n "$DEVNET_TAG" ]; then
+          DEVNET_NUMBER="${DEVNET_TAG#Devnet}"
+          if [ "$DEVNET_NUMBER" -gt 0 ] 2>/dev/null; then
+            PREVIOUS_DEVNET_NUMBER=$((DEVNET_NUMBER - 1))
+            PREVIOUS_DEVNET_TAG="Devnet$PREVIOUS_DEVNET_NUMBER"
+            if git rev-parse "$PREVIOUS_DEVNET_TAG" >/dev/null 2>&1; then
+              PREVIOUS_TAG="$PREVIOUS_DEVNET_TAG"
+            elif git rev-parse "devnet$PREVIOUS_DEVNET_NUMBER" >/dev/null 2>&1; then
+              PREVIOUS_TAG="devnet$PREVIOUS_DEVNET_NUMBER"
+            fi
+          fi
+        fi
+
+        if [ -z "$PREVIOUS_TAG" ]; then
+          while IFS= read -r TAG; do
+            TAG_VERSION="${TAG#v}"
+            HIGHEST=$(printf '%s\n%s\n' "$TAG_VERSION" "$VERSION" | sort -V | tail -1)
+            if [ "$TAG_VERSION" != "$VERSION" ] && [ "$HIGHEST" = "$VERSION" ]; then
+              PREVIOUS_TAG="$TAG"
+              break
+            fi
+          done < <(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V -r)
+        fi
+
+        if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$VERSION_TAG" ] && [ "$PREVIOUS_TAG" != "$DEVNET_TAG" ]; then
           echo "✅ Found previous tag: $PREVIOUS_TAG"
           echo "📝 Generating changelog from $PREVIOUS_TAG to current release..."
           
@@ -308,7 +452,7 @@ jobs:
           echo "ℹ️ No previous release found or this is the first release"
           CHANGELOG="## 📋 Changes
 
-          This is the first devnet release."
+          This is the first versioned release before $VERSION_TAG."
         fi
 
         # Save changelog to output (escape newlines for GitHub Actions)
@@ -328,6 +472,7 @@ jobs:
           ## Release Information
           - **Version**: ${{ needs.create-tags.outputs.version }}
           - **Network**: ${{ needs.create-tags.outputs.github_tag }}
+          - **Release commit**: `${{ needs.create-tags.outputs.release_short_sha }}`
           - **Docker Images**: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.docker_tag }}`
 
           ## 📋 Changes
@@ -345,7 +490,7 @@ jobs:
 
           ## 🏷️ All Available Tags
           ```bash
-          # Latest release
+          # Latest release (only updated when release PR head matches current main)
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
           # Version-specific
@@ -367,21 +512,15 @@ jobs:
         DEVNET_BRANCH="$DOCKER_TAG"  # branch = devnetX
 
         echo "✅ GitHub tag: $GITHUB_TAG, Docker tag/branch: $DOCKER_TAG"
-        # Fetch all remotes first - ensures origin/main and all branches are available
-        git fetch origin
+        RELEASE_SHA="${{ needs.create-tags.outputs.release_sha }}"
 
-        if git ls-remote --heads origin | grep -q "refs/heads/$DEVNET_BRANCH$"; then
-          echo "✅ $DEVNET_BRANCH branch exists, updating it"
+        # Fetch all remotes first - ensures release commit and branches are available
+        git fetch origin --prune --tags --force
 
-          git checkout "$DEVNET_BRANCH"
-          git merge origin/main --no-edit
-        else
-          echo "✅ $DEVNET_BRANCH branch doesn't exist, creating it from main"
-          git checkout -b "$DEVNET_BRANCH" origin/main
-        fi
-
-        git push origin "$DEVNET_BRANCH"
-        echo "✅ Successfully pushed code to $DEVNET_BRANCH branch"
+        echo "✅ Updating $DEVNET_BRANCH branch to release commit ${RELEASE_SHA:0:8}"
+        git checkout -B "$DEVNET_BRANCH" "$RELEASE_SHA"
+        git push origin "$DEVNET_BRANCH" --force-with-lease
+        echo "✅ Successfully pushed release commit to $DEVNET_BRANCH branch"
 
     - name: Send Telegram success notification
       if: ${{ success() }}
@@ -390,6 +529,10 @@ jobs:
         GITHUB_TAG="${{ needs.create-tags.outputs.github_tag }}"
         VERSION="${{ needs.create-tags.outputs.version }}"
         REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+        REGISTRY="${{ env.REGISTRY }}"
+        IMAGE_NAME="${{ env.IMAGE_NAME }}"
+        SHADOW_STATUS="${{ needs.rebase-shadow.outputs.shadow_status }}"
+        SHADOW_STATUS="${SHADOW_STATUS:-⚠️ skipped}"
 
         MESSAGE="🚀 *Zeam $GITHUB_TAG Release SUCCESS*
 
@@ -399,24 +542,25 @@ jobs:
         • Repository: [${{ github.repository }}]($REPO_URL)
 
         *🐋 Docker Images Available:*
-        • Multi-arch: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$DOCKER_TAG\`
-        • AMD64: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$DOCKER_TAG-amd64\`
-        • ARM64: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$DOCKER_TAG-arm64\`
+        • Multi-arch: \`$REGISTRY/$IMAGE_NAME:$DOCKER_TAG\`
+        • AMD64: \`$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-amd64\`
+        • ARM64: \`$REGISTRY/$IMAGE_NAME:$DOCKER_TAG-arm64\`
 
         *🔗 Quick Links:*
         • [GitHub Release]($REPO_URL/releases/tag/$GITHUB_TAG)
 
         *🌿 Deployment:*
-        • Code pushed to \`$(echo "$DOCKER_TAG")\` branch
+        • Code pushed to \`$DOCKER_TAG\` branch
+        • Shadow branch: $SHADOW_STATUS
 
         _🤖 Automated release notification_"
+
+        PAYLOAD=$(jq -n \
+          --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+          --arg text "$MESSAGE" \
+          '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", disable_web_page_preview: true}')
 
         # Send to Telegram
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -H "Content-Type: application/json" \
-          -d "{
-            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
-            \"text\": \"$MESSAGE\",
-            \"parse_mode\": \"Markdown\",
-            \"disable_web_page_preview\": true
-          }" && echo "📱 Telegram notification sent successfully" || echo "❌ Failed to send Telegram notification"
+          -d "$PAYLOAD" && echo "📱 Telegram notification sent successfully" || echo "❌ Failed to send Telegram notification"

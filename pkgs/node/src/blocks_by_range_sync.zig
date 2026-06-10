@@ -1,8 +1,8 @@
-//! `blocks_by_range` catch-up helpers (issue #893).
+//! `blocks_by_range` catch-up helpers.
 //!
 //! Pure gap/decision logic and unit tests live here. `BeamNode` orchestration
-//! (RPC handlers, chunk import, retry/fallback) remains in `node.zig` until a
-//! dedicated sync-worker module is split out (review on PR #894).
+//! (RPC handlers, chunk import, retry/fallback) lives in the node module until a
+//! dedicated sync-worker module is split out.
 
 const std = @import("std");
 
@@ -10,7 +10,7 @@ const types = @import("@zeam/types");
 
 const constants = @import("./constants.zig");
 
-/// Pure gap helper for status-driven `blocks_by_range` catch-up (issue #893).
+/// Pure gap helper for status-driven `blocks_by_range` catch-up.
 /// Caps the peer-reported gap used for sync thresholding and pagination; per-request
 /// size is still bounded separately by `MAX_REQUEST_BLOCKS`.
 /// Conservative overlap test for concurrent `blocks_by_range` windows.
@@ -67,18 +67,6 @@ pub fn shouldRefreshPeerStatus(
     return .{ .refresh = refresh, .wall_head_lag_slots = wall_head_lag_slots };
 }
 
-/// True when pre-finalization sync should report `peers_materially_ahead` based on
-/// wall-clock head lag alone (early devnets with `finalized_slot = 0`).
-pub fn isWallHeadLagSyncing(
-    our_finalized_slot: types.Slot,
-    max_peer_finalized_slot: types.Slot,
-    wall_head_lag_slots: u64,
-    threshold_slots: u64,
-) bool {
-    if (our_finalized_slot != 0 or max_peer_finalized_slot != 0) return false;
-    return wall_head_lag_slots >= threshold_slots;
-}
-
 /// Rotate a peer batch for rate-limited status refresh.
 pub fn peerBatchWindow(total_peers: usize, cursor: usize, batch_size: usize) struct {
     start: usize,
@@ -128,7 +116,7 @@ pub fn gossipSilentMs(now_ms: u64, last_gossip_rx_ms: u64) u64 {
     return now_ms -| last_gossip_rx_ms;
 }
 
-/// Whether a peer status should trigger proactive catch-up (issue #893 / PR #894).
+/// Whether a peer status should trigger proactive catch-up.
 /// `BLOCKS_BY_RANGE_SYNC_THRESHOLD` only selects range vs by-root inside `initiateCatchUpFromPeerStatus`.
 pub fn shouldCatchUpFromPeerStatus(
     peer_head_slot: types.Slot,
@@ -141,7 +129,7 @@ pub fn shouldCatchUpFromPeerStatus(
     return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot) > 0;
 }
 
-/// Pure decider for the "stuck mesh cluster" recovery path (#942 follow-up).
+/// Pure decider for the "stuck mesh cluster" recovery path.
 ///
 /// Fires when ALL of:
 ///   * `best_peer_head_slot` is `wall_head_lag_threshold_slots` or more slots
@@ -153,7 +141,7 @@ pub fn shouldCatchUpFromPeerStatus(
 ///   * `slot - last_force_refresh_slot >= refresh_cooldown_slots` — at least
 ///     one cooldown window has elapsed since the previous force-refresh, so
 ///     we don't burst-refresh every interval if the condition stays continuously
-///     true (and re-create the en-masse RPC-timeout cascade from #926 that
+///     true (and re-create the en-masse RPC-timeout cascade that
 ///     motivated the original status-refresh batching).
 ///   * `best_peer_head_slot < wall_slot` — sanity check; the helper returns
 ///     false if the best peer is already at or past wall-clock (no stuck cluster).
@@ -183,15 +171,14 @@ pub fn shouldForceFullPeerStatusRefresh(
 /// caller cares about. Defined here so the disposition is unit-testable
 /// without spinning up a `BeamNode`.
 ///
-/// Background (#894 regression discovered on devnet aggregator zeam_8):
-/// when the chain-worker is enabled but its block queue is full (typically
-/// because the aggregator is also draining a flood of attestations), a
-/// `blocks_by_root` / `blocks_by_range` response burst MUST NOT fall back
-/// to inline `chain.onBlock` on the libxev thread. Each inline import
-/// costs ~0.5s of XMSS verification; one 3.4 MB response burst was observed
-/// to wedge libxev for 9.7s, missing block-production duty for the
-/// proposing slot. The gossip path already drops on QueueFull
-/// (`chain.zig::onGossip`); the RPC chunk paths used to fall through.
+/// Background (regression observed on a loaded aggregator): when the
+/// chain-worker is enabled but its block queue is full (typically because the
+/// aggregator is also draining a flood of attestations), a `blocks_by_root` /
+/// `blocks_by_range` response burst must not fall back to inline `onBlock` on
+/// the libxev thread. Each inline import costs ~0.5s of XMSS verification; one
+/// 3.4 MB response burst was observed to wedge libxev for 9.7s, missing
+/// block-production duty for the proposing slot. The gossip path already drops
+/// on QueueFull; the RPC chunk paths used to fall through.
 pub const ImportSubmitOutcome = enum {
     /// Worker accepted the block. Caller returns immediately.
     submitted,
@@ -211,8 +198,8 @@ pub const ImportSubmitOutcome = enum {
 
 /// Disposition for the libxev RPC chunk handler after an
 /// `ImportSubmitOutcome`. Pure decision logic so it can be exercised in
-/// unit tests without a chain-worker. Matches the contract callers in
-/// `node.zig::processBlockByRootChunk` / `processBlockByRangeChunk` rely on.
+/// unit tests without a chain-worker. Matches the contract the RPC chunk
+/// handlers (`processBlockByRootChunk` / `processBlockByRangeChunk`) rely on.
 pub const ChunkImportDisposition = enum {
     /// Block handed off; caller returns from the RPC chunk handler.
     handled,
@@ -354,7 +341,7 @@ test "shouldRefreshPeerStatus handles cadence sync state and wall lag" {
 }
 
 test "shouldCatchUpFromPeerStatus triggers on head gap before finalization" {
-    // Early devnet: both finalized at 0, peer head ahead — must catch up via blocks_by_root.
+    // Early network: both finalized at 0, peer head ahead — must catch up via blocks_by_root.
     try std.testing.expect(shouldCatchUpFromPeerStatus(31, 0, 0, 0, 40));
     try std.testing.expect(!shouldCatchUpFromPeerStatus(0, 0, 0, 0, 40));
     try std.testing.expect(shouldCatchUpFromPeerStatus(31, 0, 0, 0, 10)); // wall caps gap but still > 0
@@ -364,19 +351,16 @@ test "shouldCatchUpFromPeerStatus triggers on head gap before finalization" {
 }
 
 test "shouldCatchUpFromPeerStatus small gaps use by-root not threshold gate" {
-    // The threshold gate distinguishes "small gap → by-root parent walk" from
-    // "large gap → bulk by-range fetch" — exercise a gap small enough to stay
-    // on the by-root path under the post-#942-follow-up threshold (4). The
-    // earlier shape of this test used gap=50 against the historic threshold
-    // of 64; the present numbers preserve the intent (gap below threshold,
-    // still triggers catch-up) with the post-fix threshold value.
-    const gap = cappedSyncGapSlots(3, 0, 10);
+    // A sub-threshold gap (range/by-root selection happens elsewhere). Expressed relative to the
+    // threshold so it stays valid if BLOCKS_BY_RANGE_SYNC_THRESHOLD changes.
+    const small_gap_peer = constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD - 1;
+    const gap = cappedSyncGapSlots(small_gap_peer, 0, 100);
     try std.testing.expect(gap < constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD);
-    try std.testing.expect(shouldCatchUpFromPeerStatus(3, 0, 0, 0, 10));
+    try std.testing.expect(shouldCatchUpFromPeerStatus(small_gap_peer, 0, 0, 0, 100));
 }
 
 test "shouldForceFullPeerStatusRefresh fires when stuck behind a cluster of stale peers" {
-    // The scenario the helper exists to recover from (#942 follow-up): wall is at
+    // The scenario the helper exists to recover from: wall is at
     // slot 300, best peer head zeam knows about is slot 50, no force-refresh has
     // run yet → stuck-mesh-cluster condition is met.
     try std.testing.expect(shouldForceFullPeerStatusRefresh(50, 300, 300, 0, 16, 16));
@@ -478,13 +462,6 @@ test "syncEndDecision fork abort" {
     try std.testing.expectEqual(SyncEndAction.abort_fallback, syncEndDecision(input));
 }
 
-test "isWallHeadLagSyncing only applies before finalization" {
-    try std.testing.expect(isWallHeadLagSyncing(0, 0, 4, 4));
-    try std.testing.expect(!isWallHeadLagSyncing(0, 0, 3, 4));
-    try std.testing.expect(!isWallHeadLagSyncing(1, 0, 10, 4));
-    try std.testing.expect(!isWallHeadLagSyncing(0, 1, 10, 4));
-}
-
 test "peerBatchWindow rotates through peers" {
     const w0 = peerBatchWindow(10, 0, 8);
     try std.testing.expectEqual(@as(usize, 0), w0.start);
@@ -516,14 +493,14 @@ test "gossipSilentMs handles never-received and elapsed silence" {
     try std.testing.expectEqual(@as(u64, 3_000), gossipSilentMs(10_000, 7_000));
 }
 
-test "classifyChunkImport: queue_full drops, never falls back to inline (#894 regression guard)" {
+test "classifyChunkImport: queue_full drops, never falls back to inline (regression guard)" {
     // The regression: under aggregator load the chain-worker block queue
     // saturates, `trySubmitImportToWorker` returns `queue_full`, and
     // (pre-fix) `processBlockByRootChunk` / `processBlockByRangeChunk`
     // fall through to `chain.onBlock` on libxev. Each inline import
     // costs ~0.5s of XMSS verification; one 3.4 MB `blocks_by_root`
-    // burst was observed to wedge libxev for 9.7s on devnet aggregator
-    // zeam_8, which then missed its slot 64 block-production duty.
+    // burst was observed to wedge libxev for 9.7s on a loaded aggregator,
+    // which then missed its slot 64 block-production duty.
     //
     // The contract under test: `queue_full` MUST classify as
     // `drop_backpressure`, never `fallback_inline`. If a future change

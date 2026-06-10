@@ -18,7 +18,7 @@
 //!     does not interfere with re-orgs
 //!
 //! Caller must ONLY insert for deterministic failures:
-//!   * AggregationError.InvalidAggregateSignature
+//!   * AggregationError.Type1VerifyFailed / Type2VerifyFailed
 //!   * StateTransitionError.InvalidBlockSignatures
 //!   * StateTransitionError.InvalidValidatorId
 //!   * BlockProcessingError.InvalidSignatureGroups

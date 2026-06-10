@@ -13,7 +13,6 @@ edition = "2021"
 # On macOS, `ld64` refuses to coalesce the duplicates when Zig links multiple
 # such staticlibs into a single executable, breaking `build-all-provers`.
 # Funnelling every glue rlib through a single staticlib emits the shim once.
-# See blockblaz/zeam#773.
 
 [dependencies]
 libp2p-glue   = { path = "../libp2p-glue",   optional = true }
@@ -21,6 +20,14 @@ hashsig-glue  = { path = "../hashsig-glue",  optional = true }
 multisig-glue = { path = "../multisig-glue", optional = true }
 risc0-glue    = { path = "../risc0-glue",    optional = true }
 openvm-glue   = { path = "../openvm-glue",   optional = true }
+
+# Process-wide allocator. jemalloc returns freed memory to the OS far more
+# readily than the system allocator and fragments less under the prover's large,
+# bursty witness allocations — the dominant source of node RSS. The unprefixed
+# feature also interposes the C malloc/free symbols, so the Zig heap (when on
+# c_allocator) and rocksdb route through jemalloc too, unifying the whole
+# process on one allocator.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"], optional = true }
 
 [features]
 # Features are intentionally additive and have no defaults so `build.zig`
@@ -30,6 +37,10 @@ hashsig  = ["dep:hashsig-glue"]
 multisig = ["dep:multisig-glue"]
 risc0    = ["dep:risc0-glue"]
 openvm   = ["dep:openvm-glue"]
+# Process allocator. build.zig adds this to the default feature set but omits it
+# for `-Dno-jemalloc`: jemalloc's init deadlocks the Shadow simulator's shim
+# (shadow/shadow#3763), so that build uses the system allocator instead.
+jemalloc = ["dep:tikv-jemallocator"]
 
 [lib]
 name = "zeam_glue"

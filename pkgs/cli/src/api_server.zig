@@ -358,7 +358,7 @@ pub const ApiServer = struct {
         // assertReleasedOrPanic registered FIRST so it runs LAST (LIFO):
         // by the time it runs, the deinit defer has already set
         // `released = true`. Catches a future helper that bypasses
-        // deinit. PR #820 / issue #803.
+        // deinit.
         defer finalized_borrow.assertReleasedOrPanic();
         defer finalized_borrow.deinit();
 
@@ -390,7 +390,7 @@ pub const ApiServer = struct {
 
     /// Serves the finalized anchor block as SSZ at GET /lean/v0/blocks/finalized.
     /// Used by downstream nodes during checkpoint sync to obtain the real anchor
-    /// block with a correct hash_tree_root (leanSpec FINALIZED_BLOCK_ENDPOINT).
+    /// block with a correct hash_tree_root (the spec's FINALIZED_BLOCK_ENDPOINT).
     ///
     /// Note: finalized root is snapshotted then the DB is queried in a separate
     /// step.  If finalization advances between the two, the block may have been
@@ -497,7 +497,7 @@ pub const ApiServer = struct {
     /// atomically on the chain; the gossip import path and the tick-driven
     /// aggregator path pick up the new value on their next read.
     ///
-    /// Scope matches leanEthereum/leanSpec#636: this toggle does not change
+    /// Scope matches the spec: this toggle does not change
     /// gossip subnet subscriptions (those are decided once at startup) and
     /// is not persisted across restarts. Use the CLI `--is-aggregator` flag
     /// to seed the value on each start.

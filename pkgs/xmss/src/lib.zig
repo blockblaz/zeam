@@ -2,15 +2,17 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const aggregate = @import("aggregation.zig");
-pub const MAX_AGGREGATE_SIGNATURE_SIZE = aggregate.MAX_AGGREGATE_SIGNATURE_SIZE;
-pub const ByteListMiB = aggregate.ByteListMiB;
+pub const MAX_AGGREGATE_PROOF_SIZE = aggregate.MAX_AGGREGATE_PROOF_SIZE;
+pub const ByteList512KiB = aggregate.ByteList512KiB;
+pub const MessageBinding = aggregate.MessageBinding;
 pub const AggregationError = aggregate.AggregationError;
 pub const setRayonThreads = aggregate.setRayonThreads;
 pub const setupXmssAggregation = aggregate.setupXmssAggregation;
-pub const aggregateSignatures = aggregate.aggregateSignatures;
-pub const verifyAggregatedPayload = aggregate.verifyAggregatedPayload;
-pub const verifyAggregatedPayloadBatch = aggregate.verifyAggregatedPayloadBatch;
-pub const AggregatedPayloadVerifyBatch = aggregate.AggregatedPayloadVerifyBatch;
+pub const aggregateType1 = aggregate.aggregateType1;
+pub const verifyType1 = aggregate.verifyType1;
+pub const mergeType1ToType2 = aggregate.mergeType1ToType2;
+pub const splitType2ByMessage = aggregate.splitType2ByMessage;
+pub const verifyType2 = aggregate.verifyType2;
 pub const aggregate_module = aggregate;
 pub const shadow_cost = aggregate.shadow_cost;
 
@@ -34,11 +36,11 @@ pub const HashSigPrivateKey = hashsig.HashSigPrivateKey;
 /// `PublicKey.fromBytes` and CAS-installs the handle; lost-race writers
 /// free their handle and adopt the winner's.
 ///
-/// Replaces the previous `std.AutoHashMap` + `pubkey_cache_lock` design
-/// (P1 of #863). The cache backing is sized to `numValidators()` at
+/// Replaces the previous `std.AutoHashMap` + `pubkey_cache_lock` design.
+/// The cache backing is sized to `numValidators()` at
 /// chain init; out-of-range indices fall through to a non-cached
 /// deserialise. Validator-set growth (post-genesis additions) is not
-/// supported here yet — we expect that when leanSpec adds it, the
+/// supported here yet — when it lands, the
 /// fork-boundary handler will rebuild the cache with the new size.
 pub const PublicKeyCache = struct {
     /// One atomic per validator index; stores `@intFromPtr(handle)` or 0.
@@ -72,12 +74,11 @@ pub const PublicKeyCache = struct {
     ///
     /// Returns `HashSigError.ValidatorIndexOutOfRange` when
     /// `validator_index >= capacity`. The cache is sized at
-    /// `BeamChain.init` from `genesis.numValidators()`; lean spec does
-    /// not currently grow the validator set after genesis. If/when
+    /// chain init from `genesis.numValidators()`; the validator set
+    /// does not currently grow after genesis. If/when
     /// post-genesis growth lands, the fork-boundary handler must
     /// rebuild the cache with the new size — until then we fail loudly
-    /// rather than fall back to a leaky uncached deserialise (PR #884
-    /// review by @zclawz).
+    /// rather than fall back to a leaky uncached deserialise.
     pub fn getOrPut(self: *Self, validator_index: usize, pubkey_bytes: []const u8) HashSigError!*const HashSigPublicKey {
         if (validator_index >= self.slots.len) {
             return HashSigError.ValidatorIndexOutOfRange;

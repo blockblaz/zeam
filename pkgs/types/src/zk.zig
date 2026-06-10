@@ -3,6 +3,7 @@ const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
 
+const aggregation = @import("./aggregation.zig");
 const block = @import("./block.zig");
 const mini_3sf = @import("./mini_3sf.zig");
 const state = @import("./state.zig");
@@ -131,10 +132,10 @@ test "ssz seralize/deserialize signed stf prover input" {
                 .attestations = attestations,
             },
         },
-        .signature = try block.createBlockSignatures(std.testing.allocator, attestations.len()),
+        .proof = try aggregation.MultiMessageAggregate.init(std.testing.allocator),
     };
     defer test_block.block.body.attestations.deinit();
-    defer test_block.signature.deinit();
+    defer test_block.proof.deinit();
 
     const prover_input = BeamSTFProverInput{
         .state = test_state,

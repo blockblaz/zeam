@@ -10,6 +10,6 @@ serde_cbor = "0.11.2"
 
 [lib]
 # Built as an rlib so its `#[no_mangle] pub extern "C"` symbols can be funnelled
-# through the `zeam-glue` staticlib shim. See blockblaz/zeam#773.
+# through the `zeam-glue` staticlib shim.
 crate-type = ["rlib"]
 name = "risc0_glue"
