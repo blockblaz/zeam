@@ -3583,7 +3583,15 @@ pub const BeamNode = struct {
                 );
                 return self.publishBlockImportThenGossip(signed_block, block_root);
             };
+            // LIFO defer pairing per locking.BorrowedState contract:
+            // assertReleasedOrPanic is registered FIRST so it runs LAST and
+            // observes `released = true` after the deinit defer below has
+            // already dropped the underlying lock + refcount. Without the
+            // matching deinit defer the assert always panics with
+            // `BorrowedState dropped without release` on every successful
+            // publishBlock call (see locking.zig:1182 docstring).
             defer state_borrow.assertReleasedOrPanic();
+            defer state_borrow.deinit();
 
             self.logger.debug("reprocessing locally produced block (cached post-state): slot={d} proposer={d}", .{
                 block.slot,
