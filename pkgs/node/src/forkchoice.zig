@@ -295,6 +295,12 @@ pub const ForkChoiceParams = struct {
     /// `types.default_max_aggregation_children` for the full rationale
     /// and operator trade-offs.
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// Cap on the number of justification-path `AttestationData` the
+    /// aggregator proves+publishes per tick. Threaded from the
+    /// `--max-aggregations-per-tick` CLI flag and consumed by
+    /// `aggregateUnlocked`. Default `1` reproduces single-aggregation
+    /// behaviour; see `types.default_max_aggregations_per_tick`.
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
 };
 
 // Use shared signature map types from types package
@@ -365,6 +371,14 @@ pub const ForkChoice = struct {
     /// bounded by flat-prove cost; see that constant's doc for trade-offs.
     /// Field-level default so test struct literals can omit it.
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// Cap on the number of justification-path `AttestationData` proved+published
+    /// per aggregator tick. Threaded from `ForkChoiceParams.max_aggregations_per_tick`
+    /// (ultimately the `--max-aggregations-per-tick` CLI flag). Default `1` keeps
+    /// the single-aggregation path; `> 1` proves the extra keys in parallel on
+    /// `thread_pool`. `0` is floored to `1` in `aggregateUnlocked` — an
+    /// aggregator-role node always runs at least one aggregation per tick.
+    /// Field-level default so test struct literals can omit it.
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
     last_node_tick_time_ms: ?i64,
 
     const Self = @This();
@@ -459,6 +473,7 @@ pub const ForkChoice = struct {
             .thread_pool = opts.thread_pool,
             .min_aggregation_inputs = opts.min_aggregation_inputs,
             .max_aggregation_children = opts.max_aggregation_children,
+            .max_aggregations_per_tick = opts.max_aggregations_per_tick,
             .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
@@ -2171,9 +2186,10 @@ pub const ForkChoice = struct {
 
     /// Aggregate attestation signatures using recursive child proofs.
     ///
-    /// Ethlambda-style per-job loop: snapshot once, then for each `att_data`
-    /// run one XMSS prove, commit, and optionally publish before starting the
-    /// next job. Sequential proves avoid ThreadPool × Rayon oversubscription.
+    /// Ethlambda-style aggregate tick: snapshot once, select a
+    /// justification-advancing key path, then run either the single-key fast
+    /// path or bounded parallel multi-key proves before committing/publishing
+    /// the produced aggregates serially.
     fn aggregateUnlocked(
         self: *Self,
         validators: *const types.Validators,
@@ -2208,58 +2224,87 @@ pub const ForkChoice = struct {
 
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
 
-        // Aggregate only the single AttestationData most likely to advance
-        // `fcStore.latest_justified`. All gossip sigs and child payloads
-        // (new + known) registered against the chosen key are still folded
-        // into the aggregate; only the choice of key is narrowed.
-        //
-        // This single-key selection (main #957) supersedes the earlier
-        // deadline-capped multi-key pass: instead of looping over every group
-        // and bailing once AGGREGATION_DEADLINE_MS is spent, we prove exactly
-        // one justification-advancing group per tick. That keeps the per-tick
-        // prove bounded so a multi-second prod-scheme prove can't run past the
-        // slot and starve justification — the same goal the deadline loop had.
+        // Select up to `max_aggregations_per_tick` AttestationData forming a
+        // greedy justification path: the first key advances
+        // `fcStore.latest_justified` to its target, the next is sourced at that
+        // target, and so on, so N proves successively move justification ahead.
+        // All gossip sigs and child payloads (new + known) registered against
+        // each chosen key are still folded into its aggregate; only the choice
+        // of keys is narrowed.
         const latest_justified = self.fcStore.latest_justified;
-        if (selectJustificationAdvancingKey(&snap, att_data_keys, latest_justified)) |data| {
-            // #985 selection observability: which key won this tick relative
+        // Aggregator fallback floor: an aggregator-role node always produces at
+        // least one aggregation per tick.
+        const configured_max: usize = @max(1, self.max_aggregations_per_tick);
+        const max_keys: usize = @min(configured_max, att_data_keys.len);
+        const key_buf = try self.allocator.alloc(types.AttestationData, max_keys);
+        defer self.allocator.free(key_buf);
+        const selected_keys = selectJustificationAdvancingKeys(&snap, att_data_keys, latest_justified, max_keys, key_buf);
+
+        if (selected_keys.len == 0) {
+            self.logger.debug(
+                "aggregator: no justification-advancing att_data this tick (latest_justified.slot={d}, candidates={d})",
+                .{ latest_justified.slot, att_data_keys.len },
+            );
+        } else {
+            // #985 selection observability: which keys won this tick relative
             // to the clock slot. A sustained "prev" rate means current-slot
             // aggregates are being deferred a full slot (the ~4 s tail).
-            {
-                const clock_slot = self.fcStore.slot_clock.timeSlots.load(.monotonic);
-                const lag_label: []const u8 = if (data.slot >= clock_slot)
+            const clock_slot = self.fcStore.slot_clock.timeSlots.load(.monotonic);
+            for (selected_keys) |key| {
+                const lag_label: []const u8 = if (key.slot >= clock_slot)
                     "current"
-                else if (clock_slot - data.slot == 1)
+                else if (clock_slot - key.slot == 1)
                     "prev"
                 else
                     "older";
                 zeam_metrics.metrics.zeam_aggregate_selected_key_lag_total.incr(.{ .lag = lag_label }) catch {};
             }
+        }
+
+        if (selected_keys.len == 1) {
+            // Single-aggregation fast path (default `--max-aggregations-per-tick 1`):
+            // prove on the calling worker, no nested ThreadPool dispatch. Behaviour
+            // is identical to the pre-multi single-aggregation tick.
             var maybe_result = try types.computeSingleAggregatedSignature(
                 self.allocator,
                 validators,
                 &snap.signatures,
                 &snap.new_payloads,
                 &snap.known_payloads,
-                data,
+                selected_keys[0],
                 self.max_aggregation_children,
             );
             if (maybe_result) |*result| {
-                defer result.attestation.deinit();
-                const att_data = result.attestation.data;
-                const signature = result.signature;
-                if (try self.commitOneAggregateResult(&snap, att_data, signature)) |signed| {
-                    if (publish_fn) |pfn| {
-                        pfn(publish_ctx.?, signed);
-                    } else {
-                        try collected.append(self.allocator, signed);
-                    }
-                }
+                try self.commitAndDispatchAggregate(&snap, result, publish_ctx, publish_fn, &collected);
             }
-        } else {
-            self.logger.debug(
-                "aggregator: no justification-advancing att_data this tick (latest_justified.slot={d}, candidates={d})",
-                .{ latest_justified.slot, att_data_keys.len },
+        } else if (selected_keys.len > 1) {
+            // Multi-aggregation path: prove the justification-path keys in
+            // parallel on the shared ThreadPool, then commit each serially under
+            // `signatures_mutex`.
+            const results = try types.computeAggregatedSignaturesForKeys(
+                self.allocator,
+                validators,
+                &snap.signatures,
+                &snap.new_payloads,
+                &snap.known_payloads,
+                selected_keys,
+                self.thread_pool,
+                self.max_aggregation_children,
             );
+            defer self.allocator.free(results);
+            // Each result fully consumed by `commitAndDispatchAggregate`;
+            // `committed` is advanced BEFORE the fallible call so this errdefer
+            // never double-frees the in-flight result.
+            var committed: usize = 0;
+            errdefer for (results[committed..]) |*r| {
+                r.attestation.deinit();
+                r.signature.deinit();
+            };
+            while (committed < results.len) {
+                var result = results[committed];
+                committed += 1;
+                try self.commitAndDispatchAggregate(&snap, &result, publish_ctx, publish_fn, &collected);
+            }
         }
         observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 
@@ -2281,7 +2326,34 @@ pub const ForkChoice = struct {
         return collected.toOwnedSlice(self.allocator);
     }
 
-    /// Commit one worker-produced aggregate into the live maps.
+    /// Commit one produced aggregate and either publish it (callback path) or
+    /// append it to `collected` (return path). Consumes `result`: deinits its
+    /// attestation and hands its signature to `commitOneAggregateResult` (which
+    /// always takes ownership of the signature, success or error). Shared by the
+    /// single- and multi-aggregation branches of `aggregateUnlocked`.
+    fn commitAndDispatchAggregate(
+        self: *Self,
+        snap: *AggregateSnapshot,
+        result: *types.SingleAggregatedSignature,
+        publish_ctx: ?*anyopaque,
+        publish_fn: ?AggregatePublishCallback,
+        collected: *std.ArrayList(types.SignedAggregatedAttestation),
+    ) !void {
+        defer result.attestation.deinit();
+        const att_data = result.attestation.data;
+        const signature = result.signature;
+        if (try self.commitOneAggregateResult(snap, att_data, signature)) |signed_result| {
+            var signed = signed_result;
+            errdefer signed.deinit();
+            if (publish_fn) |pfn| {
+                pfn(publish_ctx.?, signed);
+            } else {
+                try collected.append(self.allocator, signed);
+            }
+        }
+    }
+
+    /// Commit one worker-produced aggregate (ethlambda `apply_aggregated_group`).
     fn commitOneAggregateResult(
         self: *Self,
         snap: *AggregateSnapshot,
@@ -2291,13 +2363,17 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
+        var owned_signature = signature;
+        var signature_live = true;
+        errdefer if (signature_live) owned_signature.deinit();
+
         if (shouldSuppressDuplicateAggregateCommit(snap, att_data, &self.attestation_signatures)) {
             self.logger.debug(
                 "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
                 .{att_data.slot},
             );
-            var owned_signature = signature;
             owned_signature.deinit();
+            signature_live = false;
             return null;
         }
 
@@ -2307,9 +2383,6 @@ pub const ForkChoice = struct {
         var source_gossip_bits = try types.AggregationBits.init(self.allocator);
         var source_gossip_bits_owned = true;
         errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
-        var owned_signature = signature;
-        var signature_live = true;
-        errdefer if (signature_live) owned_signature.deinit();
         // ssz.serialize corrupts the source value; serialize once, deinit the
         // worker proof, then deserialize separate copies for store and publish
         // so no fallible step runs while signature_live is true.
@@ -3995,6 +4068,13 @@ fn checkpointsEqual(a: types.Checkpoint, b: types.Checkpoint) bool {
     return a.slot == b.slot and std.mem.eql(u8, &a.root, &b.root);
 }
 
+fn attestationDataEqual(a: types.AttestationData, b: types.AttestationData) bool {
+    return a.slot == b.slot and
+        checkpointsEqual(a.head, b.head) and
+        checkpointsEqual(a.target, b.target) and
+        checkpointsEqual(a.source, b.source);
+}
+
 /// Total snapshot inputs available for `key`: raw gossip signatures plus
 /// child proofs in both new and known payload maps. Mirrors the counting
 /// used by `pruneTrivialFromAggregateSnapshot`.
@@ -4106,45 +4186,125 @@ fn selectJustificationAdvancingKey(
     att_data_keys: []const types.AttestationData,
     latest_justified: types.Checkpoint,
 ) ?types.AttestationData {
-    var best_preferred: ?types.AttestationData = null;
-    var best_preferred_inputs: usize = 0;
+    const best_preferred = selectBestPreferredKey(snap, att_data_keys, latest_justified, &.{});
+
     var best_fallback: ?types.AttestationData = null;
     var best_fallback_inputs: usize = 0;
-
     for (att_data_keys) |key| {
         if (snapshotKeyFullyCovered(snap, key)) continue;
-
+        // Skip keys already eligible for the preferred tier — those are handled
+        // by `selectBestPreferredKey` above.
+        if (checkpointsEqual(key.source, latest_justified) and key.target.slot >= latest_justified.slot) continue;
+        if (key.source.slot < latest_justified.slot) continue;
         const inputs = snapshotInputCount(snap, key);
-
-        if (checkpointsEqual(key.source, latest_justified) and key.target.slot >= latest_justified.slot) {
-            const replace = if (best_preferred) |cur|
-                (key.target.slot > cur.target.slot or
-                    (key.target.slot == cur.target.slot and key.slot > cur.slot) or
-                    (key.target.slot == cur.target.slot and key.slot == cur.slot and inputs > best_preferred_inputs))
-            else
-                true;
-            if (replace) {
-                best_preferred = key;
-                best_preferred_inputs = inputs;
-            }
-            continue;
-        }
-
-        if (key.source.slot >= latest_justified.slot) {
-            const replace = if (best_fallback) |cur|
-                (key.source.slot > cur.source.slot or
-                    (key.source.slot == cur.source.slot and key.slot > cur.slot) or
-                    (key.source.slot == cur.source.slot and key.slot == cur.slot and inputs > best_fallback_inputs))
-            else
-                true;
-            if (replace) {
-                best_fallback = key;
-                best_fallback_inputs = inputs;
-            }
+        const replace = if (best_fallback) |cur|
+            (key.source.slot > cur.source.slot or
+                (key.source.slot == cur.source.slot and key.slot > cur.slot) or
+                (key.source.slot == cur.source.slot and key.slot == cur.slot and inputs > best_fallback_inputs))
+        else
+            true;
+        if (replace) {
+            best_fallback = key;
+            best_fallback_inputs = inputs;
         }
     }
 
     return best_preferred orelse best_fallback;
+}
+
+/// Preferred-tier pick for one justified checkpoint: among `att_data_keys` whose
+/// `source == justified` AND `target.slot >= justified.slot`, returns the key
+/// with the deepest `target.slot` (then newest `key.slot`, then max snapshot
+/// input count, then lex-first since callers pre-sort). Keys already present in
+/// `chosen` are skipped so a chain walk does not reselect the same key. Fully
+/// covered keys are skipped. Returns null when none remain.
+///
+/// Pure / unit-testable: no I/O, no allocator, no locking.
+fn selectBestPreferredKey(
+    snap: *const AggregateSnapshot,
+    att_data_keys: []const types.AttestationData,
+    justified: types.Checkpoint,
+    chosen: []const types.AttestationData,
+) ?types.AttestationData {
+    var best: ?types.AttestationData = null;
+    var best_inputs: usize = 0;
+
+    for (att_data_keys) |key| {
+        if (snapshotKeyFullyCovered(snap, key)) continue;
+        if (!checkpointsEqual(key.source, justified) or key.target.slot < justified.slot) continue;
+
+        var already_chosen = false;
+        for (chosen) |c| {
+            if (attestationDataEqual(c, key)) {
+                already_chosen = true;
+                break;
+            }
+        }
+        if (already_chosen) continue;
+
+        const inputs = snapshotInputCount(snap, key);
+        const replace = if (best) |cur|
+            (key.target.slot > cur.target.slot or
+                (key.target.slot == cur.target.slot and key.slot > cur.slot) or
+                (key.target.slot == cur.target.slot and key.slot == cur.slot and inputs > best_inputs))
+        else
+            true;
+        if (replace) {
+            best = key;
+            best_inputs = inputs;
+        }
+    }
+
+    return best;
+}
+
+/// Greedy justification-path selection. Starting from `latest_justified`, picks
+/// the deepest-target preferred key (`selectBestPreferredKey`), then treats that
+/// key's `target` as the projected-justified checkpoint and repeats — up to
+/// `max_count` keys. Each successive key is sourced at the previous key's
+/// target, so the chain T0 -> T1 -> T2 ... successively advances justification
+/// when the produced aggregates are imported.
+///
+/// Results are written into `out` (len >= max_count required) and the filled
+/// prefix is returned. When no preferred key exists for `latest_justified`,
+/// falls back to the single `selectJustificationAdvancingKey` result so the
+/// fallback tier (`source.slot >= justified.slot`) still yields a bootstrap /
+/// stall aggregate.
+///
+/// `max_count == 1` reproduces `selectJustificationAdvancingKey` exactly
+/// (preferred tier when present, else fallback), preserving the pre-existing
+/// single-aggregation behaviour.
+///
+/// Pure / unit-testable: no I/O, no allocator, no locking.
+fn selectJustificationAdvancingKeys(
+    snap: *const AggregateSnapshot,
+    att_data_keys: []const types.AttestationData,
+    latest_justified: types.Checkpoint,
+    max_count: usize,
+    out: []types.AttestationData,
+) []types.AttestationData {
+    if (max_count == 0 or out.len == 0) return out[0..0];
+
+    var len: usize = 0;
+    var current = latest_justified;
+    while (len < max_count and len < out.len) {
+        const key = selectBestPreferredKey(snap, att_data_keys, current, out[0..len]) orelse break;
+        out[len] = key;
+        len += 1;
+        // Project justification forward: this key's target is the source the
+        // next chain step must match.
+        current = key.target;
+    }
+
+    if (len == 0) {
+        if (selectJustificationAdvancingKey(snap, att_data_keys, latest_justified)) |key| {
+            out[0] = key;
+            return out[0..1];
+        }
+        return out[0..0];
+    }
+
+    return out[0..len];
 }
 
 test "selectJustificationAdvancingKey: empty keys -> null" {
@@ -4562,6 +4722,143 @@ test "snapshotKeyFullyCovered (#985): coverage split across two proofs does not 
     try snap.new_payloads.put(key, list);
 
     try std.testing.expect(!snapshotKeyFullyCovered(&snap, key));
+}
+
+/// Builds the 3-step justification chain used by the multi-key tests:
+/// J(slot 5) -> key1.target T1(slot 6) -> key2.target T2(slot 7) ->
+/// key3.target T3(slot 8). Each key is sourced at the previous key's target.
+fn buildJustificationChainKeys() struct {
+    justified: types.Checkpoint,
+    key1: types.AttestationData,
+    key2: types.AttestationData,
+    key3: types.AttestationData,
+} {
+    const zero_root = std.mem.zeroes(types.Root);
+    var r1 = std.mem.zeroes(types.Root);
+    r1[0] = 0x11;
+    var r2 = std.mem.zeroes(types.Root);
+    r2[0] = 0x22;
+    var r3 = std.mem.zeroes(types.Root);
+    r3[0] = 0x33;
+
+    const justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const t1 = types.Checkpoint{ .root = r1, .slot = 6 };
+    const t2 = types.Checkpoint{ .root = r2, .slot = 7 };
+    const t3 = types.Checkpoint{ .root = r3, .slot = 8 };
+
+    return .{
+        .justified = justified,
+        .key1 = .{ .slot = 6, .head = .{ .root = r1, .slot = 6 }, .target = t1, .source = justified },
+        .key2 = .{ .slot = 7, .head = .{ .root = r2, .slot = 7 }, .target = t2, .source = t1 },
+        .key3 = .{ .slot = 8, .head = .{ .root = r3, .slot = 8 }, .target = t3, .source = t2 },
+    };
+}
+
+test "selectJustificationAdvancingKeys: walks the full justification chain in order" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const chain = buildJustificationChainKeys();
+    // Deliberately out of chain order to confirm the walk, not slice order, drives selection.
+    const keys = [_]types.AttestationData{ chain.key3, chain.key1, chain.key2 };
+
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, chain.justified, 3, &out);
+    try std.testing.expectEqual(@as(usize, 3), selected.len);
+    try std.testing.expectEqual(chain.key1, selected[0]);
+    try std.testing.expectEqual(chain.key2, selected[1]);
+    try std.testing.expectEqual(chain.key3, selected[2]);
+}
+
+test "selectJustificationAdvancingKeys: max_count caps the chain length" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const chain = buildJustificationChainKeys();
+    const keys = [_]types.AttestationData{ chain.key1, chain.key2, chain.key3 };
+
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, chain.justified, 2, &out);
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    try std.testing.expectEqual(chain.key1, selected[0]);
+    try std.testing.expectEqual(chain.key2, selected[1]);
+}
+
+test "selectJustificationAdvancingKeys: max_count==1 matches the single-key selector" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const chain = buildJustificationChainKeys();
+    const keys = [_]types.AttestationData{ chain.key1, chain.key2, chain.key3 };
+
+    var out: [1]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, chain.justified, 1, &out);
+    const single = selectJustificationAdvancingKey(&snap, &keys, chain.justified);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expect(single != null);
+    try std.testing.expectEqual(single.?, selected[0]);
+    try std.testing.expectEqual(chain.key1, selected[0]);
+}
+
+test "selectJustificationAdvancingKeys: falls back to single fallback-tier key when no preferred" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xDD;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    // No key is sourced at `latest_justified`; only a fallback-tier key
+    // (source.slot >= justified.slot but source != justified) is present.
+    const fallback_key = types.AttestationData{
+        .slot = 9,
+        .head = .{ .root = alt_root, .slot = 9 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = .{ .root = alt_root, .slot = 6 },
+    };
+    const keys = [_]types.AttestationData{fallback_key};
+
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, latest_justified, 3, &out);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqual(fallback_key, selected[0]);
+}
+
+test "selectJustificationAdvancingKeys: empty candidates -> empty result" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 0 };
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &.{}, latest_justified, 3, &out);
+    try std.testing.expectEqual(@as(usize, 0), selected.len);
 }
 
 /// Returns true when an `att_data` in the aggregator's snapshot is

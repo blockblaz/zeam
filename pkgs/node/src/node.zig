@@ -65,6 +65,10 @@ const NodeOpts = struct {
     /// merged with raw signatures by the aggregator worker. See
     /// `pkgs/types/src/block.zig:default_max_aggregation_children`.
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// CLI knob (`--max-aggregations-per-tick`) capping how many justification-
+    /// path `AttestationData` the aggregator proves+publishes per tick. See
+    /// `pkgs/types/src/block.zig:default_max_aggregations_per_tick`.
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
     /// Soft cap on concurrent aggregate workers (`BeamChain.aggregate_inflight`).
     aggregate_max_inflight: u32 = 4,
     /// See `chainFactory.ChainOpts.proposal_deadline_pct`.
@@ -227,6 +231,7 @@ pub const BeamNode = struct {
                 .thread_pool = opts.thread_pool,
                 .min_aggregation_inputs = opts.min_aggregation_inputs,
                 .max_aggregation_children = opts.max_aggregation_children,
+                .max_aggregations_per_tick = opts.max_aggregations_per_tick,
                 .aggregate_max_inflight = opts.aggregate_max_inflight,
                 .proposal_deadline_pct = opts.proposal_deadline_pct,
             },

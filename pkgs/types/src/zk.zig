@@ -79,6 +79,10 @@ pub const BeamSTFProverInput = struct {
 };
 
 test "ssz seralize/deserialize signed stf prover input" {
+    // The updated ssz package's fixed-size analysis walks the full
+    // BeamSTFProverInput type at comptime.
+    @setEvalBranchQuota(100000);
+
     const config = state.BeamStateConfig{
         .genesis_time = 93,
     };
