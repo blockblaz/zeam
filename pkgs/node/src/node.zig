@@ -176,6 +176,11 @@ pub const BeamNode = struct {
     /// that preserves that invariant.
     sync_refresh_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Attestations whose gossip was deferred while a local block proof was
+    /// still being built (`propose_inflight > 0`). Flushed after `publishBlock`.
+    deferred_attestation_gossip: std.ArrayListUnmanaged(networks.AttestationGossip) = .empty,
+    deferred_attestation_gossip_lock: zeam_utils.SyncMutex = .{},
+
     /// Rotating cursor for rate-limited `refreshSyncFromPeers` batches.
     sync_refresh_peer_cursor: usize = 0,
 
@@ -336,6 +341,9 @@ pub const BeamNode = struct {
         self.orphan_dependents.deinit();
         self.range_async_chunk_imports.deinit();
         self.unserved_block_retries.deinit();
+        self.deferred_attestation_gossip_lock.lock();
+        self.deferred_attestation_gossip.deinit(self.allocator);
+        self.deferred_attestation_gossip_lock.unlock();
         self.network.deinit();
     }
 
@@ -3566,6 +3574,7 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
                 });
             }
+            self.flushDeferredAttestationGossip();
 
             var state_borrow = self.chain.statesGet(block_root) orelse {
                 self.logger.warn(
@@ -3597,6 +3606,29 @@ pub const BeamNode = struct {
         }
 
         return self.publishBlockImportThenGossip(signed_block, block_root);
+    }
+
+    fn flushDeferredAttestationGossip(self: *Self) void {
+        self.deferred_attestation_gossip_lock.lock();
+        defer self.deferred_attestation_gossip_lock.unlock();
+        for (self.deferred_attestation_gossip.items) |signed_attestation| {
+            const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
+            const attestation_published = self.network.publish(&gossip_msg) catch |e| {
+                self.logger.warn("failed to publish deferred attestation slot={d}: {any}", .{
+                    signed_attestation.message.message.slot,
+                    e,
+                });
+                continue;
+            };
+            if (attestation_published) {
+                self.logger.info("published deferred attestation to network: slot={d} validator={d}{f}", .{
+                    signed_attestation.message.message.slot,
+                    signed_attestation.message.validator_id,
+                    self.node_registry.getNodeNameFromValidatorIndex(signed_attestation.message.validator_id),
+                });
+            }
+        }
+        self.deferred_attestation_gossip.clearRetainingCapacity();
     }
 
     /// Import a block that is not yet in fork choice, then gossip it.
@@ -3632,6 +3664,7 @@ pub const BeamNode = struct {
                 self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
             });
         }
+        self.flushDeferredAttestationGossip();
 
         self.chain.onBlockFollowup(true, &signed_block);
         self.replayPendingAttestationsAsync(.local_publish);
@@ -3648,6 +3681,22 @@ pub const BeamNode = struct {
             validator_id,
         });
         try self.chain.onGossipAttestation(signed_attestation);
+
+        // While a local block proof is still being built, defer gossip so peers
+        // receive the block before an attestation that references its head root.
+        if (self.chain.propose_inflight.load(.acquire) > 0 and data.head.slot >= data.slot) {
+            self.deferred_attestation_gossip_lock.lock();
+            defer self.deferred_attestation_gossip_lock.unlock();
+            self.deferred_attestation_gossip.append(self.allocator, signed_attestation) catch {
+                self.logger.warn("failed to defer attestation gossip slot={d}: oom", .{data.slot});
+                return;
+            };
+            self.logger.debug(
+                "deferred attestation gossip until block publish completes: slot={d} head_slot={d}",
+                .{ data.slot, data.head.slot },
+            );
+            return;
+        }
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
