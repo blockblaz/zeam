@@ -460,7 +460,7 @@ pub const BeamChain = struct {
 
     /// The block proof is a recursive-STARK Type-2 merge that takes seconds at the
     /// prod scheme — far longer than an 800ms interval. Running it on the libxev slot loop would
-    /// freeze gossip/tick handling, so `submitProposeOnInterval` offloads the whole propose
+    /// freeze gossip/tick handling, so `submitPropose` offloads the whole propose
     /// (produceBlock + buildBlockProof + publishBlock) to a `thread_pool` worker, mirroring the
     /// aggregate worker. At most one propose runs at a time; a second trigger is dropped (the next
     /// slot re-proposes). `proposeImpl` decrements on exit.
@@ -3643,6 +3643,25 @@ pub const BeamChain = struct {
 
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
+            // Locally produced blocks (and duplicate re-imports): produceBlock already
+            // ran the transition and cached the post state, so reuse it instead of
+            // re-cloning the parent and re-running verify + the transition — work
+            // whose result `statesCommitKeepExisting` below discards anyway because
+            // the map entry already exists. The caller cannot hand us the cached
+            // state via `blockInfo.postState`: `statesGet` returns a `BorrowedState`
+            // whose read side must not be held across the exclusive commit below
+            // (the deadlock that removed the original shortcut), and the
+            // caller-supplied path deep-clones the value a second time. Resolving
+            // the cache here keeps one owned clone and a single flow.
+            reuse: {
+                if (self.forkChoice.getBlock(block_root) == null) break :reuse;
+                var cached_borrow = self.statesGet(block_root) orelse break :reuse;
+                defer cached_borrow.assertReleasedOrPanic();
+                const snapshot = try cached_borrow.cloneAndRelease(self.allocator);
+                step_watch.lap("cached_post_state_reuse");
+                break :computedstate snapshot;
+            }
+
             // 1. Snapshot parent state under `states_lock.shared`, then
             //    release. Verify + STF run on the owned snapshot so we
             //    don't hold the read lock across the long FFI window.
@@ -5001,19 +5020,16 @@ pub const BeamChain = struct {
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
-    /// Trigger off-loop block production for `time_intervals` if this node is the
-    /// proposer for the slot. Called from the libxev interval tick at interval-in-slot 0; returns
-    /// within microseconds. The whole propose (produceBlock + Type-2 merge + publishBlock) runs on
-    /// a `thread_pool` worker so the multi-second prod-scheme merge never freezes the slot loop.
-    /// At most one propose is in flight; a second trigger is dropped (the next slot re-proposes).
-    pub fn submitProposeOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
-        if (time_intervals % constants.INTERVALS_PER_SLOT != 0) return;
-        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-
-        // Only the node running this slot's proposer does anything.
-        const validator = if (node.validator) |*v| v else return;
-        const proposer_id = validator.getSlotProposer(slot) orelse return;
-
+    /// Trigger off-loop block production for an already-resolved proposer duty.
+    /// The "am I proposer this slot?" decision is the validator client's
+    /// (`ValidatorClient.onInterval` resolves `proposer_id` via `getSlotProposer`
+    /// and calls this at interval-in-slot 0); this function owns only the
+    /// chain-state gating (sync status) and the off-loop dispatch, and returns
+    /// within microseconds. The whole propose (produceBlock + Type-2 merge +
+    /// publishBlock) runs on a `thread_pool` worker so the multi-second
+    /// prod-scheme merge never freezes the slot loop. At most one propose is in
+    /// flight; a second trigger is dropped (the next slot re-proposes).
+    pub fn submitPropose(self: *Self, node: *@import("./node.zig").BeamNode, slot: usize, proposer_id: usize) void {
         // Sync gating (the checks the old on-loop maybeDoProposal performed).
         switch (self.getSyncStatus()) {
             .synced => {},

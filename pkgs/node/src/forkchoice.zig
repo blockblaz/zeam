@@ -310,6 +310,32 @@ const StoredAggregatedPayload = types.StoredAggregatedPayload;
 const AggregatedPayloadsList = types.AggregatedPayloadsList;
 const AggregatedPayloadsMap = types.AggregatedPayloadsMap;
 
+const ProposalAttestationCandidate = struct {
+    att_data: *types.AttestationData,
+    payloads: *types.AggregatedPayloadsList,
+};
+
+/// Ordering for block proposal attestation-data selection under the
+/// MAX_ATTESTATIONS_DATA cap.
+///
+/// The builder wants votes that can advance justification/finality now, not the
+/// oldest still-unjustified historical target. `AttestationData` identity
+/// includes the attestation slot, so a stalled node can retain hundreds of keys
+/// for the same logical vote. If we sort ascending by target slot, stale low
+/// targets fill the 8-key cap and fresh high-target aggregates (including whole
+/// subnets) never reach the block. Prefer the deepest target first, then the
+/// payload count for equal targets, then newest attestation slot; use the
+/// shared lexicographic att-data order only as a deterministic final
+/// tie-breaker. Coverage wins over freshness within one target because a
+/// one-slot-lagged aggregate may carry substantially more subnet coverage than
+/// the newest, still-thin key.
+fn proposalAttestationCandidateLessThan(_: void, a: ProposalAttestationCandidate, b: ProposalAttestationCandidate) bool {
+    if (a.att_data.target.slot != b.att_data.target.slot) return a.att_data.target.slot > b.att_data.target.slot;
+    if (a.payloads.items.len != b.payloads.items.len) return a.payloads.items.len > b.payloads.items.len;
+    if (a.att_data.slot != b.att_data.slot) return a.att_data.slot > b.att_data.slot;
+    return types.attestationDataLessThan({}, a.att_data.*, b.att_data.*);
+}
+
 /// Tracks whether the forkchoice has observed a real justified checkpoint via onBlock.
 /// For genesis (anchor slot == 0) we start ready; for checkpoint-sync or DB restore we
 /// start initing and transition once the first block-driven justified update arrives.
@@ -964,11 +990,16 @@ pub const ForkChoice = struct {
                 const cc_u32 = self.config.spec.attestation_committee_count;
                 if (vc > 0 and cc_u32 > 0) {
                     const cc: usize = @intCast(cc_u32);
-                    // Determine slot from the first entry key.
+                    // Stamp the snapshot with the NEWEST data slot present.
+                    // Map iteration order is arbitrary and mixed data slots are
+                    // normal (aggregates mature over several slots), so taking
+                    // the first key would stamp a random slot.
                     var payload_slot: types.Slot = 0;
                     {
                         var it_s = self.latest_new_aggregated_payloads.iterator();
-                        if (it_s.next()) |first| payload_slot = first.key_ptr.slot;
+                        while (it_s.next()) |e| {
+                            if (e.key_ptr.slot > payload_slot) payload_slot = e.key_ptr.slot;
+                        }
                     }
                     const new_seen = try self.allocator.alloc(bool, vc);
                     var coverage_saved = false;
@@ -1213,12 +1244,9 @@ pub const ForkChoice = struct {
 
             // Find attestation_data entries whose source slot is justified on this chain,
             // that reference blocks we know about, and whose target is not yet justified.
-            // Collect and sort by target slot for deterministic processing order.
-            const MapEntry = struct {
-                att_data: *types.AttestationData,
-                payloads: *types.AggregatedPayloadsList,
-            };
-            var sorted_entries: std.ArrayList(MapEntry) = .empty;
+            // Collect and sort fresh/deep targets first so stale historical keys cannot fill
+            // the MAX_ATTESTATIONS_DATA cap before current aggregates are considered.
+            var sorted_entries: std.ArrayList(ProposalAttestationCandidate) = .empty;
             defer sorted_entries.deinit(self.allocator);
 
             var payload_it = self.latest_known_aggregated_payloads.iterator();
@@ -1262,11 +1290,7 @@ pub const ForkChoice = struct {
                 try sorted_entries.append(self.allocator, .{ .att_data = att_data, .payloads = entry.value_ptr });
             }
 
-            std.mem.sort(MapEntry, sorted_entries.items, {}, struct {
-                fn lessThan(_: void, a: MapEntry, b: MapEntry) bool {
-                    return a.att_data.target.slot < b.att_data.target.slot;
-                }
-            }.lessThan);
+            std.mem.sort(ProposalAttestationCandidate, sorted_entries.items, {}, proposalAttestationCandidateLessThan);
 
             const found_entries = sorted_entries.items.len > 0;
 
@@ -1907,9 +1931,13 @@ pub const ForkChoice = struct {
     ///
     /// Sections:
     ///   prev_new  – coverage saved just before the last acceptNewAttestationsUnlocked merge
-    ///               (represents the previous slot's new payloads that were accepted)
-    ///   late      – current latest_new_aggregated_payloads for `slot`
+    ///               (represents the previous round's new payloads that were accepted)
+    ///   late      – current latest_new_aggregated_payloads near `slot`
     ///               (payloads that arrived after the last merge — late arrivals)
+    ///
+    /// All sections match data slots in the window (slot - WINDOW, slot] rather
+    /// than exactly `slot`: aggregation matures payloads 2-3 slots after the
+    /// attestation slot, so an exact-slot report is permanently empty.
     ///   block     – payloads observed in the most-recently processed block
     ///   combined  – union of all three
     ///   diff      – validator-coverage delta between block and prev_new
@@ -1954,7 +1982,8 @@ pub const ForkChoice = struct {
 
         // Fill prev_new from the coverage saved before the last merge (if slot matches).
         if (self.saved_pre_merge_new_coverage) |*cov| {
-            if (cov.slot == slot) {
+            // Window match, mirroring collectCoverageFromPayloads.
+            if (cov.slot <= slot and cov.slot +| COVERAGE_REPORT_WINDOW_SLOTS > slot) {
                 const vlen = @min(cov.seen.len, validator_count);
                 @memcpy(prev_new_seen[0..vlen], cov.seen[0..vlen]);
                 const slen = @min(cov.has_subnet.len, committee_count);
@@ -5149,6 +5178,13 @@ fn pruneTrivialFromAggregateSnapshot(
     );
 }
 
+/// Coverage-report slot window. Aggregated payloads for attestation data made
+/// at slot S mature through the pipeline (gossip aggregate -> latest_new ->
+/// rotation -> latest_known / block inclusion) over the following ~2-3 slots,
+/// so a "last round" report keyed to a single exact data slot never matches
+/// anything; it must look back a few data slots.
+const COVERAGE_REPORT_WINDOW_SLOTS: types.Slot = 4;
+
 fn collectCoverageFromPayloads(
     map: *AggregatedPayloadsMap,
     slot: types.Slot,
@@ -5160,9 +5196,10 @@ fn collectCoverageFromPayloads(
 ) void {
     var it = map.iterator();
     while (it.next()) |entry| {
-        if (entry.key_ptr.slot != slot) continue;
+        // Window match (slot - WINDOW, slot]: see COVERAGE_REPORT_WINDOW_SLOTS.
+        if (entry.key_ptr.slot > slot or entry.key_ptr.slot +| COVERAGE_REPORT_WINDOW_SLOTS <= slot) continue;
         for (entry.value_ptr.items) |*stored| {
-            if (stored.slot != slot) continue;
+            if (stored.slot > slot or stored.slot +| COVERAGE_REPORT_WINDOW_SLOTS <= slot) continue;
             for (0..stored.proof.participants.len()) |validator_index| {
                 if (validator_index >= seen.len) continue;
                 if (!(stored.proof.participants.get(validator_index) catch false)) continue;
@@ -5577,6 +5614,193 @@ const RebaseTestContext = struct {
         self.mock_chain.deinit(self.allocator);
     }
 };
+
+test "getProposalAttestations: high-target keys survive cap with stale low-target backlog" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 32);
+    defer ctx.deinit();
+
+    const source_root = createTestRoot(0xAA);
+    const head_root = createTestRoot(0xFF);
+    const parent_root = head_root;
+    const proposal_slot: types.Slot = 130;
+
+    ctx.mock_chain.genesis_state.latest_finalized = .{ .root = source_root, .slot = 0 };
+    ctx.mock_chain.genesis_state.latest_justified = .{ .root = source_root, .slot = 0 };
+
+    while (ctx.mock_chain.genesis_state.historical_block_hashes.len() <= proposal_slot) {
+        try ctx.mock_chain.genesis_state.historical_block_hashes.append(types.ZERO_HASH);
+    }
+    ctx.mock_chain.genesis_state.historical_block_hashes.slice()[0] = source_root;
+
+    var att_data: [12]types.AttestationData = undefined;
+
+    // More than MAX_ATTESTATIONS_DATA stale low-target keys: these reproduced #989
+    // by filling the old ascending-target cap before current aggregates were seen.
+    for (0..8) |i| {
+        const target_slot: types.Slot = @intCast(20 + i);
+        const target_root = createTestRoot(@intCast(0x20 + i));
+        ctx.mock_chain.genesis_state.historical_block_hashes.slice()[target_slot] = target_root;
+        att_data[i] = .{
+            .slot = @intCast(30 + i),
+            .head = .{ .root = head_root, .slot = 8 },
+            .target = .{ .root = target_root, .slot = target_slot },
+            .source = .{ .root = source_root, .slot = 0 },
+        };
+    }
+
+    // Fresh high-target keys where current aggregation concentrates proofs.
+    for (8..12) |i| {
+        const target_slot: types.Slot = @intCast(100 + i);
+        const target_root = createTestRoot(@intCast(0x40 + i));
+        ctx.mock_chain.genesis_state.historical_block_hashes.slice()[target_slot] = target_root;
+        att_data[i] = .{
+            .slot = @intCast(110 + i),
+            .head = .{ .root = head_root, .slot = 8 },
+            .target = .{ .root = target_root, .slot = target_slot },
+            .source = .{ .root = source_root, .slot = 0 },
+        };
+    }
+
+    for (&att_data, 0..) |*data, i| {
+        var proof = try types.SingleMessageAggregate.init(allocator);
+        defer proof.deinit();
+        try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
+        try ctx.fork_choice.storeAggregatedPayload(data, proof, true);
+    }
+
+    // Use an already-elapsed deadline so this selection-level regression test
+    // stops after compaction and does not depend on STF loop restarts.
+    const elapsed_deadline: i64 = @intCast(zeam_utils.monotonicTimestampNs() - std.time.ns_per_s);
+    var result = try ctx.fork_choice.getProposalAttestations(
+        &ctx.mock_chain.genesis_state,
+        proposal_slot,
+        0,
+        parent_root,
+        elapsed_deadline,
+    );
+    defer {
+        for (result.attestations.slice()) |*att| att.deinit();
+        result.attestations.deinit();
+        for (result.signatures.slice()) |*sig| sig.deinit();
+        result.signatures.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, ctx.fork_choice.config.spec.max_attestations_data), result.attestations.constSlice().len);
+
+    var high_target_count: usize = 0;
+    for (result.attestations.constSlice()) |att| {
+        if (att.data.target.slot >= 100) high_target_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), high_target_count);
+}
+
+fn makeProposalSelectionTestAttData(slot: types.Slot, target_slot: types.Slot, root_byte: u8) types.AttestationData {
+    const root = createTestRoot(root_byte);
+    const source_root = createTestRoot(0x01);
+    return .{
+        .slot = slot,
+        .head = .{ .root = root, .slot = slot },
+        .target = .{ .root = root, .slot = target_slot },
+        .source = .{ .root = source_root, .slot = 1 },
+    };
+}
+
+fn appendProposalSelectionPayloads(
+    allocator: Allocator,
+    list: *AggregatedPayloadsList,
+    count: usize,
+) !void {
+    for (0..count) |i| {
+        var proof = try types.SingleMessageAggregate.init(allocator);
+        errdefer proof.deinit();
+        try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
+        try list.append(allocator, .{ .slot = @intCast(i), .proof = proof });
+    }
+}
+
+test "proposal attestation selection: high target beats stale low target even if low key is newer" {
+    var high = makeProposalSelectionTestAttData(90, 100, 0xA0);
+    var stale = makeProposalSelectionTestAttData(120, 10, 0xB0);
+    var high_payloads: AggregatedPayloadsList = .empty;
+    var stale_payloads: AggregatedPayloadsList = .empty;
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &stale, .payloads = &stale_payloads },
+        .{ .att_data = &high, .payloads = &high_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.target.slot);
+    try std.testing.expectEqual(@as(types.Slot, 10), candidates[1].att_data.target.slot);
+}
+
+test "proposal attestation selection: payload count wins before attestation slot when target ties" {
+    const allocator = std.testing.allocator;
+    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
+    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
+    var previous_payloads: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &previous_payloads);
+    var current_payloads: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &current_payloads);
+
+    try appendProposalSelectionPayloads(allocator, &previous_payloads, 3);
+    try appendProposalSelectionPayloads(allocator, &current_payloads, 1);
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &current_slot, .payloads = &current_payloads },
+        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 99), candidates[0].att_data.slot);
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[1].att_data.slot);
+}
+
+test "proposal attestation selection: newest attestation slot wins after equal target and payload count" {
+    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
+    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
+    var previous_payloads: AggregatedPayloadsList = .empty;
+    var current_payloads: AggregatedPayloadsList = .empty;
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
+        .{ .att_data = &current_slot, .payloads = &current_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.slot);
+    try std.testing.expectEqual(@as(types.Slot, 99), candidates[1].att_data.slot);
+}
+
+test "proposal attestation selection: 8-key cap is not filled exclusively by stale low targets" {
+    var att_data: [12]types.AttestationData = undefined;
+    var payloads: [12]AggregatedPayloadsList = undefined;
+    var candidates: [12]ProposalAttestationCandidate = undefined;
+
+    for (&payloads) |*list| list.* = .empty;
+
+    // Eight stale keys would have filled the old ascending-target cap first.
+    for (0..8) |i| {
+        att_data[i] = makeProposalSelectionTestAttData(@intCast(10 + i), @intCast(20 + i), @intCast(0x20 + i));
+    }
+    // Four fresh high-target keys must lead the sorted candidate list.
+    for (8..12) |i| {
+        att_data[i] = makeProposalSelectionTestAttData(@intCast(90 + i), @intCast(100 + i), @intCast(0x40 + i));
+    }
+    for (0..12) |i| {
+        candidates[i] = .{ .att_data = &att_data[i], .payloads = &payloads[i] };
+    }
+
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    var high_target_count_in_cap: usize = 0;
+    for (candidates[0..8]) |candidate| {
+        if (candidate.att_data.target.slot >= 100) high_target_count_in_cap += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), high_target_count_in_cap);
+    try std.testing.expect(candidates[0].att_data.target.slot > candidates[7].att_data.target.slot);
+}
 
 test "rebase: parent pointer integrity after pruning" {
     // ========================================
@@ -6722,4 +6946,77 @@ test "rebase: to fork branch node (G) removes previous canonical chain" {
     try std.testing.expect(ctx.fork_choice.attestations.get(2).?.latestKnown.?.index == 1);
     // I: 8 -> 2
     try std.testing.expect(ctx.fork_choice.attestations.get(3).?.latestKnown.?.index == 2);
+}
+
+test "collectCoverageFromPayloads matches data slots within the report window" {
+    const allocator = std.testing.allocator;
+    const data_slot: types.Slot = 100;
+
+    var map = AggregatedPayloadsMap.init(allocator);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |*stored| stored.proof.deinit();
+            entry.value_ptr.deinit(allocator);
+        }
+        map.deinit();
+    }
+
+    // One stored payload for attestation data made at `data_slot`, with
+    // validators 1 and 3 as participants.
+    var proof = try types.SingleMessageAggregate.init(allocator);
+    errdefer proof.deinit();
+    try types.aggregationBitsSet(&proof.participants, 1, true);
+    try types.aggregationBitsSet(&proof.participants, 3, true);
+
+    const att_data = types.AttestationData{
+        .slot = data_slot,
+        .head = .{ .root = [_]u8{0} ** 32, .slot = data_slot },
+        .target = .{ .root = [_]u8{0} ** 32, .slot = data_slot },
+        .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+    };
+    const gop = try map.getOrPut(att_data);
+    gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(allocator, .{ .slot = data_slot, .proof = proof });
+
+    const validator_count = 8;
+    const committee_count: types.SubnetId = 1;
+    var seen: [validator_count]bool = undefined;
+    var combined_seen: [validator_count]bool = undefined;
+    var has_subnet: [1]bool = undefined;
+    var combined_has: [1]bool = undefined;
+
+    const reset = struct {
+        fn run(s: []bool, cs: []bool, h: []bool, ch: []bool) void {
+            @memset(s, false);
+            @memset(cs, false);
+            @memset(h, false);
+            @memset(ch, false);
+        }
+    }.run;
+
+    // Report asked 2 slots after the data slot (the realistic aggregation
+    // pipeline lag): must match through the window.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot + 2, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(seen[1]);
+    try std.testing.expect(seen[3]);
+    try std.testing.expect(!seen[0]);
+    try std.testing.expect(has_subnet[0]);
+
+    // Exact-slot report still matches (window upper bound is inclusive).
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(seen[1]);
+
+    // Past the window: no match.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot + COVERAGE_REPORT_WINDOW_SLOTS, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(!seen[1]);
+    try std.testing.expect(!has_subnet[0]);
+
+    // Future data (report slot BEFORE the data slot): no match.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot - 1, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(!seen[1]);
 }
