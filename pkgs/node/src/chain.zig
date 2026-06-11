@@ -3940,7 +3940,7 @@ pub const BeamChain = struct {
                         continue;
                     };
                     rec_idx += 1;
-                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false) catch |e| {
+                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false, .block_payload) catch |e| {
                         self.logger.warn("failed to store re-aggregated payload for block attestation index={d}: {any}", .{ i, e });
                     };
                 }
@@ -4782,7 +4782,7 @@ pub const BeamChain = struct {
 
         try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
         self.applyAggregatedAttestationTrackers(signedAggregation.data, validator_indices.items);
-        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
+        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false, .gossip);
     }
 
     fn verifyAggregatedAttestation(
@@ -6916,13 +6916,13 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_unseen.participants, i, true);
     }
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true, .block_payload);
 
     var proof_known = try types.SingleMessageAggregate.init(allocator);
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_known.participants, i, true);
     }
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_known, proof_known, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_known, proof_known, true, .block_payload);
 
     // Produce block at slot 3 (proposer_index = 3 % 4 = 3)
     const proposal_slot: types.Slot = 3;
@@ -7092,7 +7092,7 @@ test "produceBlock - older-but-justified source is accepted" {
     const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
     var proof = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7171,10 +7171,10 @@ test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (
     // idempotent across calls.)
     var proof_a = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_a.participants, 0, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true, .block_payload);
     var proof_b = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_b.participants, 1, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7228,7 +7228,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_zs = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zs.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true, .block_payload);
 
     // Attestation with ZERO_HASH target root — must be rejected.
     const att_zero_target = types.AttestationData{
@@ -7239,7 +7239,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_zt = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zt.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true, .block_payload);
 
     // Control: a valid attestation that must appear in the block, ensuring the
     // produced block is non-empty so the negative assertions below are not vacuous.
@@ -7251,7 +7251,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_valid = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_valid.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7322,7 +7322,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     };
     var proof_aj = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true, .block_payload);
 
     // (b) NEGATIVE: genesis self-vote — source.slot==0, target.slot==0.
     // getProposalAttestations drops any attestation with target.slot <= source.slot
@@ -7337,7 +7337,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     };
     var proof_gsv = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_gsv.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,

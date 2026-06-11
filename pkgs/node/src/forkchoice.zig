@@ -1824,9 +1824,34 @@ pub const ForkChoice = struct {
         try self.attestations.put(validator_id, attestation_tracker);
     }
 
+    /// Source of an externally-supplied aggregated payload — drives the
+    /// `source_gossip_participants` / `source_payload_participants` attribution
+    /// surfaced in the per-slot "block proposal … coverage:" log and in the
+    /// `lean_aggregate_*` Prometheus families. Locally-produced aggregates
+    /// from `commitOneAggregateResult` compute their attribution from the live
+    /// payload + raw-gossip maps; this enum is for the inbound paths that
+    /// import an already-built aggregate from elsewhere.
+    pub const AggregatePayloadSource = enum {
+        /// Aggregate read out of a block body (or recovered from a Type-2
+        /// block deconstruction). Counts every covered validator on the
+        /// `payloads` line of the proposer coverage log.
+        block_payload,
+        /// Aggregate that arrived on the `/aggregation/*` gossip topic.
+        /// Counts every covered validator on the `gossip` line.
+        gossip,
+    };
+
     /// Store an aggregated signature proof keyed by AttestationData.
     /// If is_from_block, stores in latest_known_aggregated_payloads (immediately available for block building).
     /// Otherwise, stores in latest_new_aggregated_payloads (promoted to known via periodic ticks).
+    ///
+    /// `source` drives the per-validator source attribution that
+    /// `collectSourceCoverageFromPayloadsForData` reads when building the
+    /// proposer coverage log; without it every imported aggregate (including
+    /// live-gossip `/aggregation/*` arrivals) falls into the "unknown/legacy"
+    /// branch and is mis-attributed to `payloads`, which is what made
+    /// `gossip=none` show up on every proposal even after the gossip mesh
+    /// was actually delivering aggregates.
     ///
     /// Clones `proof` into fork choice; callers retain ownership of the passed-in value
     /// (required for gossip/chain-worker paths that deinit the surrounding message later).
@@ -1835,10 +1860,26 @@ pub const ForkChoice = struct {
         attestation_data: *const types.AttestationData,
         proof: types.SingleMessageAggregate,
         is_from_block: bool,
+        source: AggregatePayloadSource,
     ) !void {
         var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, &proof, self.allocator);
         var cloned_proof_owned = true;
         errdefer if (cloned_proof_owned) cloned_proof.deinit();
+
+        // Clone `proof.participants` into the matching source-attribution slot
+        // so `collectSourceCoverageFromPayloadsForData` can credit the right
+        // source. Block-payload imports use the existing "unknown source ⇒
+        // payload-originated" else-branch in the collector and don't need an
+        // explicit clone here; gossip imports do.
+        var source_gossip_bits: ?types.AggregationBits = null;
+        var source_gossip_bits_owned = false;
+        errdefer if (source_gossip_bits_owned) {
+            if (source_gossip_bits) |*bits| bits.deinit();
+        };
+        if (source == .gossip) {
+            source_gossip_bits = try zeam_utils.clone(types.AggregationBits, &proof.participants, self.allocator);
+            source_gossip_bits_owned = true;
+        }
 
         {
             self.signatures_mutex.lock();
@@ -1857,8 +1898,10 @@ pub const ForkChoice = struct {
             try gop.value_ptr.append(self.allocator, .{
                 .slot = attestation_data.slot,
                 .proof = cloned_proof,
+                .source_gossip_participants = source_gossip_bits,
             });
             cloned_proof_owned = false;
+            source_gossip_bits_owned = false;
 
             if (is_from_block) {
                 if (self.latest_block_aggregated_payloads_slot == null or self.latest_block_aggregated_payloads_slot.? != attestation_data.slot) {
@@ -3792,7 +3835,7 @@ fn stageAggregatedAttestation(
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
 
-    try fork_choice.storeAggregatedPayload(&signed_attestation.message, proof, false);
+    try fork_choice.storeAggregatedPayload(&signed_attestation.message, proof, false, .block_payload);
 }
 
 // Rebase tests build ForkChoice structs in helper functions that outlive the helper scope.
@@ -4935,8 +4978,15 @@ fn collectSourceCoverageFromPayloadsForData(
             for (0..source_payload.len()) |validator_index| {
                 markCoverageValidatorOnly(source_payload, validator_index, committee_count, payload_seen);
             }
-        } else {
-            // Unknown/legacy source: treat the child payload itself as payload-originated.
+        } else if (stored.source_gossip_participants == null) {
+            // Unknown/legacy source: when NEITHER attribution field is set,
+            // treat the child payload itself as payload-originated. A
+            // gossip-attributed payload (source_gossip_participants != null,
+            // source_payload_participants == null) must NOT fall into this
+            // branch, otherwise every gossip-imported validator would also
+            // be credited as payload-originated and the proposer-coverage
+            // formatter (which prefers `payload_seen` over `gossip_available`)
+            // would surface `gossip=none` despite live gossip aggregates.
             for (0..stored.proof.participants.len()) |validator_index| {
                 markCoverageValidatorOnly(stored.proof.participants, validator_index, committee_count, payload_seen);
             }
@@ -5369,7 +5419,7 @@ test "getProposalAttestations: high-target keys survive cap with stale low-targe
         var proof = try types.SingleMessageAggregate.init(allocator);
         defer proof.deinit();
         try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
-        try ctx.fork_choice.storeAggregatedPayload(data, proof, true);
+        try ctx.fork_choice.storeAggregatedPayload(data, proof, true, .block_payload);
     }
 
     // Use an already-elapsed deadline so this selection-level regression test
