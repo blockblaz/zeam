@@ -69,6 +69,7 @@ const NodeOpts = struct {
     aggregate_max_inflight: u32 = 4,
     /// See `chainFactory.ChainOpts.proposal_deadline_pct`.
     proposal_deadline_pct: u32 = chainFactory.default_proposal_deadline_pct,
+    proposal_publish_target_intervals: u32 = chainFactory.default_proposal_publish_target_intervals,
 };
 
 /// blocks_by_root retry backoff (interop storm fix). A requested block root that no peer can
@@ -229,6 +230,7 @@ pub const BeamNode = struct {
                 .max_aggregation_children = opts.max_aggregation_children,
                 .aggregate_max_inflight = opts.aggregate_max_inflight,
                 .proposal_deadline_pct = opts.proposal_deadline_pct,
+                .proposal_publish_target_intervals = opts.proposal_publish_target_intervals,
             },
             network.connected_peers,
         ) catch |init_err| {
