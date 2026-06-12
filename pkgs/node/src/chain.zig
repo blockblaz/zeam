@@ -5085,9 +5085,9 @@ pub const BeamChain = struct {
     }
 
     /// Worker body for off-loop block production (runs on a shared `ThreadPool` worker).
-    /// produceBlock advances local fork-choice; buildBlockProof does the recursive-STARK Type-2
-    /// merge; publishBlock verifies + persists + gossips. The SignedBlock is freed here — onBlock
-    /// consumes it as input and does not retain its allocations (see publishBlock).
+    /// produceBlock advances local fork-choice, then validator_client signs/builds
+    /// the recursive-STARK Type-2 proof and returns a gossip output. BeamNode
+    /// drains that output on the interval tick and remains the sole publisher.
     fn proposeImpl(chain: *Self, node: *@import("./node.zig").BeamNode, slot: usize, proposer_id: usize) void {
         defer _ = chain.propose_inflight.fetchSub(1, .acq_rel);
         const worker_timer = zeam_metrics.lean_block_building_time_seconds.start();
@@ -5115,50 +5115,15 @@ pub const BeamChain = struct {
 
         chain.logger.info("produced block for slot={d} proposer={d} root={x}", .{ slot, proposer_id, &produced_block.blockRoot });
 
-        // TODO - since signing needs to be architectrually seggregated from the nodes, move following section needs to move to validator_client
-        // 1. signing by the validator to get proposer signature
-        // 2. building block proof as done underneath
-        // 3. returning the signed block as array of gossip objects like in mayBeDoAttestation which will make node handle the publish in its onInterval
-        //
-        // All this needs to happen from the mayBeDoProposal which will first call node to produce and return the block with signtaures
-        // This also frees up the node from building the merge proof in the architecture where validator client runs separately from node
-        // alleviating node from the hardwork so that it can also serve validators altruistically
-        const proposer_signature = validator.key_manager.signBlockRoot(proposer_id, &produced_block.blockRoot, @intCast(slot)) catch |e| {
-            chain.logger.err("propose worker: signBlockRoot failed slot={d}: {any}", .{ slot, e });
+        var output = validator.buildProposalOutput(&produced_block, proposer_id, slot) catch return;
+        produced_owned = false; // block now owned by output's SignedBlock
+        defer output.deinit();
+
+        node.enqueueValidatorOutput(&output) catch |e| {
+            chain.logger.err("propose worker: enqueue validator output failed slot={d}: {any}", .{ slot, e });
             return;
         };
-
-        chain.logger.info("produced block signed, building block proof for slot={d} proposer={d} root={x}", .{
-            slot,
-            proposer_id,
-            &produced_block.blockRoot,
-        });
-        var proof = types.MultiMessageAggregate.init(chain.allocator) catch return;
-        var proof_owned = true;
-        defer if (proof_owned) proof.deinit();
-        chain.buildBlockProof(&produced_block, &proposer_signature, &proof) catch |e| {
-            chain.logger.err("propose worker: buildBlockProof failed slot={d}: {any}", .{ slot, e });
-            return;
-        };
-
-        // The Type-1 list is now folded into the Type-2 proof; free it. The block moves into the
-        // SignedBlock (which we free after publishing).
-        for (produced_block.attestation_signatures.slice()) |*t1| t1.deinit();
-        produced_block.attestation_signatures.deinit();
-
-        var signed_block = types.SignedBlock{
-            .block = produced_block.block,
-            .proof = proof,
-        };
-        produced_owned = false; // block now owned by signed_block
-        proof_owned = false; // proof now owned by signed_block
-        defer signed_block.deinit();
-
-        node.publishBlock(signed_block) catch |e| {
-            chain.logger.err("propose worker: publishBlock failed slot={d}: {any}", .{ slot, e });
-            return;
-        };
-        chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+        chain.logger.info("queued signed block for validator publish slot={d} root={x}", .{ slot, &produced_block.blockRoot });
     }
 
     /// Find the subnet of the first set participant in `participants`.
