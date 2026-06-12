@@ -5117,10 +5117,10 @@ pub const BeamChain = struct {
 
         // TODO - since signing needs to be architectrually seggregated from the nodes, move following section needs to move to validator_client
         // 1. signing by the validator to get proposer signature
-        // 2. building block proof
-        // 3. calling the publish
+        // 2. building block proof as done underneath
+        // 3. returning the signed block as array of gossip objects like in mayBeDoAttestation which will make node handle the publish in its onInterval
         //
-        // All this needs to happen from the mayBeDoProposal
+        // All this needs to happen from the mayBeDoProposal which will first call node to produce and return the block with signtaures
         // This also frees up the node from building the merge proof in the architecture where validator client runs separately from node
         // alleviating node from the hardwork so that it can also serve validators altruistically
         const proposer_signature = validator.key_manager.signBlockRoot(proposer_id, &produced_block.blockRoot, @intCast(slot)) catch |e| {
@@ -5128,7 +5128,7 @@ pub const BeamChain = struct {
             return;
         };
 
-        chain.logger.debug("produced block signed, building block proof for slot={d} proposer={d} root={x}", .{
+        chain.logger.info("produced block signed, building block proof for slot={d} proposer={d} root={x}", .{
             slot,
             proposer_id,
             &produced_block.blockRoot,
