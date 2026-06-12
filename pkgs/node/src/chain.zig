@@ -2880,6 +2880,9 @@ pub const BeamChain = struct {
         // co-held while we wait on prove_gate (leaf acquisition — no deadlock).
         self.prove_gate.lock();
         defer self.prove_gate.unlock();
+        // zeam-specific: time JUST the Type-2 multi-message STARK merge (the proposal
+        // critical-path cost between produceBlock and publish).
+        const merge_start_ns = zeam_utils.monotonicTimestampNs();
         try types.buildType2BlockProof(
             self.allocator,
             &state_snapshot.validators,
@@ -2891,6 +2894,16 @@ pub const BeamChain = struct {
             proposer_sig,
             out_proof,
         );
+        const merge_secs: f32 = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - merge_start_ns)) / 1_000_000_000.0;
+        // Label by component count (distinct AttestationData) so the histogram shows the
+        // per-component scaling of the merge. Formatted directly so the label tracks the
+        // configured max_attestations_data automatically (the block enforces that bound, so
+        // cardinality stays small); the metrics lib dupes label values, so this stack buffer is safe.
+        const n_components = produced.block.body.attestations.constSlice().len;
+        var comp_buf: [8]u8 = undefined;
+        const components_label = std.fmt.bufPrint(&comp_buf, "{d}", .{n_components}) catch "overflow";
+        zeam_metrics.metrics.zeam_block_proof_merge_time_seconds.observe(.{ .components = components_label }, merge_secs) catch {};
+        self.logger.info("Type-2 block-proof STARK merge slot={d} components={d}: {d:.3}s", .{ produced.block.slot, n_components, merge_secs });
     }
 
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
