@@ -161,6 +161,11 @@ pub const BeamNode = struct {
     unserved_block_retries: std.AutoHashMap(types.Root, UnservedBlockRetry),
     unserved_block_retries_lock: zeam_utils.SyncMutex = .{},
 
+    /// Validator outputs produced by off-loop proposal workers and drained by
+    /// the libxev interval tick so BeamNode remains the only publisher.
+    pending_validator_gossip: std.ArrayList(networks.GossipMessage),
+    pending_validator_gossip_lock: zeam_utils.SyncMutex = .{},
+
     /// Test-only failure injection for `onInterval` catch-and-continue paths.
     test_inject_validator_error_at_intervals: []const usize = &.{},
     test_inject_aggregator_error_at_intervals: []const usize = &.{},
@@ -293,6 +298,7 @@ pub const BeamNode = struct {
             .orphan_dependents = std.AutoHashMap(types.Root, std.ArrayList(types.Root)).init(allocator),
             .range_async_chunk_imports = std.AutoHashMap(types.Root, u64).init(allocator),
             .unserved_block_retries = std.AutoHashMap(types.Root, UnservedBlockRetry).init(allocator),
+            .pending_validator_gossip = .empty,
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -336,7 +342,54 @@ pub const BeamNode = struct {
         self.orphan_dependents.deinit();
         self.range_async_chunk_imports.deinit();
         self.unserved_block_retries.deinit();
+        {
+            var output = validatorClient.ValidatorClientOutput{
+                .allocator = self.allocator,
+                .gossip_messages = self.pending_validator_gossip,
+            };
+            output.deinit();
+        }
         self.network.deinit();
+    }
+
+    pub fn enqueueValidatorOutput(self: *Self, output: *validatorClient.ValidatorClientOutput) !void {
+        self.pending_validator_gossip_lock.lock();
+        defer self.pending_validator_gossip_lock.unlock();
+        try self.pending_validator_gossip.appendSlice(self.allocator, output.gossip_messages.items);
+        output.gossip_messages.clearRetainingCapacity();
+    }
+
+    fn drainPendingValidatorOutput(self: *Self) validatorClient.ValidatorClientOutput {
+        var output = validatorClient.ValidatorClientOutput.init(self.allocator);
+        self.pending_validator_gossip_lock.lock();
+        std.mem.swap(std.ArrayList(networks.GossipMessage), &output.gossip_messages, &self.pending_validator_gossip);
+        self.pending_validator_gossip_lock.unlock();
+        return output;
+    }
+
+    fn publishValidatorOutput(self: *Self, output: *validatorClient.ValidatorClientOutput, slot: types.Slot, interval: usize) void {
+        for (output.gossip_messages.items) |gossip_msg| {
+            switch (gossip_msg) {
+                .block => |signed_block| {
+                    self.publishBlock(signed_block) catch |e| {
+                        self.logger.err("error publishing block from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishBlock" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                    };
+                },
+                .attestation => |signed_attestation| {
+                    self.publishAttestation(signed_attestation) catch |e| {
+                        self.logger.err("error publishing attestation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAttestation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                    };
+                },
+                .aggregation => |signed_aggregation| {
+                    self.publishAggregation(signed_aggregation) catch |e| {
+                        self.logger.err("error publishing aggregation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
+                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAggregation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                    };
+                },
+            }
+        }
     }
 
     fn recordRangeSyncOutcome(_: *Self, outcome: []const u8) void {
@@ -2957,44 +3010,32 @@ pub const BeamNode = struct {
             }
 
             // Application-layer failures are logged and counted, not returned.
-            if (self.test_inject_validator_error_at_intervals.len > 0 and
-                std.mem.indexOfScalar(usize, self.test_inject_validator_error_at_intervals, interval) != null)
-            {
-                self.logger.err("error ticking validator to time(intervals)={d} err=error.TestInjected (continuing tick)", .{interval});
-                zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-            } else if (self.validator) |*validator| {
-                // we also tick validator per interval in case it would
-                // need to sync its future duties when its an independent validator
-                var maybe_validator_output = validator.onInterval(self, interval) catch |e| blk: {
-                    self.logger.err("error ticking validator to time(intervals)={d} err={any} (continuing tick)", .{ interval, e });
-                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                    break :blk null;
-                };
+            if (self.validator) |*validator| {
+                var queued_validator_output = self.drainPendingValidatorOutput();
+                if (queued_validator_output.gossip_messages.items.len > 0) {
+                    defer queued_validator_output.deinit();
+                    self.publishValidatorOutput(&queued_validator_output, slot, interval);
+                } else {
+                    queued_validator_output.deinit();
+                }
 
-                if (maybe_validator_output) |*output| {
-                    defer output.deinit();
-                    for (output.gossip_messages.items) |gossip_msg| {
-                        // Process based on message type
-                        switch (gossip_msg) {
-                            .block => |signed_block| {
-                                self.publishBlock(signed_block) catch |e| {
-                                    self.logger.err("error publishing block from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
-                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishBlock" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                                };
-                            },
-                            .attestation => |signed_attestation| {
-                                self.publishAttestation(signed_attestation) catch |e| {
-                                    self.logger.err("error publishing attestation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
-                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAttestation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                                };
-                            },
-                            .aggregation => |signed_aggregation| {
-                                self.publishAggregation(signed_aggregation) catch |e| {
-                                    self.logger.err("error publishing aggregation from validator at slot={d} interval={d}: {any} (continuing tick)", .{ slot, interval, e });
-                                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "publishAggregation" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
-                                };
-                            },
-                        }
+                if (self.test_inject_validator_error_at_intervals.len > 0 and
+                    std.mem.indexOfScalar(usize, self.test_inject_validator_error_at_intervals, interval) != null)
+                {
+                    self.logger.err("error ticking validator to time(intervals)={d} err=error.TestInjected (continuing tick)", .{interval});
+                    zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                } else {
+                    // we also tick validator per interval in case it would
+                    // need to sync its future duties when its an independent validator
+                    var maybe_validator_output = validator.onInterval(self, interval) catch |e| blk: {
+                        self.logger.err("error ticking validator to time(intervals)={d} err={any} (continuing tick)", .{ interval, e });
+                        zeam_metrics.metrics.lean_node_interval_error_total.incr(.{ .site = "validator.onInterval" }) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                        break :blk null;
+                    };
+
+                    if (maybe_validator_output) |*output| {
+                        defer output.deinit();
+                        self.publishValidatorOutput(output, slot, interval);
                     }
                 }
             }
