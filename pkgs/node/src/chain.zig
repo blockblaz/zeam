@@ -5115,11 +5115,24 @@ pub const BeamChain = struct {
 
         chain.logger.info("produced block for slot={d} proposer={d} root={x}", .{ slot, proposer_id, &produced_block.blockRoot });
 
+        // TODO - since signing needs to be architectrually seggregated from the nodes, move following section needs to move to validator_client
+        // 1. signing by the validator to get proposer signature
+        // 2. building block proof
+        // 3. calling the publish
+        //
+        // All this needs to happen from the mayBeDoProposal
+        // This also frees up the node from building the merge proof in the architecture where validator client runs separately from node
+        // alleviating node from the hardwork so that it can also serve validators altruistically
         const proposer_signature = validator.key_manager.signBlockRoot(proposer_id, &produced_block.blockRoot, @intCast(slot)) catch |e| {
             chain.logger.err("propose worker: signBlockRoot failed slot={d}: {any}", .{ slot, e });
             return;
         };
 
+        chain.logger.debug("produced block signed, building block proof for slot={d} proposer={d} root={x}", .{
+            slot,
+            proposer_id,
+            &produced_block.blockRoot,
+        });
         var proof = types.MultiMessageAggregate.init(chain.allocator) catch return;
         var proof_owned = true;
         defer if (proof_owned) proof.deinit();
