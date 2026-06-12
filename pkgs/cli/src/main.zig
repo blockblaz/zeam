@@ -6,12 +6,57 @@ const constants = @import("constants.zig");
 
 const simargs = @import("simargs");
 
-// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings
+/// Runtime gate for QUIC-stack info/debug logs.  Defaults to **false**
+/// (suppressed); flipped to true at startup when `DEBUG_QUIC=1` (or
+/// `true`/`yes`/`on`) is set in the environment.  See `quicAwareLogFn`
+/// for the scopes that are gated and `mainInner` for the env-var read.
+var quic_debug_enabled = std.atomic.Value(bool).init(false);
+
+/// Scopes whose `.info` / `.debug` messages are suppressed unless
+/// `DEBUG_QUIC=1`.  Keep this list in sync with the `std.log.scoped`
+/// callers in zquic + zig-libp2p that emit per-packet / per-frame
+/// chatter (the gossip-wedge investigation made
+/// `quic_runtime`/`zquic`/`connection_manager`/`tls` collectively the
+/// loudest sources on a long devnet run).  Warnings and errors from
+/// these scopes still pass through so genuine problems remain visible.
+fn isQuicStackScope(comptime scope: @TypeOf(.enum_literal)) bool {
+    return scope == .zquic or
+        scope == .quic_runtime or
+        scope == .quic_dcutr or
+        scope == .quic_relay or
+        scope == .connection_manager or
+        scope == .tls;
+}
+
+/// Custom log fn: gates info/debug for the QUIC stack scopes on the
+/// `quic_debug_enabled` atomic, then delegates to `std.log.defaultLog`
+/// (which still respects `log_scope_levels` for the other scopes
+/// configured below).
+fn quicAwareLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (comptime isQuicStackScope(scope)) {
+        // Levels are err=0, warn=1, info=2, debug=3.  We only gate the
+        // chattier levels (>= info); warn/err always pass through.
+        if (comptime @intFromEnum(level) >= @intFromEnum(std.log.Level.info)) {
+            if (!quic_debug_enabled.load(.monotonic)) return;
+        }
+    }
+    std.log.defaultLog(level, scope, format, args);
+}
+
+// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings.
+// `logFn` is overridden to add a runtime DEBUG_QUIC gate (see above) for the noisy
+// QUIC-stack scopes; everything else continues to use `defaultLog`.
 pub const std_options: std.Options = .{
     .log_scope_levels = &[_]std.log.ScopeLevel{
         .{ .scope = .tokenizer, .level = .err },
         .{ .scope = .parser, .level = .err },
     },
+    .logFn = quicAwareLogFn,
 };
 
 const types = @import("@zeam/types");
@@ -321,6 +366,22 @@ fn mainInner(init: std.process.Init) !void {
             std.process.exit(1);
         }
     };
+
+    // Honour the `DEBUG_QUIC` env var (mirrors `lean-quickstart`'s shell-side
+    // contract for ethlambda/quinn): unset / `0` / empty → suppress info+debug
+    // from the QUIC stack scopes; `1` / `true` / `yes` / `on` → unmute.  This
+    // must run before any QUIC-stack logging is emitted so the first messages
+    // (e.g. transport init) are filtered consistently.  Zig 0.16 removed
+    // `std.process.getEnvVarOwned`; the CLI binary already links libc (for
+    // rust glue + rocksdb), so `std.c.getenv` is the simplest no-alloc path.
+    if (std.c.getenv("DEBUG_QUIC")) |raw| {
+        const trimmed = std.mem.trim(u8, std.mem.span(raw), " \t\n\r");
+        const truthy = std.mem.eql(u8, trimmed, "1") or
+            std.ascii.eqlIgnoreCase(trimmed, "true") or
+            std.ascii.eqlIgnoreCase(trimmed, "yes") or
+            std.ascii.eqlIgnoreCase(trimmed, "on");
+        if (truthy) quic_debug_enabled.store(true, .monotonic);
+    }
 
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
