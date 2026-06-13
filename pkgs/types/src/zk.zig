@@ -105,12 +105,12 @@ test "ssz seralize/deserialize signed stf prover input" {
         .justified_slots = try state.JustifiedSlots.init(std.testing.allocator),
         .validators = try validator.Validators.init(std.testing.allocator),
         .justifications_roots = blk: {
-            var roots = try ssz.utils.List(utils.Root, params.HISTORICAL_ROOTS_LIMIT).init(std.testing.allocator);
+            var roots = try state.JustificationRoots.init(std.testing.allocator);
             try roots.append(genesis_root);
             break :blk roots;
         },
         .justifications_validators = blk: {
-            var validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(std.testing.allocator);
+            var validators = try state.JustificationValidators.init(std.testing.allocator);
             try validators.append(true);
             try validators.append(false);
             try validators.append(true);
