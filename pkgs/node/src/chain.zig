@@ -126,6 +126,8 @@ pub const CachedProcessedBlockInfo = struct {
     // for database persistence and skips re-serializing the live SignedBlock, which
     // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
     sszBytes: ?[]const u8 = null,
+    // Used to skip XMSS signature verification during stress tests
+    skipVerify: bool = false,
 };
 
 pub const GossipProcessingResult = struct {
@@ -3695,16 +3697,31 @@ pub const BeamChain = struct {
             // rejected without mutating post state). Uses the shared thread pool when available to
             // parallelize per-attestation verification across CPU workers.
             //
-            // The XMSS pubkey cache is lock-free (`xmss.PublicKeyCache`
-            // uses per-slot atomic CAS). No `pubkey_cache_lock`
-            // acquisition needed here — readers and the STF's own
-            // population path race on the slot's atomic and the loser
-            // frees its handle. An earlier mutex around this block was
-            // the dominant contributor to a ~78ms mean lock hold.
-            // A block carries one merged Type-2 proof, so verification is a single
-            // container.verify (no per-attestation parallel batch).
-            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
+            // The XMSS pubkey cache is documented NOT thread-safe; today the
+            // The XMSS pubkey cache is lock-free as of P1 of #863
+            // (`xmss.PublicKeyCache` uses per-slot atomic CAS). No
+            // `pubkey_cache_lock` acquisition needed here — readers
+            // and the STF's own population path race on the slot's
+            // atomic and the loser frees its handle. The previous
+            // mutex around this block was the dominant contributor
+            // to the ~78ms mean lock hold reported in #863.
+            //
+            // `skipVerify` — stress-test-only knob (#825). Skips XMSS signature
+            // verification to increase lock-contention rate. Must NEVER be set
+            // by production callers.
+            if (!blockInfo.skipVerify) {
+                // The XMSS pubkey cache is lock-free (`xmss.PublicKeyCache`
+                // uses per-slot atomic CAS). No `pubkey_cache_lock`
+                // acquisition needed here — readers and the STF's own
+                // population path race on the slot's atomic and the loser
+                // frees its handle. An earlier mutex around this block was
+                // the dominant contributor to a ~78ms mean lock hold.
+                // A block carries one merged Type-2 proof, so verification is a single
+                // container.verify (no per-attestation parallel batch).
+                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
+            }
 
+            // left outside of the check block to make visible that verification was not done
             step_watch.lap("verify_signatures");
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify).
