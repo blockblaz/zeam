@@ -181,6 +181,8 @@ const Metrics = struct {
     // Block production metrics
     lean_block_building_time_seconds: BlockBuildingTimeHistogram,
     lean_block_building_payload_aggregation_time_seconds: BlockPayloadAggregationTimeHistogram,
+    // zeam-specific: Type-2 multi-message STARK merge time (buildBlockProof), the proposal critical-path cost.
+    zeam_block_proof_merge_time_seconds: BlockProofMergeTimeHistogram,
     lean_block_aggregated_payloads: BlockAggregatedPayloadsHistogram,
     lean_block_building_success_total: BlockBuildingSuccessCounter,
     lean_block_building_failures_total: BlockBuildingFailuresCounter,
@@ -606,6 +608,7 @@ const Metrics = struct {
     // Block production metric types
     const BlockBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     const BlockPayloadAggregationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
+    const BlockProofMergeTimeHistogram = metrics_lib.HistogramVec(f32, struct { components: []const u8 }, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5 });
     const BlockAggregatedPayloadsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128 });
     // Total participant count summed across all aggregated_attestations in
     // a block. Each attestation can have up to NUM_VALIDATORS participants;
@@ -1167,6 +1170,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         // Block production metrics
         .lean_block_building_time_seconds = Metrics.BlockBuildingTimeHistogram.init("lean_block_building_time_seconds", .{ .help = "Time taken to build a block" }, .{}),
         .lean_block_building_payload_aggregation_time_seconds = Metrics.BlockPayloadAggregationTimeHistogram.init("lean_block_building_payload_aggregation_time_seconds", .{ .help = "Time taken to build aggregated_payloads during block building" }, .{}),
+        .zeam_block_proof_merge_time_seconds = try Metrics.BlockProofMergeTimeHistogram.init(allocator, io, "zeam_block_proof_merge_time_seconds", .{ .help = "buildBlockProof Type-2 multi-message STARK merge time (proposal critical path), labeled by components = number of distinct AttestationData merged into the block proof" }, .{}),
         .lean_block_aggregated_payloads = Metrics.BlockAggregatedPayloadsHistogram.init("lean_block_aggregated_payloads", .{ .help = "Number of aggregated_payloads in a block" }, .{}),
         .lean_block_building_success_total = Metrics.BlockBuildingSuccessCounter.init("lean_block_building_success_total", .{ .help = "Successful block builds" }, .{}),
         .lean_block_building_failures_total = Metrics.BlockBuildingFailuresCounter.init("lean_block_building_failures_total", .{ .help = "Failed block builds (exception in build_block)" }, .{}),

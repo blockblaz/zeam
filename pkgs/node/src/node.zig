@@ -2660,7 +2660,15 @@ pub const BeamNode = struct {
         if (missing_roots.items.len == 0) return;
 
         const handler = self.getReqRespResponseHandler();
-        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer, self.chain.forkChoice.getHead().slot + 1) catch |err| blk: {
+        // No `min_slot` filter on blocks-by-root: a peer can serve a block by
+        // its root regardless of the peer's last-known head_slot. The filter
+        // (PR #950) is meaningful for forward sync (`BlocksByRange`) where we
+        // need a peer at or beyond a target slot; for a root-hash lookup it
+        // only deadlocks repair after our own head advances past a stale
+        // `latest_status.head_slot` (status is refreshed on handshake / explicit
+        // re-status, not per-gossip), turning a transient gossip miss into an
+        // unrecoverable fork.
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer, null) catch |err| blk: {
             switch (err) {
                 error.NoPeersAvailable => {
                     // Previously this path bumped
