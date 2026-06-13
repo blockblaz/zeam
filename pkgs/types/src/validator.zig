@@ -14,9 +14,14 @@ const ValidatorIndex = utils.ValidatorIndex;
 
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 // Types
-pub const Validators = ssz.utils.List(Validator, params.VALIDATOR_REGISTRY_LIMIT);
+//
+// `Validators` is the cached (incremental `hashTreeRoot`) variant: a
+// `TreeHasher` wrapper around the SSZ list. The hasher MUST be `Sha256` to
+// match `@zeam/utils`'s `hashTreeRoot`, otherwise the cache is bypassed.
+pub const Validators = ssz.utils.TreeHasher(ssz.utils.List(Validator, params.VALIDATOR_REGISTRY_LIMIT), Sha256);
 
 pub const Validator = struct {
     attestation_pubkey: Bytes52,
