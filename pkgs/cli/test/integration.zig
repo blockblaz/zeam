@@ -57,7 +57,12 @@ fn getZeamExecutable() ![]const u8 {
 fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
     const io = std.testing.io;
 
-    // Set up process with beam command and mock network
+    // Use the in-process `networks.Mock` shortcut for simtest so CI
+    // exercises consensus + SSE finalization without depending on
+    // zig-libp2p mesh/finality timing (EthLibp2pV2 is covered by unit
+    // tests and `zeam node beam` in production). Wipe `./data` first —
+    // stale RocksDB MANIFEST from a crashed run aborts node init.
+    std.Io.Dir.deleteTree(.cwd(), std.testing.io, "./data") catch {};
     const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
 

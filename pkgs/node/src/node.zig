@@ -176,6 +176,11 @@ pub const BeamNode = struct {
     /// that preserves that invariant.
     sync_refresh_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Attestations whose gossip was deferred while a local block proof was
+    /// still being built (`propose_inflight > 0`). Flushed after `publishBlock`.
+    deferred_attestation_gossip: std.ArrayListUnmanaged(networks.AttestationGossip) = .empty,
+    deferred_attestation_gossip_lock: zeam_utils.SyncMutex = .{},
+
     /// Rotating cursor for rate-limited `refreshSyncFromPeers` batches.
     sync_refresh_peer_cursor: usize = 0,
 
@@ -336,6 +341,9 @@ pub const BeamNode = struct {
         self.orphan_dependents.deinit();
         self.range_async_chunk_imports.deinit();
         self.unserved_block_retries.deinit();
+        self.deferred_attestation_gossip_lock.lock();
+        self.deferred_attestation_gossip.deinit(self.allocator);
+        self.deferred_attestation_gossip_lock.unlock();
         self.network.deinit();
     }
 
@@ -3548,46 +3556,106 @@ pub const BeamNode = struct {
     pub fn publishBlock(self: *Self, signed_block: types.SignedBlock) !void {
         const block = signed_block.block;
 
-        // 1. Process locally through chain so the produced block is confirmed and persisted.
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator);
 
-        // 2. Reprocess locally produced block through chain so forkchoice is updated.
-        //    TODO: might not be needed for locally produced block if we totally depend on the aggregators to serve us attestations
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
+
+        // Locally produced blocks (`produceBlock` → forkchoice + states) are
+        // already imported. Publish gossip *first* so peers see the block
+        // before attestations in the same slot reference its head root, and
+        // pass the cached post-state into `onBlock` so we skip the expensive
+        // STF recompute that was adding ~1.5–2.5s before the block hit the wire.
         if (hasBlock) {
-            self.logger.debug("reprocessing locally produced block: slot={d} proposer={d}", .{
+            const gossip_msg = networks.GossipMessage{ .block = signed_block };
+            const block_published = try self.network.publish(&gossip_msg);
+            if (block_published) {
+                self.logger.info("published block to network: slot={d} proposer={d}{f}", .{
+                    block.slot,
+                    block.proposer_index,
+                    self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+                });
+            } else {
+                self.logger.warn("failed to publish block to network (backend dropped publish): slot={d} proposer={d}{f}", .{
+                    block.slot,
+                    block.proposer_index,
+                    self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+                });
+            }
+            self.flushDeferredAttestationGossip();
+
+            var state_borrow = self.chain.statesGet(block_root) orelse {
+                self.logger.warn(
+                    "publishBlock: block in forkchoice but post-state missing for root=0x{x} slot={d}, falling back to full onBlock before gossip",
+                    .{ &block_root, block.slot },
+                );
+                return self.publishBlockImportThenGossip(signed_block, block_root);
+            };
+            // LIFO defer pairing per locking.BorrowedState contract:
+            // assertReleasedOrPanic is registered FIRST so it runs LAST and
+            // observes `released = true` after the deinit defer below has
+            // already dropped the underlying lock + refcount. Without the
+            // matching deinit defer the assert always panics with
+            // `BorrowedState dropped without release` on every successful
+            // publishBlock call (see locking.zig:1182 docstring).
+            defer state_borrow.assertReleasedOrPanic();
+            defer state_borrow.deinit();
+
+            self.logger.debug("reprocessing locally produced block (cached post-state): slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
-        } else {
-            self.logger.debug("processing block not locally produced before publishing: slot={d} proposer={d}", .{
-                block.slot,
-                block.proposer_index,
+
+            const missing_roots = try self.chain.onBlock(signed_block, .{
+                .blockRoot = block_root,
+                .postState = @constCast(state_borrow.state),
             });
+            defer self.allocator.free(missing_roots);
+
+            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+            };
+
+            self.chain.onBlockFollowup(true, &signed_block);
+            self.replayPendingAttestationsAsync(.local_publish);
+            return;
         }
 
-        // Slice (a-2) migration: the previous `states.get(block_root)`
-        // shortcut handed `chain.onBlock` the cached post-state pointer to
-        // skip recomputation when the block was already produced locally.
-        // Under the new per-resource locking model that pointer would have
-        // to be carried as a `BorrowedState`, but `chain.onBlock` itself
-        // takes `states_lock.exclusive` to commit — holding the read side
-        // across that call would deadlock. The post-state recompute path
-        // is now the single source of truth for both produced-locally and
-        // received-from-gossip blocks; the `statesPutOrSwap` helper inside
-        // `onBlock` keeps the original in-map pointer intact when the
-        // entry already exists, so locally produced blocks no longer leak
-        // their initial post-state on the publish hop. See the design doc
-        // §Resource-by-resource design / `BeamChain.states` for context.
-        //
-        // Stays inline (NOT routed through the chain-worker like the RPC
-        // paths): the validator path runs on the libxev thread,
-        // and downstream callers / tests assume the block is in
-        // forkchoice by the time `publishBlock` returns. Async would
-        // surface a race where attestations produced in the same
-        // interval reference a block the chain hasn't imported yet.
-        // The replay below still goes via the worker.
+        return self.publishBlockImportThenGossip(signed_block, block_root);
+    }
+
+    fn flushDeferredAttestationGossip(self: *Self) void {
+        self.deferred_attestation_gossip_lock.lock();
+        defer self.deferred_attestation_gossip_lock.unlock();
+        for (self.deferred_attestation_gossip.items) |signed_attestation| {
+            const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
+            const attestation_published = self.network.publish(&gossip_msg) catch |e| {
+                self.logger.warn("failed to publish deferred attestation slot={d}: {any}", .{
+                    signed_attestation.message.message.slot,
+                    e,
+                });
+                continue;
+            };
+            if (attestation_published) {
+                self.logger.info("published deferred attestation to network: slot={d} validator={d}{f}", .{
+                    signed_attestation.message.message.slot,
+                    signed_attestation.message.validator_id,
+                    self.node_registry.getNodeNameFromValidatorIndex(signed_attestation.message.validator_id),
+                });
+            }
+        }
+        self.deferred_attestation_gossip.clearRetainingCapacity();
+    }
+
+    /// Import a block that is not yet in fork choice, then gossip it.
+    fn publishBlockImportThenGossip(self: *Self, signed_block: types.SignedBlock, block_root: types.Root) !void {
+        const block = signed_block.block;
+
+        self.logger.debug("processing block not locally produced before publishing: slot={d} proposer={d}", .{
+            block.slot,
+            block.proposer_index,
+        });
+
         const missing_roots = try self.chain.onBlock(signed_block, .{
             .blockRoot = block_root,
         });
@@ -3597,7 +3665,6 @@ pub const BeamNode = struct {
             self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
         };
 
-        // 3. Publish gossip message to the network.
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         const block_published = try self.network.publish(&gossip_msg);
         if (block_published) {
@@ -3607,17 +3674,14 @@ pub const BeamNode = struct {
                 self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
             });
         } else {
-            // Backend dropped the publish (e.g. rust-libp2p command
-            // channel full). The block is in our local chain but never reached
-            // the network — surface it instead of logging "published".
             self.logger.warn("failed to publish block to network (backend dropped publish): slot={d} proposer={d}{f}", .{
                 block.slot,
                 block.proposer_index,
                 self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
             });
         }
+        self.flushDeferredAttestationGossip();
 
-        // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
         self.replayPendingAttestationsAsync(.local_publish);
     }
@@ -3633,6 +3697,22 @@ pub const BeamNode = struct {
             validator_id,
         });
         try self.chain.onGossipAttestation(signed_attestation);
+
+        // While a local block proof is still being built, defer gossip so peers
+        // receive the block before an attestation that references its head root.
+        if (self.chain.propose_inflight.load(.acquire) > 0 and data.head.slot >= data.slot) {
+            self.deferred_attestation_gossip_lock.lock();
+            defer self.deferred_attestation_gossip_lock.unlock();
+            self.deferred_attestation_gossip.append(self.allocator, signed_attestation) catch {
+                self.logger.warn("failed to defer attestation gossip slot={d}: oom", .{data.slot});
+                return;
+            };
+            self.logger.debug(
+                "deferred attestation gossip until block publish completes: slot={d} head_slot={d}",
+                .{ data.slot, data.head.slot },
+            );
+            return;
+        }
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
