@@ -676,7 +676,7 @@ pub const BeamNode = struct {
         defer if (missing_roots.len > 0) self.allocator.free(missing_roots);
 
         if (missing_roots.len > 0) {
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.fetchBlockByRoots(missing_roots, 0, null) catch |err| {
                 self.logger.warn(
                     "failed to fetch {d} missing block root(s) from gossip: {any}",
                     .{ missing_roots.len, err },
@@ -799,7 +799,7 @@ pub const BeamNode = struct {
         // backchannel wired, RPC fetches kick off the moment the
         // chain knows the dependency.
         if (missing_roots.len > 0) {
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.fetchBlockByRoots(missing_roots, 0, null) catch |err| {
                 self.logger.warn(
                     "imported-block callback: failed to fetch {d} missing block(s): {any}",
                     .{ missing_roots.len, err },
@@ -1209,7 +1209,7 @@ pub const BeamNode = struct {
                 self.processCachedDescendants(descendant_root);
 
                 // Fetch any missing attestation head blocks
-                self.fetchBlockByRoots(missing_roots, 0) catch |fetch_err| {
+                self.fetchBlockByRoots(missing_roots, 0, null) catch |fetch_err| {
                     self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, fetch_err });
                 };
             }
@@ -1620,7 +1620,7 @@ pub const BeamNode = struct {
             self.processCachedDescendants(block_root);
 
             // Fetch any missing attestation head blocks
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.fetchBlockByRoots(missing_roots, 0, null) catch |err| {
                 self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
@@ -1681,7 +1681,7 @@ pub const BeamNode = struct {
 
     fn syncFetchPeerHeadByRoot(self: *Self, peer_id: []const u8, head_root: types.Root) void {
         const roots = [_]types.Root{head_root};
-        self.fetchBlockByRootsFromPeer(&roots, 0, peer_id) catch |err| {
+        self.fetchBlockByRoots(&roots, 0, peer_id) catch |err| {
             self.logger.warn("failed to fetch peer head block 0x{x} from peer {s}{f}: {any}", .{
                 &head_root,
                 peer_id,
@@ -2050,7 +2050,7 @@ pub const BeamNode = struct {
         self.chain.onBlockFollowup(true, signed_block);
         self.replayPendingAttestationsAsync(.gossip_or_rpc_followup);
         self.processCachedDescendants(block_root);
-        self.fetchBlockByRootsFromPeer(missing_roots, 0, peer_id) catch |err| {
+        self.fetchBlockByRoots(missing_roots, 0, peer_id) catch |err| {
             self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
         };
         self.flushPendingParentFetches(peer_id);
@@ -2543,20 +2543,12 @@ pub const BeamNode = struct {
         if (roots.items.len == 0) return;
         self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
 
-        self.fetchBlockByRootsFromPeer(roots.items, max_depth, preferred_peer) catch |err| {
+        self.fetchBlockByRoots(roots.items, max_depth, preferred_peer) catch |err| {
             self.logger.warn("failed to batch-fetch {d} pending parent root(s): {any}", .{ roots.items.len, err });
         };
     }
 
     fn fetchBlockByRoots(
-        self: *Self,
-        roots: []const types.Root,
-        depth: u32,
-    ) !void {
-        return self.fetchBlockByRootsFromPeer(roots, depth, null);
-    }
-
-    fn fetchBlockByRootsFromPeer(
         self: *Self,
         roots: []const types.Root,
         depth: u32,
@@ -2937,7 +2929,7 @@ pub const BeamNode = struct {
                     const missing_roots = self.chain.processPendingBlocks();
                     defer self.allocator.free(missing_roots);
                     if (missing_roots.len > 0) {
-                        self.fetchBlockByRoots(missing_roots, 0) catch |e| {
+                        self.fetchBlockByRoots(missing_roots, 0, null) catch |e| {
                             self.logger.warn(
                                 "failed to fetch {d} missing block root(s) from processPendingBlocks: {any}",
                                 .{ missing_roots.len, e },
@@ -3400,7 +3392,7 @@ pub const BeamNode = struct {
         for (roots_to_retry.items) |item| {
             if (self.scheduleUnservedRetry(item.root, item.depth)) {
                 const single = [_]types.Root{item.root};
-                self.fetchBlockByRoots(&single, item.depth) catch |err| {
+                self.fetchBlockByRoots(&single, item.depth, null) catch |err| {
                     self.logger.warn("retryUnservedBlockRoots: failed to re-fetch root after unserved EOS/failure: {any}", .{err});
                 };
             }
@@ -3470,7 +3462,7 @@ pub const BeamNode = struct {
 
         for (due.items) |item| {
             const single = [_]types.Root{item.root};
-            self.fetchBlockByRoots(&single, item.depth) catch |err| {
+            self.fetchBlockByRoots(&single, item.depth, null) catch |err| {
                 self.logger.warn("drainUnservedRetries: failed to re-fetch backed-off root: {any}", .{err});
             };
         }
@@ -3519,7 +3511,7 @@ pub const BeamNode = struct {
                     // Retry each root — fetchBlockByRoots picks a new random peer
                     for (roots_to_retry.items) |item| {
                         const roots = [_]types.Root{item.root};
-                        self.fetchBlockByRoots(&roots, item.depth) catch |err| {
+                        self.fetchBlockByRoots(&roots, item.depth, null) catch |err| {
                             self.logger.warn("failed to retry block fetch after timeout: {any}", .{err});
                         };
                     }
@@ -3593,7 +3585,7 @@ pub const BeamNode = struct {
         });
         defer self.allocator.free(missing_roots);
 
-        self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+        self.fetchBlockByRoots(missing_roots, 0, null) catch |err| {
             self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
         };
 
