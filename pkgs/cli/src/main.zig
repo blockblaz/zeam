@@ -114,6 +114,15 @@ pub const NodeCommand = struct {
     /// See `types.default_max_aggregation_children` for full rationale.
     @"max-aggregation-children": u32 = types.default_max_aggregation_children,
 
+    /// Cap on the number of `AttestationData` the aggregator proves+publishes
+    /// per tick, chosen as a greedy justification path. Default `1` reproduces
+    /// the single-aggregation behaviour exactly. `0` is floored to `1` (an
+    /// aggregator-role node always runs at least one aggregation per tick).
+    /// `> 1` runs the extra proves in parallel on the shared ThreadPool — pair
+    /// with a lower `--rayon-threads` to avoid CPU oversubscription. See
+    /// `types.default_max_aggregations_per_tick`.
+    @"max-aggregations-per-tick": u32 = types.default_max_aggregations_per_tick,
+
     pub const __shorts__ = .{
         .help = .h,
     };
@@ -135,8 +144,8 @@ pub const NodeCommand = struct {
         .@"is-aggregator" = "Seed the node's aggregator role on startup. The role can be toggled at runtime via POST /lean/v0/admin/aggregator.",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
-        .@"shadow-xmss-aggregate-signatures-rate" = "Shadow sim only: signatures aggregated per second; injects sleep = n/rate into aggregation so CPU cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE",
-        .@"shadow-xmss-verify-aggregated-signatures-rate" = "Shadow sim only: signatures verified per second inside an aggregate; injects sleep = n/rate into verification. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE",
+        // .@"shadow-xmss-aggregate-signatures-rate" = "Shadow sim only: signatures aggregated per second; injects sleep = n/rate into aggregation so CPU cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE",
+        // .@"shadow-xmss-verify-aggregated-signatures-rate" = "Shadow sim only: signatures verified per second inside an aggregate; injects sleep = n/rate into verification. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE",
         .@"shadow-xmss-merge-rate" = "Shadow sim only: Type-1 components merged into a Type-2 per second; injects sleep = n/rate into the proposal Type-2 merge so block-building cost shows up in Shadow's virtual clock. Unset or <=0 disables. Env: ZEAM_SHADOW_XMSS_MERGE_RATE",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
@@ -145,6 +154,7 @@ pub const NodeCommand = struct {
         .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to the earlier behavior that always aggregated at least one signature. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
         .@"proposal-deadline-pct" = "Percentage of one proposal interval (SECONDS_PER_INTERVAL_MS, default 800ms) budgeted to the block-build/aggregation worker. This is an intra-interval split: the worker self-truncates at this percentage and the remaining (100-pct)% of the SAME interval is reserved for the finalize step (STF on the harvested partial body + propose-side sign + gossip publish), so the signed block is ready before the attestation interval. Default 90 (~720ms aggregation + ~80ms finalize/sign at the default 800ms interval). Lower this on slow validator hardware to widen the finalize/sign window; raise toward 99 to maximise aggregation throughput. Clamped to [0, 99] inside the consumer.",
         .@"max-aggregation-children" = "Cap on the number of child STARK proofs the aggregator worker merges with raw signatures via rec_xmss_aggregate. Default 0 keeps per-call latency bounded by flat-prove cost (~0.5 s/call on typical aggregator hardware) by never taking the recursive code path; peer-published aggregates for the same att_data remain in latest_known_aggregated_payloads for the block proposer to compact at proposal time. Set 1 to allow at most one peer child to be merged (~1.5 s/call). Higher values reintroduce the multi-second tail (in one measurement, num_children=3-4 averaged ~4.8 s).",
+        .@"max-aggregations-per-tick" = "Cap on the number of AttestationData the aggregator proves+publishes per tick. The keys form a greedy justification path: the first key advances latest_justified to its target, the next is sourced at that target, and so on, so N proves successively move justification ahead. Default 1 reproduces the single-aggregation behaviour exactly (one prove on the calling worker). 0 is treated as 1: an aggregator-role node always produces at least one aggregation per tick. Values >1 run the extra proves in parallel on the shared ThreadPool; since each prove drives Rayon internally, pair a higher value with a lower --rayon-threads to avoid CPU oversubscription (the reason #925 sequentialized the old multi-key prover).",
         .help = "Show help information for the node command",
     };
 };
@@ -328,10 +338,13 @@ fn mainInner(init: std.process.Init) !void {
     var parse_arena = std.heap.ArenaAllocator.init(allocator);
     defer parse_arena.deinit();
 
-    const opts = simargs.structargs.parse(parse_arena.allocator(), init.io, init.minimal.args, ZeamArgs, .{
-        .argument_prompt = app_description,
-        .version_string = app_version,
-    }) catch |err| {
+    const opts = blk: {
+        @setEvalBranchQuota(100000);
+        break :blk simargs.structargs.parse(parse_arena.allocator(), init.io, init.minimal.args, ZeamArgs, .{
+            .argument_prompt = app_description,
+            .version_string = app_version,
+        });
+    } catch |err| {
         std.debug.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)});
         std.debug.print("Run 'zeam --help' for usage information.\n", .{});
         return err;
@@ -918,6 +931,7 @@ fn mainInner(init: std.process.Init) !void {
                 .min_aggregation_inputs = leancmd.@"min-aggregation-inputs",
                 .proposal_deadline_pct = leancmd.@"proposal-deadline-pct",
                 .max_aggregation_children = leancmd.@"max-aggregation-children",
+                .max_aggregations_per_tick = leancmd.@"max-aggregations-per-tick",
             };
 
             defer start_options.deinit(allocator);

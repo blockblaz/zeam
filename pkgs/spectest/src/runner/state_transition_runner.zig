@@ -368,13 +368,13 @@ pub fn buildState(
     const latest_justified = try parseCheckpoint(ctx, pre_obj, "latestJustified");
     const latest_finalized = try parseCheckpoint(ctx, pre_obj, "latestFinalized");
 
-    var historical = try types.HistoricalBlockHashes.init(allocator);
+    var historical = types.HistoricalBlockHashes.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer historical.deinit();
     if (pre_obj.get("historicalBlockHashes")) |val| {
         try expect.appendBytesDataField(FixtureError, types.Root, &historical, ctx, val, "historicalBlockHashes");
     }
 
-    var justified_slots = try types.JustifiedSlots.init(allocator);
+    var justified_slots = types.JustifiedSlots.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer justified_slots.deinit();
     if (pre_obj.get("justifiedSlots")) |val| {
         try expect.appendBoolDataField(FixtureError, &justified_slots, ctx, val, "justifiedSlots");
@@ -383,13 +383,13 @@ pub fn buildState(
     var validators = try parseValidators(allocator, ctx, pre_obj);
     errdefer validators.deinit();
 
-    var just_roots = try types.JustificationRoots.init(allocator);
+    var just_roots = types.JustificationRoots.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer just_roots.deinit();
     if (pre_obj.get("justificationsRoots")) |val| {
         try expect.appendBytesDataField(FixtureError, types.Root, &just_roots, ctx, val, "justificationsRoots");
     }
 
-    var just_validators = try types.JustificationValidators.init(allocator);
+    var just_validators = types.JustificationValidators.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer just_validators.deinit();
     if (pre_obj.get("justificationsValidators")) |val| {
         try expect.appendBoolDataField(FixtureError, &just_validators, ctx, val, "justificationsValidators");
@@ -414,7 +414,7 @@ pub fn parseValidators(
     ctx: Context,
     pre_obj: std.json.ObjectMap,
 ) FixtureError!types.Validators {
-    var validators = try types.Validators.init(allocator);
+    var validators = types.Validators.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer validators.deinit();
 
     if (pre_obj.get("validators")) |val| {
