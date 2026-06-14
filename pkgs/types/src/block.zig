@@ -76,6 +76,9 @@ pub const default_min_aggregation_inputs: u32 = 2;
 /// `num_children=3-4` proves averaged ~4.5 s, dominating the p95).
 pub const default_max_aggregation_children: u32 = 0;
 
+/// Default `max_aggregations_per_tick` for the aggregator role.
+pub const default_max_aggregations_per_tick: u32 = 1;
+
 // signatures_map types for aggregation
 
 /// Stored signatures_map entry: per-validator signature + slot metadata.
@@ -1035,6 +1038,133 @@ pub fn computeSingleAggregatedSignature(
             break :blk result;
         },
     };
+}
+
+/// Aggregator multi-key path: serial prep then **parallel** XMSS proves across
+/// the shared `thread_pool`, returning the produced aggregates for the caller
+/// to commit/publish.
+///
+/// Unlike the spec-pure `Block.computeAggregatedSignatures` (which derives every
+/// key from the maps and appends into a block), this proves only the explicit,
+/// caller-chosen `keys` — the greedy justification path picked by
+/// `selectJustificationAdvancingKeys` — and hands ownership of the results back.
+///
+/// Prep (`prepareAggregateAttData`, which calls `xmss.PublicKey.fromBytes`) runs
+/// serially on the calling thread so the uncontrolled-thread-safety FFI stays
+/// off the workers, matching `compactAttestations`. Only `runAggregateAttDataFfi`
+/// (recursive `aggregate()` on already-deserialized const handles) runs on the
+/// workers. Each prove drives Rayon internally; the caller bounds `keys.len` via
+/// `--max-aggregations-per-tick` to keep total CPU demand in check (#925).
+///
+/// Caller owns the returned slice and every result in it: deinit each
+/// `.attestation` and `.signature`, then free the slice.
+pub fn computeAggregatedSignaturesForKeys(
+    allocator: Allocator,
+    validators: *const Validators,
+    signatures_map: *const SignaturesMap,
+    new_payloads: ?*const AggregatedPayloadsMap,
+    known_payloads: ?*const AggregatedPayloadsMap,
+    keys: []const attestation.AttestationData,
+    thread_pool: anytype,
+    max_aggregation_children: u32,
+) ![]SingleAggregatedSignature {
+    if (keys.len == 0) return allocator.alloc(SingleAggregatedSignature, 0);
+
+    // -------- Serial prep phase (FFI deserialization stays on this thread) --------
+    var preps = try allocator.alloc(AggregateAttDataPrep, keys.len);
+    var preps_len: usize = 0;
+    defer {
+        for (preps[0..preps_len]) |*prep| prep.deinit(allocator);
+        allocator.free(preps);
+    }
+
+    const prep_start_ns = zeam_utils.monotonicTimestampNs();
+    for (keys, 0..) |data, i| {
+        preps[i] = try prepareAggregateAttData(
+            allocator,
+            validators,
+            signatures_map,
+            new_payloads,
+            known_payloads,
+            data,
+            max_aggregation_children,
+        );
+        preps_len += 1;
+    }
+    observeAggregateAttDataPrepPhase(prep_start_ns);
+
+    // -------- Parallel prove phase --------
+    const slots = try allocator.alloc(AggregateAttDataSlot, preps.len);
+    defer allocator.free(slots);
+    for (slots) |*slot| slot.* = .{};
+    errdefer {
+        for (slots) |*slot| {
+            if (slot.result) |*r| {
+                r.attestation.deinit();
+                r.signature.deinit();
+            }
+        }
+    }
+
+    const Runner = struct {
+        fn runScope(
+            scope: anytype,
+            preps_in: []AggregateAttDataPrep,
+            alloc: Allocator,
+            out_slots: []AggregateAttDataSlot,
+        ) Allocator.Error!void {
+            for (preps_in, 0..) |*prep, i| {
+                try scope.spawn(runOne, .{ alloc, prep, &out_slots[i] });
+            }
+        }
+
+        fn runOne(
+            alloc: Allocator,
+            prep: *AggregateAttDataPrep,
+            out_slot: *AggregateAttDataSlot,
+        ) void {
+            switch (prep.outcome) {
+                .skip => {},
+                .done => |result| {
+                    prep.outcome = .skip;
+                    out_slot.result = result;
+                },
+                .ffi => |*args| {
+                    const result = runAggregateAttDataFfi(alloc, prep.data, args) catch |err| {
+                        out_slot.err = err;
+                        return;
+                    };
+                    args.deinit(alloc);
+                    prep.outcome = .skip;
+                    out_slot.result = result;
+                },
+            }
+        }
+    };
+
+    try thread_pool.scope(Runner.runScope, .{ preps, allocator, slots });
+
+    for (slots) |*slot| {
+        if (slot.err) |err| return err;
+    }
+
+    // -------- Harvest produced aggregates --------
+    var results: std.ArrayList(SingleAggregatedSignature) = .empty;
+    errdefer {
+        for (results.items) |*r| {
+            r.attestation.deinit();
+            r.signature.deinit();
+        }
+        results.deinit(allocator);
+    }
+    for (slots) |*slot| {
+        if (slot.result) |result| {
+            try results.append(allocator, result);
+            slot.result = null;
+        }
+    }
+
+    return results.toOwnedSlice(allocator);
 }
 
 const AggregateAttDataOutcome = union(enum) {
