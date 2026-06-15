@@ -979,7 +979,14 @@ fn processAttestationStep(
     // Gossip attestations land in `latestNew`; `updateHead` only reads
     // `latestKnown`.  Promote new→known so the weight is visible to head
     // selection, matching the production `acceptNewAttestations` path.
-    _ = try ctx.fork_choice.acceptNewAttestations();
+    //
+    // We use `promoteGossipVotes` (not `acceptNewAttestations`) so that
+    // `latest_new_aggregated_payloads` is NOT migrated to `known` here.
+    // Aggregated-payload promotion belongs only at the periodic acceptance
+    // tick (slot_interval == 4); calling the full `acceptNewAttestations`
+    // would drain the "new" pool prematurely and break fixture checks that
+    // expect the payload to still be in `latestNew` at this point.
+    _ = try ctx.fork_choice.promoteGossipVotes();
 }
 
 fn processGossipAggregatedAttestationStep(
