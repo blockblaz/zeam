@@ -2948,6 +2948,36 @@ pub const ForkChoice = struct {
         return self.acceptNewAttestationsUnlocked();
     }
 
+    /// Promote per-validator gossip votes (latestNew → latestKnown) and recompute head.
+    ///
+    /// Unlike `acceptNewAttestations`, this does NOT migrate `latest_new_aggregated_payloads`
+    /// into `latest_known_aggregated_payloads`.  That migration only belongs at the periodic
+    /// acceptance tick (slot_interval == 4 in production, or an explicit TickStep that crosses
+    /// interval 4 in the spec-test runner).
+    ///
+    /// Use this from the spec-test runner's `processAttestationStep` when processing individual
+    /// gossip attestations: the vote becomes visible to head selection immediately (matching the
+    /// production `acceptNewAttestations` path), but the aggregated-payload pools remain in the
+    /// state the fixture expects until the next proper acceptance tick.
+    pub fn promoteGossipVotes(self: *Self) !ProtoBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Mirror the tracker-promotion half of acceptNewAttestationsUnlocked:
+        // keep the fresher of latestNew / latestKnown, never drop a known vote.
+        for (0..self.config.genesis.numValidators()) |validator_id| {
+            var tracker = self.attestations.get(validator_id) orelse continue;
+            const new_vote = tracker.latestNew orelse continue;
+            const known_slot = (tracker.latestKnown orelse ProtoAttestation{}).slot;
+            if (tracker.latestKnown == null or new_vote.slot >= known_slot) {
+                tracker.latestKnown = new_vote;
+                try self.attestations.put(validator_id, tracker);
+            }
+        }
+
+        return self.updateHeadUnlocked();
+    }
+
     //  SAFE GETTERS FOR SHARED STATE
     // These provide thread-safe access to internal state
 

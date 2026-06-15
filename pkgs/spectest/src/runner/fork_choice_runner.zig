@@ -976,7 +976,17 @@ fn processAttestationStep(
         return err;
     };
 
-    _ = try ctx.fork_choice.updateHead();
+    // Gossip attestations land in `latestNew`; `updateHead` only reads
+    // `latestKnown`.  Promote new→known so the weight is visible to head
+    // selection, matching the production `acceptNewAttestations` path.
+    //
+    // We use `promoteGossipVotes` (not `acceptNewAttestations`) so that
+    // `latest_new_aggregated_payloads` is NOT migrated to `known` here.
+    // Aggregated-payload promotion belongs only at the periodic acceptance
+    // tick (slot_interval == 4); calling the full `acceptNewAttestations`
+    // would drain the "new" pool prematurely and break fixture checks that
+    // expect the payload to still be in `latestNew` at this point.
+    _ = try ctx.fork_choice.promoteGossipVotes();
 }
 
 fn processGossipAggregatedAttestationStep(
@@ -1074,6 +1084,10 @@ fn processGossipAggregatedAttestationStep(
         return FixtureError.FixtureMismatch;
     };
 
+    // storeAggregatedPayload only updates latest_new_aggregated_payloads, not the
+    // per-validator tracker.latestNew.  updateHead() reads tracker.latestKnown
+    // (unchanged), so it gives the correct head without draining the "new" pool
+    // prematurely (promotion happens via periodic tick at slot_interval==4).
     _ = try ctx.fork_choice.updateHead();
 }
 
