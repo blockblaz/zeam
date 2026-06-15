@@ -30,6 +30,7 @@ pub const ValidatorClientOutput = struct {
     pub fn deinit(self: *Self) void {
         for (self.gossip_messages.items) |*gossip_msg| {
             switch (gossip_msg.*) {
+                .block => |*signed_block| signed_block.deinit(),
                 .aggregation => |*signed_aggregation| signed_aggregation.deinit(),
                 else => {},
             }
@@ -117,13 +118,56 @@ pub const ValidatorClient = struct {
         }
     }
 
-    // Block production moved off the slot loop to submitPropose / proposeImpl (a
-    // thread_pool worker). The old on-loop maybeDoProposal — which built the multi-second Type-2
-    // merge inline and would freeze gossip/tick handling — was removed in favour of that single
-    // off-loop path. main's improvements to the old maybeDoProposal (the
-    // .behind_peers → .peers_materially_ahead rename, logBehindPeersDebug, behind_peer_count, and
-    // the submitBlockBuildOnInterval/finalizeProposalIfReady build/sign split) now live in the
-    // off-loop chain.proposeImpl path and in mayBeDoAttestation below.
+    // Block production still runs off the slot loop, but validator-owned signing
+    // and proof assembly live here rather than in chain.zig. The chain worker
+    // produces the unsigned block, calls this method to sign/build the
+    // SignedBlock, and queues the resulting gossip output back to BeamNode for
+    // publication on the next interval tick.
+    pub fn buildProposalOutput(
+        self: *Self,
+        produced_block: *chains.ProducedBlock,
+        proposer_id: usize,
+        slot: usize,
+    ) !ValidatorClientOutput {
+        var result = ValidatorClientOutput.init(self.allocator);
+        errdefer result.deinit();
+        try result.gossip_messages.ensureTotalCapacity(self.allocator, 1);
+
+        const proposer_signature = self.key_manager.signBlockRoot(proposer_id, &produced_block.blockRoot, @intCast(slot)) catch |e| {
+            self.logger.err("propose worker: signBlockRoot failed slot={d}: {any}", .{ slot, e });
+            return e;
+        };
+
+        self.logger.info("produced block signed, building block proof for slot={d} proposer={d} root={x}", .{
+            slot,
+            proposer_id,
+            &produced_block.blockRoot,
+        });
+
+        var proof = types.MultiMessageAggregate.init(self.allocator) catch |e| {
+            self.logger.err("propose worker: init block proof failed slot={d}: {any}", .{ slot, e });
+            return e;
+        };
+        errdefer proof.deinit();
+
+        self.chain.buildBlockProof(produced_block, &proposer_signature, &proof) catch |e| {
+            self.logger.err("propose worker: buildBlockProof failed slot={d}: {any}", .{ slot, e });
+            return e;
+        };
+
+        // The Type-1 list is now folded into the Type-2 proof; free it. The
+        // produced block itself moves into the SignedBlock below, which is
+        // owned by the ValidatorClientOutput until BeamNode publishes it.
+        for (produced_block.attestation_signatures.slice()) |*t1| t1.deinit();
+        produced_block.attestation_signatures.deinit();
+
+        const signed_block = types.SignedBlock{
+            .block = produced_block.block,
+            .proof = proof,
+        };
+        result.gossip_messages.appendAssumeCapacity(.{ .block = signed_block });
+        return result;
+    }
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;
