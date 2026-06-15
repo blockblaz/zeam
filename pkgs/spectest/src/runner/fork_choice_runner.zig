@@ -976,7 +976,10 @@ fn processAttestationStep(
         return err;
     };
 
-    _ = try ctx.fork_choice.updateHead();
+    // Gossip attestations land in `latestNew`; `updateHead` only reads
+    // `latestKnown`.  Promote new→known so the weight is visible to head
+    // selection, matching the production `acceptNewAttestations` path.
+    _ = try ctx.fork_choice.acceptNewAttestations();
 }
 
 fn processGossipAggregatedAttestationStep(
@@ -1074,7 +1077,8 @@ fn processGossipAggregatedAttestationStep(
         return FixtureError.FixtureMismatch;
     };
 
-    _ = try ctx.fork_choice.updateHead();
+    // Same as processAttestationStep: promote new→known before head selection.
+    _ = try ctx.fork_choice.acceptNewAttestations();
 }
 
 /// Validate attestation data per the spec's store.validate_attestation rules.
