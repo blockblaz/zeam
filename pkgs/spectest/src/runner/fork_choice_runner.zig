@@ -1077,8 +1077,11 @@ fn processGossipAggregatedAttestationStep(
         return FixtureError.FixtureMismatch;
     };
 
-    // Same as processAttestationStep: promote new→known before head selection.
-    _ = try ctx.fork_choice.acceptNewAttestations();
+    // storeAggregatedPayload only updates latest_new_aggregated_payloads, not the
+    // per-validator tracker.latestNew.  updateHead() reads tracker.latestKnown
+    // (unchanged), so it gives the correct head without draining the "new" pool
+    // prematurely (promotion happens via periodic tick at slot_interval==4).
+    _ = try ctx.fork_choice.updateHead();
 }
 
 /// Validate attestation data per the spec's store.validate_attestation rules.
