@@ -303,6 +303,42 @@ These are **not** the same as `zeam_compact_attestations_*`: those measure only 
 - **Labels**: None
 - **Sample Collection Event**: On successful return from `getProposalAttestationsUnlocked`
 
+### Block proposer & aggregation lifecycle metrics
+
+Lifecycle counters that complement the timing histograms above. They mark the
+start/outcome of the off-loop proposer worker (`proposeImpl`) and the start of the
+single-message (Type-1 `compactAttestations`) and multi-message (Type-2
+`buildBlockProof`) aggregation phases. Paired with `info` log lines on the same
+events.
+
+#### `zeam_block_proposer_started_total` (Counter)
+- **Description**: Block-proposer worker (`proposeImpl`) invocations started.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: At the top of each `proposeImpl` worker run
+
+#### `zeam_block_proposer_completed_total` (CounterVec)
+- **Description**: Block-proposer worker (`proposeImpl`) terminations.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: `result` — `success` (block published) | `failed` (any early-return error path)
+- **Sample Collection Event**: On every `proposeImpl` exit (via `defer`)
+
+#### `zeam_single_message_aggregation_total` (Counter)
+- **Description**: `compactAttestations` single-message (Type-1) aggregation passes run during block proposal. Can increment more than once per proposal because the selection loop is fixed-point (re-scans on justification/finalization advance).
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: After each `compactAttestations` call in `getProposalAttestationsUnlocked`
+
+#### `zeam_block_proof_merge_started_total` (Counter)
+- **Description**: Type-2 multi-message STARK merge (`buildBlockProof`) invocations started. Pairs with `zeam_block_proof_merge_time_seconds` (recorded on completion).
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: Before the `buildType2BlockProof` call in `buildBlockProof`
+
 
 ## Usage
 

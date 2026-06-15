@@ -1357,6 +1357,8 @@ pub const ForkChoice = struct {
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_input = agg_attestations.constSlice().len;
+            self.logger.info("single-message aggregation start slot={d}: inputs={d}", .{ slot, compact_input });
             const compact_start_ns = zeam_utils.monotonicTimestampNs();
             const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
@@ -1372,6 +1374,8 @@ pub const ForkChoice = struct {
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
             zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
+            zeam_metrics.metrics.zeam_single_message_aggregation_total.incr();
+            self.logger.info("single-message aggregation complete slot={d}: inputs={d} outputs={d}", .{ slot, compact_input, agg_attestations.constSlice().len });
             observeProposalBuildPhase("compact", compact_start_ns);
 
             // Deadline elapsed → ship what we have; another full iteration
