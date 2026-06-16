@@ -1084,7 +1084,8 @@ fn processGossipAggregatedAttestationStep(
 /// 2. Checkpoint slot ordering: source.slot <= target.slot
 /// 3. Head must not be older than target: head.slot >= target.slot
 /// 4. Checkpoint slots match their respective block slots (source, target, head)
-/// 5. Attestation slot not too far in future: data.slot <= current_slot + 1
+/// 5. Source, target, and head lie on one parent chain (ancestry)
+/// 6. Attestation slot not too far in future: data.slot <= current_slot + 1
 fn validateAttestationDataForGossip(
     ctx: *StepContext,
     data: types.AttestationData,
@@ -1123,7 +1124,18 @@ fn validateAttestationDataForGossip(
         return error.HeadCheckpointSlotMismatch;
     }
 
-    // 5. Attestation slot must not be too far in future.
+    // 5. Source, target, and head must lie on one parent chain.
+    //
+    // Fork-choice weight accrues to every ancestor of the attested head, so a
+    // sibling head would steer that weight onto a non-canonical branch.
+    if (!ctx.fork_choice.checkpointIsAncestor(data.source, data.target)) {
+        return error.SourceCheckpointNotAncestorOfTarget;
+    }
+    if (!ctx.fork_choice.checkpointIsAncestor(data.target, data.head)) {
+        return error.TargetCheckpointNotAncestorOfHead;
+    }
+
+    // 6. Attestation slot must not be too far in future.
     //
     // The spec tightened this from "1 whole slot" to
     // "GOSSIP_DISPARITY_INTERVALS intervals". The check now operates in

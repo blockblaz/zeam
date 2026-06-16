@@ -575,6 +575,13 @@ fn validateAttestationDataForGossip(driver: *ForkChoiceDriverState, data: types.
     if (target_node.slot != data.target.slot) return error.TargetCheckpointSlotMismatch;
     if (head_node.slot != data.head.slot) return error.HeadCheckpointSlotMismatch;
 
+    if (!driver.fork_choice.checkpointIsAncestor(data.source, data.target)) {
+        return error.SourceCheckpointNotAncestorOfTarget;
+    }
+    if (!driver.fork_choice.checkpointIsAncestor(data.target, data.head)) {
+        return error.TargetCheckpointNotAncestorOfHead;
+    }
+
     const time_intervals = driver.fork_choice.fcStore.slot_clock.time.load(.monotonic);
     const attestation_start_interval = data.slot * node_constants.INTERVALS_PER_SLOT;
     if (attestation_start_interval > time_intervals + node_constants.GOSSIP_DISPARITY_INTERVALS) {
