@@ -65,6 +65,10 @@ const NodeOpts = struct {
     /// merged with raw signatures by the aggregator worker. See
     /// `pkgs/types/src/block.zig:default_max_aggregation_children`.
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// CLI knob (`--max-aggregations-per-tick`) capping how many justification-
+    /// path `AttestationData` the aggregator proves+publishes per tick. See
+    /// `pkgs/types/src/block.zig:default_max_aggregations_per_tick`.
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
     /// Soft cap on concurrent aggregate workers (`BeamChain.aggregate_inflight`).
     aggregate_max_inflight: u32 = 4,
     /// See `chainFactory.ChainOpts.proposal_deadline_pct`.
@@ -227,6 +231,7 @@ pub const BeamNode = struct {
                 .thread_pool = opts.thread_pool,
                 .min_aggregation_inputs = opts.min_aggregation_inputs,
                 .max_aggregation_children = opts.max_aggregation_children,
+                .max_aggregations_per_tick = opts.max_aggregations_per_tick,
                 .aggregate_max_inflight = opts.aggregate_max_inflight,
                 .proposal_deadline_pct = opts.proposal_deadline_pct,
             },
@@ -1758,7 +1763,25 @@ pub const BeamNode = struct {
         status: CatchUpPeerStatus,
         our_head_slot: types.Slot,
     ) void {
-        const gap = self.cappedSyncGap(status.head_slot, our_head_slot);
+        var gap = self.cappedSyncGap(status.head_slot, our_head_slot);
+        var start_slot: types.Slot = our_head_slot + 1;
+
+        // Finalization-gap recovery (liveness deadlock fix): a peer that has
+        // finalized PAST our finalized slot while its head is <= ours means we
+        // forked onto a chain that never finalized — our head is "ahead" only on
+        // a minority fork lacking the canonical attestations. Head-gap sync then
+        // computes gap==0 and fetches nothing, so we never reorg to the peer's
+        // finalized chain; getSyncStatus keeps us `peers_materially_ahead`, which
+        // gates off block/attestation production, so finalization never advances
+        // → permanent stall (observed: our head=48/finalized=25 vs peer head=46/
+        // finalized=40). Re-anchor the request to just after OUR finalized slot so
+        // fork-choice receives the peer's canonical finalized blocks and reorgs.
+        const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+        if (gap == 0 and status.finalized_slot > our_finalized_slot) {
+            start_slot = our_finalized_slot + 1;
+            gap = self.cappedSyncGap(status.head_slot, our_finalized_slot);
+        }
+
         if (gap == 0) return;
 
         const head_snapshot = self.chain.forkChoice.getHead();
@@ -1767,7 +1790,6 @@ pub const BeamNode = struct {
         if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD and
             self.network.peerSupportsBlocksByRange(status.peer_id))
         {
-            const start_slot: types.Slot = our_head_slot + 1;
             const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
             self.logger.info(
                 "peer {s}{f} is far ahead (gap={d} slots), initiating bulk catch-up via blocks_by_range start_slot={d} count={d}",
@@ -2647,7 +2669,15 @@ pub const BeamNode = struct {
         if (missing_roots.items.len == 0) return;
 
         const handler = self.getReqRespResponseHandler();
-        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer, self.chain.forkChoice.getHead().slot + 1) catch |err| blk: {
+        // No `min_slot` filter on blocks-by-root: a peer can serve a block by
+        // its root regardless of the peer's last-known head_slot. The filter
+        // (PR #950) is meaningful for forward sync (`BlocksByRange`) where we
+        // need a peer at or beyond a target slot; for a root-hash lookup it
+        // only deadlocks repair after our own head advances past a stale
+        // `latest_status.head_slot` (status is refreshed on handshake / explicit
+        // re-status, not per-gossip), turning a transient gossip miss into an
+        // unrecoverable fork.
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler, preferred_peer, null) catch |err| blk: {
             switch (err) {
                 error.NoPeersAvailable => {
                     // Previously this path bumped
