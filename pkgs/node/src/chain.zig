@@ -2929,7 +2929,11 @@ pub const BeamChain = struct {
         self.prove_gate.lock();
         defer self.prove_gate.unlock();
         // zeam-specific: time JUST the Type-2 multi-message STARK merge (the proposal
-        // critical-path cost between produceBlock and publish).
+        // critical-path cost between produceBlock and publish). Component count
+        // (distinct AttestationData) is known up front from the produced block.
+        const n_components = produced.block.body.attestations.constSlice().len;
+        zeam_metrics.metrics.zeam_block_proof_merge_started_total.incr();
+        self.logger.info("Type-2 block-proof STARK merge start slot={d} components={d}", .{ produced.block.slot, n_components });
         const merge_start_ns = zeam_utils.monotonicTimestampNs();
         try types.buildType2BlockProof(
             self.allocator,
@@ -2947,7 +2951,6 @@ pub const BeamChain = struct {
         // per-component scaling of the merge. Formatted directly so the label tracks the
         // configured max_attestations_data automatically (the block enforces that bound, so
         // cardinality stays small); the metrics lib dupes label values, so this stack buffer is safe.
-        const n_components = produced.block.body.attestations.constSlice().len;
         var comp_buf: [8]u8 = undefined;
         const components_label = std.fmt.bufPrint(&comp_buf, "{d}", .{n_components}) catch "overflow";
         zeam_metrics.metrics.zeam_block_proof_merge_time_seconds.observe(.{ .components = components_label }, merge_secs) catch {};
@@ -5141,6 +5144,17 @@ pub const BeamChain = struct {
         const worker_timer = zeam_metrics.lean_block_building_time_seconds.start();
         defer _ = worker_timer.observe();
 
+        chain.logger.info("block proposer started slot={d} proposer={d}", .{ slot, proposer_id });
+        zeam_metrics.metrics.zeam_block_proposer_started_total.incr();
+        // Records the proposer outcome across every exit path (all the `.err`
+        // early-returns below leave this "failed"; flipped to "success" right
+        // before the publish-success log).
+        var proposer_result: []const u8 = "failed";
+        defer {
+            zeam_metrics.metrics.zeam_block_proposer_completed_total.incr(.{ .result = proposer_result }) catch {};
+            chain.logger.info("block proposer ended slot={d} proposer={d} result={s}", .{ slot, proposer_id, proposer_result });
+        }
+
         const validator = if (node.validator) |*v| v else return;
 
         // Cap single-message attestation aggregation at `type1_aggregation_deadline_pct`% of the
@@ -5206,6 +5220,7 @@ pub const BeamChain = struct {
             chain.logger.err("propose worker: publishBlock failed slot={d}: {any}", .{ slot, e });
             return;
         };
+        proposer_result = "success";
         chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
     }
 

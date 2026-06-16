@@ -221,6 +221,13 @@ const Metrics = struct {
     zeam_proposal_deadline_hits_total: ZeamProposalDeadlineHitsCounter,
     zeam_proposal_partial_prefix_size: ZeamProposalPartialPrefixSizeHistogram,
     zeam_proposal_skipped_empty_total: ZeamProposalSkippedEmptyCounter,
+    // Block proposer lifecycle (proposeImpl worker)
+    zeam_block_proposer_started_total: ZeamBlockProposerStartedCounter,
+    zeam_block_proposer_completed_total: ZeamBlockProposerCompletedCounter,
+    // Single-message attestation aggregation (compactAttestations) lifecycle
+    zeam_single_message_aggregation_total: ZeamSingleMessageAggregationCounter,
+    // Multi-message Type-2 STARK merge lifecycle (buildBlockProof)
+    zeam_block_proof_merge_started_total: ZeamBlockProofMergeStartedCounter,
     // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
     /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run`.
@@ -659,6 +666,11 @@ const Metrics = struct {
     const ZeamProposalDeadlineHitsCounter = metrics_lib.Counter(u64);
     const ZeamProposalPartialPrefixSizeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16 });
     const ZeamProposalSkippedEmptyCounter = metrics_lib.Counter(u64);
+    // Block proposer / aggregation lifecycle counter types
+    const ZeamBlockProposerStartedCounter = metrics_lib.Counter(u64);
+    const ZeamBlockProposerCompletedCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
+    const ZeamSingleMessageAggregationCounter = metrics_lib.Counter(u64);
+    const ZeamBlockProofMergeStartedCounter = metrics_lib.Counter(u64);
     // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
     // both fast acquisitions and long stalls observed when STF runs under the lock.
     const NodeMutexLabel = struct { site: []const u8 };
@@ -1194,6 +1206,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_proposal_deadline_hits_total = Metrics.ZeamProposalDeadlineHitsCounter.init("zeam_proposal_deadline_hits_total", .{ .help = "Number of compactAttestations runs whose returned prefix was truncated because the caller-supplied deadline elapsed mid-loop." }, .{}),
         .zeam_proposal_partial_prefix_size = Metrics.ZeamProposalPartialPrefixSizeHistogram.init("zeam_proposal_partial_prefix_size", .{ .help = "Number of AttestationData groups fully committed by deadline-aware compactAttestations when the deadline truncated the loop." }, .{}),
         .zeam_proposal_skipped_empty_total = Metrics.ZeamProposalSkippedEmptyCounter.init("zeam_proposal_skipped_empty_total", .{ .help = "Number of interval-0 finalize calls that found no partial proposal body for the proposer's slot." }, .{}),
+        .zeam_block_proposer_started_total = Metrics.ZeamBlockProposerStartedCounter.init("zeam_block_proposer_started_total", .{ .help = "Block-proposer worker (proposeImpl) invocations started." }, .{}),
+        .zeam_block_proposer_completed_total = try Metrics.ZeamBlockProposerCompletedCounter.init(allocator, io, "zeam_block_proposer_completed_total", .{ .help = "Block-proposer worker (proposeImpl) terminations, labeled result=success|failed." }, .{}),
+        .zeam_single_message_aggregation_total = Metrics.ZeamSingleMessageAggregationCounter.init("zeam_single_message_aggregation_total", .{ .help = "compactAttestations single-message (Type-1) aggregation passes run during block proposal." }, .{}),
+        .zeam_block_proof_merge_started_total = Metrics.ZeamBlockProofMergeStartedCounter.init("zeam_block_proof_merge_started_total", .{ .help = "Type-2 multi-message STARK merge (buildBlockProof) invocations started." }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
