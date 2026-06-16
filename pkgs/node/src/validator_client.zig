@@ -101,7 +101,15 @@ pub const ValidatorClient = struct {
             1 => return self.mayBeDoAttestation(slot),
             2 => return null,
             3 => return null,
-            4 => return null,
+            // Interval-4 proposer pre-aggregation: if THIS node proposes the NEXT
+            // slot, pre-build its Type-1 attestation set now (one interval early)
+            // so the interval-0 proposal can skip the Type-1 compact and start the
+            // Type-2 merge immediately. Off-loop dispatch; returns immediately.
+            4 => {
+                const next_proposer = self.getSlotProposer(slot + 1) orelse return null;
+                self.chain.submitPreAggregate(slot + 1, next_proposer);
+                return null;
+            },
             else => @panic("interval error"),
         }
     }

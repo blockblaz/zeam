@@ -2219,10 +2219,19 @@ pub const ForkChoice = struct {
     /// justification-advancing key path, then run either the single-key fast
     /// path or bounded parallel multi-key proves before committing/publishing
     /// the produced aggregates serially.
+    /// Key-selection strategy for `aggregateUnlocked`. `justification_chain` is the
+    /// interval-2 aggregator's greedy justification path (capped at
+    /// `max_aggregations_per_tick`); `all_proposal_keys` is the proposer warm-up
+    /// that aggregates EVERY proposal-eligible att_data in the snapshot (per-key
+    /// no-improvement skipping still happens inside `prepareAggregateAttData`).
+    const AggregateKeySelection = enum { justification_chain, all_proposal_keys };
+
     fn aggregateUnlocked(
         self: *Self,
         validators: *const types.Validators,
         slot_filter: ?[]const types.Slot,
+        selection: AggregateKeySelection,
+        deadline_ns: ?i64,
         publish_ctx: ?*anyopaque,
         publish_fn: ?AggregatePublishCallback,
     ) ![]types.SignedAggregatedAttestation {
@@ -2253,26 +2262,41 @@ pub const ForkChoice = struct {
 
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
 
-        // Select up to `max_aggregations_per_tick` AttestationData forming a
-        // greedy justification path: the first key advances
-        // `fcStore.latest_justified` to its target, the next is sourced at that
-        // target, and so on, so N proves successively move justification ahead.
-        // All gossip sigs and child payloads (new + known) registered against
-        // each chosen key are still folded into its aggregate; only the choice
-        // of keys is narrowed.
-        const latest_justified = self.fcStore.latest_justified;
-        // Aggregator fallback floor: an aggregator-role node always produces at
-        // least one aggregation per tick.
-        const configured_max: usize = @max(1, self.max_aggregations_per_tick);
-        const max_keys: usize = @min(configured_max, att_data_keys.len);
-        const key_buf = try self.allocator.alloc(types.AttestationData, max_keys);
+        // Key selection depends on the caller. `justification_chain` (interval-2
+        // aggregator) picks up to `max_aggregations_per_tick` keys forming a greedy
+        // justification path: the first advances `fcStore.latest_justified` to its
+        // target, the next is sourced there, etc. `all_proposal_keys` (proposer
+        // warm-up) picks every proposal-eligible att_data (time-forward
+        // target>source); the per-key no-improvement skip still fires inside
+        // prepareAggregateAttData. All gossip sigs + child payloads for a chosen key
+        // are folded into its aggregate; only the choice of keys differs.
+        const key_cap: usize = switch (selection) {
+            .justification_chain => @min(@max(1, self.max_aggregations_per_tick), att_data_keys.len),
+            .all_proposal_keys => att_data_keys.len,
+        };
+        const key_buf = try self.allocator.alloc(types.AttestationData, key_cap);
         defer self.allocator.free(key_buf);
-        const selected_keys = selectJustificationAdvancingKeys(&snap, att_data_keys, latest_justified, max_keys, key_buf);
+        var selected_keys = switch (selection) {
+            .justification_chain => selectJustificationAdvancingKeys(&snap, att_data_keys, self.fcStore.latest_justified, key_cap, key_buf),
+            .all_proposal_keys => selectProposalEligibleKeys(att_data_keys, key_buf),
+        };
+
+        // Pre-dispatch deadline gate. The FFI prove is uninterruptible, so a
+        // deadline can only prevent STARTING the prove batch (mirrors
+        // compactAttestations' loop-boundary check), never truncate mid-FFI. The
+        // interval-4 warm-up passes a 100%-of-interval deadline (never trips); the
+        // interval-0 re-aggregate passes the tight type1_aggregation_deadline_pct.
+        if (deadline_ns) |d| {
+            if (zeam_utils.monotonicTimestampNs() >= @as(i128, d)) {
+                self.logger.debug("aggregateUnlocked: past deadline, skipping {d} selected key(s)", .{selected_keys.len});
+                selected_keys = selected_keys[0..0];
+            }
+        }
 
         if (selected_keys.len == 0) {
             self.logger.debug(
-                "aggregator: no justification-advancing att_data this tick (latest_justified.slot={d}, candidates={d})",
-                .{ latest_justified.slot, att_data_keys.len },
+                "aggregateUnlocked: no keys to prove this pass (selection={s}, candidates={d})",
+                .{ @tagName(selection), att_data_keys.len },
             );
         } else {
             // #985 selection observability: which keys won this tick relative
@@ -2549,7 +2573,22 @@ pub const ForkChoice = struct {
         publish_ctx: ?*anyopaque,
         publish_fn: ?AggregatePublishCallback,
     ) ![]types.SignedAggregatedAttestation {
-        return self.aggregateUnlocked(validators, slots, publish_ctx, publish_fn);
+        return self.aggregateUnlocked(validators, slots, .justification_chain, null, publish_ctx, publish_fn);
+    }
+
+    /// Proposer warm-up aggregation: aggregate EVERY proposal-eligible att_data in
+    /// the snapshot for `slots` into `latest_new_aggregated_payloads`, bounded by a
+    /// pre-dispatch `deadline_ns` (the FFI itself is uninterruptible). Reuses the
+    /// aggregator path, so `prepareAggregateAttData`/`anyStoredProofCoversAll` skip
+    /// any att_data already fully covered (i.e. only re-aggregates when coverage
+    /// improved). Returns owned aggregates (no gossip publish); the caller frees them.
+    pub fn aggregateProposalKeysForSlots(
+        self: *Self,
+        validators: *const types.Validators,
+        slots: []const types.Slot,
+        deadline_ns: ?i64,
+    ) ![]types.SignedAggregatedAttestation {
+        return self.aggregateUnlocked(validators, slots, .all_proposal_keys, deadline_ns, null, null);
     }
 
     pub fn aggregateForSlot(
@@ -4305,6 +4344,26 @@ fn selectBestPreferredKey(
 /// single-aggregation behaviour.
 ///
 /// Pure / unit-testable: no I/O, no allocator, no locking.
+/// Select every proposal-eligible att_data key (time-forward: target strictly
+/// after source, which excludes genesis source==target self-votes — the proposer
+/// drops those at build time, so pre-aggregating them is wasted prove). Per-key
+/// no-improvement skipping is handled later by prepareAggregateAttData /
+/// anyStoredProofCoversAll, so this applies only the cheap eligibility filter.
+/// `out` must be sized >= `att_data_keys.len`; returns the filled prefix.
+fn selectProposalEligibleKeys(
+    att_data_keys: []const types.AttestationData,
+    out: []types.AttestationData,
+) []types.AttestationData {
+    var len: usize = 0;
+    for (att_data_keys) |key| {
+        if (len >= out.len) break;
+        if (key.target.slot <= key.source.slot) continue;
+        out[len] = key;
+        len += 1;
+    }
+    return out[0..len];
+}
+
 fn selectJustificationAdvancingKeys(
     snap: *const AggregateSnapshot,
     att_data_keys: []const types.AttestationData,

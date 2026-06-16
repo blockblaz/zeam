@@ -58,7 +58,7 @@ pub const BlockProductionParams = struct {
     proposer_index: usize,
     /// Optional monotonic-ns cutoff for the single-message attestation aggregation
     /// phase (`getProposalAttestations`). `null` = unbounded. `proposeImpl` derives
-    /// this from `proposal_deadline_pct` so the proposer caps gathering and leaves the
+    /// this from `type1_aggregation_deadline_pct` so the proposer caps gathering and leaves the
     /// rest of the interval for block signing and the Type-2 multi-message merge.
     deadline_ns: ?i64 = null,
 
@@ -106,21 +106,23 @@ pub const ChainOpts = struct {
     /// slot filter is `{slot-1, slot}`, so aggregations for further-back slots
     /// are wasted work. See `BeamChain.aggregateImpl`.
     aggregate_max_inflight: u32 = 4,
-    /// Share of one proposal interval (`SECONDS_PER_INTERVAL_MS`) budgeted to
-    /// the block build + attestation-aggregation worker. This is an
-    /// INTRA-interval time budget, not a cross-interval split: the worker
-    /// self-truncates at `pct%` of the interval, and the remaining
-    /// `(100-pct)%` of the SAME interval is reserved for the finalize step
-    /// (STF over the harvested partial body + propose-side sign + gossip
-    /// publish), so the signed block is ready before the attestation interval.
+    /// Percentage of one proposal interval (`SECONDS_PER_INTERVAL_MS`, default
+    /// 800ms) budgeted to the proposer's interval-0 Type-1 work — the interval-0
+    /// re-aggregate pass (folding gossip that arrived since the interval-4 warm-up)
+    /// plus the block compaction — as a pre-dispatch deadline gate, after which the
+    /// proposer proceeds to sign + the Type-2 multi-message merge. INTRA-interval
+    /// cap, not a cross-interval split: the remaining `(100-pct)%` is reserved for
+    /// Type-2 + sign + publish. The bulk per-att_data aggregation is warmed at
+    /// interval-4 (which uses a 100%-of-interval bound, not this knob), so the
+    /// interval-0 work is normally cheap and rarely reaches this cap.
     ///
-    /// Default 90: ~720ms aggregation budget + ~80ms finalize/sign budget at
-    /// the default 800ms interval.
-    proposal_deadline_pct: u32 = default_proposal_deadline_pct,
+    /// Default 20: ~160ms interval-0 Type-1 cap + ~640ms Type-2/sign at the 800ms
+    /// interval. Clamped to [0, 99] inside the consumer.
+    type1_aggregation_deadline_pct: u32 = default_type1_aggregation_deadline_pct,
 };
 
-/// Default value for `ChainOpts.proposal_deadline_pct`
-pub const default_proposal_deadline_pct: u32 = 50;
+/// Default value for `ChainOpts.type1_aggregation_deadline_pct`
+pub const default_type1_aggregation_deadline_pct: u32 = 20;
 
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
@@ -469,21 +471,37 @@ pub const BeamChain = struct {
     /// Joined at `deinit` so propose workers cannot outlive chain state.
     propose_wg: WaitGroup = .{},
 
+    /// Interval-4 proposer pre-aggregation. The node that will propose slot N
+    /// runs its Type-1 attestation aggregation one interval early (interval-in-slot
+    /// 4 of slot N-1) so the interval-0 proposal can skip the Type-1 compact and
+    /// start the Type-2 merge immediately. Single-flight like `propose_inflight`
+    /// (cap 1); `preAggregateImpl` decrements on exit.
+    preagg_inflight: std.atomic.Value(u32) = .init(0),
+
+    /// Joined at `deinit` so a pre-aggregation worker cannot outlive chain state.
+    preagg_wg: WaitGroup = .{},
+
     /// Serialize the rayon-heavy recursive-STARK proves so each gets the full rayon thread
-    /// budget instead of fighting for it. Three paths now enter the prover concurrently — the
-    /// propose worker (Type-2 merge in `buildBlockProof`), the aggregate worker
-    /// (`aggregateForSlots`), and block import (`deconstructType2BlockProof`). Without this gate
-    /// they over-subscribe rayon and each prove runs ~Nx slower, which inflates block latency and
-    /// makes safe_target lag (breaking finalization). Acquired ONLY around the leaf FFI prove (no
-    /// other zeam lock co-held) or, for aggregate, as the OUTERMOST lock before forkChoice.mutex —
-    /// never `fcmutex -> prove_gate` — so there is no lock cycle.
+    /// budget instead of fighting for it AND so aggregation is a singleton per unit of work:
+    /// every Type-1 / Type-2 prove path holds this gate, so no two ever execute simultaneously
+    /// (in particular, no two Type-1 aggregations on the same attestation_data — the snapshot +
+    /// `anyStoredProofCoversAll` skip then dedups across passes). The prove paths are — the
+    /// interval-2 aggregate worker (`aggregateForSlots`, Type-1), the interval-4 proposer warm-up
+    /// (`preAggregateImpl` -> `aggregateProposalKeysForSlots`, Type-1), the interval-0 proposer
+    /// re-aggregate (`reaggregateProposalKeys`, Type-1) and compaction (`produceBlock` ->
+    /// `getProposalAttestations`, Type-1), the propose worker (Type-2 merge in `buildBlockProof`),
+    /// and block import (`deconstructType2BlockProof`, Type-2 verify). Without this gate they
+    /// over-subscribe rayon and each prove runs ~Nx slower, which inflates block latency and makes
+    /// safe_target lag (breaking finalization). Acquired ONLY around the leaf FFI prove (no other
+    /// zeam lock co-held) or, for the att-aggregation paths, as the OUTERMOST lock before
+    /// forkChoice.mutex — never `fcmutex -> prove_gate` — so there is no lock cycle.
     prove_gate: zeam_utils.SyncMutex = .{},
 
-    /// See `ChainOpts.proposal_deadline_pct`. Surfaced as a config knob
-    /// (CLI `--proposal-deadline-pct`) and stored here; devnet5's off-loop
-    /// `proposeImpl` derives the single-message aggregation `deadline_ns` from
-    /// it (this percent of the proposal interval).
-    proposal_deadline_pct: u32,
+    /// See `ChainOpts.type1_aggregation_deadline_pct`. Surfaced as a config knob
+    /// (CLI `--type1-aggregation-deadline-pct`) and stored here; the off-loop
+    /// `proposeImpl` derives the inline single-message (Type-1) aggregation
+    /// `deadline_ns` from it (this percent of the proposal interval).
+    type1_aggregation_deadline_pct: u32,
 
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
@@ -669,7 +687,7 @@ pub const BeamChain = struct {
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
-            .proposal_deadline_pct = opts.proposal_deadline_pct,
+            .type1_aggregation_deadline_pct = opts.type1_aggregation_deadline_pct,
             // Pending attestation / aggregated-attestation buffers — empty
             // at init; FIFO-bounded by constants.MAX_PENDING_ATTESTATIONS in
             // the enqueue helpers.
@@ -1721,6 +1739,10 @@ pub const BeamChain = struct {
         // publishBlock) — they reference chain state and must not outlive it.
         self.thread_pool.waitAndWork(&self.propose_wg);
 
+        // Join in-flight interval-4 pre-aggregation workers before tearing down
+        // the chain state they aggregate against.
+        self.thread_pool.waitAndWork(&self.preagg_wg);
+
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
         // `stop()` is idempotent and joins the worker thread; after
@@ -2683,6 +2705,12 @@ pub const BeamChain = struct {
         // called post ticking the chain to the correct time, but once validator is separated
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
+        // Interval-0 re-aggregate pass: fold gossip/payloads that arrived since the
+        // interval-4 warm-up into the per-att_data aggregates in latest_new, BEFORE
+        // getProposalHead below promotes latest_new -> latest_known for the compaction.
+        // Best-effort; anyStoredProofCoversAll makes it a no-op when nothing improved.
+        self.reaggregateProposalKeys(opts.slot, opts.deadline_ns);
+
         // Accept new aggregated payloads before proposing so the proposer
         // builds on the latest proposal head derived from known aggregated
         // payloads.
@@ -2723,9 +2751,17 @@ pub const BeamChain = struct {
         post_state.* = try zeam_utils.clone(types.BeamState, pre_snapshot, self.allocator);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
-        // FFI call against the owned snapshot — no lock held during this
-        // window.
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
+        // Build the block's Type-1 set by compacting the per-att_data aggregates now
+        // resident in latest_known (warmed at interval-4, refreshed by the interval-0
+        // re-aggregate above). This is cheap: the per-att_data aggregates are dominant,
+        // so greedy selection picks ~1 proof per att_data and compactAttestations has
+        // little to merge. prove_gate acquired AFTER cloneAndRelease (no states_lock
+        // co-held), order prove_gate -> forkChoice.mutex.
+        const proposal_atts = blk: {
+            self.prove_gate.lock();
+            defer self.prove_gate.unlock();
+            break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
+        };
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -5100,13 +5136,13 @@ pub const BeamChain = struct {
 
         const validator = if (node.validator) |*v| v else return;
 
-        // Cap single-message attestation aggregation at `proposal_deadline_pct`% of the
+        // Cap single-message attestation aggregation at `type1_aggregation_deadline_pct`% of the
         // proposal interval, reserving the remainder for block signing and the Type-2
         // multi-message merge. A timely block with fewer attestation_data beats a late
         // block carrying more — the off-loop merge is the dominant cost, so we bound the
         // controllable gathering phase rather than the merge. Clamp to [0, 99] so the
         // sign/merge step always keeps headroom (same form as main's produceBlockWorker).
-        const pct_clamped: i64 = @intCast(@min(chain.proposal_deadline_pct, 99));
+        const pct_clamped: i64 = @intCast(@min(chain.type1_aggregation_deadline_pct, 99));
         const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
         const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
 
@@ -5164,6 +5200,181 @@ pub const BeamChain = struct {
             return;
         };
         chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+    }
+
+    /// Trigger off-loop interval-4 proposer pre-aggregation for an
+    /// already-resolved next-slot proposer duty. The "do I propose `target_slot`?"
+    /// decision is the validator client's (`ValidatorClient.onInterval` interval-4
+    /// arm resolves it via `getSlotProposer(slot+1)`); this owns only chain-state
+    /// gating + the off-loop dispatch, and returns within microseconds. Mirrors
+    /// `submitPropose`. At most one pre-aggregation is in flight; a second trigger
+    /// is dropped (the next slot re-warms). `preAggregateImpl` decrements on exit.
+    pub fn submitPreAggregate(self: *Self, target_slot: usize, proposer_id: usize) void {
+        // Sync gating, identical to submitPropose (including the pre-finalization
+        // cold-start exception). A pre-agg that bails is harmless: the interval-0
+        // proposal falls back to the inline Type-1 compact.
+        switch (self.getSyncStatus()) {
+            .synced => {},
+            .no_peers => {},
+            .fc_initing => {
+                self.logger.info("skipping pre-aggregation for slot={d} proposer={d}: forkchoice still initing", .{ target_slot, proposer_id });
+                return;
+            },
+            .peers_materially_ahead => |info| {
+                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
+                    // Pre-finalization cold start: still warm latest_new to help
+                    // reach a first justification.
+                } else {
+                    self.logBehindPeersDebug("skipping pre-aggregation", info);
+                    return;
+                }
+            },
+        }
+
+        // Single-flight: at most one pre-aggregation at a time. fetchAdd-then-compare
+        // is a soft ceiling, released on every early return below.
+        const prev = self.preagg_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= 1) {
+            _ = self.preagg_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("skipping pre-aggregation for slot={d}: previous pre-aggregation still in flight", .{target_slot});
+            return;
+        }
+
+        self.thread_pool.spawnWg(&self.preagg_wg, preAggregateImpl, .{ self, target_slot, proposer_id }) catch {
+            _ = self.preagg_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue pre-aggregation for slot={d}; skipping", .{target_slot});
+            return;
+        };
+    }
+
+    /// Worker body for interval-4 proposer pre-aggregation (runs on a shared
+    /// `ThreadPool` worker). Aggregates EVERY proposal-eligible att_data for the
+    /// upcoming proposal's slot window into `latest_new_aggregated_payloads` via the
+    /// aggregator path (so `anyStoredProofCoversAll` skips already-covered keys), so
+    /// the interval-0 proposal finds the per-att_data aggregates ready and only
+    /// re-aggregates what improved. Derives the head READ-ONLY (never ticks the FC
+    /// clock). Does NO Type-2 work and publishes nothing.
+    fn preAggregateImpl(chain: *Self, target_slot: usize, proposer_id: usize) void {
+        defer _ = chain.preagg_inflight.fetchSub(1, .acq_rel);
+
+        // Timeliness guard: bail if the chain already reached interval 0 of
+        // target_slot — the proposal is happening now (or already happened), so the
+        // warm-up is wasted and would only contend on prove_gate with the proposal.
+        // Re-checked after prove_gate is acquired. Mirrors aggregateImpl's clock read.
+        const target_propose_time: u64 = @intCast(target_slot * constants.INTERVALS_PER_SLOT);
+        if (chain.forkChoice.fcStore.slot_clock.time.load(.monotonic) >= target_propose_time) {
+            chain.logger.info("skipping pre-aggregation for slot={d}: already at/after its proposal interval", .{target_slot});
+            return;
+        }
+
+        // Read-only head: getHead() takes only forkChoice.mutex.lockShared and does
+        // NOT tick the clock. getProposalHead(target_slot) WOULD tick the FC clock to
+        // interval 0 a full interval early, so it must not be used here. We need only
+        // the head's validators (cheap clone, no full BeamState snapshot).
+        const head_root = chain.forkChoice.getHead().blockRoot;
+        var borrow = chain.statesGet(head_root) orelse {
+            chain.logger.info("skipping pre-aggregation for slot={d}: missing state for head root", .{target_slot});
+            return;
+        };
+        var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, chain.allocator) catch |e| {
+            borrow.deinit();
+            chain.logger.warn("pre-aggregation: clone validators failed slot={d}: {any}", .{ target_slot, e });
+            return;
+        };
+        // Release the state borrow BEFORE the prove — never hold a states lock across
+        // the multi-100ms FFI (on the --chain-worker=off path the borrow carries
+        // states_lock.shared and would stall block-import; rc-only on the default path).
+        borrow.deinit();
+        defer validators_owned.deinit();
+
+        // No truncating deadline: a 100%-of-interval bound (run-to-completion within
+        // the interval). The FFI is uninterruptible anyway; the timeliness guards
+        // above + below keep a late start from bleeding into the proposal.
+        const start_ns = zeam_utils.monotonicTimestampNs();
+        const deadline_ns: i64 = @intCast(start_ns + @as(i128, constants.SECONDS_PER_INTERVAL_MS) * @as(i128, std.time.ns_per_ms));
+
+        // Slot window {target_slot-1, target_slot}, same shape the aggregator uses.
+        var window_buf: [2]types.Slot = undefined;
+        var window_len: usize = 0;
+        if (target_slot > 0) {
+            window_buf[window_len] = @intCast(target_slot - 1);
+            window_len += 1;
+        }
+        window_buf[window_len] = @intCast(target_slot);
+        window_len += 1;
+
+        // Serialize against the aggregate / propose-merge / deconstruct proves
+        // (prove_gate OUTERMOST -> forkChoice.mutex inside aggregateUnlocked).
+        // Opportunistic: a busy gate means another prove is running, so skip rather
+        // than wait and risk starting too close to the proposal.
+        if (!chain.prove_gate.tryLock()) {
+            chain.logger.info("skipping pre-aggregation for slot={d}: prove_gate busy", .{target_slot});
+            return;
+        }
+        if (chain.forkChoice.fcStore.slot_clock.time.load(.monotonic) >= target_propose_time) {
+            chain.prove_gate.unlock();
+            chain.logger.info("skipping pre-aggregation for slot={d}: reached proposal interval while waiting for prove_gate", .{target_slot});
+            return;
+        }
+        const aggregations = chain.forkChoice.aggregateProposalKeysForSlots(&validators_owned, window_buf[0..window_len], deadline_ns) catch |e| {
+            chain.prove_gate.unlock();
+            chain.logger.warn("pre-aggregation: aggregateProposalKeysForSlots failed slot={d}: {any}", .{ target_slot, e });
+            return;
+        };
+        chain.prove_gate.unlock();
+        // Warm-up commits aggregates into latest_new inside aggregateUnlocked; the
+        // returned aggregates are not gossiped (proposer warm-up), just freed.
+        defer {
+            for (aggregations) |*a| a.deinit();
+            chain.allocator.free(aggregations);
+        }
+
+        const elapsed_s: f32 = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+        chain.logger.info("pre-aggregated Type-1 for slot={d} proposer={d} att_data={d} took={d:.3}s", .{ target_slot, proposer_id, aggregations.len, elapsed_s });
+    }
+
+    /// Interval-0 proposer re-aggregate pass. Folds gossip/payloads that arrived
+    /// since the interval-4 warm-up into the per-att_data aggregates in
+    /// `latest_new_aggregated_payloads`, so the subsequent `getProposalHead` accept
+    /// promotes them into `latest_known` before the block compaction reads it.
+    /// `anyStoredProofCoversAll` re-proves only att_data whose coverage improved;
+    /// unchanged keys short-circuit to zero FFI. Best-effort — any failure leaves the
+    /// proposal to compact whatever is already known. MUST run before getProposalHead.
+    fn reaggregateProposalKeys(self: *Self, slot: types.Slot, deadline_ns: ?i64) void {
+        const head_root = self.forkChoice.getHead().blockRoot;
+        var borrow = self.statesGet(head_root) orelse {
+            self.logger.debug("interval-0 re-aggregate: no head state, skipping slot={d}", .{slot});
+            return;
+        };
+        var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, self.allocator) catch |e| {
+            borrow.deinit();
+            self.logger.warn("interval-0 re-aggregate: clone validators failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+        // Release the state borrow before the prove (see preAggregateImpl).
+        borrow.deinit();
+        defer validators_owned.deinit();
+
+        var window_buf: [2]types.Slot = undefined;
+        var window_len: usize = 0;
+        if (slot > 0) {
+            window_buf[window_len] = slot - 1;
+            window_len += 1;
+        }
+        window_buf[window_len] = slot;
+        window_len += 1;
+
+        self.prove_gate.lock();
+        const aggregations = self.forkChoice.aggregateProposalKeysForSlots(&validators_owned, window_buf[0..window_len], deadline_ns) catch |e| {
+            self.prove_gate.unlock();
+            self.logger.warn("interval-0 re-aggregate failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+        self.prove_gate.unlock();
+        defer {
+            for (aggregations) |*a| a.deinit();
+            self.allocator.free(aggregations);
+        }
     }
 
     /// Find the subnet of the first set participant in `participants`.
@@ -7143,8 +7354,8 @@ test "produceBlock - older-but-justified source is accepted" {
     try std.testing.expect(found_older);
 }
 
-test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (proposal_deadline_pct wiring)" {
-    // proposal_deadline_pct is wired (via BlockProductionParams.deadline_ns) into
+test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (type1_aggregation_deadline_pct wiring)" {
+    // type1_aggregation_deadline_pct is wired (via BlockProductionParams.deadline_ns) into
     // getProposalAttestations -> compactAttestations. The deadline only bites on COMPACTION:
     // compactAttestations returns inputs as-is when each AttestationData has a single proof,
     // but an elapsed deadline short-circuits the merge of multiple proofs sharing one att_data

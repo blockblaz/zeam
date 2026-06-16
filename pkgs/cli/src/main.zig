@@ -99,10 +99,10 @@ pub const NodeCommand = struct {
     /// for fewer sub-threshold aggregates on chatty subnets.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
     /// Single-message attestation aggregation deadline budget (see
-    /// `ChainOpts.proposal_deadline_pct`): the proposer truncates attestation
+    /// `ChainOpts.type1_aggregation_deadline_pct`): the proposer truncates attestation
     /// gathering at this percent of the proposal interval; the remainder is for
     /// block signing and the Type-2 multi-message merge.
-    @"proposal-deadline-pct": u32 = node_lib.default_proposal_deadline_pct,
+    @"type1-aggregation-deadline-pct": u32 = node_lib.default_type1_aggregation_deadline_pct,
 
     /// Cap on the number of child STARK proofs the aggregator worker merges
     /// with raw signatures via `rec_xmss_aggregate`.
@@ -152,7 +152,7 @@ pub const NodeCommand = struct {
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
         .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to the earlier behavior that always aggregated at least one signature. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
-        .@"proposal-deadline-pct" = "Percentage of one proposal interval (SECONDS_PER_INTERVAL_MS, default 800ms) budgeted to the block-build/aggregation worker. This is an intra-interval split: the worker self-truncates at this percentage and the remaining (100-pct)% of the SAME interval is reserved for the finalize step (STF on the harvested partial body + propose-side sign + gossip publish), so the signed block is ready before the attestation interval. Default 90 (~720ms aggregation + ~80ms finalize/sign at the default 800ms interval). Lower this on slow validator hardware to widen the finalize/sign window; raise toward 99 to maximise aggregation throughput. Clamped to [0, 99] inside the consumer.",
+        .@"type1-aggregation-deadline-pct" = "Percentage of one proposal interval (SECONDS_PER_INTERVAL_MS, default 800ms) the proposer spends on interval-0 Type-1 (single-message attestation) work before it proceeds to sign + the Type-2 merge. Intra-interval cap: the interval-4 proposer warm-up aggregates every proposal-eligible attestation data with a full-interval budget, then interval 0 uses this percentage for the re-aggregate/compact pass that folds in newly arrived gossip. Default 20 (~160ms Type-1 refresh + ~640ms Type-2/sign at the default 800ms interval). Lower to give Type-2 more room; raise toward 99 to gather more attestations at interval 0. Clamped to [0, 99] inside the consumer.",
         .@"max-aggregation-children" = "Cap on the number of child STARK proofs the aggregator worker merges with raw signatures via rec_xmss_aggregate. Default 0 keeps per-call latency bounded by flat-prove cost (~0.5 s/call on typical aggregator hardware) by never taking the recursive code path; peer-published aggregates for the same att_data remain in latest_known_aggregated_payloads for the block proposer to compact at proposal time. Set 1 to allow at most one peer child to be merged (~1.5 s/call). Higher values reintroduce the multi-second tail (in one measurement, num_children=3-4 averaged ~4.8 s).",
         .@"max-aggregations-per-tick" = "Cap on the number of AttestationData the aggregator proves+publishes per tick. The keys form a greedy justification path: the first key advances latest_justified to its target, the next is sourced at that target, and so on, so N proves successively move justification ahead. Default 1 reproduces the single-aggregation behaviour exactly (one prove on the calling worker). 0 is treated as 1: an aggregator-role node always produces at least one aggregation per tick. Values >1 run the extra proves in parallel on the shared ThreadPool; since each prove drives Rayon internally, pair a higher value with a lower --rayon-threads to avoid CPU oversubscription (the reason #925 sequentialized the old multi-key prover).",
         .help = "Show help information for the node command",
@@ -929,7 +929,7 @@ fn mainInner(init: std.process.Init) !void {
                 .db_backend = leancmd.@"db-backend",
                 .rayon_threads = leancmd.@"rayon-threads",
                 .min_aggregation_inputs = leancmd.@"min-aggregation-inputs",
-                .proposal_deadline_pct = leancmd.@"proposal-deadline-pct",
+                .type1_aggregation_deadline_pct = leancmd.@"type1-aggregation-deadline-pct",
                 .max_aggregation_children = leancmd.@"max-aggregation-children",
                 .max_aggregations_per_tick = leancmd.@"max-aggregations-per-tick",
             };
