@@ -129,6 +129,14 @@ pub const NodeOptions = struct {
     /// `pkgs/types/src/block.zig:default_max_aggregation_children` (0 —
     /// flat-only worker path).
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// Cap on the number of `AttestationData` the aggregator proves+publishes
+    /// per tick (greedy justification path). Threaded through to
+    /// `ForkChoice.max_aggregations_per_tick` and consumed by
+    /// `aggregateUnlocked`. Surfaced as `--max-aggregations-per-tick` on the
+    /// `zeam node` CLI; default is
+    /// `pkgs/types/src/block.zig:default_max_aggregations_per_tick` (1 —
+    /// single-aggregation behaviour).
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -537,10 +545,11 @@ pub const Node = struct {
             desired_workers
         else
             @max(@as(usize, 1), desired_workers -| worker_count);
-        // One outer aggregate worker at a time on aggregators. Each att_data
-        // prove runs sequentially inside that worker (ethlambda-style) so
-        // Rayon gets the full CPU budget per job instead of ThreadPool ×
-        // Rayon oversubscription.
+        // One outer aggregate tick at a time on aggregators. A tick may prove
+        // multiple justification-path att_data in parallel (bounded by
+        // --max-aggregations-per-tick), so Rayon gets the full post-system CPU
+        // budget while we avoid stacking multiple concurrent aggregate ticks
+        // on top of ThreadPool × Rayon work (#925).
         const aggregate_max_inflight: u32 = if (options.is_aggregator) 1 else 4;
         const rayon_source: []const u8 = if (options.rayon_threads != null)
             " (--rayon-threads override)"
@@ -590,6 +599,17 @@ pub const Node = struct {
             },
         );
 
+        self.logger.info(
+            "aggregator cap: max_aggregations_per_tick={d}{s}",
+            .{
+                options.max_aggregations_per_tick,
+                if (options.max_aggregations_per_tick != types.default_max_aggregations_per_tick)
+                    " (override via --max-aggregations-per-tick)"
+                else
+                    "",
+            },
+        );
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -607,6 +627,7 @@ pub const Node = struct {
             .chain_worker_enabled = options.chain_worker_enabled,
             .min_aggregation_inputs = options.min_aggregation_inputs,
             .max_aggregation_children = options.max_aggregation_children,
+            .max_aggregations_per_tick = options.max_aggregations_per_tick,
             .aggregate_max_inflight = aggregate_max_inflight,
             .proposal_deadline_pct = options.proposal_deadline_pct,
         });

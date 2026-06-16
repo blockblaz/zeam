@@ -107,6 +107,116 @@ test "Network: preferred blocks_by_root peer is a hint with fallback" {
     try std.testing.expectEqualStrings("fallback-peer", ctx.last_peer.?);
 }
 
+test "Network: blocks_by_root ignores stale peer head_slot (null min_slot)" {
+    // Regression: PR #950 added the min_slot peer filter to selectPeer and the
+    // production call site in node.fetchBlockByRoots passed
+    // `forkChoice.getHead().slot + 1`. Because `latest_status.head_slot` is
+    // only updated on Status handshake / explicit re-status, every connected
+    // peer becomes ineligible once our own head advances past the
+    // boot-time status — turning a transient gossip miss into a permanent
+    // fork ("no peers available to request 1 block(s) by root" warning).
+    // The fix passes `null` for `min_slot` on the blocks_by_root path; this
+    // test pins that behaviour at the network layer.
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        allocator: Allocator,
+        last_peer: ?[]u8 = null,
+        next_request_id: u64 = 1,
+
+        fn deinit(self: *@This()) void {
+            if (self.last_peer) |peer| self.allocator.free(peer);
+        }
+
+        fn publish(_: *anyopaque, _: *const networks.GossipMessage) anyerror!bool {
+            return true;
+        }
+
+        fn subscribeGossip(_: *anyopaque, _: []networks.GossipTopic, _: networks.OnGossipCbHandler) anyerror!void {}
+        fn onGossip(_: *anyopaque, _: *networks.GossipMessage, _: []const u8) anyerror!void {}
+
+        fn sendRequest(
+            ptr: *anyopaque,
+            peer_id: []const u8,
+            _: *const networks.ReqRespRequest,
+            _: ?networks.OnReqRespResponseCbHandler,
+        ) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.last_peer) |old| self.last_peer = blk: {
+                self.allocator.free(old);
+                break :blk null;
+            };
+            self.last_peer = try self.allocator.dupe(u8, peer_id);
+            const id = self.next_request_id;
+            self.next_request_id += 1;
+            return id;
+        }
+
+        fn onReqRespRequest(_: *anyopaque, _: *networks.ReqRespRequest, _: networks.ReqRespServerStream) anyerror!void {}
+        fn subscribeReqResp(_: *anyopaque, _: networks.OnReqRespRequestCbHandler) anyerror!void {}
+        fn cancelInflightRequest(_: *anyopaque, _: u64) void {}
+        fn subscribePeers(_: *anyopaque, _: networks.OnPeerEventCbHandler) anyerror!void {}
+    };
+
+    var ctx = Ctx{ .allocator = allocator };
+    defer ctx.deinit();
+
+    var network = try Network.init(allocator, .{
+        .gossip = .{
+            .ptr = &ctx,
+            .publishFn = Ctx.publish,
+            .subscribeFn = Ctx.subscribeGossip,
+            .onGossipFn = Ctx.onGossip,
+        },
+        .reqresp = .{
+            .ptr = &ctx,
+            .sendRequestFn = Ctx.sendRequest,
+            .onReqRespRequestFn = Ctx.onReqRespRequest,
+            .subscribeFn = Ctx.subscribeReqResp,
+            .cancelInflightRequestFn = Ctx.cancelInflightRequest,
+        },
+        .peers = .{ .ptr = &ctx, .subscribeFn = Ctx.subscribePeers },
+    });
+    defer network.deinit();
+
+    try network.connectPeer("stale-peer-a");
+    try network.connectPeer("stale-peer-b");
+
+    // Both peers reported head_slot=3 at handshake (boot), but our own chain
+    // has since advanced — exactly the live-devnet pattern.
+    const stale_status: types.Status = .{
+        .finalized_root = [_]u8{0} ** 32,
+        .finalized_slot = 0,
+        .head_root = [_]u8{0} ** 32,
+        .head_slot = 3,
+    };
+    try std.testing.expect(network.setPeerLatestStatus("stale-peer-a", stale_status));
+    try std.testing.expect(network.setPeerLatestStatus("stale-peer-b", stale_status));
+
+    const handler: networks.OnReqRespResponseCbHandler = .{
+        .ptr = &ctx,
+        .onReqRespResponseCb = struct {
+            fn cb(_: *anyopaque, _: *const networks.ReqRespResponseEvent) anyerror!void {}
+        }.cb,
+    };
+
+    // Pre-fix this would have returned error.NoPeersAvailable for any
+    // min_slot > 3. Post-fix the call site passes null, so dispatch succeeds.
+    const root: types.Root = [_]u8{0xcc} ** 32;
+    var pinned = (try network.ensureBlocksByRootRequest(&[_]types.Root{root}, 0, handler, null, null)).?;
+    defer pinned.deinit(allocator);
+    try std.testing.expect(pinned.peer_id.len > 0);
+    try std.testing.expect(ctx.last_peer != null);
+
+    // And the filter still has bite when set explicitly — proves we only
+    // dropped the filter at the call site, not removed the mechanism.
+    network.finalizePendingRequest(pinned.request_id);
+    try std.testing.expectError(
+        error.NoPeersAvailable,
+        network.ensureBlocksByRootRequest(&[_]types.Root{root}, 0, handler, null, 4),
+    );
+}
+
 pub const StatusRequestContext = struct {
     peer_id: []const u8,
 

@@ -61,9 +61,10 @@ jobs:
 
     - name: Send Telegram failure notification
       if: failure()
+      env:
+        COMMIT_MSG_FULL: ${{ github.event.head_commit.message || 'manual trigger' }}
       run: |
         MAIN_SHA="${{ github.sha }}"
-        COMMIT_MSG_FULL="${{ github.event.head_commit.message || 'manual trigger' }}"
         COMMIT_MSG="${COMMIT_MSG_FULL%%$'\n'*}"
         REPO_URL="${{ github.server_url }}/${{ github.repository }}"
         RUN_URL="$REPO_URL/actions/runs/${{ github.run_id }}"

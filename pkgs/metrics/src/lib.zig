@@ -181,6 +181,8 @@ const Metrics = struct {
     // Block production metrics
     lean_block_building_time_seconds: BlockBuildingTimeHistogram,
     lean_block_building_payload_aggregation_time_seconds: BlockPayloadAggregationTimeHistogram,
+    // zeam-specific: Type-2 multi-message STARK merge time (buildBlockProof), the proposal critical-path cost.
+    zeam_block_proof_merge_time_seconds: BlockProofMergeTimeHistogram,
     lean_block_aggregated_payloads: BlockAggregatedPayloadsHistogram,
     lean_block_building_success_total: BlockBuildingSuccessCounter,
     lean_block_building_failures_total: BlockBuildingFailuresCounter,
@@ -219,6 +221,13 @@ const Metrics = struct {
     zeam_proposal_deadline_hits_total: ZeamProposalDeadlineHitsCounter,
     zeam_proposal_partial_prefix_size: ZeamProposalPartialPrefixSizeHistogram,
     zeam_proposal_skipped_empty_total: ZeamProposalSkippedEmptyCounter,
+    // Block proposer lifecycle (proposeImpl worker)
+    zeam_block_proposer_started_total: ZeamBlockProposerStartedCounter,
+    zeam_block_proposer_completed_total: ZeamBlockProposerCompletedCounter,
+    // Single-message attestation aggregation (compactAttestations) lifecycle
+    zeam_single_message_aggregation_total: ZeamSingleMessageAggregationCounter,
+    // Multi-message Type-2 STARK merge lifecycle (buildBlockProof)
+    zeam_block_proof_merge_started_total: ZeamBlockProofMergeStartedCounter,
     // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
     lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
     /// Wall time for one `xev.Loop.run(.until_done)` in `Clock.run`.
@@ -248,6 +257,16 @@ const Metrics = struct {
     zeam_aggregate_coalesced_total: AggregateCoalescedCounter,
     /// Histogram for the wall-clock duration of the aggregate FFI worker.
     zeam_aggregate_worker_duration_seconds: AggregateWorkerDurationHistogram,
+    /// Lag, in slot-clock intervals, between an aggregate's att_data slot
+    /// start and the moment the aggregate was committed/published (#985).
+    /// On-time = bucket ≤3 (duty fires at interval 2); ≥5 = landed in the
+    /// next slot. See `AggregateCommitLagIntervalsHistogram` doc.
+    zeam_aggregate_commit_lag_intervals: AggregateCommitLagIntervalsHistogram,
+    /// Which key the aggregator tick selected, relative to the clock slot
+    /// (#985): lag="current" (key.slot == clock slot), "prev" (one behind),
+    /// "older" (≥2 behind). A high "prev" rate means current-slot aggregates
+    /// are being deferred — the selection pathology behind the ~4 s tail.
+    zeam_aggregate_selected_key_lag_total: AggregateSelectedKeyLagCounter,
     /// Counter for SignedAggregatedAttestation messages published by the local
     /// aggregator worker (after the FFI returned), labeled by attestation subnet.
     /// Separate from the standard `lean_pq_sig_aggregated_signatures_total`
@@ -596,6 +615,7 @@ const Metrics = struct {
     // Block production metric types
     const BlockBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     const BlockPayloadAggregationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
+    const BlockProofMergeTimeHistogram = metrics_lib.HistogramVec(f32, struct { components: []const u8 }, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5 });
     const BlockAggregatedPayloadsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128 });
     // Total participant count summed across all aggregated_attestations in
     // a block. Each attestation can have up to NUM_VALIDATORS participants;
@@ -646,6 +666,11 @@ const Metrics = struct {
     const ZeamProposalDeadlineHitsCounter = metrics_lib.Counter(u64);
     const ZeamProposalPartialPrefixSizeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0, 1, 2, 4, 8, 16 });
     const ZeamProposalSkippedEmptyCounter = metrics_lib.Counter(u64);
+    // Block proposer / aggregation lifecycle counter types
+    const ZeamBlockProposerStartedCounter = metrics_lib.Counter(u64);
+    const ZeamBlockProposerCompletedCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
+    const ZeamSingleMessageAggregationCounter = metrics_lib.Counter(u64);
+    const ZeamBlockProofMergeStartedCounter = metrics_lib.Counter(u64);
     // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
     // both fast acquisitions and long stalls observed when STF runs under the lock.
     const NodeMutexLabel = struct { site: []const u8 };
@@ -679,6 +704,16 @@ const Metrics = struct {
     const AggregateSkipCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
     const AggregateCoalescedCounter = metrics_lib.Counter(u64);
     const AggregateWorkerDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 });
+    // Aggregation publish-timing instrumentation (#985). Lag is measured in
+    // INTERVALS (the slot clock's native unit; INTERVALS_PER_SLOT=5 at
+    // SECONDS_PER_SLOT=4 → 800 ms each): commit-time clock intervals minus
+    // att_data.slot * INTERVALS_PER_SLOT. The aggregation duty fires at
+    // interval 2, so an on-time commit lands in bucket ≤3; ≥5 means the
+    // aggregate for that att_data landed in the NEXT slot — the ~4 s tail of
+    // #985, invisible to the worker-duration histogram because the worker
+    // itself is fast; the att_data just wasn't selected on its own tick.
+    const AggregateCommitLagIntervalsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 3, 4, 5, 6, 8, 10, 15 });
+    const AggregateSelectedKeyLagCounter = metrics_lib.CounterVec(u64, struct { lag: []const u8 });
     const AggregatorPublishAggregationsCounter = metrics_lib.CounterVec(u64, struct { subnet: []const u8 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
@@ -1147,6 +1182,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         // Block production metrics
         .lean_block_building_time_seconds = Metrics.BlockBuildingTimeHistogram.init("lean_block_building_time_seconds", .{ .help = "Time taken to build a block" }, .{}),
         .lean_block_building_payload_aggregation_time_seconds = Metrics.BlockPayloadAggregationTimeHistogram.init("lean_block_building_payload_aggregation_time_seconds", .{ .help = "Time taken to build aggregated_payloads during block building" }, .{}),
+        .zeam_block_proof_merge_time_seconds = try Metrics.BlockProofMergeTimeHistogram.init(allocator, io, "zeam_block_proof_merge_time_seconds", .{ .help = "buildBlockProof Type-2 multi-message STARK merge time (proposal critical path), labeled by components = number of distinct AttestationData merged into the block proof" }, .{}),
         .lean_block_aggregated_payloads = Metrics.BlockAggregatedPayloadsHistogram.init("lean_block_aggregated_payloads", .{ .help = "Number of aggregated_payloads in a block" }, .{}),
         .lean_block_building_success_total = Metrics.BlockBuildingSuccessCounter.init("lean_block_building_success_total", .{ .help = "Successful block builds" }, .{}),
         .lean_block_building_failures_total = Metrics.BlockBuildingFailuresCounter.init("lean_block_building_failures_total", .{ .help = "Failed block builds (exception in build_block)" }, .{}),
@@ -1170,6 +1206,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_proposal_deadline_hits_total = Metrics.ZeamProposalDeadlineHitsCounter.init("zeam_proposal_deadline_hits_total", .{ .help = "Number of compactAttestations runs whose returned prefix was truncated because the caller-supplied deadline elapsed mid-loop." }, .{}),
         .zeam_proposal_partial_prefix_size = Metrics.ZeamProposalPartialPrefixSizeHistogram.init("zeam_proposal_partial_prefix_size", .{ .help = "Number of AttestationData groups fully committed by deadline-aware compactAttestations when the deadline truncated the loop." }, .{}),
         .zeam_proposal_skipped_empty_total = Metrics.ZeamProposalSkippedEmptyCounter.init("zeam_proposal_skipped_empty_total", .{ .help = "Number of interval-0 finalize calls that found no partial proposal body for the proposer's slot." }, .{}),
+        .zeam_block_proposer_started_total = Metrics.ZeamBlockProposerStartedCounter.init("zeam_block_proposer_started_total", .{ .help = "Block-proposer worker (proposeImpl) invocations started." }, .{}),
+        .zeam_block_proposer_completed_total = try Metrics.ZeamBlockProposerCompletedCounter.init(allocator, io, "zeam_block_proposer_completed_total", .{ .help = "Block-proposer worker (proposeImpl) terminations, labeled result=success|failed." }, .{}),
+        .zeam_single_message_aggregation_total = Metrics.ZeamSingleMessageAggregationCounter.init("zeam_single_message_aggregation_total", .{ .help = "compactAttestations single-message (Type-1) aggregation passes run during block proposal." }, .{}),
+        .zeam_block_proof_merge_started_total = Metrics.ZeamBlockProofMergeStartedCounter.init("zeam_block_proof_merge_started_total", .{ .help = "Type-2 multi-message STARK merge (buildBlockProof) invocations started." }, .{}),
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_xev_clock_until_done_drain_seconds = Metrics.XevClockUntilDoneDrainHistogram.init("zeam_xev_clock_until_done_drain_seconds", .{ .help = "Wall time in seconds for one xev run(.until_done) in the clock driver (issues #863, #867). Captures completion backlog before the next tickInterval()." }, .{}),
         .zeam_xev_clock_until_done_slow_ge_500ms_total = Metrics.ZeamXevClockUntilDoneSlowGe500msCounter.init("zeam_xev_clock_until_done_slow_ge_500ms_total", .{ .help = "Clock-loop xev run(.until_done) drains with wall time >= 0.5s (#863)." }, .{}),
@@ -1180,6 +1220,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_aggregator_skipped_total = try Metrics.AggregateSkipCounter.init(allocator, io, "lean_aggregator_skipped_total", .{ .help = "Number of aggregate submissions skipped, labeled by reason: not_aggregator, not_synced, missing_state, spawn_failed, other. In-flight triggers are coalesced (see zeam_aggregate_coalesced_total)." }, .{}),
         .zeam_aggregate_coalesced_total = Metrics.AggregateCoalescedCounter.init("zeam_aggregate_coalesced_total", .{ .help = "Aggregation slot triggers coalesced while a worker was in flight; one catch-up run is scheduled when the worker finishes." }, .{}),
         .zeam_aggregate_worker_duration_seconds = Metrics.AggregateWorkerDurationHistogram.init("zeam_aggregate_worker_duration_seconds", .{ .help = "Wall-clock duration of one aggregate worker run (snapshot through publishProducedAggregations), including all XMSS recursive STARK FFI inside computeAggregatedSignatures. Primary latency signal for aggregator slot budget (issue #907)." }, .{}),
+        .zeam_aggregate_commit_lag_intervals = Metrics.AggregateCommitLagIntervalsHistogram.init("zeam_aggregate_commit_lag_intervals", .{ .help = "Lag in slot-clock intervals (800 ms each at 4 s slots) between an aggregate's att_data slot start and its commit/publish. Duty fires at interval 2, so on-time commits land in buckets <=3; values >=5 mean the aggregate landed in the NEXT slot (the ~4 s publish tail of #985)." }, .{}),
+        .zeam_aggregate_selected_key_lag_total = try Metrics.AggregateSelectedKeyLagCounter.init(allocator, io, "zeam_aggregate_selected_key_lag_total", .{ .help = "Which att_data key each aggregator tick selected, relative to the clock slot (#985): lag=\"current\" (key.slot == clock slot), \"prev\" (one slot behind), \"older\" (>=2 behind). A high prev rate means current-slot aggregates are systematically deferred one slot." }, .{}),
         .zeam_aggregator_publish_aggregations_total = try Metrics.AggregatorPublishAggregationsCounter.init(allocator, io, "zeam_aggregator_publish_aggregations_total", .{ .help = "SignedAggregatedAttestation messages published by the local aggregator worker, labeled by attestation subnet. Distinct from lean_pq_sig_aggregated_signatures_total (block-proposal path only) so cross-client dashboards keep the standard metric's semantics intact." }, .{}),
         // BeamNode mutex contention metrics.
         .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
