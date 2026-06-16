@@ -2340,19 +2340,19 @@ fn buildState(
     const latest_justified = try parseCheckpoint(pre_obj, "latestJustified", fixture_path, case_name);
     const latest_finalized = try parseCheckpoint(pre_obj, "latestFinalized", fixture_path, case_name);
 
-    var historical = try types.HistoricalBlockHashes.init(allocator);
+    var historical = types.HistoricalBlockHashes.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer historical.deinit();
     if (pre_obj.get("historicalBlockHashes")) |v| {
         try appendRoots(&historical, v, fixture_path, case_name, "historicalBlockHashes");
     }
 
-    var justified_slots = try types.JustifiedSlots.init(allocator);
+    var justified_slots = types.JustifiedSlots.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer justified_slots.deinit();
     if (pre_obj.get("justifiedSlots")) |v| {
         try appendBools(&justified_slots, v, fixture_path, case_name, "justifiedSlots");
     }
 
-    var validators = try types.Validators.init(allocator);
+    var validators = types.Validators.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer validators.deinit();
     if (pre_obj.get("validators")) |val| {
         const validators_obj = try expect.expectObjectValue(FixtureError, val, ctx, "validators");
@@ -2395,13 +2395,13 @@ fn buildState(
         }
     }
 
-    var just_roots = try types.JustificationRoots.init(allocator);
+    var just_roots = types.JustificationRoots.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer just_roots.deinit();
     if (pre_obj.get("justificationsRoots")) |v| {
         try appendRoots(&just_roots, v, fixture_path, case_name, "justificationsRoots");
     }
 
-    var just_validators = try types.JustificationValidators.init(allocator);
+    var just_validators = types.JustificationValidators.init(allocator) catch return FixtureError.InvalidFixture;
     errdefer just_validators.deinit();
     if (pre_obj.get("justificationsValidators")) |v| {
         try appendBools(&just_validators, v, fixture_path, case_name, "justificationsValidators");

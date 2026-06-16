@@ -23,6 +23,7 @@ const Validators = validator.Validators;
 
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 // PQ config
 pub const BeamStateConfig = struct {
@@ -46,10 +47,16 @@ pub const BeamStateConfig = struct {
 };
 
 // Types
-pub const HistoricalBlockHashes = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
-pub const JustificationRoots = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
-pub const JustifiedSlots = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT);
-pub const JustificationValidators = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT);
+//
+// These are the cached (incremental `hashTreeRoot`) variants: `TreeHasher`
+// wrappers around the SSZ list/bitlist. They re-merkleize only the dirtied
+// paths on each state-root computation instead of walking the whole tree. The
+// hasher MUST be `Sha256` to match `@zeam/utils`'s `hashTreeRoot`, otherwise
+// the cache is silently bypassed.
+pub const HistoricalBlockHashes = ssz.utils.TreeHasher(ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT), Sha256);
+pub const JustificationRoots = ssz.utils.TreeHasher(ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT), Sha256);
+pub const JustifiedSlots = ssz.utils.TreeHasher(ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT), Sha256);
+pub const JustificationValidators = ssz.utils.TreeHasher(ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT), Sha256);
 
 pub const BeamState = struct {
     config: BeamStateConfig,
@@ -88,10 +95,10 @@ pub const BeamState = struct {
         var justified_slots = try JustifiedSlots.init(allocator);
         errdefer justified_slots.deinit();
 
-        var justifications_roots = try ssz.utils.List(utils.Root, params.HISTORICAL_ROOTS_LIMIT).init(allocator);
+        var justifications_roots = try JustificationRoots.init(allocator);
         errdefer justifications_roots.deinit();
 
-        var justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator);
+        var justifications_validators = try JustificationValidators.init(allocator);
         errdefer justifications_validators.deinit();
 
         var validators = try Validators.init(allocator);
@@ -718,12 +725,12 @@ test "ssz seralize/deserialize signed beam state" {
         .justified_slots = try JustifiedSlots.init(std.testing.allocator),
         .validators = try Validators.init(std.testing.allocator),
         .justifications_roots = blk: {
-            var roots = try ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT).init(std.testing.allocator);
+            var roots = try JustificationRoots.init(std.testing.allocator);
             try roots.append(genesis_root);
             break :blk roots;
         },
         .justifications_validators = blk: {
-            var validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(std.testing.allocator);
+            var validators = try JustificationValidators.init(std.testing.allocator);
             try validators.append(true);
             try validators.append(false);
             try validators.append(true);

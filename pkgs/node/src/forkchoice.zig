@@ -295,6 +295,12 @@ pub const ForkChoiceParams = struct {
     /// `types.default_max_aggregation_children` for the full rationale
     /// and operator trade-offs.
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// Cap on the number of justification-path `AttestationData` the
+    /// aggregator proves+publishes per tick. Threaded from the
+    /// `--max-aggregations-per-tick` CLI flag and consumed by
+    /// `aggregateUnlocked`. Default `1` reproduces single-aggregation
+    /// behaviour; see `types.default_max_aggregations_per_tick`.
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
 };
 
 // Use shared signature map types from types package
@@ -303,6 +309,32 @@ const SignaturesMap = types.SignaturesMap;
 const StoredAggregatedPayload = types.StoredAggregatedPayload;
 const AggregatedPayloadsList = types.AggregatedPayloadsList;
 const AggregatedPayloadsMap = types.AggregatedPayloadsMap;
+
+const ProposalAttestationCandidate = struct {
+    att_data: *types.AttestationData,
+    payloads: *types.AggregatedPayloadsList,
+};
+
+/// Ordering for block proposal attestation-data selection under the
+/// MAX_ATTESTATIONS_DATA cap.
+///
+/// The builder wants votes that can advance justification/finality now, not the
+/// oldest still-unjustified historical target. `AttestationData` identity
+/// includes the attestation slot, so a stalled node can retain hundreds of keys
+/// for the same logical vote. If we sort ascending by target slot, stale low
+/// targets fill the 8-key cap and fresh high-target aggregates (including whole
+/// subnets) never reach the block. Prefer the deepest target first, then the
+/// payload count for equal targets, then newest attestation slot; use the
+/// shared lexicographic att-data order only as a deterministic final
+/// tie-breaker. Coverage wins over freshness within one target because a
+/// one-slot-lagged aggregate may carry substantially more subnet coverage than
+/// the newest, still-thin key.
+fn proposalAttestationCandidateLessThan(_: void, a: ProposalAttestationCandidate, b: ProposalAttestationCandidate) bool {
+    if (a.att_data.target.slot != b.att_data.target.slot) return a.att_data.target.slot > b.att_data.target.slot;
+    if (a.payloads.items.len != b.payloads.items.len) return a.payloads.items.len > b.payloads.items.len;
+    if (a.att_data.slot != b.att_data.slot) return a.att_data.slot > b.att_data.slot;
+    return types.attestationDataLessThan({}, a.att_data.*, b.att_data.*);
+}
 
 /// Tracks whether the forkchoice has observed a real justified checkpoint via onBlock.
 /// For genesis (anchor slot == 0) we start ready; for checkpoint-sync or DB restore we
@@ -365,6 +397,14 @@ pub const ForkChoice = struct {
     /// bounded by flat-prove cost; see that constant's doc for trade-offs.
     /// Field-level default so test struct literals can omit it.
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// Cap on the number of justification-path `AttestationData` proved+published
+    /// per aggregator tick. Threaded from `ForkChoiceParams.max_aggregations_per_tick`
+    /// (ultimately the `--max-aggregations-per-tick` CLI flag). Default `1` keeps
+    /// the single-aggregation path; `> 1` proves the extra keys in parallel on
+    /// `thread_pool`. `0` is floored to `1` in `aggregateUnlocked` — an
+    /// aggregator-role node always runs at least one aggregation per tick.
+    /// Field-level default so test struct literals can omit it.
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
     last_node_tick_time_ms: ?i64,
 
     const Self = @This();
@@ -459,6 +499,7 @@ pub const ForkChoice = struct {
             .thread_pool = opts.thread_pool,
             .min_aggregation_inputs = opts.min_aggregation_inputs,
             .max_aggregation_children = opts.max_aggregation_children,
+            .max_aggregations_per_tick = opts.max_aggregations_per_tick,
             .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
@@ -949,11 +990,16 @@ pub const ForkChoice = struct {
                 const cc_u32 = self.config.spec.attestation_committee_count;
                 if (vc > 0 and cc_u32 > 0) {
                     const cc: usize = @intCast(cc_u32);
-                    // Determine slot from the first entry key.
+                    // Stamp the snapshot with the NEWEST data slot present.
+                    // Map iteration order is arbitrary and mixed data slots are
+                    // normal (aggregates mature over several slots), so taking
+                    // the first key would stamp a random slot.
                     var payload_slot: types.Slot = 0;
                     {
                         var it_s = self.latest_new_aggregated_payloads.iterator();
-                        if (it_s.next()) |first| payload_slot = first.key_ptr.slot;
+                        while (it_s.next()) |e| {
+                            if (e.key_ptr.slot > payload_slot) payload_slot = e.key_ptr.slot;
+                        }
                     }
                     const new_seen = try self.allocator.alloc(bool, vc);
                     var coverage_saved = false;
@@ -1198,12 +1244,9 @@ pub const ForkChoice = struct {
 
             // Find attestation_data entries whose source slot is justified on this chain,
             // that reference blocks we know about, and whose target is not yet justified.
-            // Collect and sort by target slot for deterministic processing order.
-            const MapEntry = struct {
-                att_data: *types.AttestationData,
-                payloads: *types.AggregatedPayloadsList,
-            };
-            var sorted_entries: std.ArrayList(MapEntry) = .empty;
+            // Collect and sort fresh/deep targets first so stale historical keys cannot fill
+            // the MAX_ATTESTATIONS_DATA cap before current aggregates are considered.
+            var sorted_entries: std.ArrayList(ProposalAttestationCandidate) = .empty;
             defer sorted_entries.deinit(self.allocator);
 
             var payload_it = self.latest_known_aggregated_payloads.iterator();
@@ -1247,11 +1290,7 @@ pub const ForkChoice = struct {
                 try sorted_entries.append(self.allocator, .{ .att_data = att_data, .payloads = entry.value_ptr });
             }
 
-            std.mem.sort(MapEntry, sorted_entries.items, {}, struct {
-                fn lessThan(_: void, a: MapEntry, b: MapEntry) bool {
-                    return a.att_data.target.slot < b.att_data.target.slot;
-                }
-            }.lessThan);
+            std.mem.sort(ProposalAttestationCandidate, sorted_entries.items, {}, proposalAttestationCandidateLessThan);
 
             const found_entries = sorted_entries.items.len > 0;
 
@@ -1318,6 +1357,8 @@ pub const ForkChoice = struct {
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_input = agg_attestations.constSlice().len;
+            self.logger.info("single-message aggregation start slot={d}: inputs={d}", .{ slot, compact_input });
             const compact_start_ns = zeam_utils.monotonicTimestampNs();
             const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
@@ -1333,6 +1374,8 @@ pub const ForkChoice = struct {
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
             zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
+            zeam_metrics.metrics.zeam_single_message_aggregation_total.incr();
+            self.logger.info("single-message aggregation complete slot={d}: inputs={d} outputs={d}", .{ slot, compact_input, agg_attestations.constSlice().len });
             observeProposalBuildPhase("compact", compact_start_ns);
 
             // Deadline elapsed → ship what we have; another full iteration
@@ -1892,9 +1935,13 @@ pub const ForkChoice = struct {
     ///
     /// Sections:
     ///   prev_new  – coverage saved just before the last acceptNewAttestationsUnlocked merge
-    ///               (represents the previous slot's new payloads that were accepted)
-    ///   late      – current latest_new_aggregated_payloads for `slot`
+    ///               (represents the previous round's new payloads that were accepted)
+    ///   late      – current latest_new_aggregated_payloads near `slot`
     ///               (payloads that arrived after the last merge — late arrivals)
+    ///
+    /// All sections match data slots in the window (slot - WINDOW, slot] rather
+    /// than exactly `slot`: aggregation matures payloads 2-3 slots after the
+    /// attestation slot, so an exact-slot report is permanently empty.
     ///   block     – payloads observed in the most-recently processed block
     ///   combined  – union of all three
     ///   diff      – validator-coverage delta between block and prev_new
@@ -1939,7 +1986,8 @@ pub const ForkChoice = struct {
 
         // Fill prev_new from the coverage saved before the last merge (if slot matches).
         if (self.saved_pre_merge_new_coverage) |*cov| {
-            if (cov.slot == slot) {
+            // Window match, mirroring collectCoverageFromPayloads.
+            if (cov.slot <= slot and cov.slot +| COVERAGE_REPORT_WINDOW_SLOTS > slot) {
                 const vlen = @min(cov.seen.len, validator_count);
                 @memcpy(prev_new_seen[0..vlen], cov.seen[0..vlen]);
                 const slen = @min(cov.has_subnet.len, committee_count);
@@ -2171,9 +2219,10 @@ pub const ForkChoice = struct {
 
     /// Aggregate attestation signatures using recursive child proofs.
     ///
-    /// Ethlambda-style per-job loop: snapshot once, then for each `att_data`
-    /// run one XMSS prove, commit, and optionally publish before starting the
-    /// next job. Sequential proves avoid ThreadPool × Rayon oversubscription.
+    /// Ethlambda-style aggregate tick: snapshot once, select a
+    /// justification-advancing key path, then run either the single-key fast
+    /// path or bounded parallel multi-key proves before committing/publishing
+    /// the produced aggregates serially.
     fn aggregateUnlocked(
         self: *Self,
         validators: *const types.Validators,
@@ -2208,45 +2257,87 @@ pub const ForkChoice = struct {
 
         const compute_start_ns = zeam_utils.monotonicTimestampNs();
 
-        // Aggregate only the single AttestationData most likely to advance
-        // `fcStore.latest_justified`. All gossip sigs and child payloads
-        // (new + known) registered against the chosen key are still folded
-        // into the aggregate; only the choice of key is narrowed.
-        //
-        // This single-key selection (main #957) supersedes the earlier
-        // deadline-capped multi-key pass: instead of looping over every group
-        // and bailing once AGGREGATION_DEADLINE_MS is spent, we prove exactly
-        // one justification-advancing group per tick. That keeps the per-tick
-        // prove bounded so a multi-second prod-scheme prove can't run past the
-        // slot and starve justification — the same goal the deadline loop had.
+        // Select up to `max_aggregations_per_tick` AttestationData forming a
+        // greedy justification path: the first key advances
+        // `fcStore.latest_justified` to its target, the next is sourced at that
+        // target, and so on, so N proves successively move justification ahead.
+        // All gossip sigs and child payloads (new + known) registered against
+        // each chosen key are still folded into its aggregate; only the choice
+        // of keys is narrowed.
         const latest_justified = self.fcStore.latest_justified;
-        if (selectJustificationAdvancingKey(&snap, att_data_keys, latest_justified)) |data| {
+        // Aggregator fallback floor: an aggregator-role node always produces at
+        // least one aggregation per tick.
+        const configured_max: usize = @max(1, self.max_aggregations_per_tick);
+        const max_keys: usize = @min(configured_max, att_data_keys.len);
+        const key_buf = try self.allocator.alloc(types.AttestationData, max_keys);
+        defer self.allocator.free(key_buf);
+        const selected_keys = selectJustificationAdvancingKeys(&snap, att_data_keys, latest_justified, max_keys, key_buf);
+
+        if (selected_keys.len == 0) {
+            self.logger.debug(
+                "aggregator: no justification-advancing att_data this tick (latest_justified.slot={d}, candidates={d})",
+                .{ latest_justified.slot, att_data_keys.len },
+            );
+        } else {
+            // #985 selection observability: which keys won this tick relative
+            // to the clock slot. A sustained "prev" rate means current-slot
+            // aggregates are being deferred a full slot (the ~4 s tail).
+            const clock_slot = self.fcStore.slot_clock.timeSlots.load(.monotonic);
+            for (selected_keys) |key| {
+                const lag_label: []const u8 = if (key.slot >= clock_slot)
+                    "current"
+                else if (clock_slot - key.slot == 1)
+                    "prev"
+                else
+                    "older";
+                zeam_metrics.metrics.zeam_aggregate_selected_key_lag_total.incr(.{ .lag = lag_label }) catch {};
+            }
+        }
+
+        if (selected_keys.len == 1) {
+            // Single-aggregation fast path (default `--max-aggregations-per-tick 1`):
+            // prove on the calling worker, no nested ThreadPool dispatch. Behaviour
+            // is identical to the pre-multi single-aggregation tick.
             var maybe_result = try types.computeSingleAggregatedSignature(
                 self.allocator,
                 validators,
                 &snap.signatures,
                 &snap.new_payloads,
                 &snap.known_payloads,
-                data,
+                selected_keys[0],
                 self.max_aggregation_children,
             );
             if (maybe_result) |*result| {
-                defer result.attestation.deinit();
-                const att_data = result.attestation.data;
-                const signature = result.signature;
-                if (try self.commitOneAggregateResult(&snap, att_data, signature)) |signed| {
-                    if (publish_fn) |pfn| {
-                        pfn(publish_ctx.?, signed);
-                    } else {
-                        try collected.append(self.allocator, signed);
-                    }
-                }
+                try self.commitAndDispatchAggregate(&snap, result, publish_ctx, publish_fn, &collected);
             }
-        } else {
-            self.logger.debug(
-                "aggregator: no justification-advancing att_data this tick (latest_justified.slot={d}, candidates={d})",
-                .{ latest_justified.slot, att_data_keys.len },
+        } else if (selected_keys.len > 1) {
+            // Multi-aggregation path: prove the justification-path keys in
+            // parallel on the shared ThreadPool, then commit each serially under
+            // `signatures_mutex`.
+            const results = try types.computeAggregatedSignaturesForKeys(
+                self.allocator,
+                validators,
+                &snap.signatures,
+                &snap.new_payloads,
+                &snap.known_payloads,
+                selected_keys,
+                self.thread_pool,
+                self.max_aggregation_children,
             );
+            defer self.allocator.free(results);
+            // Each result fully consumed by `commitAndDispatchAggregate`;
+            // `committed` is advanced BEFORE the fallible call so this errdefer
+            // never double-frees the in-flight result.
+            var committed: usize = 0;
+            errdefer for (results[committed..]) |*r| {
+                r.attestation.deinit();
+                r.signature.deinit();
+            };
+            while (committed < results.len) {
+                var result = results[committed];
+                committed += 1;
+                try self.commitAndDispatchAggregate(&snap, &result, publish_ctx, publish_fn, &collected);
+            }
         }
         observeAggregateBuildPhase("compute_ffi", compute_start_ns);
 
@@ -2268,7 +2359,34 @@ pub const ForkChoice = struct {
         return collected.toOwnedSlice(self.allocator);
     }
 
-    /// Commit one worker-produced aggregate into the live maps.
+    /// Commit one produced aggregate and either publish it (callback path) or
+    /// append it to `collected` (return path). Consumes `result`: deinits its
+    /// attestation and hands its signature to `commitOneAggregateResult` (which
+    /// always takes ownership of the signature, success or error). Shared by the
+    /// single- and multi-aggregation branches of `aggregateUnlocked`.
+    fn commitAndDispatchAggregate(
+        self: *Self,
+        snap: *AggregateSnapshot,
+        result: *types.SingleAggregatedSignature,
+        publish_ctx: ?*anyopaque,
+        publish_fn: ?AggregatePublishCallback,
+        collected: *std.ArrayList(types.SignedAggregatedAttestation),
+    ) !void {
+        defer result.attestation.deinit();
+        const att_data = result.attestation.data;
+        const signature = result.signature;
+        if (try self.commitOneAggregateResult(snap, att_data, signature)) |signed_result| {
+            var signed = signed_result;
+            errdefer signed.deinit();
+            if (publish_fn) |pfn| {
+                pfn(publish_ctx.?, signed);
+            } else {
+                try collected.append(self.allocator, signed);
+            }
+        }
+    }
+
+    /// Commit one worker-produced aggregate (ethlambda `apply_aggregated_group`).
     fn commitOneAggregateResult(
         self: *Self,
         snap: *AggregateSnapshot,
@@ -2278,13 +2396,17 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
+        var owned_signature = signature;
+        var signature_live = true;
+        errdefer if (signature_live) owned_signature.deinit();
+
         if (shouldSuppressDuplicateAggregateCommit(snap, att_data, &self.attestation_signatures)) {
             self.logger.debug(
                 "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
                 .{att_data.slot},
             );
-            var owned_signature = signature;
             owned_signature.deinit();
+            signature_live = false;
             return null;
         }
 
@@ -2294,9 +2416,6 @@ pub const ForkChoice = struct {
         var source_gossip_bits = try types.AggregationBits.init(self.allocator);
         var source_gossip_bits_owned = true;
         errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
-        var owned_signature = signature;
-        var signature_live = true;
-        errdefer if (signature_live) owned_signature.deinit();
         // ssz.serialize corrupts the source value; serialize once, deinit the
         // worker proof, then deserialize separate copies for store and publish
         // so no fallible step runs while signature_live is true.
@@ -2379,6 +2498,20 @@ pub const ForkChoice = struct {
 
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
         zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(participant_count);
+
+        // #985 publish-timing observability: how far past the att_data's
+        // slot start this commit landed, in slot-clock intervals. The duty
+        // fires at interval 2, so on-time commits observe <=3; >=5 means the
+        // aggregate landed in the next slot.
+        {
+            const now_intervals = self.fcStore.slot_clock.time.load(.monotonic);
+            const slot_start_intervals = att_data.slot * constants.INTERVALS_PER_SLOT;
+            const lag_intervals: u64 = if (now_intervals >= slot_start_intervals)
+                now_intervals - slot_start_intervals
+            else
+                0;
+            zeam_metrics.metrics.zeam_aggregate_commit_lag_intervals.observe(@floatFromInt(lag_intervals));
+        }
 
         // Emit a one-line summary per committed aggregate so operators can
         // see what the aggregator just published from structured logs alone
@@ -3968,6 +4101,13 @@ fn checkpointsEqual(a: types.Checkpoint, b: types.Checkpoint) bool {
     return a.slot == b.slot and std.mem.eql(u8, &a.root, &b.root);
 }
 
+fn attestationDataEqual(a: types.AttestationData, b: types.AttestationData) bool {
+    return a.slot == b.slot and
+        checkpointsEqual(a.head, b.head) and
+        checkpointsEqual(a.target, b.target) and
+        checkpointsEqual(a.source, b.source);
+}
+
 /// Total snapshot inputs available for `key`: raw gossip signatures plus
 /// child proofs in both new and known payload maps. Mirrors the counting
 /// used by `pruneTrivialFromAggregateSnapshot`.
@@ -3979,15 +4119,90 @@ fn snapshotInputCount(snap: *const AggregateSnapshot, key: types.AttestationData
     return n;
 }
 
+/// True when one stored proof in `maybe_list` covers every raw vid in `inner`.
+/// Same one-proof-covers-all rule as `types.anyStoredProofCoversAll` /
+/// `shouldSuppressDuplicateAggregateCommit` — per-vid coverage spread across
+/// MULTIPLE proofs does not count (merging those proofs would still add value).
+fn coveredByAnyProofIn(
+    maybe_list: ?types.AggregatedPayloadsList,
+    inner: *const types.SignaturesMap.InnerMap,
+) bool {
+    const list = maybe_list orelse return false;
+    for (list.items) |*stored| {
+        const p = &stored.proof.participants;
+        var all_covered = true;
+        var it = inner.keyIterator();
+        while (it.next()) |vid_ptr| {
+            const vid: usize = @intCast(vid_ptr.*);
+            const covered = vid < p.len() and (p.get(vid) catch false);
+            if (!covered) {
+                all_covered = false;
+                break;
+            }
+        }
+        if (all_covered) return true;
+    }
+    return false;
+}
+
+/// True when proving `key` this tick is guaranteed wasted work (#985):
+///
+///   * it has raw gossip signatures and ONE stored proof (new or known
+///     payloads) already covers every raw vid — the prove result would be
+///     duplicate-suppressed at commit; or
+///   * it has no raw signatures and exactly one stored payload — re-proving
+///     a single child proof reproduces the same participant set.
+///
+/// Keys with no raws but ≥2 stored payloads are NOT covered: merging child
+/// proofs can produce a strictly larger participant set. Keys with no
+/// snapshot inputs at all are also NOT covered — the prove no-ops on them
+/// exactly as it did before this guard, preserving the selector's previous
+/// behaviour for keys outside the snapshot.
+///
+/// Selecting a covered key burns the slot's single interval-2 prove on a
+/// no-op and defers the current slot's aggregate to the next slot — the
+/// direct cause of the ~4 s bimodal publish tail in #985.
+fn snapshotKeyFullyCovered(snap: *const AggregateSnapshot, key: types.AttestationData) bool {
+    const n_payloads = blk: {
+        var n: usize = 0;
+        if (snap.new_payloads.get(key)) |list| n += list.items.len;
+        if (snap.known_payloads.get(key)) |list| n += list.items.len;
+        break :blk n;
+    };
+
+    const inner = snap.signatures.get(key) orelse return n_payloads == 1;
+    if (inner.count() == 0) return n_payloads == 1;
+
+    return coveredByAnyProofIn(snap.new_payloads.get(key), &inner) or
+        coveredByAnyProofIn(snap.known_payloads.get(key), &inner);
+}
+
 /// Picks the single AttestationData this aggregator tick should aggregate,
 /// favouring keys whose votes would advance `latest_justified`.
 ///
+/// Keys that are already fully covered by a committed aggregate
+/// (`snapshotKeyFullyCovered`) are skipped entirely: proving them is a
+/// guaranteed duplicate-suppress, and selecting one burns the slot's single
+/// interval-2 prove while the current slot's aggregate slips a full slot —
+/// the ~4 s bimodal publish tail of #985. When every candidate is covered
+/// the function returns null and the caller skips the tick.
+///
 /// Selection tiers (preferred always wins over fallback, regardless of weight):
 ///   1. preferred: `source == latest_justified` AND `target.slot >= latest_justified.slot`
-///      Ranked by deepest `target.slot`, then max snapshot input count.
+///      Ranked by deepest `target.slot`, then newest `key.slot`, then max
+///      snapshot input count.
 ///   2. fallback:  `source.slot >= latest_justified.slot` (any target).
-///      Ranked by deepest `source.slot`, then max snapshot input count.
+///      Ranked by deepest `source.slot`, then newest `key.slot`, then max
+///      snapshot input count.
 ///   3. neither populated -> null (caller skips the tick entirely)
+///
+/// The `key.slot` tiebreak (#985) runs BEFORE input count: when the previous
+/// and current slot's att_data tie on justification value, the current slot
+/// must win its own interval-2 tick — its aggregate is what the next slot's
+/// proposer collects at interval 0. The previous slot's key typically has
+/// more accumulated inputs (a full slot of gossip vs ~one interval), so an
+/// inputs-first tiebreak systematically deferred the current slot's publish
+/// to the next tick, one slot late.
 ///
 /// The comparisons are `>=`, not `>`: the caller passes the genesis anchor's
 /// `latest_justified` (slot 0), so genesis-sourced bootstrap votes
@@ -4004,41 +4219,125 @@ fn selectJustificationAdvancingKey(
     att_data_keys: []const types.AttestationData,
     latest_justified: types.Checkpoint,
 ) ?types.AttestationData {
-    var best_preferred: ?types.AttestationData = null;
-    var best_preferred_inputs: usize = 0;
+    const best_preferred = selectBestPreferredKey(snap, att_data_keys, latest_justified, &.{});
+
     var best_fallback: ?types.AttestationData = null;
     var best_fallback_inputs: usize = 0;
-
     for (att_data_keys) |key| {
+        if (snapshotKeyFullyCovered(snap, key)) continue;
+        // Skip keys already eligible for the preferred tier — those are handled
+        // by `selectBestPreferredKey` above.
+        if (checkpointsEqual(key.source, latest_justified) and key.target.slot >= latest_justified.slot) continue;
+        if (key.source.slot < latest_justified.slot) continue;
         const inputs = snapshotInputCount(snap, key);
-
-        if (checkpointsEqual(key.source, latest_justified) and key.target.slot >= latest_justified.slot) {
-            const replace = if (best_preferred) |cur|
-                (key.target.slot > cur.target.slot or
-                    (key.target.slot == cur.target.slot and inputs > best_preferred_inputs))
-            else
-                true;
-            if (replace) {
-                best_preferred = key;
-                best_preferred_inputs = inputs;
-            }
-            continue;
-        }
-
-        if (key.source.slot >= latest_justified.slot) {
-            const replace = if (best_fallback) |cur|
-                (key.source.slot > cur.source.slot or
-                    (key.source.slot == cur.source.slot and inputs > best_fallback_inputs))
-            else
-                true;
-            if (replace) {
-                best_fallback = key;
-                best_fallback_inputs = inputs;
-            }
+        const replace = if (best_fallback) |cur|
+            (key.source.slot > cur.source.slot or
+                (key.source.slot == cur.source.slot and key.slot > cur.slot) or
+                (key.source.slot == cur.source.slot and key.slot == cur.slot and inputs > best_fallback_inputs))
+        else
+            true;
+        if (replace) {
+            best_fallback = key;
+            best_fallback_inputs = inputs;
         }
     }
 
     return best_preferred orelse best_fallback;
+}
+
+/// Preferred-tier pick for one justified checkpoint: among `att_data_keys` whose
+/// `source == justified` AND `target.slot >= justified.slot`, returns the key
+/// with the deepest `target.slot` (then newest `key.slot`, then max snapshot
+/// input count, then lex-first since callers pre-sort). Keys already present in
+/// `chosen` are skipped so a chain walk does not reselect the same key. Fully
+/// covered keys are skipped. Returns null when none remain.
+///
+/// Pure / unit-testable: no I/O, no allocator, no locking.
+fn selectBestPreferredKey(
+    snap: *const AggregateSnapshot,
+    att_data_keys: []const types.AttestationData,
+    justified: types.Checkpoint,
+    chosen: []const types.AttestationData,
+) ?types.AttestationData {
+    var best: ?types.AttestationData = null;
+    var best_inputs: usize = 0;
+
+    for (att_data_keys) |key| {
+        if (snapshotKeyFullyCovered(snap, key)) continue;
+        if (!checkpointsEqual(key.source, justified) or key.target.slot < justified.slot) continue;
+
+        var already_chosen = false;
+        for (chosen) |c| {
+            if (attestationDataEqual(c, key)) {
+                already_chosen = true;
+                break;
+            }
+        }
+        if (already_chosen) continue;
+
+        const inputs = snapshotInputCount(snap, key);
+        const replace = if (best) |cur|
+            (key.target.slot > cur.target.slot or
+                (key.target.slot == cur.target.slot and key.slot > cur.slot) or
+                (key.target.slot == cur.target.slot and key.slot == cur.slot and inputs > best_inputs))
+        else
+            true;
+        if (replace) {
+            best = key;
+            best_inputs = inputs;
+        }
+    }
+
+    return best;
+}
+
+/// Greedy justification-path selection. Starting from `latest_justified`, picks
+/// the deepest-target preferred key (`selectBestPreferredKey`), then treats that
+/// key's `target` as the projected-justified checkpoint and repeats — up to
+/// `max_count` keys. Each successive key is sourced at the previous key's
+/// target, so the chain T0 -> T1 -> T2 ... successively advances justification
+/// when the produced aggregates are imported.
+///
+/// Results are written into `out` (len >= max_count required) and the filled
+/// prefix is returned. When no preferred key exists for `latest_justified`,
+/// falls back to the single `selectJustificationAdvancingKey` result so the
+/// fallback tier (`source.slot >= justified.slot`) still yields a bootstrap /
+/// stall aggregate.
+///
+/// `max_count == 1` reproduces `selectJustificationAdvancingKey` exactly
+/// (preferred tier when present, else fallback), preserving the pre-existing
+/// single-aggregation behaviour.
+///
+/// Pure / unit-testable: no I/O, no allocator, no locking.
+fn selectJustificationAdvancingKeys(
+    snap: *const AggregateSnapshot,
+    att_data_keys: []const types.AttestationData,
+    latest_justified: types.Checkpoint,
+    max_count: usize,
+    out: []types.AttestationData,
+) []types.AttestationData {
+    if (max_count == 0 or out.len == 0) return out[0..0];
+
+    var len: usize = 0;
+    var current = latest_justified;
+    while (len < max_count and len < out.len) {
+        const key = selectBestPreferredKey(snap, att_data_keys, current, out[0..len]) orelse break;
+        out[len] = key;
+        len += 1;
+        // Project justification forward: this key's target is the source the
+        // next chain step must match.
+        current = key.target;
+    }
+
+    if (len == 0) {
+        if (selectJustificationAdvancingKey(snap, att_data_keys, latest_justified)) |key| {
+            out[0] = key;
+            return out[0..1];
+        }
+        return out[0..0];
+    }
+
+    return out[0..len];
 }
 
 test "selectJustificationAdvancingKey: empty keys -> null" {
@@ -4237,6 +4536,362 @@ test "selectJustificationAdvancingKey: deepest source wins within fallback tier"
     const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
     try std.testing.expect(picked != null);
     try std.testing.expectEqual(deep, picked.?);
+}
+
+/// Test helper (#985): build a StoredAggregatedPayload whose proof covers
+/// exactly `covered_vids`. Caller owns the returned payload's interior
+/// allocations via the snapshot's deinit (insert into a payloads map).
+fn testMakeStoredPayload(allocator: Allocator, slot: types.Slot, covered_vids: []const usize) !types.StoredAggregatedPayload {
+    var proof = try types.SingleMessageAggregate.init(allocator);
+    errdefer proof.deinit();
+    for (covered_vids) |vid| {
+        try types.aggregationBitsSet(&proof.participants, vid, true);
+    }
+    return .{ .slot = slot, .proof = proof };
+}
+
+test "selectJustificationAdvancingKey (#985): tie on target.slot -> newer key.slot beats heavier inputs" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xDD;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    // Previous slot's key: a full slot of accumulated gossip (3 raws).
+    const prev_key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+    // Current slot's key: same justification value, fewer raws so far.
+    const current_key = types.AttestationData{
+        .slot = 9,
+        .head = .{ .root = alt_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var prev_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try prev_inner.put(0, stored_sig);
+    try prev_inner.put(1, stored_sig);
+    try prev_inner.put(2, stored_sig);
+    try snap.signatures.put(prev_key, prev_inner);
+    var current_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try current_inner.put(3, stored_sig);
+    try snap.signatures.put(current_key, current_inner);
+
+    // Pre-#985 the inputs tiebreak picked prev_key (3 inputs vs 1), deferring
+    // the current slot's aggregate a full slot. Newer key.slot must win.
+    const keys = [_]types.AttestationData{ prev_key, current_key };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(current_key, picked.?);
+}
+
+test "selectJustificationAdvancingKey (#985): fully-covered key is skipped" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xEE;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    // Covered key has the DEEPER target, so absent the coverage guard it
+    // would win the tier outright.
+    const covered_key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 8 },
+        .source = latest_justified,
+    };
+    const fresh_key = types.AttestationData{
+        .slot = 9,
+        .head = .{ .root = alt_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var covered_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try covered_inner.put(0, stored_sig);
+    try covered_inner.put(1, stored_sig);
+    try snap.signatures.put(covered_key, covered_inner);
+    var fresh_inner = types.SignaturesMap.InnerMap.init(allocator);
+    try fresh_inner.put(2, stored_sig);
+    try snap.signatures.put(fresh_key, fresh_inner);
+
+    // Stored proof for covered_key spans vids {0,1} — every raw covered, so
+    // re-proving it would be duplicate-suppressed at commit.
+    var covered_list: types.AggregatedPayloadsList = .empty;
+    try covered_list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{ 0, 1 }));
+    try snap.new_payloads.put(covered_key, covered_list);
+
+    const keys = [_]types.AttestationData{ covered_key, fresh_key };
+    const picked = selectJustificationAdvancingKey(&snap, &keys, latest_justified);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqual(fresh_key, picked.?);
+}
+
+test "selectJustificationAdvancingKey (#985): all candidates covered -> null (tick skipped)" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xF0;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = latest_justified,
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var inner = types.SignaturesMap.InnerMap.init(allocator);
+    try inner.put(0, stored_sig);
+    try snap.signatures.put(key, inner);
+
+    var list: types.AggregatedPayloadsList = .empty;
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{0}));
+    try snap.known_payloads.put(key, list);
+
+    const keys = [_]types.AttestationData{key};
+    try std.testing.expect(selectJustificationAdvancingKey(&snap, &keys, latest_justified) == null);
+}
+
+test "snapshotKeyFullyCovered (#985): payload-only key with two payloads is mergeable, not covered" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = zero_root, .slot = 7 },
+        .source = .{ .root = zero_root, .slot = 5 },
+    };
+
+    var list: types.AggregatedPayloadsList = .empty;
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{0}));
+    try snap.new_payloads.put(key, list);
+
+    // One payload, no raws: nothing to merge — covered.
+    try std.testing.expect(snapshotKeyFullyCovered(&snap, key));
+
+    var second_list = snap.new_payloads.getPtr(key).?;
+    try second_list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{1}));
+
+    // Two payloads: merging them adds coverage — not covered.
+    try std.testing.expect(!snapshotKeyFullyCovered(&snap, key));
+}
+
+test "snapshotKeyFullyCovered (#985): coverage split across two proofs does not count" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const key = types.AttestationData{
+        .slot = 8,
+        .head = .{ .root = zero_root, .slot = 0 },
+        .target = .{ .root = zero_root, .slot = 7 },
+        .source = .{ .root = zero_root, .slot = 5 },
+    };
+
+    const stored_sig = types.StoredSignature{
+        .slot = 8,
+        .signature = std.mem.zeroes(@TypeOf(@as(types.StoredSignature, undefined).signature)),
+    };
+    var inner = types.SignaturesMap.InnerMap.init(allocator);
+    try inner.put(0, stored_sig);
+    try inner.put(1, stored_sig);
+    try snap.signatures.put(key, inner);
+
+    // vid 0 covered by one proof, vid 1 by another — no SINGLE proof covers
+    // both, so a merge prove still adds value. Must not be treated covered.
+    var list: types.AggregatedPayloadsList = .empty;
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{0}));
+    try list.append(allocator, try testMakeStoredPayload(allocator, 8, &.{1}));
+    try snap.new_payloads.put(key, list);
+
+    try std.testing.expect(!snapshotKeyFullyCovered(&snap, key));
+}
+
+/// Builds the 3-step justification chain used by the multi-key tests:
+/// J(slot 5) -> key1.target T1(slot 6) -> key2.target T2(slot 7) ->
+/// key3.target T3(slot 8). Each key is sourced at the previous key's target.
+fn buildJustificationChainKeys() struct {
+    justified: types.Checkpoint,
+    key1: types.AttestationData,
+    key2: types.AttestationData,
+    key3: types.AttestationData,
+} {
+    const zero_root = std.mem.zeroes(types.Root);
+    var r1 = std.mem.zeroes(types.Root);
+    r1[0] = 0x11;
+    var r2 = std.mem.zeroes(types.Root);
+    r2[0] = 0x22;
+    var r3 = std.mem.zeroes(types.Root);
+    r3[0] = 0x33;
+
+    const justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    const t1 = types.Checkpoint{ .root = r1, .slot = 6 };
+    const t2 = types.Checkpoint{ .root = r2, .slot = 7 };
+    const t3 = types.Checkpoint{ .root = r3, .slot = 8 };
+
+    return .{
+        .justified = justified,
+        .key1 = .{ .slot = 6, .head = .{ .root = r1, .slot = 6 }, .target = t1, .source = justified },
+        .key2 = .{ .slot = 7, .head = .{ .root = r2, .slot = 7 }, .target = t2, .source = t1 },
+        .key3 = .{ .slot = 8, .head = .{ .root = r3, .slot = 8 }, .target = t3, .source = t2 },
+    };
+}
+
+test "selectJustificationAdvancingKeys: walks the full justification chain in order" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const chain = buildJustificationChainKeys();
+    // Deliberately out of chain order to confirm the walk, not slice order, drives selection.
+    const keys = [_]types.AttestationData{ chain.key3, chain.key1, chain.key2 };
+
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, chain.justified, 3, &out);
+    try std.testing.expectEqual(@as(usize, 3), selected.len);
+    try std.testing.expectEqual(chain.key1, selected[0]);
+    try std.testing.expectEqual(chain.key2, selected[1]);
+    try std.testing.expectEqual(chain.key3, selected[2]);
+}
+
+test "selectJustificationAdvancingKeys: max_count caps the chain length" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const chain = buildJustificationChainKeys();
+    const keys = [_]types.AttestationData{ chain.key1, chain.key2, chain.key3 };
+
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, chain.justified, 2, &out);
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    try std.testing.expectEqual(chain.key1, selected[0]);
+    try std.testing.expectEqual(chain.key2, selected[1]);
+}
+
+test "selectJustificationAdvancingKeys: max_count==1 matches the single-key selector" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const chain = buildJustificationChainKeys();
+    const keys = [_]types.AttestationData{ chain.key1, chain.key2, chain.key3 };
+
+    var out: [1]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, chain.justified, 1, &out);
+    const single = selectJustificationAdvancingKey(&snap, &keys, chain.justified);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expect(single != null);
+    try std.testing.expectEqual(single.?, selected[0]);
+    try std.testing.expectEqual(chain.key1, selected[0]);
+}
+
+test "selectJustificationAdvancingKeys: falls back to single fallback-tier key when no preferred" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    var alt_root = std.mem.zeroes(types.Root);
+    alt_root[0] = 0xDD;
+
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 5 };
+    // No key is sourced at `latest_justified`; only a fallback-tier key
+    // (source.slot >= justified.slot but source != justified) is present.
+    const fallback_key = types.AttestationData{
+        .slot = 9,
+        .head = .{ .root = alt_root, .slot = 9 },
+        .target = .{ .root = alt_root, .slot = 7 },
+        .source = .{ .root = alt_root, .slot = 6 },
+    };
+    const keys = [_]types.AttestationData{fallback_key};
+
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &keys, latest_justified, 3, &out);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqual(fallback_key, selected[0]);
+}
+
+test "selectJustificationAdvancingKeys: empty candidates -> empty result" {
+    const allocator = std.testing.allocator;
+    var snap = AggregateSnapshot{
+        .signatures = types.SignaturesMap.init(allocator),
+        .new_payloads = AggregatedPayloadsMap.init(allocator),
+        .known_payloads = AggregatedPayloadsMap.init(allocator),
+    };
+    defer snap.deinit(allocator);
+
+    const zero_root = std.mem.zeroes(types.Root);
+    const latest_justified = types.Checkpoint{ .root = zero_root, .slot = 0 };
+    var out: [3]types.AttestationData = undefined;
+    const selected = selectJustificationAdvancingKeys(&snap, &.{}, latest_justified, 3, &out);
+    try std.testing.expectEqual(@as(usize, 0), selected.len);
 }
 
 /// Returns true when an `att_data` in the aggregator's snapshot is
@@ -4527,6 +5182,13 @@ fn pruneTrivialFromAggregateSnapshot(
     );
 }
 
+/// Coverage-report slot window. Aggregated payloads for attestation data made
+/// at slot S mature through the pipeline (gossip aggregate -> latest_new ->
+/// rotation -> latest_known / block inclusion) over the following ~2-3 slots,
+/// so a "last round" report keyed to a single exact data slot never matches
+/// anything; it must look back a few data slots.
+const COVERAGE_REPORT_WINDOW_SLOTS: types.Slot = 4;
+
 fn collectCoverageFromPayloads(
     map: *AggregatedPayloadsMap,
     slot: types.Slot,
@@ -4538,9 +5200,10 @@ fn collectCoverageFromPayloads(
 ) void {
     var it = map.iterator();
     while (it.next()) |entry| {
-        if (entry.key_ptr.slot != slot) continue;
+        // Window match (slot - WINDOW, slot]: see COVERAGE_REPORT_WINDOW_SLOTS.
+        if (entry.key_ptr.slot > slot or entry.key_ptr.slot +| COVERAGE_REPORT_WINDOW_SLOTS <= slot) continue;
         for (entry.value_ptr.items) |*stored| {
-            if (stored.slot != slot) continue;
+            if (stored.slot > slot or stored.slot +| COVERAGE_REPORT_WINDOW_SLOTS <= slot) continue;
             for (0..stored.proof.participants.len()) |validator_index| {
                 if (validator_index >= seen.len) continue;
                 if (!(stored.proof.participants.get(validator_index) catch false)) continue;
@@ -4955,6 +5618,193 @@ const RebaseTestContext = struct {
         self.mock_chain.deinit(self.allocator);
     }
 };
+
+test "getProposalAttestations: high-target keys survive cap with stale low-target backlog" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 32);
+    defer ctx.deinit();
+
+    const source_root = createTestRoot(0xAA);
+    const head_root = createTestRoot(0xFF);
+    const parent_root = head_root;
+    const proposal_slot: types.Slot = 130;
+
+    ctx.mock_chain.genesis_state.latest_finalized = .{ .root = source_root, .slot = 0 };
+    ctx.mock_chain.genesis_state.latest_justified = .{ .root = source_root, .slot = 0 };
+
+    while (ctx.mock_chain.genesis_state.historical_block_hashes.len() <= proposal_slot) {
+        try ctx.mock_chain.genesis_state.historical_block_hashes.append(types.ZERO_HASH);
+    }
+    ctx.mock_chain.genesis_state.historical_block_hashes.slice()[0] = source_root;
+
+    var att_data: [12]types.AttestationData = undefined;
+
+    // More than MAX_ATTESTATIONS_DATA stale low-target keys: these reproduced #989
+    // by filling the old ascending-target cap before current aggregates were seen.
+    for (0..8) |i| {
+        const target_slot: types.Slot = @intCast(20 + i);
+        const target_root = createTestRoot(@intCast(0x20 + i));
+        ctx.mock_chain.genesis_state.historical_block_hashes.slice()[target_slot] = target_root;
+        att_data[i] = .{
+            .slot = @intCast(30 + i),
+            .head = .{ .root = head_root, .slot = 8 },
+            .target = .{ .root = target_root, .slot = target_slot },
+            .source = .{ .root = source_root, .slot = 0 },
+        };
+    }
+
+    // Fresh high-target keys where current aggregation concentrates proofs.
+    for (8..12) |i| {
+        const target_slot: types.Slot = @intCast(100 + i);
+        const target_root = createTestRoot(@intCast(0x40 + i));
+        ctx.mock_chain.genesis_state.historical_block_hashes.slice()[target_slot] = target_root;
+        att_data[i] = .{
+            .slot = @intCast(110 + i),
+            .head = .{ .root = head_root, .slot = 8 },
+            .target = .{ .root = target_root, .slot = target_slot },
+            .source = .{ .root = source_root, .slot = 0 },
+        };
+    }
+
+    for (&att_data, 0..) |*data, i| {
+        var proof = try types.SingleMessageAggregate.init(allocator);
+        defer proof.deinit();
+        try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
+        try ctx.fork_choice.storeAggregatedPayload(data, proof, true);
+    }
+
+    // Use an already-elapsed deadline so this selection-level regression test
+    // stops after compaction and does not depend on STF loop restarts.
+    const elapsed_deadline: i64 = @intCast(zeam_utils.monotonicTimestampNs() - std.time.ns_per_s);
+    var result = try ctx.fork_choice.getProposalAttestations(
+        &ctx.mock_chain.genesis_state,
+        proposal_slot,
+        0,
+        parent_root,
+        elapsed_deadline,
+    );
+    defer {
+        for (result.attestations.slice()) |*att| att.deinit();
+        result.attestations.deinit();
+        for (result.signatures.slice()) |*sig| sig.deinit();
+        result.signatures.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, ctx.fork_choice.config.spec.max_attestations_data), result.attestations.constSlice().len);
+
+    var high_target_count: usize = 0;
+    for (result.attestations.constSlice()) |att| {
+        if (att.data.target.slot >= 100) high_target_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), high_target_count);
+}
+
+fn makeProposalSelectionTestAttData(slot: types.Slot, target_slot: types.Slot, root_byte: u8) types.AttestationData {
+    const root = createTestRoot(root_byte);
+    const source_root = createTestRoot(0x01);
+    return .{
+        .slot = slot,
+        .head = .{ .root = root, .slot = slot },
+        .target = .{ .root = root, .slot = target_slot },
+        .source = .{ .root = source_root, .slot = 1 },
+    };
+}
+
+fn appendProposalSelectionPayloads(
+    allocator: Allocator,
+    list: *AggregatedPayloadsList,
+    count: usize,
+) !void {
+    for (0..count) |i| {
+        var proof = try types.SingleMessageAggregate.init(allocator);
+        errdefer proof.deinit();
+        try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
+        try list.append(allocator, .{ .slot = @intCast(i), .proof = proof });
+    }
+}
+
+test "proposal attestation selection: high target beats stale low target even if low key is newer" {
+    var high = makeProposalSelectionTestAttData(90, 100, 0xA0);
+    var stale = makeProposalSelectionTestAttData(120, 10, 0xB0);
+    var high_payloads: AggregatedPayloadsList = .empty;
+    var stale_payloads: AggregatedPayloadsList = .empty;
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &stale, .payloads = &stale_payloads },
+        .{ .att_data = &high, .payloads = &high_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.target.slot);
+    try std.testing.expectEqual(@as(types.Slot, 10), candidates[1].att_data.target.slot);
+}
+
+test "proposal attestation selection: payload count wins before attestation slot when target ties" {
+    const allocator = std.testing.allocator;
+    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
+    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
+    var previous_payloads: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &previous_payloads);
+    var current_payloads: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &current_payloads);
+
+    try appendProposalSelectionPayloads(allocator, &previous_payloads, 3);
+    try appendProposalSelectionPayloads(allocator, &current_payloads, 1);
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &current_slot, .payloads = &current_payloads },
+        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 99), candidates[0].att_data.slot);
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[1].att_data.slot);
+}
+
+test "proposal attestation selection: newest attestation slot wins after equal target and payload count" {
+    var previous_slot = makeProposalSelectionTestAttData(99, 100, 0xA1);
+    var current_slot = makeProposalSelectionTestAttData(100, 100, 0xA2);
+    var previous_payloads: AggregatedPayloadsList = .empty;
+    var current_payloads: AggregatedPayloadsList = .empty;
+
+    var candidates = [_]ProposalAttestationCandidate{
+        .{ .att_data = &previous_slot, .payloads = &previous_payloads },
+        .{ .att_data = &current_slot, .payloads = &current_payloads },
+    };
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    try std.testing.expectEqual(@as(types.Slot, 100), candidates[0].att_data.slot);
+    try std.testing.expectEqual(@as(types.Slot, 99), candidates[1].att_data.slot);
+}
+
+test "proposal attestation selection: 8-key cap is not filled exclusively by stale low targets" {
+    var att_data: [12]types.AttestationData = undefined;
+    var payloads: [12]AggregatedPayloadsList = undefined;
+    var candidates: [12]ProposalAttestationCandidate = undefined;
+
+    for (&payloads) |*list| list.* = .empty;
+
+    // Eight stale keys would have filled the old ascending-target cap first.
+    for (0..8) |i| {
+        att_data[i] = makeProposalSelectionTestAttData(@intCast(10 + i), @intCast(20 + i), @intCast(0x20 + i));
+    }
+    // Four fresh high-target keys must lead the sorted candidate list.
+    for (8..12) |i| {
+        att_data[i] = makeProposalSelectionTestAttData(@intCast(90 + i), @intCast(100 + i), @intCast(0x40 + i));
+    }
+    for (0..12) |i| {
+        candidates[i] = .{ .att_data = &att_data[i], .payloads = &payloads[i] };
+    }
+
+    std.mem.sort(ProposalAttestationCandidate, &candidates, {}, proposalAttestationCandidateLessThan);
+
+    var high_target_count_in_cap: usize = 0;
+    for (candidates[0..8]) |candidate| {
+        if (candidate.att_data.target.slot >= 100) high_target_count_in_cap += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), high_target_count_in_cap);
+    try std.testing.expect(candidates[0].att_data.target.slot > candidates[7].att_data.target.slot);
+}
 
 test "rebase: parent pointer integrity after pruning" {
     // ========================================
@@ -6100,4 +6950,77 @@ test "rebase: to fork branch node (G) removes previous canonical chain" {
     try std.testing.expect(ctx.fork_choice.attestations.get(2).?.latestKnown.?.index == 1);
     // I: 8 -> 2
     try std.testing.expect(ctx.fork_choice.attestations.get(3).?.latestKnown.?.index == 2);
+}
+
+test "collectCoverageFromPayloads matches data slots within the report window" {
+    const allocator = std.testing.allocator;
+    const data_slot: types.Slot = 100;
+
+    var map = AggregatedPayloadsMap.init(allocator);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |*stored| stored.proof.deinit();
+            entry.value_ptr.deinit(allocator);
+        }
+        map.deinit();
+    }
+
+    // One stored payload for attestation data made at `data_slot`, with
+    // validators 1 and 3 as participants.
+    var proof = try types.SingleMessageAggregate.init(allocator);
+    errdefer proof.deinit();
+    try types.aggregationBitsSet(&proof.participants, 1, true);
+    try types.aggregationBitsSet(&proof.participants, 3, true);
+
+    const att_data = types.AttestationData{
+        .slot = data_slot,
+        .head = .{ .root = [_]u8{0} ** 32, .slot = data_slot },
+        .target = .{ .root = [_]u8{0} ** 32, .slot = data_slot },
+        .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+    };
+    const gop = try map.getOrPut(att_data);
+    gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(allocator, .{ .slot = data_slot, .proof = proof });
+
+    const validator_count = 8;
+    const committee_count: types.SubnetId = 1;
+    var seen: [validator_count]bool = undefined;
+    var combined_seen: [validator_count]bool = undefined;
+    var has_subnet: [1]bool = undefined;
+    var combined_has: [1]bool = undefined;
+
+    const reset = struct {
+        fn run(s: []bool, cs: []bool, h: []bool, ch: []bool) void {
+            @memset(s, false);
+            @memset(cs, false);
+            @memset(h, false);
+            @memset(ch, false);
+        }
+    }.run;
+
+    // Report asked 2 slots after the data slot (the realistic aggregation
+    // pipeline lag): must match through the window.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot + 2, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(seen[1]);
+    try std.testing.expect(seen[3]);
+    try std.testing.expect(!seen[0]);
+    try std.testing.expect(has_subnet[0]);
+
+    // Exact-slot report still matches (window upper bound is inclusive).
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(seen[1]);
+
+    // Past the window: no match.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot + COVERAGE_REPORT_WINDOW_SLOTS, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(!seen[1]);
+    try std.testing.expect(!has_subnet[0]);
+
+    // Future data (report slot BEFORE the data slot): no match.
+    reset(&seen, &combined_seen, &has_subnet, &combined_has);
+    collectCoverageFromPayloads(&map, data_slot - 1, committee_count, &seen, &combined_seen, &has_subnet, &combined_has);
+    try std.testing.expect(!seen[1]);
 }

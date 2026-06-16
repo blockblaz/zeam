@@ -93,6 +93,10 @@ pub const ChainOpts = struct {
     /// per-`ForkChoice` recursive-child cap. See
     /// `pkgs/types/src/block.zig:default_max_aggregation_children`.
     max_aggregation_children: u32 = types.default_max_aggregation_children,
+    /// Surfaces the `--max-aggregations-per-tick` CLI flag to the
+    /// per-`ForkChoice` justification-path aggregation cap. See
+    /// `pkgs/types/src/block.zig:default_max_aggregations_per_tick`.
+    max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
     /// Max in-flight aggregations on the shared `ThreadPool`. Soft ceiling
     /// enforced lock-free by `submitAggregateOnInterval`. When the cap is
     /// reached the trigger is coalesced into `aggregate_reschedule_intervals`
@@ -458,7 +462,7 @@ pub const BeamChain = struct {
 
     /// The block proof is a recursive-STARK Type-2 merge that takes seconds at the
     /// prod scheme — far longer than an 800ms interval. Running it on the libxev slot loop would
-    /// freeze gossip/tick handling, so `submitProposeOnInterval` offloads the whole propose
+    /// freeze gossip/tick handling, so `submitPropose` offloads the whole propose
     /// (produceBlock + buildBlockProof + publishBlock) to a `thread_pool` worker, mirroring the
     /// aggregate worker. At most one propose runs at a time; a second trigger is dropped (the next
     /// slot re-proposes). `proposeImpl` decrements on exit.
@@ -605,6 +609,7 @@ pub const BeamChain = struct {
             .thread_pool = opts.thread_pool,
             .min_aggregation_inputs = opts.min_aggregation_inputs,
             .max_aggregation_children = opts.max_aggregation_children,
+            .max_aggregations_per_tick = opts.max_aggregations_per_tick,
         });
 
         var states = std.AutoHashMap(types.Root, *RcBeamState).init(allocator);
@@ -2882,6 +2887,13 @@ pub const BeamChain = struct {
         // co-held while we wait on prove_gate (leaf acquisition — no deadlock).
         self.prove_gate.lock();
         defer self.prove_gate.unlock();
+        // zeam-specific: time JUST the Type-2 multi-message STARK merge (the proposal
+        // critical-path cost between produceBlock and publish). Component count
+        // (distinct AttestationData) is known up front from the produced block.
+        const n_components = produced.block.body.attestations.constSlice().len;
+        zeam_metrics.metrics.zeam_block_proof_merge_started_total.incr();
+        self.logger.info("Type-2 block-proof STARK merge start slot={d} components={d}", .{ produced.block.slot, n_components });
+        const merge_start_ns = zeam_utils.monotonicTimestampNs();
         try types.buildType2BlockProof(
             self.allocator,
             &state_snapshot.validators,
@@ -2893,6 +2905,15 @@ pub const BeamChain = struct {
             proposer_sig,
             out_proof,
         );
+        const merge_secs: f32 = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - merge_start_ns)) / 1_000_000_000.0;
+        // Label by component count (distinct AttestationData) so the histogram shows the
+        // per-component scaling of the merge. Formatted directly so the label tracks the
+        // configured max_attestations_data automatically (the block enforces that bound, so
+        // cardinality stays small); the metrics lib dupes label values, so this stack buffer is safe.
+        var comp_buf: [8]u8 = undefined;
+        const components_label = std.fmt.bufPrint(&comp_buf, "{d}", .{n_components}) catch "overflow";
+        zeam_metrics.metrics.zeam_block_proof_merge_time_seconds.observe(.{ .components = components_label }, merge_secs) catch {};
+        self.logger.info("Type-2 block-proof STARK merge slot={d} components={d}: {d:.3}s", .{ produced.block.slot, n_components, merge_secs });
     }
 
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
@@ -3640,6 +3661,25 @@ pub const BeamChain = struct {
 
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
+            // Locally produced blocks (and duplicate re-imports): produceBlock already
+            // ran the transition and cached the post state, so reuse it instead of
+            // re-cloning the parent and re-running verify + the transition — work
+            // whose result `statesCommitKeepExisting` below discards anyway because
+            // the map entry already exists. The caller cannot hand us the cached
+            // state via `blockInfo.postState`: `statesGet` returns a `BorrowedState`
+            // whose read side must not be held across the exclusive commit below
+            // (the deadlock that removed the original shortcut), and the
+            // caller-supplied path deep-clones the value a second time. Resolving
+            // the cache here keeps one owned clone and a single flow.
+            reuse: {
+                if (self.forkChoice.getBlock(block_root) == null) break :reuse;
+                var cached_borrow = self.statesGet(block_root) orelse break :reuse;
+                defer cached_borrow.assertReleasedOrPanic();
+                const snapshot = try cached_borrow.cloneAndRelease(self.allocator);
+                step_watch.lap("cached_post_state_reuse");
+                break :computedstate snapshot;
+            }
+
             // 1. Snapshot parent state under `states_lock.shared`, then
             //    release. Verify + STF run on the owned snapshot so we
             //    don't hold the read lock across the long FFI window.
@@ -5013,19 +5053,16 @@ pub const BeamChain = struct {
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
-    /// Trigger off-loop block production for `time_intervals` if this node is the
-    /// proposer for the slot. Called from the libxev interval tick at interval-in-slot 0; returns
-    /// within microseconds. The whole propose (produceBlock + Type-2 merge + publishBlock) runs on
-    /// a `thread_pool` worker so the multi-second prod-scheme merge never freezes the slot loop.
-    /// At most one propose is in flight; a second trigger is dropped (the next slot re-proposes).
-    pub fn submitProposeOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
-        if (time_intervals % constants.INTERVALS_PER_SLOT != 0) return;
-        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-
-        // Only the node running this slot's proposer does anything.
-        const validator = if (node.validator) |*v| v else return;
-        const proposer_id = validator.getSlotProposer(slot) orelse return;
-
+    /// Trigger off-loop block production for an already-resolved proposer duty.
+    /// The "am I proposer this slot?" decision is the validator client's
+    /// (`ValidatorClient.onInterval` resolves `proposer_id` via `getSlotProposer`
+    /// and calls this at interval-in-slot 0); this function owns only the
+    /// chain-state gating (sync status) and the off-loop dispatch, and returns
+    /// within microseconds. The whole propose (produceBlock + Type-2 merge +
+    /// publishBlock) runs on a `thread_pool` worker so the multi-second
+    /// prod-scheme merge never freezes the slot loop. At most one propose is in
+    /// flight; a second trigger is dropped (the next slot re-proposes).
+    pub fn submitPropose(self: *Self, node: *@import("./node.zig").BeamNode, slot: usize, proposer_id: usize) void {
         // Sync gating (the checks the old on-loop maybeDoProposal performed).
         switch (self.getSyncStatus()) {
             .synced => {},
@@ -5081,6 +5118,17 @@ pub const BeamChain = struct {
         const worker_timer = zeam_metrics.lean_block_building_time_seconds.start();
         defer _ = worker_timer.observe();
 
+        chain.logger.info("block proposer started slot={d} proposer={d}", .{ slot, proposer_id });
+        zeam_metrics.metrics.zeam_block_proposer_started_total.incr();
+        // Records the proposer outcome across every exit path (all the `.err`
+        // early-returns below leave this "failed"; flipped to "success" right
+        // before the publish-success log).
+        var proposer_result: []const u8 = "failed";
+        defer {
+            zeam_metrics.metrics.zeam_block_proposer_completed_total.incr(.{ .result = proposer_result }) catch {};
+            chain.logger.info("block proposer ended slot={d} proposer={d} result={s}", .{ slot, proposer_id, proposer_result });
+        }
+
         const validator = if (node.validator) |*v| v else return;
 
         // Cap single-message attestation aggregation at `proposal_deadline_pct`% of the
@@ -5103,11 +5151,24 @@ pub const BeamChain = struct {
 
         chain.logger.info("produced block for slot={d} proposer={d} root={x}", .{ slot, proposer_id, &produced_block.blockRoot });
 
+        // TODO - since signing needs to be architectrually seggregated from the nodes, move following section needs to move to validator_client
+        // 1. signing by the validator to get proposer signature
+        // 2. building block proof as done underneath
+        // 3. returning the signed block as array of gossip objects like in mayBeDoAttestation which will make node handle the publish in its onInterval
+        //
+        // All this needs to happen from the mayBeDoProposal which will first call node to produce and return the block with signtaures
+        // This also frees up the node from building the merge proof in the architecture where validator client runs separately from node
+        // alleviating node from the hardwork so that it can also serve validators altruistically
         const proposer_signature = validator.key_manager.signBlockRoot(proposer_id, &produced_block.blockRoot, @intCast(slot)) catch |e| {
             chain.logger.err("propose worker: signBlockRoot failed slot={d}: {any}", .{ slot, e });
             return;
         };
 
+        chain.logger.info("produced block signed, building block proof for slot={d} proposer={d} root={x}", .{
+            slot,
+            proposer_id,
+            &produced_block.blockRoot,
+        });
         var proof = types.MultiMessageAggregate.init(chain.allocator) catch return;
         var proof_owned = true;
         defer if (proof_owned) proof.deinit();
@@ -5133,6 +5194,7 @@ pub const BeamChain = struct {
             chain.logger.err("propose worker: publishBlock failed slot={d}: {any}", .{ slot, e });
             return;
         };
+        proposer_result = "success";
         chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
     }
 

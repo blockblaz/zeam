@@ -86,13 +86,16 @@ pub const ValidatorClient = struct {
 
         // if a new slot interval may be do a proposal
         switch (interval) {
-            // Block production is a proposer duty — the "am I proposer this slot?" decision lives
-            // here (submitProposeOnInterval consults getSlotProposer). It runs off the slot loop on a
-            // thread_pool worker, since the prod-scheme Type-2 merge is multi-second and would freeze
-            // gossip/tick handling if run inline. The worker produces, merges, and publishes itself,
-            // so this interval emits no synchronous output.
+            // Block production is a proposer duty — the "am I proposer this slot?" decision is
+            // resolved HERE in the validator client; the chain receives the already-resolved
+            // duty and owns only chain-state gating (sync status) plus the off-loop dispatch.
+            // The heavy work runs on a thread_pool worker, since the prod-scheme Type-2 merge
+            // is multi-second and would freeze gossip/tick handling if run inline. The worker
+            // produces, merges, and publishes itself, so this interval emits no synchronous
+            // output.
             0 => {
-                self.chain.submitProposeOnInterval(node, time_intervals);
+                const proposer_id = self.getSlotProposer(slot) orelse return null;
+                self.chain.submitPropose(node, slot, proposer_id);
                 return null;
             },
             1 => return self.mayBeDoAttestation(slot),
@@ -114,7 +117,7 @@ pub const ValidatorClient = struct {
         }
     }
 
-    // Block production moved off the slot loop to submitProposeOnInterval / proposeImpl (a
+    // Block production moved off the slot loop to submitPropose / proposeImpl (a
     // thread_pool worker). The old on-loop maybeDoProposal — which built the multi-second Type-2
     // merge inline and would freeze gossip/tick handling — was removed in favour of that single
     // off-loop path. main's improvements to the old maybeDoProposal (the

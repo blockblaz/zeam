@@ -39,8 +39,10 @@ pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
 pub const compactAttestations = block.compactAttestations;
 pub const default_min_aggregation_inputs = block.default_min_aggregation_inputs;
 pub const default_max_aggregation_children = block.default_max_aggregation_children;
+pub const default_max_aggregations_per_tick = block.default_max_aggregations_per_tick;
 pub const SingleAggregatedSignature = block.SingleAggregatedSignature;
 pub const computeSingleAggregatedSignature = block.computeSingleAggregatedSignature;
+pub const computeAggregatedSignaturesForKeys = block.computeAggregatedSignaturesForKeys;
 pub const attestationDataLessThan = block.attestationDataLessThan;
 pub const participantsContainsAll = block.participantsContainsAll;
 

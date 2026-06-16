@@ -16,6 +16,11 @@ const stf_runtime_logger = zeam_logger_config.logger(.state_transition_runtime);
 // implements riscv5 runtime that runs in zkvm on provided inputs and witnesses to execute
 // and prove the state transition as imported from `pkgs/state-transition`
 export fn main() noreturn {
+    // The updated ssz package's fixed-size analysis walks the full
+    // BeamSTFProverInput type at comptime; the zkVM runtime entrypoint needs a
+    // higher quota than Zig's default 1000 backward branches.
+    @setEvalBranchQuota(100000);
+
     logger.info("running block transition function\n", .{});
 
     var prover_input: types.BeamSTFProverInput = undefined;
