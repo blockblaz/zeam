@@ -2755,12 +2755,19 @@ pub const BeamChain = struct {
         // resident in latest_known (warmed at interval-4, refreshed by the interval-0
         // re-aggregate above). This is cheap: the per-att_data aggregates are dominant,
         // so greedy selection picks ~1 proof per att_data and compactAttestations has
-        // little to merge. prove_gate acquired AFTER cloneAndRelease (no states_lock
-        // co-held), order prove_gate -> forkChoice.mutex.
+        // little to merge. If another prove is already running, do not block the
+        // proposer behind opportunistic work; pass an already-elapsed deadline so
+        // compactAttestations cannot start a new FFI prove and will only use what is
+        // already compact enough.
         const proposal_atts = blk: {
-            self.prove_gate.lock();
-            defer self.prove_gate.unlock();
-            break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
+            if (self.prove_gate.tryLock()) {
+                defer self.prove_gate.unlock();
+                break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
+            }
+
+            self.logger.info("proposal Type-1 compact: prove_gate busy, using elapsed deadline slot={d}", .{opts.slot});
+            const elapsed_deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() - 1);
+            break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, elapsed_deadline_ns);
         };
         _ = payload_agg_timer.observe();
 
@@ -5364,7 +5371,15 @@ pub const BeamChain = struct {
         window_buf[window_len] = slot;
         window_len += 1;
 
-        self.prove_gate.lock();
+        // Non-blocking: the FFI prove cannot be interrupted, so if the interval-4
+        // warm-up (or any other prove) holds the gate, do NOT block the proposal
+        // here — skip the refresh and let produceBlock compact whatever is already
+        // warmed into latest_known. tryLock mirrors preAggregateImpl so a slow
+        // warm-up never delays the block this change is meant to speed up.
+        if (!self.prove_gate.tryLock()) {
+            self.logger.info("interval-0 re-aggregate: prove_gate busy, skipping refresh slot={d}", .{slot});
+            return;
+        }
         const aggregations = self.forkChoice.aggregateProposalKeysForSlots(&validators_owned, window_buf[0..window_len], deadline_ns) catch |e| {
             self.prove_gate.unlock();
             self.logger.warn("interval-0 re-aggregate failed slot={d}: {any}", .{ slot, e });

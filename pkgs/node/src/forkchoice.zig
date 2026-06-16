@@ -2314,25 +2314,44 @@ pub const ForkChoice = struct {
             }
         }
 
-        if (selected_keys.len == 1) {
-            // Single-aggregation fast path (default `--max-aggregations-per-tick 1`):
-            // prove on the calling worker, no nested ThreadPool dispatch. Behaviour
-            // is identical to the pre-multi single-aggregation tick.
-            var maybe_result = try types.computeSingleAggregatedSignature(
-                self.allocator,
-                validators,
-                &snap.signatures,
-                &snap.new_payloads,
-                &snap.known_payloads,
-                selected_keys[0],
-                self.max_aggregation_children,
-            );
-            if (maybe_result) |*result| {
-                try self.commitAndDispatchAggregate(&snap, result, publish_ctx, publish_fn, &collected);
+        if (selection == .all_proposal_keys or selected_keys.len <= 1) {
+            // Serial prove on the calling worker (no nested ThreadPool dispatch).
+            // Covers the single-key justification_chain fast path AND the proposer
+            // warm-up / re-aggregate (`all_proposal_keys`), which selects every
+            // eligible att_data with no cap. Dispatching that batch through
+            // `computeAggregatedSignaturesForKeys` would run each prove's internal
+            // rayon on top of the ThreadPool fan-out — the ThreadPool x rayon
+            // oversubscription that #925 sequentialized; with several keys on a
+            // few-core box each prove runs slower and the batch can exceed its
+            // serial cost. The warm-up owns a full interval, so serial proving
+            // (each prove gets the whole rayon budget) is correct and faster. The
+            // deadline is re-checked per key so a tight interval-0 budget bounds the
+            // batch (the FFI is uninterruptible, so this only gates STARTING a key).
+            for (selected_keys) |key| {
+                if (deadline_ns) |d| {
+                    if (zeam_utils.monotonicTimestampNs() >= @as(i128, d)) {
+                        self.logger.debug("aggregateUnlocked: deadline reached mid-batch, stopping serial prove", .{});
+                        break;
+                    }
+                }
+                var maybe_result = try types.computeSingleAggregatedSignature(
+                    self.allocator,
+                    validators,
+                    &snap.signatures,
+                    &snap.new_payloads,
+                    &snap.known_payloads,
+                    key,
+                    self.max_aggregation_children,
+                );
+                if (maybe_result) |*result| {
+                    try self.commitAndDispatchAggregate(&snap, result, publish_ctx, publish_fn, &collected);
+                }
             }
-        } else if (selected_keys.len > 1) {
-            // Multi-aggregation path: prove the justification-path keys in
-            // parallel on the shared ThreadPool, then commit each serially under
+        } else {
+            // Multi-aggregation path (justification_chain, capped by
+            // `max_aggregations_per_tick`): prove the justification-path keys in
+            // parallel on the shared ThreadPool — pair with `--rayon-threads` to
+            // avoid oversubscription (#925) — then commit each serially under
             // `signatures_mutex`.
             const results = try types.computeAggregatedSignaturesForKeys(
                 self.allocator,
