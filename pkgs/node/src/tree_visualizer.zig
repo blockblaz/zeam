@@ -418,6 +418,8 @@ fn createTestProtoNode(
         .stateRoot = createTestRoot(0x00),
         .timeliness = true,
         .confirmed = true,
+        // Provenance is irrelevant to tree visualization; default to 0.
+        .stateFinalizedSlot = 0,
         .parent = parent,
         .weight = 0,
         .bestChild = null,

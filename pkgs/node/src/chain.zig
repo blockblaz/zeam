@@ -6198,7 +6198,7 @@ test "attestation validation - comprehensive" {
         .stateRoot = zero_state_root,
         .timeliness = true,
         .confirmed = true,
-    }, 2);
+    }, 2, 0);
 
     // A sibling head at slot 2 whose parent is genesis (skips the canonical slot-1 block).
     const sibling_head_root = [_]u8{0xB2} ** 32;
@@ -6210,7 +6210,7 @@ test "attestation validation - comprehensive" {
         .stateRoot = zero_state_root,
         .timeliness = true,
         .confirmed = true,
-    }, 2);
+    }, 2, 0);
 
     // An orphan head at slot 2 whose parent is not in the store at all.
     const orphan_head_root = [_]u8{0xC3} ** 32;
@@ -6222,7 +6222,7 @@ test "attestation validation - comprehensive" {
         .stateRoot = zero_state_root,
         .timeliness = true,
         .confirmed = true,
-    }, 2);
+    }, 2, 0);
 
     // Test 10: A proper genesis -> slot1 -> slot2 ancestor chain passes.
     {

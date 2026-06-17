@@ -48,6 +48,9 @@ pub const ProtoNode = struct {
     stateRoot: Root,
     timeliness: bool,
     confirmed: bool,
+    // This block's post-state `latest_finalized.slot`; updateHead walks the head chain to this
+    // slot to derive fcStore.latest_finalized.
+    stateFinalizedSlot: types.Slot,
     // Fields from ProtoMeta
     parent: ?usize,
     weight: isize,
@@ -80,17 +83,17 @@ pub const ProtoArray = struct {
     allocator: Allocator,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, anchorBlock: ProtoBlock) !Self {
+    pub fn init(allocator: Allocator, anchorBlock: ProtoBlock, stateFinalizedSlot: types.Slot) !Self {
         var proto_array = Self{
             .nodes = .empty,
             .indices = std.AutoHashMap(types.Root, usize).init(allocator),
             .allocator = allocator,
         };
-        try proto_array.onBlock(anchorBlock, anchorBlock.slot);
+        try proto_array.onBlock(anchorBlock, anchorBlock.slot, stateFinalizedSlot);
         return proto_array;
     }
 
-    pub fn onBlock(self: *Self, block: ProtoBlock, currentSlot: types.Slot) !void {
+    pub fn onBlock(self: *Self, block: ProtoBlock, currentSlot: types.Slot, stateFinalizedSlot: types.Slot) !void {
         const onblock_timer = zeam_metrics.lean_fork_choice_block_processing_time_seconds.start();
         defer _ = onblock_timer.observe();
 
@@ -135,6 +138,7 @@ pub const ProtoArray = struct {
             .stateRoot = block.stateRoot,
             .timeliness = block.timeliness,
             .confirmed = block.confirmed,
+            .stateFinalizedSlot = stateFinalizedSlot,
             .parent = parent,
             .weight = 0,
             .bestChild = null,
@@ -248,13 +252,11 @@ pub const ForkChoiceStore = struct {
     latest_finalized: types.Checkpoint,
 
     const Self = @This();
-    pub fn update(self: *Self, justified: types.Checkpoint, finalized: types.Checkpoint) void {
+    // Only justified is tracked here; latest_finalized is derived from the head chain in
+    // updateHeadUnlocked.
+    pub fn update(self: *Self, justified: types.Checkpoint) void {
         if (justified.slot > self.latest_justified.slot) {
             self.latest_justified = justified;
-        }
-
-        if (finalized.slot > self.latest_finalized.slot) {
-            self.latest_finalized = finalized;
         }
     }
 };
@@ -456,7 +458,10 @@ pub const ForkChoice = struct {
             .timeliness = true,
             .confirmed = true,
         };
-        const proto_array = try ProtoArray.init(allocator, anchor_block);
+        // Seed the anchor node's finalized slot from the anchor state. For a checkpoint-sync
+        // anchor whose state names a finalized slot BELOW the anchor block slot, updateHead's
+        // parent walk stops at a null parent and keeps the trusted anchor finalized.
+        const proto_array = try ProtoArray.init(allocator, anchor_block, opts.anchorState.latest_finalized.slot);
         const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
         const fc_store = ForkChoiceStore{
             .slot_clock = zeam_utils.SlotTimeClock.init(
@@ -549,6 +554,9 @@ pub const ForkChoice = struct {
                 .stateRoot = self.head.stateRoot,
                 .timeliness = self.head.timeliness,
                 .confirmed = self.head.confirmed,
+                // No node in protoArray for this head (fallback path): use the
+                // store's current finalized slot as the synthetic provenance.
+                .stateFinalizedSlot = self.fcStore.latest_finalized.slot,
                 .parent = null,
                 .weight = 0,
                 .bestChild = null,
@@ -1659,6 +1667,28 @@ pub const ForkChoice = struct {
         // Update the lean_head_slot metric
         zeam_metrics.metrics.lean_head_slot.set(self.head.slot);
 
+        // Keep the store finalized in lock-step with the head-state finalized that the STF
+        // validates against, so a losing fork that finalized a higher slot can never latch
+        // it.
+        const nodes = self.protoArray.nodes.items;
+        if (self.protoArray.indices.get(self.head.blockRoot)) |head_idx| {
+            const fin_slot = nodes[head_idx].stateFinalizedSlot;
+            var cur_idx = head_idx;
+            // May break early on a checkpoint-sync short chain (null parent before fin_slot).
+            while (nodes[cur_idx].slot > fin_slot) {
+                cur_idx = nodes[cur_idx].parent orelse break;
+            }
+            // Only adopt when an ancestor lands exactly on fin_slot; otherwise (skipped
+            // finalized slot, or short chain stopped at a null parent) keep the existing
+            // finalized — an expected no-op, not an error.
+            if (nodes[cur_idx].slot == fin_slot) {
+                self.fcStore.latest_finalized = types.Checkpoint{
+                    .root = nodes[cur_idx].blockRoot,
+                    .slot = fin_slot,
+                };
+            }
+        }
+
         // Detect reorg: if head changed and previous head is not an ancestor of new head
         if (!std.mem.eql(u8, &self.head.blockRoot, &previous_head.blockRoot)) {
             // Build ancestor map while checking - reused in calculateReorgDepth if reorg detected
@@ -2682,9 +2712,8 @@ pub const ForkChoice = struct {
             // chain.validateBlock, not here.
 
             const justified = state.latest_justified;
-            const finalized = state.latest_finalized;
             const prev_justified_slot = self.fcStore.latest_justified.slot;
-            self.fcStore.update(justified, finalized);
+            self.fcStore.update(justified);
             // Transition from initing to ready once we observe a real justified checkpoint
             // that is strictly newer than the anchor (i.e., actual chain progress has been seen).
             if (self.status == .initing and self.fcStore.latest_justified.slot > prev_justified_slot) {
@@ -2750,7 +2779,9 @@ pub const ForkChoice = struct {
                 .confirmed = opts.confirmed,
             };
 
-            try self.protoArray.onBlock(proto_block, opts.currentSlot);
+            // Thread the block's post-state finalized slot as node provenance so
+            // updateHead can derive fcStore.latest_finalized from the head chain.
+            try self.protoArray.onBlock(proto_block, opts.currentSlot, state.latest_finalized.slot);
             return proto_block;
         } else {
             return ForkChoiceError.UnknownParent;
@@ -3480,14 +3511,14 @@ test "protoarray tie-break uses lexicographic hash ordering" {
     const allocator = std.testing.allocator;
 
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
-    var proto_array = try ProtoArray.init(allocator, anchor_block);
+    var proto_array = try ProtoArray.init(allocator, anchor_block, 0);
     defer proto_array.nodes.deinit(proto_array.allocator);
     defer proto_array.indices.deinit();
 
     // Equal-weight siblings with different slots.
     // Pick the lexicographically larger root, not higher slot.
-    try proto_array.onBlock(createTestProtoBlock(2, 0x10, 0xAA), 2);
-    try proto_array.onBlock(createTestProtoBlock(1, 0x20, 0xAA), 2);
+    try proto_array.onBlock(createTestProtoBlock(2, 0x10, 0xAA), 2, 0);
+    try proto_array.onBlock(createTestProtoBlock(1, 0x20, 0xAA), 2, 0);
 
     var deltas = try allocator.alloc(isize, proto_array.nodes.items.len);
     defer allocator.free(deltas);
@@ -3573,21 +3604,21 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
 
     // Genesis block A at slot 0
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
-    var proto_array = try ProtoArray.init(allocator, anchor_block);
+    var proto_array = try ProtoArray.init(allocator, anchor_block, 0);
     defer proto_array.nodes.deinit(proto_array.allocator);
     defer proto_array.indices.deinit();
 
     // Canonical chain with missed slots
-    try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1); // B: slot 1
-    try proto_array.onBlock(createTestProtoBlock(3, 0xCC, 0xBB), 3); // C: slot 3 (missed slot 2)
-    try proto_array.onBlock(createTestProtoBlock(5, 0xDD, 0xCC), 5); // D: slot 5 (missed slot 4)
-    try proto_array.onBlock(createTestProtoBlock(6, 0xEE, 0xDD), 6); // E: slot 6
-    try proto_array.onBlock(createTestProtoBlock(8, 0xFF, 0xEE), 8); // F: slot 8 (missed slot 7) - HEAD
+    try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1, 0); // B: slot 1
+    try proto_array.onBlock(createTestProtoBlock(3, 0xCC, 0xBB), 3, 0); // C: slot 3 (missed slot 2)
+    try proto_array.onBlock(createTestProtoBlock(5, 0xDD, 0xCC), 5, 0); // D: slot 5 (missed slot 4)
+    try proto_array.onBlock(createTestProtoBlock(6, 0xEE, 0xDD), 6, 0); // E: slot 6
+    try proto_array.onBlock(createTestProtoBlock(8, 0xFF, 0xEE), 8, 0); // F: slot 8 (missed slot 7) - HEAD
 
     // Fork branch from C (with its own missed slots pattern)
-    try proto_array.onBlock(createTestProtoBlock(4, 0x11, 0xCC), 4); // G: slot 4, parent C
-    try proto_array.onBlock(createTestProtoBlock(6, 0x22, 0x11), 6); // H: slot 6, parent G (missed slot 5)
-    try proto_array.onBlock(createTestProtoBlock(7, 0x33, 0x22), 7); // I: slot 7, parent H
+    try proto_array.onBlock(createTestProtoBlock(4, 0x11, 0xCC), 4, 0); // G: slot 4, parent C
+    try proto_array.onBlock(createTestProtoBlock(6, 0x22, 0x11), 6, 0); // H: slot 6, parent G (missed slot 5)
+    try proto_array.onBlock(createTestProtoBlock(7, 0x33, 0x22), 7, 0); // I: slot 7, parent H
 
     // Verify we have 9 nodes total
     try std.testing.expect(proto_array.nodes.items.len == 9);
@@ -3850,6 +3881,123 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         // Potential should include D, E, F (canonical descendants) + G, H, I (fork)
         try std.testing.expect(potential.len == 6);
     }
+}
+
+test "updateHead derives finalized from head chain: losing fork's higher finalized does not latch (leanSpec #1001)" {
+    // A losing fork finalizes a HIGHER slot but loses head selection; the store finalized
+    // must track the head chain (slot 1 / root B), not latch the losing fork (slot 2 / root H),
+    // even when it starts latched on the losing fork's higher slot.
+
+    const allocator = std.testing.allocator;
+
+    var mock_chain = try stf.genMockChain(allocator, 2, null);
+    defer mock_chain.deinit(allocator);
+
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    defer allocator.free(spec_name);
+    defer allocator.free(fork_digest);
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 8,
+        },
+    };
+
+    var beam_state = mock_chain.genesis_state;
+    defer beam_state.deinit();
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const module_logger = zeam_logger_config.logger(.forkchoice);
+
+    // Anchor A at slot 0; its post-state finalized slot is 0.
+    const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
+    var proto_array = try ProtoArray.init(allocator, anchor_block, 0);
+    defer proto_array.nodes.deinit(proto_array.allocator);
+    defer proto_array.indices.deinit();
+
+    // Head chain X: B (fin=0), C (fin=1 -> root B). The currentSlot arg is unused
+    // by onBlock; the trailing arg is the block's post-state finalized slot.
+    try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1, 0); // B: idx 1
+    // C: idx 2, finalizes B (slot 1)
+    try proto_array.onBlock(createTestProtoBlock(2, 0xCC, 0xBB), 2, 1);
+
+    // Losing fork Y: G, H, I (fin=2 -> root H). I finalizes a HIGHER slot than C.
+    try proto_array.onBlock(createTestProtoBlock(1, 0x11, 0xAA), 1, 0); // G: idx 3
+    try proto_array.onBlock(createTestProtoBlock(2, 0x22, 0x11), 2, 0); // H: idx 4
+    // I: idx 5, finalizes H (slot 2)
+    try proto_array.onBlock(createTestProtoBlock(3, 0x33, 0x22), 3, 2);
+
+    // Sanity: provenance was threaded correctly onto each node (C = idx 2, I = idx 5).
+    try std.testing.expectEqual(@as(types.Slot, 1), proto_array.nodes.items[2].stateFinalizedSlot);
+    try std.testing.expectEqual(@as(types.Slot, 2), proto_array.nodes.items[5].stateFinalizedSlot);
+
+    // Store STARTS latched on the losing fork's higher finalized (slot 2 / root H),
+    // exactly the divergent state the pre-fix monotonic-max could produce. Justified
+    // stays at the anchor so head selection walks best descendants from A.
+    const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
+    const latched_finalized = types.Checkpoint{ .slot = 2, .root = createTestRoot(0x22) }; // root H
+    const fc_store = ForkChoiceStore{
+        .slot_clock = zeam_utils.SlotTimeClock.init(3 * constants.INTERVALS_PER_SLOT, 3, 0),
+        .latest_justified = anchorCP,
+        .latest_finalized = latched_finalized,
+    };
+
+    const test_thread_pool = try setupTestPrimitives();
+    defer test_thread_pool.deinit();
+    var fork_choice = ForkChoice{
+        .allocator = allocator,
+        .protoArray = proto_array,
+        .anchorState = &beam_state,
+        .config = chain_config,
+        .fcStore = fc_store,
+        .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
+        .head = createTestProtoBlock(0, 0xAA, 0x00), // starts at anchor; updateHead recomputes
+        .safeTarget = createTestProtoBlock(0, 0xAA, 0x00),
+        .deltas = .empty,
+        .logger = module_logger,
+        .mutex = zeam_utils.SyncRwLock{},
+        .attestation_signatures = SignaturesMap.init(allocator),
+        .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .latest_block_aggregated_payloads_slot = null,
+        .signatures_mutex = zeam_utils.SyncMutex{},
+        .status = .ready,
+        .thread_pool = test_thread_pool,
+        .last_node_tick_time_ms = null,
+    };
+    defer fork_choice.attestations.deinit();
+    defer fork_choice.deltas.deinit(fork_choice.allocator);
+    defer fork_choice.attestation_signatures.deinit();
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_block_aggregated_payloads);
+    defer if (fork_choice.saved_pre_merge_new_coverage) |*cov| cov.deinit(allocator);
+
+    // Concentrate all attestation weight on C (head chain leaf, idx 2) so the
+    // canonical branch beats the (unvoted) losing fork and head selection lands
+    // on C, not I.
+    const c_idx = fork_choice.protoArray.indices.get(createTestRoot(0xCC)).?;
+    for (0..4) |validator_id| {
+        try fork_choice.attestations.put(validator_id, AttestationTracker{
+            .latestKnown = .{ .index = c_idx, .slot = 2, .attestation_data = null },
+        });
+    }
+
+    const head = try fork_choice.updateHead();
+
+    // Head landed on the canonical chain (C), not the losing fork.
+    try std.testing.expect(std.mem.eql(u8, &head.blockRoot, &createTestRoot(0xCC)));
+
+    // CORE ASSERTION: store finalized tracks the head chain's finalized
+    // (slot 1 / root B), NOT the losing fork's higher slot 2 / root H.
+    try std.testing.expectEqual(@as(types.Slot, 1), fork_choice.fcStore.latest_finalized.slot);
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &createTestRoot(0xBB)));
 }
 
 // ============================================================================
@@ -5527,19 +5675,19 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
 
     // Genesis block A at slot 0
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
-    var proto_array = try ProtoArray.init(allocator, anchor_block);
+    var proto_array = try ProtoArray.init(allocator, anchor_block, 0);
 
     // Canonical chain with missed slots
-    try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1); // B: slot 1
-    try proto_array.onBlock(createTestProtoBlock(3, 0xCC, 0xBB), 3); // C: slot 3 (missed slot 2)
-    try proto_array.onBlock(createTestProtoBlock(5, 0xDD, 0xCC), 5); // D: slot 5 (missed slot 4)
-    try proto_array.onBlock(createTestProtoBlock(6, 0xEE, 0xDD), 6); // E: slot 6
-    try proto_array.onBlock(createTestProtoBlock(8, 0xFF, 0xEE), 8); // F: slot 8 (missed slot 7) - HEAD
+    try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1, 0); // B: slot 1
+    try proto_array.onBlock(createTestProtoBlock(3, 0xCC, 0xBB), 3, 0); // C: slot 3 (missed slot 2)
+    try proto_array.onBlock(createTestProtoBlock(5, 0xDD, 0xCC), 5, 0); // D: slot 5 (missed slot 4)
+    try proto_array.onBlock(createTestProtoBlock(6, 0xEE, 0xDD), 6, 0); // E: slot 6
+    try proto_array.onBlock(createTestProtoBlock(8, 0xFF, 0xEE), 8, 0); // F: slot 8 (missed slot 7) - HEAD
 
     // Fork branch from C (with its own missed slots pattern)
-    try proto_array.onBlock(createTestProtoBlock(4, 0x11, 0xCC), 4); // G: slot 4, parent C
-    try proto_array.onBlock(createTestProtoBlock(6, 0x22, 0x11), 6); // H: slot 6, parent G
-    try proto_array.onBlock(createTestProtoBlock(7, 0x33, 0x22), 7); // I: slot 7, parent H
+    try proto_array.onBlock(createTestProtoBlock(4, 0x11, 0xCC), 4, 0); // G: slot 4, parent C
+    try proto_array.onBlock(createTestProtoBlock(6, 0x22, 0x11), 6, 0); // H: slot 6, parent G
+    try proto_array.onBlock(createTestProtoBlock(7, 0x33, 0x22), 7, 0); // I: slot 7, parent H
 
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
@@ -6702,13 +6850,13 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
 
     // Build smaller tree: A -> B -> C -> D
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
-    var proto_array = try ProtoArray.init(allocator, anchor_block);
+    var proto_array = try ProtoArray.init(allocator, anchor_block, 0);
     defer proto_array.nodes.deinit(proto_array.allocator);
     defer proto_array.indices.deinit();
 
-    try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1);
-    try proto_array.onBlock(createTestProtoBlock(2, 0xCC, 0xBB), 2);
-    try proto_array.onBlock(createTestProtoBlock(3, 0xDD, 0xCC), 3);
+    try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1, 0);
+    try proto_array.onBlock(createTestProtoBlock(2, 0xCC, 0xBB), 2, 0);
+    try proto_array.onBlock(createTestProtoBlock(3, 0xDD, 0xCC), 3, 0);
 
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
