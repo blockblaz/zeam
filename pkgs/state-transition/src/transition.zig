@@ -269,11 +269,11 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         // useful comparison window is the early-chain bootstrap where
         // divergence either does or doesn't happen.
         if (block.slot <= POSTSTATE_DIAG_SLOT_MAX) {
-            opts.logger.info(
+            opts.logger.debug(
                 "PostStateMatch slot={d} state_root={x}",
                 .{ block.slot, &state_root },
             );
-            logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger, "PostStateMatch", .info_level);
+            logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger, "PostStateMatch", .debug_level);
         }
     }
 }
@@ -289,9 +289,11 @@ const POSTSTATE_DIAG_SLOT_MAX: u64 = 80;
 
 /// Log level selector for `logBeamStatePerFieldRoots`.
 /// Failure-side calls log at `err` to surface alongside the underlying
-/// state-root mismatch; success-side calls log at `info` so they don't
-/// drown out real errors but stay visible in operator logs.
-const PerFieldLogLevel = enum { err_level, info_level };
+/// state-root mismatch; success-side calls log at `debug` so they stay
+/// available for diagnostic deep-dives without polluting normal operator
+/// info-level output (one ~250-char line per slot for the first
+/// `POSTSTATE_DIAG_SLOT_MAX` slots is too noisy at info).
+const PerFieldLogLevel = enum { err_level, debug_level };
 
 /// Emit per-field hashTreeRoots of a post-state. Called
 /// from two sites in `apply_transition`:
@@ -379,6 +381,6 @@ fn logBeamStatePerFieldRoots(
     const fmt = "{s} per-field block_slot={d} state_slot={d} hbh_len={d} js_len={d} jr_len={d} | slot={x} lbh={x} lj={x} lf={x} hbh={x} js={x} v={x} jr={x} jv={x}";
     switch (level) {
         .err_level => logger.err(fmt, args),
-        .info_level => logger.info(fmt, args),
+        .debug_level => logger.debug(fmt, args),
     }
 }

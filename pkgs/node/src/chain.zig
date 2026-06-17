@@ -469,6 +469,18 @@ pub const BeamChain = struct {
     /// Joined at `deinit` so propose workers cannot outlive chain state.
     propose_wg: WaitGroup = .{},
 
+    /// Per-validator XMSS `signAttestation` runs ~0.3s/interval and, replayed
+    /// across the libxev catch-up loop, dominates `onInterval.tick` (the #863
+    /// slot-driver stall — confirmed by per-site instrumentation). `submitAttestOnInterval`
+    /// offloads the whole attestation duty (gate + constructAttestationData + sign +
+    /// publish) to a `thread_pool` worker, mirroring `submitPropose`. Single-flight:
+    /// at most one runs; a second trigger is dropped (the next slot re-attests).
+    /// `attestImpl` decrements on exit.
+    attest_inflight: std.atomic.Value(u32) = .init(0),
+
+    /// Joined at `deinit` so attestation workers cannot outlive chain state.
+    attest_wg: WaitGroup = .{},
+
     /// Serialize the rayon-heavy recursive-STARK proves so each gets the full rayon thread
     /// budget instead of fighting for it. Three paths now enter the prover concurrently — the
     /// propose worker (Type-2 merge in `buildBlockProof`), the aggregate worker
@@ -668,6 +680,8 @@ pub const BeamChain = struct {
             .aggregate_reschedule_intervals = .init(0),
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
+            .attest_inflight = .init(0),
+            .attest_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
             .proposal_deadline_pct = opts.proposal_deadline_pct,
             // Pending attestation / aggregated-attestation buffers — empty
@@ -1720,6 +1734,10 @@ pub const BeamChain = struct {
         // Same for in-flight propose workers (produceBlock + Type-2 merge +
         // publishBlock) — they reference chain state and must not outlive it.
         self.thread_pool.waitAndWork(&self.propose_wg);
+
+        // Same for in-flight attestation workers (constructAttestationData + sign +
+        // publishAttestation) — they reference chain/validator state.
+        self.thread_pool.waitAndWork(&self.attest_wg);
 
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
@@ -3961,7 +3979,7 @@ pub const BeamChain = struct {
                         continue;
                     };
                     rec_idx += 1;
-                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false) catch |e| {
+                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false, .block_payload) catch |e| {
                         self.logger.warn("failed to store re-aggregated payload for block attestation index={d}: {any}", .{ i, e });
                     };
                 }
@@ -4803,7 +4821,7 @@ pub const BeamChain = struct {
 
         try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
         self.applyAggregatedAttestationTrackers(signedAggregation.data, validator_indices.items);
-        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
+        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false, .gossip);
     }
 
     fn verifyAggregatedAttestation(
@@ -5179,6 +5197,56 @@ pub const BeamChain = struct {
         };
         proposer_result = "success";
         chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+    }
+
+    /// Off-loop attestation duty: dispatch construct+sign+publish to a `thread_pool`
+    /// worker so the ~0.3s/interval per-validator XMSS signing does not block the
+    /// libxev slot loop (the #863 stall, confirmed by `onInterval.validator` site
+    /// instrumentation). Mirrors `submitPropose`. Single-flight; a second trigger
+    /// while one is in flight is dropped (the next slot re-attests). Returns within
+    /// microseconds — `attestImpl` does the work and publishes itself.
+    pub fn submitAttestOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, slot: usize) void {
+        const prev = self.attest_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= 1) {
+            _ = self.attest_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("skipping attestation for slot={d}: previous attestation still in flight", .{slot});
+            return;
+        }
+
+        self.thread_pool.spawnWg(&self.attest_wg, attestImpl, .{ self, node, slot }) catch {
+            _ = self.attest_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue attestation for slot={d}; skipping", .{slot});
+            return;
+        };
+    }
+
+    /// Worker body for off-loop attestation. `mayBeDoAttestation` performs the sync
+    /// gate, builds `AttestationData` (read-only fork-choice under the shared lock)
+    /// and per-validator XMSS signs; this then publishes each signed attestation
+    /// directly — the same publish the libxev loop used to do. Worker-safe: signing
+    /// reads only immutable `*const` keys; `publishAttestation` is internally locked
+    /// and the libp2p publish is Send+Sync (same contract as the aggregate worker).
+    fn attestImpl(chain: *Self, node: *@import("./node.zig").BeamNode, slot: usize) void {
+        defer _ = chain.attest_inflight.fetchSub(1, .acq_rel);
+        const validator = if (node.validator) |*v| v else return;
+
+        var maybe_output = validator.mayBeDoAttestation(slot) catch |e| {
+            chain.logger.err("attestation worker: mayBeDoAttestation failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+        if (maybe_output) |*output| {
+            defer output.deinit();
+            for (output.gossip_messages.items) |gossip_msg| {
+                switch (gossip_msg) {
+                    .attestation => |signed_attestation| {
+                        node.publishAttestation(signed_attestation) catch |e| {
+                            chain.logger.err("attestation worker: publishAttestation failed slot={d}: {any}", .{ slot, e });
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 
     /// Find the subnet of the first set participant in `participants`.
@@ -6962,13 +7030,13 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_unseen.participants, i, true);
     }
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true, .block_payload);
 
     var proof_known = try types.SingleMessageAggregate.init(allocator);
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_known.participants, i, true);
     }
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_known, proof_known, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_known, proof_known, true, .block_payload);
 
     // Produce block at slot 3 (proposer_index = 3 % 4 = 3)
     const proposal_slot: types.Slot = 3;
@@ -7138,7 +7206,7 @@ test "produceBlock - older-but-justified source is accepted" {
     const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
     var proof = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7217,10 +7285,10 @@ test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (
     // idempotent across calls.)
     var proof_a = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_a.participants, 0, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true, .block_payload);
     var proof_b = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_b.participants, 1, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7274,7 +7342,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_zs = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zs.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true, .block_payload);
 
     // Attestation with ZERO_HASH target root — must be rejected.
     const att_zero_target = types.AttestationData{
@@ -7285,7 +7353,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_zt = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zt.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true, .block_payload);
 
     // Control: a valid attestation that must appear in the block, ensuring the
     // produced block is non-empty so the negative assertions below are not vacuous.
@@ -7297,7 +7365,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_valid = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_valid.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7368,7 +7436,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     };
     var proof_aj = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true, .block_payload);
 
     // (b) NEGATIVE: genesis self-vote — source.slot==0, target.slot==0.
     // getProposalAttestations drops any attestation with target.slot <= source.slot
@@ -7383,7 +7451,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     };
     var proof_gsv = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_gsv.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,

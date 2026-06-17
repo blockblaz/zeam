@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "libp2p-glue",
   "openvm-glue",
   "risc0-glue",
   "hashsig-glue",
