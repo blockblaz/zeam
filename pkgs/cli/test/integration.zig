@@ -59,7 +59,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 
     // Use the in-process `networks.Mock` shortcut for simtest so CI
     // exercises consensus + SSE finalization without depending on
-    // zig-libp2p mesh/finality timing (EthLibp2pV2 is covered by unit
+    // zig-libp2p mesh/finality timing (EthLibp2p is covered by unit
     // tests and `zeam node beam` in production). Wipe `./data` first —
     // stale RocksDB MANIFEST from a crashed run aborts node init.
     std.Io.Dir.deleteTree(.cwd(), std.testing.io, "./data") catch {};

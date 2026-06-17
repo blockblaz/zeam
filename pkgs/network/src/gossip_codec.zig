@@ -1,5 +1,5 @@
 //! Pure-Zig snappy-block + SSZ codec helpers for the gossipsub path,
-//! reused by `ethlibp2p_v2.zig` and the related #942 regression fixtures.
+//! reused by `ethlibp2p.zig` and the related #942 regression fixtures.
 //!
 //! Lifted out of the legacy `ethlibp2p.zig` (which the Rust-FFI consumer
 //! used) so the codec stays around after that file + the `rust/libp2p-glue/`
@@ -7,7 +7,7 @@
 //! implementations; the helpers are intentionally allocator- + logger-
 //! agnostic so they're cheap to call from any transport layer.
 //!
-//! Surface (consumed by `ethlibp2p_v2.zig`):
+//! Surface (consumed by `ethlibp2p.zig`):
 //!   - `MESSAGE_DOMAIN_VALID_SNAPPY`
 //!   - `MAX_GOSSIP_BLOCK_SIZE` / `MAX_RPC_MESSAGE_SIZE` / `GOSSIP_PREVIEW_MAX_BYTES`
 //!   - `BytePreview` + `byteHexPreview`
@@ -22,7 +22,7 @@ const uvarint = multiformats.uvarint;
 const zeam_utils = @import("@zeam/utils");
 
 /// gossipsub `message_id` domain prefix per the libp2p spec, used by the
-/// validator hook side; kept here so the v2 path imports a single source.
+/// validator hook side; kept here so the network path imports a single source.
 pub const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = .{ 0x01, 0x00, 0x00, 0x00 };
 
 /// Worst-case post-snappy block size for the gossip path (zeam's spec

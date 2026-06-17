@@ -74,7 +74,7 @@ pub const NodeOptions = struct {
     node_key_index: usize,
     /// Path to the lean-quickstart `<node>.key` file holding a 64-hex-char
     /// ASCII representation of the 32-byte ECDSA-P-256 host-identity seed.
-    /// Threaded through to `EthLibp2pV2Params.host_identity_key_path` so the
+    /// Threaded through to `EthLibp2pParams.host_identity_key_path` so the
     /// libp2p PeerId derives from the SAME seed `eth-beacon-genesis` used to
     /// populate `nodes.yaml`. Without this, every outbound dial fails
     /// `PeerIdMismatch` against the dial-multiaddr's expected peer id.
@@ -181,9 +181,9 @@ pub const NodeOptions = struct {
 /// It manages the event loop, network interface, clock, and beam node.
 pub const Node = struct {
     loop: xev.Loop,
-    /// `EthLibp2pV2.init` returns a heap-allocated `*Self`, so this is a
+    /// `EthLibp2p.init` returns a heap-allocated `*Self`, so this is a
     /// pointer (was a value field under the legacy `EthLibp2p` flow).
-    network: *networks.EthLibp2pV2,
+    network: *networks.EthLibp2p,
     /// String-form listen + connect multiaddrs handed to v2. Owned by
     /// `Node`; freed at `deinit` so v2 (which stores slice refs, not
     /// dupes) is safe across its lifetime.
@@ -411,7 +411,7 @@ pub const Node = struct {
         self.connect_peers_str = try joinMultiaddrsCsv(allocator, addresses.connect_peers);
         errdefer allocator.free(self.connect_peers_str);
 
-        self.network = try networks.EthLibp2pV2.init(allocator, &self.loop, .{
+        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
             .networkId = options.network_id,
             .fork_digest = chain_config.spec.fork_digest,
             .listen_addresses = self.listen_addresses_str,
@@ -996,7 +996,7 @@ pub const Node = struct {
 
 /// Reads ATTESTATION_COMMITTEE_COUNT from a parsed config.yaml Yaml document.
 /// Returns null if the field is absent or cannot be parsed.
-/// Comma-separated multiaddr string for `EthLibp2pV2Params.connect_peers`.
+/// Comma-separated multiaddr string for `EthLibp2pParams.connect_peers`.
 /// Returns an allocator-owned slice (empty string for the no-bootnodes case).
 fn joinMultiaddrsCsv(allocator: std.mem.Allocator, addrs: []const Multiaddr) ![]u8 {
     if (addrs.len == 0) return try allocator.dupe(u8, "");

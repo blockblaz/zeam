@@ -1,63 +1,39 @@
-//! Pure-Zig replacement for the Rust libp2p-glue path, built on
-//! `zig_libp2p` v0.1.0. Implements `EthLibp2pV2` — same public API as the
-//! legacy `EthLibp2p` (init / deinit / publish / subscribe /
-//! subscribeReqResp / subscribePeerEvents) but with `zig_libp2p.host.Host`
-//! as the in-process libp2p stack instead of the Rust crate's FFI.
+//! zeam's libp2p networking, built on `zig_libp2p` over QUIC + libp2p TLS.
+//! `EthLibp2p` is the production `NetworkInterface` implementation (init /
+//! deinit / publish / subscribe / subscribeReqResp / subscribePeerEvents),
+//! using `zig_libp2p.host.Host` as the in-process libp2p stack. It replaced
+//! the former Rust `libp2p-glue` FFI path, which has been removed.
 //!
-//! ## What's wired today
+//! ## What's wired
 //!
-//!   - **Gossipsub publish / subscribe over Host**, with byte-for-byte parity
-//!     against the Rust path:
+//!   - **QUIC transport** via `zig_libp2p` `QuicRuntime`: per-`listen_address`
+//!     endpoint, dial, multistream-select dispatch on accepted streams.
+//!   - **Gossipsub publish / subscribe over Host**:
 //!       * Per-topic SSZ + snappy block encoding, then `host.publish`.
-//!       * Per-topic decode through the file-scope #942 validators in
-//!         `ethlibp2p.zig` (promoted to `pub` in this branch so v2 doesn't
-//!         fork the 400 LOC of frame-hardening logic).
-//!       * Local delivery to `GenericGossipHandler` runs through gossipsub's
-//!         topic-validator hook (v0.1.0's only inbound channel today).
-//!   - **Req/resp send / register-inbound / response-chunk / end-of-stream /
-//!     error** wired straight onto `Host.sendRequest` and friends. Per-method
-//!     SSZ decode (the wire layer in zig-libp2p handles snappy framing).
+//!       * Per-topic decode through the #942 frame-hardening validators in
+//!         `gossip_codec.zig`.
+//!       * Inbound delivery to `GenericGossipHandler` via gossipsub's
+//!         topic-validator hook.
+//!   - **Req/resp** send / register-inbound / response-chunk / end-of-stream /
+//!     error wired onto `Host.sendRequest` and friends, with per-method SSZ
+//!     decode (the wire layer in zig-libp2p handles snappy framing).
 //!   - **Peer-event dispatch** from the driver thread (drains
-//!     `host.nextEvent`) into the existing `PeerEventHandler` instance. Peer
-//!     IDs are base58-multihash-encoded to match the Rust glue's
-//!     `PeerId::to_string()` output exactly, so the node-name registry
-//!     lookups keep matching.
-//!   - **In-flight RPC failure on peer disconnect** — same defense as the
-//!     legacy path: when a peer drops, every pending outbound RPC awaiting
-//!     a response from that peer is failed with `error.PeerDisconnected`.
+//!     `host.nextEvent`) into the `PeerEventHandler`. Peer IDs are
+//!     base58-multihash-encoded to match `eth-beacon-genesis` `/p2p/...` ids.
+//!   - **In-flight RPC failure on peer disconnect**: when a peer drops, every
+//!     pending outbound RPC awaiting a response from it is failed with
+//!     `error.PeerDisconnected`.
 //!   - **Bootnode dial** — `connect_peers` is parsed as a comma-separated
-//!     list of multiaddrs and each is registered via
-//!     `host.registerKnownPeer`. The driver thread calls
-//!     `connection_manager.tick(now_ms)` once per loop so dial attempts
-//!     (with exponential backoff per upstream policy) get scheduled.
-//!   - **Driver thread + shutdown** sequencing matches the Rust bridge
-//!     thread semantics: `run` parks the calling thread on
+//!     list of multiaddrs, each registered via `host.registerKnownPeer` and
+//!     added as a gossipsub direct peer. The driver thread calls
+//!     `connection_manager.tick(now_ms)` once per loop so dial attempts (with
+//!     exponential backoff) get scheduled.
+//!   - **Driver thread + shutdown**: `run` parks the calling thread on
 //!     `host.waitUntilReady`, then spawns the event-drain worker; `deinit`
 //!     signals shutdown, joins, then tears down the Host.
-//!   - **Metrics parity**: a per-instance `Metrics` registry is wired into
-//!     the Host config so gossipsub + swarm record into it. A scrape
-//!     refresher copies `host.gossipsub.meshPeers()` and per-reason
-//!     `swarm.metrics.?.swarmCommandDropped()` totals into zeam's
-//!     `lean_gossip_mesh_peers` gauge / `zeam_libp2p_swarm_command_dropped_total`
-//!     counter on every Prometheus scrape (same shape and labels the Rust
-//!     glue used).
-//!
-//! ## What's deferred to follow-up commits on this branch
-//!
-//!   - **QUIC listener bring-up** (`zl.transport.quic_endpoint.QuicListener`
-//!     per `listen_address`, plus multistream-select dispatch on accepted
-//!     streams). Today v2 publishes / subscribes locally and exchanges
-//!     gossipsub RPC frames via direct `Host.handleGossipRpc` calls — which
-//!     is enough to test the wire-level encode/decode path between two v2
-//!     instances in-process but is NOT a real network endpoint. Without
-//!     this, the dial stub in zig-libp2p v0.1.0 reports `DialFailed`
-//!     immediately for every bootnode, so the connect_peers wiring above
-//!     only exercises the scheduler, not actual peer establishment.
-//!
-//! The legacy `ethlibp2p.zig` (Rust-FFI consumer) is untouched and remains
-//! the production path while these land. Embedders flip one network slot
-//! over at a time by constructing `EthLibp2pV2` instead of `EthLibp2p`; the
-//! `NetworkInterface` shape is identical so callers don't change.
+//!   - **Metrics parity**: a per-instance `Metrics` registry feeds gossipsub +
+//!     swarm totals into zeam's `lean_gossip_mesh_peers` gauge /
+//!     `zeam_libp2p_swarm_command_dropped_total` counter on every scrape.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -81,7 +57,7 @@ const peer_id_pkg = zl.peer_id;
 const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
 // Shared snappy + SSZ codec helpers; previously lived inside the legacy
-// `ethlibp2p.zig` and were `pub`'d for v2 reuse. After the Rust-glue
+// `ethlibp2p.zig` and were `pub`'d for reuse. After the Rust-glue
 // teardown those helpers live in their own module so the codec sticks
 // around once the legacy file is deleted.
 const v1 = @import("./gossip_codec.zig");
@@ -98,7 +74,7 @@ const GOSSIP_PREVIEW_MAX_BYTES: usize = v1.GOSSIP_PREVIEW_MAX_BYTES;
 /// directly and inherit the same 15s deadline.
 const DEFAULT_REQ_TIMEOUT_NOW_MS = 0; // see commentary at `sendRPCRequest`
 
-pub const EthLibp2pV2Params = struct {
+pub const EthLibp2pParams = struct {
     networkId: u32,
     fork_digest: []const u8,
     listen_addresses: []const u8 = "",
@@ -127,7 +103,7 @@ pub const EthLibp2pV2Params = struct {
 
 /// Heap-allocated host signer state that captures the secp256k1 keypair
 /// for the libp2p TLS cert's `SignedKey` DER ECDSA signature. Stored on
-/// `EthLibp2pV2` so the pointer in `HostIdentityKey.secp256k1.sign_ctx`
+/// `EthLibp2p` so the pointer in `HostIdentityKey.secp256k1.sign_ctx`
 /// stays valid for the lifetime of any cert minted from it.
 ///
 /// secp256k1 (NOT Ed25519 or P-256) is the libp2p convention in the lean
@@ -156,7 +132,7 @@ const Secp256k1HostSigner = struct {
 };
 
 /// Zig 0.16 moved secure randomness to `std.Io.randomSecure`, which requires
-/// an `Io` instance the v2 module doesn't otherwise need. Same fallback shape
+/// an `Io` instance the module does not otherwise need. Same fallback shape
 /// as zig-libp2p's gossipsub seed routine: prefer the Linux `getrandom`
 /// syscall, else `arc4random_buf` on libc platforms.
 fn fillRandomBytes(out: []u8) !void {
@@ -216,13 +192,13 @@ const TopicSubscription = struct {
     encoded: []u8, // owned: the on-the-wire libp2p topic string
 };
 
-pub const EthLibp2pV2 = struct {
+pub const EthLibp2p = struct {
     allocator: Allocator,
     host: *zl.host.Host,
-    /// Per-instance metrics registry owned by this v2. Wired into Host so
+    /// Per-instance metrics registry owned by this instance. Wired into Host so
     /// gossipsub + swarm record into it; the scrape refresher reads from it.
     metrics_registry: *zl.metrics.Metrics,
-    params: EthLibp2pV2Params,
+    params: EthLibp2pParams,
     logger: zeam_utils.ModuleLogger,
 
     /// Pinned local PeerId so callbacks that need to return it stay
@@ -262,7 +238,7 @@ pub const EthLibp2pV2 = struct {
     /// embedder left `listen_addresses` empty.
     quic_runtime: ?*zl.transport.quic_runtime.QuicRuntime = null,
 
-    /// PEM-encoded TLS cert + key, owned by this v2 instance and BORROWED by
+    /// PEM-encoded TLS cert + key, owned by this instance and BORROWED by
     /// `QuicRuntime` (which forwards the slices straight into zquic v1.6.6's
     /// `ServerConfig.cert_pem` / `ClientConfig.client_cert_pem`). The server
     /// config parses them once during `QuicRuntime.create`, but the client
@@ -277,7 +253,7 @@ pub const EthLibp2pV2 = struct {
     pub fn init(
         allocator: Allocator,
         loop: *xev.Loop,
-        params: EthLibp2pV2Params,
+        params: EthLibp2pParams,
         logger: zeam_utils.ModuleLogger,
     ) !*Self {
         // Build a secp256k1 host identity from a 32-byte private-key scalar.
@@ -573,7 +549,7 @@ pub const EthLibp2pV2 = struct {
         self.quic_runtime = rt;
 
         self.logger.debug(
-            "network-{d}:: v2 QUIC transport up on {s}",
+            "network-{d}:: QUIC transport up on {s}",
             .{ self.params.networkId, self.params.listen_addresses },
         );
     }
@@ -665,7 +641,7 @@ pub const EthLibp2pV2 = struct {
             // same `setMeshPeers` write.
             if (now_ms - last_mesh_log_ms >= 1_000) {
                 self.logger.debug(
-                    "network-{d}:: v2 MESH STATUS mesh_peers={d}",
+                    "network-{d}:: MESH STATUS mesh_peers={d}",
                     .{ self.params.networkId, mesh },
                 );
                 last_mesh_log_ms = now_ms;
@@ -724,7 +700,7 @@ pub const EthLibp2pV2 = struct {
         defer self.allocator.free(compressed);
 
         self.logger.debug(
-            "network-{d}:: v2 publish topic={s} ssz={d} compressed={d}",
+            "network-{d}:: publish topic={s} ssz={d} compressed={d}",
             .{ self.params.networkId, topic_str, ssz_buf.items.len, compressed.len },
         );
 
@@ -753,7 +729,7 @@ pub const EthLibp2pV2 = struct {
 
             try self.host.subscribe(encoded);
             self.logger.debug(
-                "network-{d}:: v2 SUBSCRIBE topic={s} mesh_peers_after={d}",
+                "network-{d}:: SUBSCRIBE topic={s} mesh_peers_after={d}",
                 .{ self.params.networkId, encoded, self.host.gossipsub.meshPeers() },
             );
 
@@ -865,7 +841,7 @@ pub const EthLibp2pV2 = struct {
         return self.reqresp_handler.onReqRespRequest(data, stream);
     }
 
-    /// No-op for v2 — the gossipsub mesh in zig-libp2p re-subscribes
+    /// No-op — the gossipsub mesh in zig-libp2p re-subscribes
     /// automatically. The legacy Rust path needed manual re-subscribes
     /// because of an FFI race that doesn't apply here.
     fn refreshGossipMeshSubscriptions(_: *anyopaque) void {}
@@ -887,11 +863,11 @@ pub const EthLibp2pV2 = struct {
     ) zl.gossipsub.runtime.ValidationResult {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
         self.logger.debug(
-            "network-{d}:: v2 INBOUND gossip topic={s} bytes={d} mesh_peers={d}",
+            "network-{d}:: INBOUND gossip topic={s} bytes={d} mesh_peers={d}",
             .{ self.params.networkId, topic, data.len, self.host.gossipsub.meshPeers() },
         );
         self.dispatchInboundGossipFrame(topic, data) catch |e| {
-            self.logger.err("v2 inbound dispatch error: {any}", .{e});
+            self.logger.err("inbound dispatch error: {any}", .{e});
         };
         return .accept;
     }
@@ -904,7 +880,7 @@ pub const EthLibp2pV2 = struct {
         const topic_z = try self.allocator.dupeZ(u8, topic_str);
         defer self.allocator.free(topic_z);
         const topic = interface.LeanNetworkTopic.decode(self.allocator, topic_z.ptr) catch |e| {
-            self.logger.err("v2 ignoring invalid topic={s}: {any}", .{ topic_str, e });
+            self.logger.err("ignoring invalid topic={s}: {any}", .{ topic_str, e });
             return;
         };
 
@@ -914,14 +890,14 @@ pub const EthLibp2pV2 = struct {
         };
 
         _ = v1.validateGossipSnappyHeader(message_bytes, decode_limit) catch |e| {
-            self.logger.err("v2 #942 header reject topic={s} err={any}", .{ topic_str, e });
+            self.logger.err("#942 header reject topic={s} err={any}", .{ topic_str, e });
             return;
         };
 
         const uncompressed = snappyz.decodeWithMax(self.allocator, message_bytes, decode_limit) catch |e| {
             const preview = v1.byteHexPreview(message_bytes, GOSSIP_PREVIEW_MAX_BYTES);
             self.logger.err(
-                "v2 snappy decode failed topic={s} len={d}: {any}; first={s}",
+                "snappy decode failed topic={s} len={d}: {any}; first={s}",
                 .{ topic_str, message_bytes.len, e, preview.slice() },
             );
             return;
@@ -938,7 +914,7 @@ pub const EthLibp2pV2 = struct {
             ) orelse return },
             .attestation => blk: {
                 const subnet_id = topic.gossip_topic.subnet_id orelse {
-                    self.logger.err("v2 attestation missing subnet_id: {s}", .{topic_str});
+                    self.logger.err("attestation missing subnet_id: {s}", .{topic_str});
                     return;
                 };
                 const signed = v1.deserializeGossipMessage(
@@ -1022,7 +998,7 @@ pub const EthLibp2pV2 = struct {
         }
 
         self.logger.debug(
-            "network-{d}:: v2 sendRPCRequest peer={s} method={s} request_id={d} ssz_len={d}",
+            "network-{d}:: sendRPCRequest peer={s} method={s} request_id={d} ssz_len={d}",
             .{ self.params.networkId, peer_id, @tagName(proto), request_id, ssz_bytes.len },
         );
 
@@ -1078,7 +1054,7 @@ pub const EthLibp2pV2 = struct {
         // discriminants — asserted in tests).
         const method: interface.LeanSupportedProtocol = mapInboundProtocol(r.protocol) orelse {
             self.logger.err(
-                "network-{d}:: v2 inbound rpc unknown protocol tag={d}",
+                "network-{d}:: inbound rpc unknown protocol tag={d}",
                 .{ self.params.networkId, @intFromEnum(r.protocol) },
             );
             return;
@@ -1088,14 +1064,14 @@ pub const EthLibp2pV2 = struct {
         var peer_buf: [128]u8 = undefined;
         const peer_str = r.peer.toBase58(&peer_buf) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 inbound rpc peer_id encode failed: {any}",
+                "network-{d}:: inbound rpc peer_id encode failed: {any}",
                 .{ self.params.networkId, e },
             );
             return;
         };
         const peer_owned = self.allocator.dupe(u8, peer_str) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 inbound rpc OOM duping peer_id: {any}",
+                "network-{d}:: inbound rpc OOM duping peer_id: {any}",
                 .{ self.params.networkId, e },
             );
             return;
@@ -1104,7 +1080,7 @@ pub const EthLibp2pV2 = struct {
 
         var request = interface.ReqRespRequest.deserialize(self.allocator, method, r.payload) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 inbound rpc SSZ decode method={s} from={s} failed: {any}",
+                "network-{d}:: inbound rpc SSZ decode method={s} from={s} failed: {any}",
                 .{ self.params.networkId, @tagName(method), peer_str, e },
             );
             self.allocator.free(peer_owned);
@@ -1114,7 +1090,7 @@ pub const EthLibp2pV2 = struct {
 
         const stream_ctx = self.allocator.create(ServerStreamContext) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 inbound rpc OOM allocating stream context: {any}",
+                "network-{d}:: inbound rpc OOM allocating stream context: {any}",
                 .{ self.params.networkId, e },
             );
             self.allocator.free(peer_owned);
@@ -1142,7 +1118,7 @@ pub const EthLibp2pV2 = struct {
         // Handler may retain the stream context; ownership transferred.
         self.reqresp_handler.onReqRespRequest(&request, stream) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 inbound rpc handler error method={s} from={s}: {any}",
+                "network-{d}:: inbound rpc handler error method={s} from={s}: {any}",
                 .{ self.params.networkId, @tagName(method), peer_str, e },
             );
         };
@@ -1153,7 +1129,7 @@ pub const EthLibp2pV2 = struct {
         if (!stream_ctx.finished) {
             serverStreamFinish(stream_ctx) catch |e| {
                 self.logger.err(
-                    "network-{d}:: v2 inbound rpc auto-finish failed: {any}",
+                    "network-{d}:: inbound rpc auto-finish failed: {any}",
                     .{ self.params.networkId, e },
                 );
             };
@@ -1173,7 +1149,7 @@ pub const EthLibp2pV2 = struct {
 
         const response = interface.ReqRespResponse.deserialize(self.allocator, snap.method, r.chunk) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 response chunk decode method={s} request_id={d}: {any}",
+                "network-{d}:: response chunk decode method={s} request_id={d}: {any}",
                 .{ self.params.networkId, @tagName(snap.method), r.request_id, e },
             );
             return;
@@ -1183,7 +1159,7 @@ pub const EthLibp2pV2 = struct {
         defer event.deinit(self.allocator);
         handler.onReqRespResponse(&event) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 response chunk notify request_id={d}: {any}",
+                "network-{d}:: response chunk notify request_id={d}: {any}",
                 .{ self.params.networkId, r.request_id, e },
             );
         };
@@ -1195,7 +1171,7 @@ pub const EthLibp2pV2 = struct {
         var event = interface.ReqRespResponseEvent.initCompleted(r.request_id, cb.method);
         cb.notify(&event) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 response end notify request_id={d}: {any}",
+                "network-{d}:: response end notify request_id={d}: {any}",
                 .{ self.params.networkId, r.request_id, e },
             );
         };
@@ -1206,7 +1182,7 @@ pub const EthLibp2pV2 = struct {
         defer cb.deinit();
         const message = self.allocator.dupe(u8, @errorName(r.kind)) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 response error OOM duping message: {any}",
+                "network-{d}:: response error OOM duping message: {any}",
                 .{ self.params.networkId, e },
             );
             return;
@@ -1219,7 +1195,7 @@ pub const EthLibp2pV2 = struct {
         defer event.deinit(self.allocator);
         cb.notify(&event) catch |e| {
             self.logger.err(
-                "network-{d}:: v2 response error notify request_id={d}: {any}",
+                "network-{d}:: response error notify request_id={d}: {any}",
                 .{ self.params.networkId, r.request_id, e },
             );
         };
@@ -1260,7 +1236,7 @@ pub const EthLibp2pV2 = struct {
             defer event.deinit(self.allocator);
             cb.notify(&event) catch |e| {
                 self.logger.err(
-                    "network-{d}:: v2 failInflightRpcsForPeer notify request_id={d}: {any}",
+                    "network-{d}:: failInflightRpcsForPeer notify request_id={d}: {any}",
                     .{ self.params.networkId, request_id, e },
                 );
             };
@@ -1277,7 +1253,7 @@ pub const EthLibp2pV2 = struct {
         };
         const direction = mapDirection(p.direction);
         self.peer_event_handler.onPeerConnected(peer_str, direction) catch |e| {
-            self.logger.err("network-{d}:: v2 onPeerConnected handler error: {any}", .{ self.params.networkId, e });
+            self.logger.err("network-{d}:: onPeerConnected handler error: {any}", .{ self.params.networkId, e });
         };
     }
 
@@ -1291,7 +1267,7 @@ pub const EthLibp2pV2 = struct {
         const direction = mapDirection(p.direction);
         const reason = mapDisconnectReason(p.reason);
         self.peer_event_handler.onPeerDisconnected(peer_str, direction, reason) catch |e| {
-            self.logger.err("network-{d}:: v2 onPeerDisconnected handler error: {any}", .{ self.params.networkId, e });
+            self.logger.err("network-{d}:: onPeerDisconnected handler error: {any}", .{ self.params.networkId, e });
         };
     }
 
@@ -1307,7 +1283,7 @@ pub const EthLibp2pV2 = struct {
             .err => .error_,
         };
         self.peer_event_handler.onPeerConnectionFailed(peer_str, direction, result) catch |e| {
-            self.logger.err("network-{d}:: v2 onPeerConnectionFailed handler error: {any}", .{ self.params.networkId, e });
+            self.logger.err("network-{d}:: onPeerConnectionFailed handler error: {any}", .{ self.params.networkId, e });
         };
     }
 
@@ -1321,7 +1297,7 @@ pub const EthLibp2pV2 = struct {
         if (ctx == null) return;
         const self: *Self = @ptrCast(@alignCast(ctx.?));
 
-        // Mesh peers gauge. With multiple v2 instances, last-write-wins —
+        // Mesh peers gauge. With multiple network instances, last-write-wins —
         // same caveat as the legacy path's single-`set` semantics.
         zeam_metrics.metrics.lean_gossip_mesh_peers.set(self.metrics_registry.meshPeers());
 
@@ -1380,7 +1356,7 @@ fn mapDisconnectReason(r: zl.peer_events.DisconnectReason) interface.Disconnecti
 // ── Server-stream context (outbound responses to inbound RPCs) ─────────────
 
 const ServerStreamContext = struct {
-    parent: *EthLibp2pV2,
+    parent: *EthLibp2p,
     channel_id: u64,
     peer_id: []const u8,
     method: interface.LeanSupportedProtocol,
@@ -1426,7 +1402,7 @@ fn serverStreamFinish(ptr: *anyopaque) anyerror!void {
 
 const testing = std.testing;
 
-test "EthLibp2pV2 init / deinit smoke" {
+test "EthLibp2p init / deinit smoke" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
@@ -1440,7 +1416,7 @@ test "EthLibp2pV2 init / deinit smoke" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(null);
 
-    var net = try EthLibp2pV2.init(a, &loop, .{
+    var net = try EthLibp2p.init(a, &loop, .{
         .networkId = 0,
         .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
         .listen_addresses = "",
@@ -1453,7 +1429,7 @@ test "EthLibp2pV2 init / deinit smoke" {
     try testing.expect(net.host.isReady());
 }
 
-test "EthLibp2pV2 protocol enum discriminants match zig-libp2p" {
+test "EthLibp2p protocol enum discriminants match zig-libp2p" {
     // Critical for the `@intFromEnum` round-trip in dispatchRpcRequest +
     // sendRPCRequest. If these ever drift, both directions of req/resp
     // routing break silently.
@@ -1471,20 +1447,20 @@ test "EthLibp2pV2 protocol enum discriminants match zig-libp2p" {
     );
 }
 
-test "EthLibp2pV2 direction mapping is total + 1:1" {
+test "EthLibp2p direction mapping is total + 1:1" {
     try testing.expectEqual(interface.PeerDirection.inbound, mapDirection(.inbound));
     try testing.expectEqual(interface.PeerDirection.outbound, mapDirection(.outbound));
     try testing.expectEqual(interface.PeerDirection.unknown, mapDirection(.unknown));
 }
 
-test "EthLibp2pV2 disconnect reason mapping is total" {
+test "EthLibp2p disconnect reason mapping is total" {
     try testing.expectEqual(interface.DisconnectionReason.timeout, mapDisconnectReason(.timeout));
     try testing.expectEqual(interface.DisconnectionReason.remote_close, mapDisconnectReason(.remote_close));
     try testing.expectEqual(interface.DisconnectionReason.local_close, mapDisconnectReason(.local_close));
     try testing.expectEqual(interface.DisconnectionReason.error_, mapDisconnectReason(.err));
 }
 
-test "EthLibp2pV2 peer-event dispatch fires registered handler" {
+test "EthLibp2p peer-event dispatch fires registered handler" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
@@ -1498,7 +1474,7 @@ test "EthLibp2pV2 peer-event dispatch fires registered handler" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(null);
 
-    var net = try EthLibp2pV2.init(a, &loop, .{
+    var net = try EthLibp2p.init(a, &loop, .{
         .networkId = 0,
         .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
         .node_registry = &registry,
@@ -1545,7 +1521,7 @@ test "EthLibp2pV2 peer-event dispatch fires registered handler" {
     try testing.expectEqual(@as(u32, 1), Counter.instance.failed);
 }
 
-test "EthLibp2pV2 brings up QuicRuntime when listen_addresses is set" {
+test "EthLibp2p brings up QuicRuntime when listen_addresses is set" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
@@ -1561,7 +1537,7 @@ test "EthLibp2pV2 brings up QuicRuntime when listen_addresses is set" {
 
     // Deterministic host identity so we can assert this never relies on a
     // particular peer id — only that bring-up succeeds end-to-end.
-    var net = try EthLibp2pV2.init(a, &loop, .{
+    var net = try EthLibp2p.init(a, &loop, .{
         .networkId = 0,
         .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
         .listen_addresses = "/ip4/127.0.0.1/udp/0/quic-v1",
@@ -1584,7 +1560,7 @@ test "EthLibp2pV2 brings up QuicRuntime when listen_addresses is set" {
     try testing.expect(net.quic_runtime.?.boundUdpPortIpv4().? != 0);
 }
 
-test "EthLibp2pV2 bootnode multiaddr parsing tolerates whitespace + empty entries" {
+test "EthLibp2p bootnode multiaddr parsing tolerates whitespace + empty entries" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
 
@@ -1603,7 +1579,7 @@ test "EthLibp2pV2 bootnode multiaddr parsing tolerates whitespace + empty entrie
     // should land in the connection manager's known-peer table.
     const peers = "/ip4/127.0.0.1/udp/9000/quic-v1, , not-a-multiaddr";
 
-    var net = try EthLibp2pV2.init(a, &loop, .{
+    var net = try EthLibp2p.init(a, &loop, .{
         .networkId = 0,
         .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
         .connect_peers = peers,

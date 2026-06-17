@@ -338,7 +338,7 @@ pub fn build(b: *Builder) !void {
 
     // zig-libp2p — pure-Zig libp2p stack. The legacy `ethlibp2p.zig`
     // / `rust/libp2p-glue/` path was deleted; this is the only libp2p
-    // implementation now. `ethlibp2p_v2.zig` consumes it via
+    // implementation now. `ethlibp2p.zig` consumes it via
     // `@import("zig_libp2p")`.
     const zig_libp2p_dep = b.dependency("zig_libp2p", .{
         .target = target,

@@ -612,9 +612,9 @@ fn mainInner(init: std.process.Init) !void {
 
             // These are owned by the network implementations and will be freed in their deinit functions
             // We will run network1, network2, and network3 after the nodes are running to avoid race conditions
-            var network1: *networks.EthLibp2pV2 = undefined;
-            var network2: *networks.EthLibp2pV2 = undefined;
-            var network3: *networks.EthLibp2pV2 = undefined;
+            var network1: *networks.EthLibp2p = undefined;
+            var network2: *networks.EthLibp2p = undefined;
+            var network3: *networks.EthLibp2p = undefined;
             // v2 takes string-shaped listen/connect multiaddrs (one or
             // comma-separated). We allocate them after we know each network's
             // peer id (so connect strings can carry `/p2p/<peer>`), keep them
@@ -681,11 +681,11 @@ fn mainInner(init: std.process.Init) !void {
                 // inbound-only peers can't be the target of `sendRequest`
                 // — so making every node dial every other node is the
                 // cheapest fix at this layer.
-                const peer1_b58 = try networks.EthLibp2pV2.peerIdBase58FromSeed(allocator, seed1);
+                const peer1_b58 = try networks.EthLibp2p.peerIdBase58FromSeed(allocator, seed1);
                 defer allocator.free(peer1_b58);
-                const peer2_b58 = try networks.EthLibp2pV2.peerIdBase58FromSeed(allocator, seed2);
+                const peer2_b58 = try networks.EthLibp2p.peerIdBase58FromSeed(allocator, seed2);
                 defer allocator.free(peer2_b58);
-                const peer3_b58 = try networks.EthLibp2pV2.peerIdBase58FromSeed(allocator, seed3);
+                const peer3_b58 = try networks.EthLibp2p.peerIdBase58FromSeed(allocator, seed3);
                 defer allocator.free(peer3_b58);
 
                 connect_str1 = try std.fmt.allocPrint(
@@ -705,7 +705,7 @@ fn mainInner(init: std.process.Init) !void {
                 );
 
                 // ── Network 1 ───────────────────────────────────────────
-                // `EthLibp2pV2.init` returns a heap-allocated `*Self`; we
+                // `EthLibp2p.init` returns a heap-allocated `*Self`; we
                 // do NOT need a separate `allocator.create` like the
                 // legacy `EthLibp2p` flow.
                 const fork_digest1 = try allocator.dupe(u8, chain_config.spec.fork_digest);
@@ -715,7 +715,7 @@ fn mainInner(init: std.process.Init) !void {
                 test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry1.deinit();
 
-                network1 = try networks.EthLibp2pV2.init(allocator, loop, .{
+                network1 = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 0,
                     .fork_digest = fork_digest1,
                     .listen_addresses = listen_str1.?,
@@ -733,7 +733,7 @@ fn mainInner(init: std.process.Init) !void {
                 test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry2.deinit();
 
-                network2 = try networks.EthLibp2pV2.init(allocator, loop, .{
+                network2 = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 1,
                     .fork_digest = fork_digest2,
                     .listen_addresses = listen_str2.?,
@@ -751,7 +751,7 @@ fn mainInner(init: std.process.Init) !void {
                 test_registry3.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry3.deinit();
 
-                network3 = try networks.EthLibp2pV2.init(allocator, loop, .{
+                network3 = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 2,
                     .fork_digest = fork_digest3,
                     .listen_addresses = listen_str3.?,
@@ -879,7 +879,7 @@ fn mainInner(init: std.process.Init) !void {
                 beam_node: *BeamNode,
                 /// Reference node whose finalization status determines when node 3 starts
                 reference_node: *BeamNode,
-                network: ?*networks.EthLibp2pV2 = null,
+                network: ?*networks.EthLibp2p = null,
                 started: bool = false,
 
                 pub fn onInterval(ptr: *anyopaque, interval: isize) !void {
