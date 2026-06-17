@@ -1668,8 +1668,7 @@ pub const ForkChoice = struct {
         zeam_metrics.metrics.lean_head_slot.set(self.head.slot);
 
         // Keep the store finalized in lock-step with the head-state finalized that the STF
-        // validates against, so a losing fork that finalized a higher slot can never latch
-        // it.
+        // validates against, so a losing fork that finalized a higher slot can never latch it.
         const nodes = self.protoArray.nodes.items;
         if (self.protoArray.indices.get(self.head.blockRoot)) |head_idx| {
             const fin_slot = nodes[head_idx].stateFinalizedSlot;
@@ -2520,7 +2519,7 @@ pub const ForkChoice = struct {
         // pre-check there short-circuits when nothing new has arrived, so we
         // do not re-aggregate redundantly. Memory is still bounded — the
         // finalization-driven prune at `pruneStaleSignatures` removes
-        // signatures whose `target.slot <= finalized_slot`, same as before.
+        // signatures whose `head.slot <= finalized_slot`, same as before.
         if (snap.signatures.fetchRemove(att_data)) |snap_inner_kv| {
             var snap_inner = snap_inner_kv.value;
             snap_inner.deinit();
@@ -2610,9 +2609,9 @@ pub const ForkChoice = struct {
 
     /// Remove attestation data that can no longer influence fork choice.
     ///
-    /// An attestation becomes stale when its target checkpoint falls at or before
+    /// An attestation becomes stale when its head checkpoint falls at or before
     /// the finalized slot. Such attestations cannot affect chain selection since
-    /// the target is already finalized.
+    /// the head they vote for is already at or below the finalized boundary.
     ///
     /// Pruning removes all attestation-related data:
     /// - Attestation data entries
@@ -2623,13 +2622,13 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        // Collect stale AttestationData keys from attestation_signatures (target.slot <= finalized)
+        // Collect stale AttestationData keys from attestation_signatures (head.slot <= finalized)
         var att_sig_keys_to_remove: std.ArrayList(types.AttestationData) = .empty;
         defer att_sig_keys_to_remove.deinit(self.allocator);
 
         var att_sig_it = self.attestation_signatures.iterator();
         while (att_sig_it.next()) |entry| {
-            if (entry.key_ptr.target.slot <= finalized_slot) {
+            if (entry.key_ptr.head.slot <= finalized_slot) {
                 try att_sig_keys_to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
@@ -2663,7 +2662,7 @@ pub const ForkChoice = struct {
         var removed_total: usize = 0;
         var it = payloads.iterator();
         while (it.next()) |entry| {
-            if (entry.key_ptr.target.slot > finalized_slot) continue;
+            if (entry.key_ptr.head.slot > finalized_slot) continue;
 
             removed_total += entry.value_ptr.items.len;
             try keys_to_remove.append(allocator, entry.key_ptr.*);
@@ -3039,14 +3038,6 @@ pub const ForkChoice = struct {
         return self.protoArray.nodes.items[idx].slot;
     }
 
-    /// Get a ProtoNode by root (returns a copy)
-    pub fn getProtoNode(self: *Self, blockRoot: types.Root) ?ProtoNode {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
-        const idx = self.protoArray.indices.get(blockRoot) orelse return null;
-        return self.protoArray.nodes.items[idx];
-    }
-
     /// Return whether the `ancestor` checkpoint lies on the `descendant`'s parent chain.
     ///
     /// Walks parent links from the descendant down to the ancestor's slot.
@@ -3055,13 +3046,12 @@ pub const ForkChoice = struct {
     /// Mirrors the spec's `_checkpoint_is_ancestor`. Fork-choice weight accrues to every
     /// ancestor of an attested head, so a sibling head/target would otherwise steer that
     /// weight onto a non-canonical branch.
-    pub fn checkpointIsAncestor(self: *Self, ancestor: types.Checkpoint, descendant: types.Checkpoint) bool {
+    ///
+    /// Internal unlocked version - assumes caller holds (at least shared) lock.
+    fn checkpointIsAncestorUnlocked(self: *Self, ancestor: types.Checkpoint, descendant: types.Checkpoint) bool {
         if (ancestor.slot > descendant.slot) {
             return false;
         }
-
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
 
         var current_root = descendant.root;
         while (self.protoArray.indices.get(current_root)) |current_idx| {
@@ -3076,6 +3066,103 @@ pub const ForkChoice = struct {
         }
 
         return false;
+    }
+
+    /// Validate attestation data against fork-choice state alone.
+    ///
+    /// Performs every check derivable from the proto-array and slot clock,
+    /// matching the spec's store.validate_attestation:
+    ///
+    ///  1. Source, target, and head blocks exist in the proto-array.
+    ///  2. Checkpoint slot ordering: source.slot <= target.slot, head.slot >= target.slot.
+    ///  3. Checkpoint slots match their blocks' slots (source, target, head).
+    ///  4. Ancestry: source lies on target's chain, target lies on head's chain.
+    ///  5. The vote's slot does not precede the head it claims to have seen.
+    ///  6. The vote's slot has started locally within the disparity margin.
+    ///
+    /// The future-slot bound applies only to gossip; block-included
+    /// attestations are trusted under the block's own validation and pass
+    /// `check_future_slot = false`. Ancestry (4) applies on BOTH paths.
+    ///
+    /// Signature, proof, registry-bound, and empty-bits checks are NOT here.
+    /// They need chain/state context and are layered by the caller.
+    pub fn validateAttestationDataForGossip(self: *Self, data: types.AttestationData, check_future_slot: bool) GossipAttestationValidationError!void {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.validateAttestationDataForGossipUnlocked(data, check_future_slot);
+    }
+
+    // Internal unlocked version - assumes caller holds (at least shared) lock.
+    fn validateAttestationDataForGossipUnlocked(self: *Self, data: types.AttestationData, check_future_slot: bool) GossipAttestationValidationError!void {
+        // The future-slot bound is hoisted before the proto-node lookups.
+        // An attestation for a far-future slot referencing future blocks
+        // would otherwise bottom out at UnknownHeadBlock and trigger a
+        // BlocksByRoot fetch for a head that does not exist anywhere — a
+        // fetch-storm amplifier on aggregators. Rejecting here means the
+        // missing root is never derived and the fetch is never enqueued.
+        if (check_future_slot) {
+            const now_intervals = self.fcStore.slot_clock.time.load(.monotonic);
+            const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
+            if (attestation_start_interval > now_intervals + constants.GOSSIP_DISPARITY_INTERVALS) {
+                return GossipAttestationValidationError.AttestationTooFarInFuture;
+            }
+        }
+
+        // 1. Source, target, and head blocks must exist in the proto-array.
+        const source_idx = self.protoArray.indices.get(data.source.root) orelse {
+            return GossipAttestationValidationError.UnknownSourceBlock;
+        };
+        const target_idx = self.protoArray.indices.get(data.target.root) orelse {
+            return GossipAttestationValidationError.UnknownTargetBlock;
+        };
+        const head_idx = self.protoArray.indices.get(data.head.root) orelse {
+            return GossipAttestationValidationError.UnknownHeadBlock;
+        };
+        const source_node = self.protoArray.nodes.items[source_idx];
+        const target_node = self.protoArray.nodes.items[target_idx];
+        const head_node = self.protoArray.nodes.items[head_idx];
+
+        // 2. Slot relationships. History is linear and monotonic.
+        if (source_node.slot > target_node.slot) {
+            return GossipAttestationValidationError.SourceSlotExceedsTarget;
+        }
+        // Invariant: attestation.source.slot <= attestation.target.slot
+        if (data.source.slot > data.target.slot) {
+            return GossipAttestationValidationError.SourceCheckpointExceedsTarget;
+        }
+        // Invariant: data.head.slot >= data.target.slot
+        if (data.head.slot < data.target.slot) {
+            return GossipAttestationValidationError.HeadOlderThanTarget;
+        }
+
+        // 3. Checkpoint slots must match their blocks' slots.
+        if (source_node.slot != data.source.slot) {
+            return GossipAttestationValidationError.SourceCheckpointSlotMismatch;
+        }
+        if (target_node.slot != data.target.slot) {
+            return GossipAttestationValidationError.TargetCheckpointSlotMismatch;
+        }
+        if (head_node.slot != data.head.slot) {
+            return GossipAttestationValidationError.HeadCheckpointSlotMismatch;
+        }
+
+        // 4. Ancestry: fork-choice weight accrues to every ancestor of the
+        // attested head, so a source off the target's chain (or a target off
+        // the head's chain) would steer weight onto a non-canonical branch.
+        // checkpointIsAncestor matches by root, so a sibling block at the same
+        // slot is correctly rejected. Reuse the unlocked walk — we already hold
+        // the shared lock here, so the locked variant would self-deadlock.
+        if (!self.checkpointIsAncestorUnlocked(data.source, data.target)) {
+            return GossipAttestationValidationError.SourceCheckpointNotAncestorOfTarget;
+        }
+        if (!self.checkpointIsAncestorUnlocked(data.target, data.head)) {
+            return GossipAttestationValidationError.TargetCheckpointNotAncestorOfHead;
+        }
+
+        // 5. A vote cannot have observed its head before that head existed.
+        if (data.slot < data.head.slot) {
+            return GossipAttestationValidationError.AttestationSlotBeforeHead;
+        }
     }
 
     /// Get a ProtoNode's index in the underlying nodes array. Callers use
@@ -3114,6 +3201,29 @@ pub const ForkChoiceError = error{
     InvalidSafeTargetCompute,
     DuplicateAttestationData,
     TooManyAttestationData,
+};
+
+/// Errors raised by the shared gossip attestation-data validator.
+///
+/// These cover every check derivable from fork-choice state alone:
+/// proto-array block existence, checkpoint slot ordering and matching,
+/// source/target/head ancestry, the slot-before-head lower bound, and
+/// the interval-based future-slot bound from the slot clock.
+/// Signature, proof, and registry-bound concerns live in the chain layer.
+pub const GossipAttestationValidationError = error{
+    UnknownSourceBlock,
+    UnknownTargetBlock,
+    UnknownHeadBlock,
+    SourceSlotExceedsTarget,
+    SourceCheckpointExceedsTarget,
+    SourceCheckpointSlotMismatch,
+    TargetCheckpointSlotMismatch,
+    HeadCheckpointSlotMismatch,
+    HeadOlderThanTarget,
+    SourceCheckpointNotAncestorOfTarget,
+    TargetCheckpointNotAncestorOfHead,
+    AttestationSlotBeforeHead,
+    AttestationTooFarInFuture,
 };
 
 fn setupTestPrimitives() !*ThreadPool {
@@ -3883,7 +3993,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     }
 }
 
-test "updateHead derives finalized from head chain: losing fork's higher finalized does not latch (leanSpec #1001)" {
+test "updateHead derives finalized from head chain: losing fork's higher finalized does not latch" {
     // A losing fork finalizes a HIGHER slot but loses head selection; the store finalized
     // must track the head chain (slot 1 / root B), not latch the losing fork (slot 2 / root H),
     // even when it starts latched on the losing fork's higher slot.
@@ -3936,9 +4046,8 @@ test "updateHead derives finalized from head chain: losing fork's higher finaliz
     try std.testing.expectEqual(@as(types.Slot, 1), proto_array.nodes.items[2].stateFinalizedSlot);
     try std.testing.expectEqual(@as(types.Slot, 2), proto_array.nodes.items[5].stateFinalizedSlot);
 
-    // Store STARTS latched on the losing fork's higher finalized (slot 2 / root H),
-    // exactly the divergent state the pre-fix monotonic-max could produce. Justified
-    // stays at the anchor so head selection walks best descendants from A.
+    // Store STARTS latched on the losing fork's higher finalized (slot 2 / root H).
+    // Justified stays at the anchor so head selection walks best descendants from A.
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const latched_finalized = types.Checkpoint{ .slot = 2, .root = createTestRoot(0x22) }; // root H
     const fc_store = ForkChoiceStore{
