@@ -293,7 +293,7 @@ const POSTSTATE_DIAG_SLOT_MAX: u64 = 80;
 /// available for diagnostic deep-dives without polluting normal operator
 /// info-level output (one ~250-char line per slot for the first
 /// `POSTSTATE_DIAG_SLOT_MAX` slots is too noisy at info).
-const PerFieldLogLevel = enum { err_level, debug_level };
+const PerFieldLogLevel = enum { err_level, info_level, debug_level };
 
 /// Emit per-field hashTreeRoots of a post-state. Called
 /// from two sites in `apply_transition`:
@@ -302,7 +302,8 @@ const PerFieldLogLevel = enum { err_level, debug_level };
 ///   * Success side — for `block.slot <= POSTSTATE_DIAG_SLOT_MAX`, as a
 ///     ground-truth baseline so the failure case can be compared per-field
 ///     against the last known good post-state. `tag = "PostStateMatch"`,
-///     `level = .info_level`.
+///     `level = .debug_level` (`.info_level` is also available for callers
+///     that want the baseline surfaced at info).
 /// Errors during per-field hashing are logged-and-swallowed at err level
 /// regardless of the caller's chosen level — they indicate a genuine
 /// runtime fault and must not be masked by an info-tagged invocation.
@@ -381,6 +382,7 @@ fn logBeamStatePerFieldRoots(
     const fmt = "{s} per-field block_slot={d} state_slot={d} hbh_len={d} js_len={d} jr_len={d} | slot={x} lbh={x} lj={x} lf={x} hbh={x} js={x} v={x} jr={x} jv={x}";
     switch (level) {
         .err_level => logger.err(fmt, args),
+        .info_level => logger.info(fmt, args),
         .debug_level => logger.debug(fmt, args),
     }
 }
