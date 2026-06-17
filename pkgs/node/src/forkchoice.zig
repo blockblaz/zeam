@@ -3016,6 +3016,37 @@ pub const ForkChoice = struct {
         return self.protoArray.nodes.items[idx];
     }
 
+    /// Return whether the `ancestor` checkpoint lies on the `descendant`'s parent chain.
+    ///
+    /// Walks parent links from the descendant down to the ancestor's slot.
+    /// Conservative: a skipped slot or a block missing from the store yields false.
+    ///
+    /// Mirrors the spec's `_checkpoint_is_ancestor`. Fork-choice weight accrues to every
+    /// ancestor of an attested head, so a sibling head/target would otherwise steer that
+    /// weight onto a non-canonical branch.
+    pub fn checkpointIsAncestor(self: *Self, ancestor: types.Checkpoint, descendant: types.Checkpoint) bool {
+        if (ancestor.slot > descendant.slot) {
+            return false;
+        }
+
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+
+        var current_root = descendant.root;
+        while (self.protoArray.indices.get(current_root)) |current_idx| {
+            const current_node = self.protoArray.nodes.items[current_idx];
+            if (current_node.slot == ancestor.slot) {
+                return std.mem.eql(u8, &current_node.blockRoot, &ancestor.root);
+            }
+            if (current_node.slot < ancestor.slot) {
+                return false;
+            }
+            current_root = current_node.parentRoot;
+        }
+
+        return false;
+    }
+
     /// Get a ProtoNode's index in the underlying nodes array. Callers use
     /// this to measure how many nodes precede a given block (e.g. to gate
     /// proto-array rebase on a grace-window threshold).

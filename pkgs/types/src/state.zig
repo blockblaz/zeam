@@ -411,6 +411,7 @@ pub const BeamState = struct {
 
             logger.debug("processing attestation={s} validators_count={d}\n", .{ attestation_str, validator_indices.items.len });
 
+            const head_slot: Slot = attestation_data.head.slot;
             const historical_len: Slot = @intCast(self.historical_block_hashes.len());
             if (source_slot >= historical_len) {
                 return StateTransitionError.InvalidSlotIndex;
@@ -418,23 +419,30 @@ pub const BeamState = struct {
             if (target_slot >= historical_len) {
                 return StateTransitionError.InvalidSlotIndex;
             }
+            if (head_slot >= historical_len) {
+                return StateTransitionError.InvalidSlotIndex;
+            }
 
             const is_source_justified = try utils.isSlotJustified(finalized_slot, &self.justified_slots, source_slot);
             const is_target_already_justified = try utils.isSlotJustified(finalized_slot, &self.justified_slots, target_slot);
             const stored_source_root = try self.historical_block_hashes.get(@intCast(source_slot));
             const stored_target_root = try self.historical_block_hashes.get(@intCast(target_slot));
+            const stored_head_root = try self.historical_block_hashes.get(@intCast(head_slot));
             const is_zero_source = std.mem.eql(u8, &attestation_data.source.root, &utils.ZERO_HASH);
             const is_zero_target = std.mem.eql(u8, &attestation_data.target.root, &utils.ZERO_HASH);
-            if (is_zero_source or is_zero_target) {
-                logger.debug("skipping the attestation as not viable: source_zero_root={} target_zero_root={}", .{
+            const is_zero_head = std.mem.eql(u8, &attestation_data.head.root, &utils.ZERO_HASH);
+            if (is_zero_source or is_zero_target or is_zero_head) {
+                logger.debug("skipping the attestation as not viable: source_zero_root={} target_zero_root={} head_zero_root={}", .{
                     is_zero_source,
                     is_zero_target,
+                    is_zero_head,
                 });
                 continue;
             }
             const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &stored_source_root);
             const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &stored_target_root);
-            const has_known_root = has_correct_source_root and has_correct_target_root;
+            const has_correct_head_root = std.mem.eql(u8, &attestation_data.head.root, &stored_head_root);
+            const has_known_root = has_correct_source_root and has_correct_target_root and has_correct_head_root;
 
             const target_not_ahead = target_slot <= source_slot;
             const is_target_justifiable = utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot) catch false;
@@ -789,6 +797,18 @@ fn makeAggregatedAttestation(
     source: Checkpoint,
     target: Checkpoint,
 ) !attestation.AggregatedAttestation {
+    // Default head to target, the common case for chain-following votes.
+    return makeAggregatedAttestationWithHead(allocator, participant_ids, attestation_slot, source, target, target);
+}
+
+fn makeAggregatedAttestationWithHead(
+    allocator: Allocator,
+    participant_ids: []const usize,
+    attestation_slot: Slot,
+    source: Checkpoint,
+    target: Checkpoint,
+    head: Checkpoint,
+) !attestation.AggregatedAttestation {
     var bits = try attestation.AggregationBits.init(allocator);
     errdefer bits.deinit();
 
@@ -800,7 +820,7 @@ fn makeAggregatedAttestation(
         .aggregation_bits = bits,
         .data = .{
             .slot = attestation_slot,
-            .head = target,
+            .head = head,
             .target = target,
             .source = source,
         },
@@ -896,6 +916,141 @@ test "process_attestations silently skips pre-finalized target attestations" {
 
     // Must succeed: the pre-finalized attestation is skipped, not an error.
     try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+}
+
+test "process_attestations silently skips head root off the canonical chain" {
+    // Source and target match the local chain, but the head root names a different
+    // block at the head slot. Without the head check the vote would justify the target
+    // (2 of 3 validators is a supermajority), so this guards a real fork-choice path.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    const source_root = [_]u8{1} ** 32;
+    const target_root = [_]u8{2} ** 32;
+    const canonical_head_root = [_]u8{3} ** 32;
+    const sibling_head_root = [_]u8{4} ** 32;
+
+    try state.historical_block_hashes.append(source_root);
+    try state.historical_block_hashes.append(target_root);
+    try state.historical_block_hashes.append(canonical_head_root);
+    try state.justified_slots.append(false);
+    state.slot = 3;
+
+    var att = try makeAggregatedAttestationWithHead(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        2,
+        .{ .root = source_root, .slot = 0 },
+        .{ .root = target_root, .slot = 1 },
+        .{ .root = sibling_head_root, .slot = 2 },
+    );
+    var att_transferred = false;
+    defer if (!att_transferred) att.deinit();
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att);
+    att_transferred = true;
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &state.latest_justified.root, &utils.ZERO_HASH));
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_roots.len());
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
+}
+
+test "process_attestations silently skips zero-hash head" {
+    // A zero-hash head names an empty slot, not a block; source and target still match.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    const source_root = [_]u8{1} ** 32;
+    const target_root = [_]u8{2} ** 32;
+    const canonical_head_root = [_]u8{3} ** 32;
+
+    try state.historical_block_hashes.append(source_root);
+    try state.historical_block_hashes.append(target_root);
+    try state.historical_block_hashes.append(canonical_head_root);
+    try state.justified_slots.append(false);
+    state.slot = 3;
+
+    var att = try makeAggregatedAttestationWithHead(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        2,
+        .{ .root = source_root, .slot = 0 },
+        .{ .root = target_root, .slot = 1 },
+        .{ .root = utils.ZERO_HASH, .slot = 2 },
+    );
+    var att_transferred = false;
+    defer if (!att_transferred) att.deinit();
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att);
+    att_transferred = true;
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &state.latest_justified.root, &utils.ZERO_HASH));
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_roots.len());
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
+}
+
+test "process_attestations rejects head slot beyond history" {
+    // Source and target sit inside the chain view; only the head slot does not.
+    // The bounds guard must reject the vote (matching source/target out-of-bounds
+    // handling) instead of indexing past the end of the chain.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    const source_root = [_]u8{1} ** 32;
+    const target_root = [_]u8{2} ** 32;
+    const canonical_head_root = [_]u8{3} ** 32;
+
+    try state.historical_block_hashes.append(source_root);
+    try state.historical_block_hashes.append(target_root);
+    try state.historical_block_hashes.append(canonical_head_root);
+    try state.justified_slots.append(false);
+    state.slot = 3;
+
+    var att = try makeAggregatedAttestationWithHead(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        2,
+        .{ .root = source_root, .slot = 0 },
+        .{ .root = target_root, .slot = 1 },
+        .{ .root = [_]u8{5} ** 32, .slot = 10 },
+    );
+    var att_transferred = false;
+    defer if (!att_transferred) att.deinit();
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att);
+    att_transferred = true;
+
+    try std.testing.expectError(
+        StateTransitionError.InvalidSlotIndex,
+        state.process_attestations(std.testing.allocator, attestations_list, logger, null),
+    );
 }
 
 test "justified_slots do not include finalized boundary" {
