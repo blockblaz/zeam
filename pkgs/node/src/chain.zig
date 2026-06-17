@@ -4748,6 +4748,32 @@ pub const BeamChain = struct {
             return AttestationValidationError.HeadCheckpointSlotMismatch;
         }
 
+        // 4. Validate that source, target, and head lie on one parent chain.
+        //
+        // Fork-choice weight accrues to every ancestor of the attested head, so a
+        // sibling head would steer that weight onto a non-canonical branch while the
+        // FFG vote still rode the canonical source -> target pair.
+        //
+        // Applied unconditionally (including is_from_block): block-embedded
+        // attestations are also fed to the fork-choice tracker via onAttestation,
+        // so gating this on the gossip path would reopen the vote-splitting vector
+        // for attestations smuggled inside a block.
+        if (!self.forkChoice.checkpointIsAncestor(data.source, data.target)) {
+            self.logger.debug("attestation validation failed: source checkpoint slot {d} not ancestor of target slot {d}", .{
+                data.source.slot,
+                data.target.slot,
+            });
+            return AttestationValidationError.SourceCheckpointNotAncestorOfTarget;
+        }
+
+        if (!self.forkChoice.checkpointIsAncestor(data.target, data.head)) {
+            self.logger.debug("attestation validation failed: target checkpoint slot {d} not ancestor of head slot {d}", .{
+                data.target.slot,
+                data.head.slot,
+            });
+            return AttestationValidationError.TargetCheckpointNotAncestorOfHead;
+        }
+
         // (Future-slot bound check is hoisted above the proto-node
         // lookups — see the comment at the top of this function.)
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
@@ -5639,6 +5665,8 @@ const AttestationValidationError = error{
     TargetCheckpointSlotMismatch,
     HeadCheckpointSlotMismatch,
     HeadOlderThanTarget,
+    SourceCheckpointNotAncestorOfTarget,
+    TargetCheckpointNotAncestorOfHead,
     AttestationTooFarInFuture,
 };
 pub const BlockValidationError = error{
@@ -6220,6 +6248,117 @@ test "attestation validation - comprehensive" {
             .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(future_attestation.message, false));
+    }
+
+    // Insert sibling/orphan blocks so we can exercise the checkpoint ancestry checks.
+    // The mock chain is linear (genesis -> slot1 -> slot2); these synthetic blocks add
+    // off-chain branches that share neither parent chain with the canonical slot-2 block.
+    const genesis_root = mock_chain.blockRoots[0];
+    const zero_state_root = [_]u8{0} ** 32;
+
+    // A sibling at slot 1 whose parent is genesis (a peer of the canonical slot-1 block).
+    const sibling_slot1_root = [_]u8{0xA1} ** 32;
+    try beam_chain.forkChoice.protoArray.onBlock(types.ProtoBlock{
+        .slot = 1,
+        .proposer_index = 0,
+        .blockRoot = sibling_slot1_root,
+        .parentRoot = genesis_root,
+        .stateRoot = zero_state_root,
+        .timeliness = true,
+        .confirmed = true,
+    }, 2);
+
+    // A sibling head at slot 2 whose parent is genesis (skips the canonical slot-1 block).
+    const sibling_head_root = [_]u8{0xB2} ** 32;
+    try beam_chain.forkChoice.protoArray.onBlock(types.ProtoBlock{
+        .slot = 2,
+        .proposer_index = 0,
+        .blockRoot = sibling_head_root,
+        .parentRoot = genesis_root,
+        .stateRoot = zero_state_root,
+        .timeliness = true,
+        .confirmed = true,
+    }, 2);
+
+    // An orphan head at slot 2 whose parent is not in the store at all.
+    const orphan_head_root = [_]u8{0xC3} ** 32;
+    try beam_chain.forkChoice.protoArray.onBlock(types.ProtoBlock{
+        .slot = 2,
+        .proposer_index = 0,
+        .blockRoot = orphan_head_root,
+        .parentRoot = [_]u8{0x99} ** 32,
+        .stateRoot = zero_state_root,
+        .timeliness = true,
+        .confirmed = true,
+    }, 2);
+
+    // Test 10: A proper genesis -> slot1 -> slot2 ancestor chain passes.
+    {
+        const valid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+                .source = types.Checkpoint{ .root = genesis_root, .slot = 0 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try beam_chain.validateAttestationData(valid_attestation.message, false);
+    }
+
+    // Test 11: A source on a sibling branch is not an ancestor of the canonical target.
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+                .source = types.Checkpoint{ .root = sibling_slot1_root, .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(
+            error.SourceCheckpointNotAncestorOfTarget,
+            beam_chain.validateAttestationData(invalid_attestation.message, false),
+        );
+    }
+
+    // Test 12: A head on a sibling branch is not a descendant of the canonical target.
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = sibling_head_root, .slot = 2 },
+                .source = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(
+            error.TargetCheckpointNotAncestorOfHead,
+            beam_chain.validateAttestationData(invalid_attestation.message, false),
+        );
+    }
+
+    // Test 13: A head whose parent chain leaves the store cannot prove ancestry.
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = orphan_head_root, .slot = 2 },
+                .source = types.Checkpoint{ .root = genesis_root, .slot = 0 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(
+            error.TargetCheckpointNotAncestorOfHead,
+            beam_chain.validateAttestationData(invalid_attestation.message, false),
+        );
     }
 }
 
