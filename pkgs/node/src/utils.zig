@@ -45,7 +45,14 @@ pub const OnIntervalCbWrapper = struct {
     ptr: *anyopaque,
     onIntervalCb: OnIntervalCbType,
     interval: isize = 0,
-    c: xev.Completion = undefined,
+    // Both completions MUST be value-initialized (not `undefined`): `Timer.reset`
+    // in `Clock.tickInterval` reads `c.flags.state` to decide whether the timer
+    // is still armed, and requires `c_cancel` to be a valid `.{}` completion.
+    // Re-arming a still-pending timer with `Timer.run` (which blindly re-inserts
+    // the completion's intrusive heap node) corrupts the libxev timer pairing
+    // heap into a cycle — a 100% CPU spin in `Loop.tick`.
+    c: xev.Completion = .{},
+    c_cancel: xev.Completion = .{},
 
     pub fn onInterval(self: OnIntervalCbWrapper) !void {
         return self.onIntervalCb(self.ptr, self.interval);
