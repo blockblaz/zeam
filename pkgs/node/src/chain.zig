@@ -62,6 +62,14 @@ pub const BlockProductionParams = struct {
     /// rest of the interval for block signing and the Type-2 multi-message merge.
     deadline_ns: ?i64 = null,
 
+    /// Optional cap on the number of distinct attestation groups selected into
+    /// the block (each group is one component of the Type-2 block proof).
+    /// `proposeImpl` derives this from the publish-target budget and the
+    /// observed per-component merge cost so the merge finishes in time for the
+    /// block to reach gossip by `proposal_publish_target_intervals`. `null` =
+    /// spec cap only.
+    max_attestation_groups: ?usize = null,
+
     pub fn format(self: BlockProductionParams, writer: anytype) !void {
         try writer.print("BlockProductionParams{{ slot={d}, proposer_index={d} }}", .{ self.slot, self.proposer_index });
     }
@@ -117,10 +125,28 @@ pub const ChainOpts = struct {
     /// Default 90: ~720ms aggregation budget + ~80ms finalize/sign budget at
     /// the default 800ms interval.
     proposal_deadline_pct: u32 = default_proposal_deadline_pct,
+    proposal_publish_target_intervals: u32 = default_proposal_publish_target_intervals,
 };
 
 /// Default value for `ChainOpts.proposal_deadline_pct`
 pub const default_proposal_deadline_pct: u32 = 50;
+
+/// Default value for `ChainOpts.proposal_publish_target_intervals`: the block
+/// (including its Type-2 proof) should reach gossip before this many proposal
+/// intervals have elapsed since the propose trigger. This bounds how LATE the
+/// block lands, trading block fullness for timeliness; it does not make
+/// same-slot attestation (interval 1) reachable — at current prover speeds a
+/// merge with any attestation group overruns interval 1 regardless, and
+/// attesters vote on the parent. 2 keeps the block well ahead of the next
+/// slot's proposer instead of drifting toward intervals 3-4 unbounded.
+pub const default_proposal_publish_target_intervals: u32 = 2;
+
+/// Seed for the per-component merge-cost estimate (EMA, nanoseconds) used to
+/// derive the attestation-group cap from the publish budget. Calibrated from
+/// observed Type-2 merge times (~0.8-1.5s for 1-2 components on devnet-class
+/// hardware); the estimate self-corrects from measured merges after the first
+/// proposal.
+pub const default_merge_per_part_ns: u64 = 800 * std.time.ns_per_ms;
 
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
@@ -487,6 +513,17 @@ pub const BeamChain = struct {
     /// it (this percent of the proposal interval).
     proposal_deadline_pct: u32,
 
+    /// See `ChainOpts.proposal_publish_target_intervals` (CLI
+    /// `--proposal-publish-target-intervals`): the publish budget, in proposal
+    /// intervals, from which `proposeImpl` derives the attestation-group cap.
+    proposal_publish_target_intervals: u32,
+
+    /// Exponential moving average of the observed per-component Type-2 merge
+    /// cost in nanoseconds. Written only by the propose worker (single-flight),
+    /// read at the next proposal to size the group cap. Atomic for cross-thread
+    /// visibility, not for contention.
+    merge_per_part_ns: std.atomic.Value(u64) = .init(default_merge_per_part_ns),
+
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
     /// methods which enqueue work onto the worker's queues; the
@@ -672,6 +709,7 @@ pub const BeamChain = struct {
             .aggregate_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
             .proposal_deadline_pct = opts.proposal_deadline_pct,
+            .proposal_publish_target_intervals = opts.proposal_publish_target_intervals,
             // Pending attestation / aggregated-attestation buffers — empty
             // at init; FIFO-bounded by constants.MAX_PENDING_ATTESTATIONS in
             // the enqueue helpers.
@@ -2727,7 +2765,7 @@ pub const BeamChain = struct {
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         // FFI call against the owned snapshot — no lock held during this
         // window.
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
+        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns, opts.max_attestation_groups);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -5037,14 +5075,33 @@ pub const BeamChain = struct {
         // Cap single-message attestation aggregation at `proposal_deadline_pct`% of the
         // proposal interval, reserving the remainder for block signing and the Type-2
         // multi-message merge. A timely block with fewer attestation_data beats a late
-        // block carrying more — the off-loop merge is the dominant cost, so we bound the
-        // controllable gathering phase rather than the merge. Clamp to [0, 99] so the
-        // sign/merge step always keeps headroom (same form as main's produceBlockWorker).
+        // block carrying more. The merge itself is bounded separately below via the
+        // publish-budget group cap. Clamp to [0, 99] so the sign/merge step always
+        // keeps headroom (same form as main's produceBlockWorker).
         const pct_clamped: i64 = @intCast(@min(chain.proposal_deadline_pct, 99));
         const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
         const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
 
-        var produced_block = chain.produceBlock(.{ .slot = slot, .proposer_index = proposer_id, .deadline_ns = deadline_ns }) catch |e| {
+        // Merge-budget group cap: the Type-2 merge cost scales with its component
+        // count (one per attestation group + the proposer), so cap the number of
+        // groups such that the merge fits in what remains of the publish budget
+        // after gathering and signing. The per-component cost estimate is an EMA
+        // of measured merges (seeded by default_merge_per_part_ns). Degrades to a
+        // proposer-only (empty-attestation) block when nothing fits: a thin block
+        // on time beats a full block that misses the attestation interval, and
+        // deferred groups stay in the pool for later proposers.
+        const publish_budget_ns: u64 = @as(u64, chain.proposal_publish_target_intervals) *
+            @as(u64, constants.SECONDS_PER_INTERVAL_MS) * std.time.ns_per_ms;
+        const sign_margin_ns: u64 = 100 * std.time.ns_per_ms;
+        const merge_budget_ns = publish_budget_ns -| @as(u64, @intCast(budget_ms)) * std.time.ns_per_ms -| sign_margin_ns;
+        const max_groups = computeMergeGroupCap(merge_budget_ns, chain.merge_per_part_ns.load(.monotonic));
+
+        var produced_block = chain.produceBlock(.{
+            .slot = slot,
+            .proposer_index = proposer_id,
+            .deadline_ns = deadline_ns,
+            .max_attestation_groups = max_groups,
+        }) catch |e| {
             chain.logger.err("propose worker: produceBlock failed slot={d}: {any}", .{ slot, e });
             return;
         };
@@ -5075,10 +5132,30 @@ pub const BeamChain = struct {
         var proof = types.MultiMessageAggregate.init(chain.allocator) catch return;
         var proof_owned = true;
         defer if (proof_owned) proof.deinit();
+        const merge_start_ns = zeam_utils.monotonicTimestampNs();
         chain.buildBlockProof(&produced_block, &proposer_signature, &proof) catch |e| {
             chain.logger.err("propose worker: buildBlockProof failed slot={d}: {any}", .{ slot, e });
             return;
         };
+        // Update the per-component merge-cost EMA from the measured merge
+        // (components = attestation groups + the proposer part). Weight 3:1
+        // toward history so a single outlier cannot whipsaw the next cap.
+        // Only multi-part merges update the estimate: a proposer-only merge
+        // attributes its entire fixed cost (state snapshot, proposer prove,
+        // gate wait) to a single part and carries no marginal signal — feeding
+        // those samples back would inflate the estimate and ratchet the cap
+        // down. The measured window still includes the fixed overhead, so the
+        // estimate is an upper bound on the marginal cost; the liveness floor
+        // in computeMergeGroupCap keeps that conservatism harmless.
+        {
+            const merge_ns: u64 = @intCast(@max(zeam_utils.monotonicTimestampNs() - merge_start_ns, 0));
+            const parts: u64 = @intCast(produced_block.attestation_signatures.len() + 1);
+            if (parts >= 2) {
+                const per_part = merge_ns / parts;
+                const old = chain.merge_per_part_ns.load(.monotonic);
+                chain.merge_per_part_ns.store((old * 3 + per_part) / 4, .monotonic);
+            }
+        }
 
         // The Type-1 list is now folded into the Type-2 proof; free it. The block moves into the
         // SignedBlock (which we free after publishing).
@@ -5099,6 +5176,21 @@ pub const BeamChain = struct {
         };
         proposer_result = "success";
         chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+    }
+
+    /// Pure decision: how many attestation groups fit the merge budget, given
+    /// the per-component cost estimate. One component is always reserved for
+    /// the proposer's own signature; returns 0 when even a 2-component merge
+    /// does not fit (proposer-only block).
+    pub fn computeMergeGroupCap(merge_budget_ns: u64, per_part_ns: u64) usize {
+        const per = @max(per_part_ns, 1);
+        const max_parts = merge_budget_ns / per;
+        // Liveness floor: never cap below one attestation group. Attestations
+        // only reach the state through blocks, so an all-zero cap across the
+        // network would stall justification outright; one group per block is
+        // the minimum that keeps the chain advancing, even when it overruns
+        // the publish budget. The thin-vs-late trade applies only above this.
+        return @max(@as(usize, @intCast(max_parts -| 1)), 1);
     }
 
     /// Find the subnet of the first set participant in `participants`.
@@ -9672,4 +9764,19 @@ test "chain.statesGet under chain_worker enabled does not block exclusive writer
     // The reader's borrow is still valid even after the writer mutated
     // the map: refcount kept the underlying state alive.
     try std.testing.expectEqual(mock_chain.genesis_state.slot, borrow.state.slot);
+}
+
+test "computeMergeGroupCap reserves the proposer part and floors at one group" {
+    const ms = std.time.ns_per_ms;
+    // 2200ms budget at 700ms/part -> 3 parts fit -> 2 attestation groups.
+    try std.testing.expectEqual(@as(usize, 2), BeamChain.computeMergeGroupCap(2200 * ms, 700 * ms));
+    // 1500ms budget at 700ms/part -> 2 parts fit -> 1 group.
+    try std.testing.expectEqual(@as(usize, 1), BeamChain.computeMergeGroupCap(1500 * ms, 700 * ms));
+    // Budget too small for any group -> liveness floor keeps 1 group anyway.
+    try std.testing.expectEqual(@as(usize, 1), BeamChain.computeMergeGroupCap(700 * ms, 700 * ms));
+    try std.testing.expectEqual(@as(usize, 1), BeamChain.computeMergeGroupCap(0, 700 * ms));
+    // Large budget at the default seed -> plenty of room (spec cap applies later).
+    try std.testing.expect(BeamChain.computeMergeGroupCap(8000 * ms, default_merge_per_part_ns) >= 8);
+    // Degenerate estimate of 0 must not divide-by-zero.
+    _ = BeamChain.computeMergeGroupCap(1000 * ms, 0);
 }

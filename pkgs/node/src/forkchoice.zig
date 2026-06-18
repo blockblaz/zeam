@@ -1194,6 +1194,7 @@ pub const ForkChoice = struct {
         proposer_index: types.ValidatorIndex,
         parent_root: [32]u8,
         deadline_ns: ?i64,
+        max_groups: ?usize,
     ) !ProposalAttestationsResult {
         var agg_attestations = try types.AggregatedAttestations.init(self.allocator);
         var agg_att_cleanup = true;
@@ -1303,8 +1304,25 @@ pub const ForkChoice = struct {
             const found_entries = sorted_entries.items.len > 0;
 
             for (sorted_entries.items) |map_entry| {
-                // Limit the number of distinct AttestationData entries per block.
-                if (processed_att_data.count() >= self.config.spec.max_attestations_data) break;
+                // Limit the number of distinct AttestationData entries per block:
+                // the spec cap, further tightened by the caller's merge-budget cap
+                // (each distinct entry becomes one component of the Type-2 block
+                // proof, so the part count directly sets the merge duration; the
+                // entries are sorted most-valuable-first, so truncation defers the
+                // least valuable groups to a later proposer).
+                const group_cap: usize = @min(
+                    @as(usize, self.config.spec.max_attestations_data),
+                    max_groups orelse std.math.maxInt(usize),
+                );
+                if (processed_att_data.count() >= group_cap) {
+                    if (group_cap < self.config.spec.max_attestations_data) {
+                        self.logger.info(
+                            "proposal slot={d}: merge budget caps attestation groups at {d}, remaining candidates deferred",
+                            .{ slot, group_cap },
+                        );
+                    }
+                    break;
+                }
 
                 try processed_att_data.put(map_entry.att_data.*, {});
 
@@ -2872,10 +2890,11 @@ pub const ForkChoice = struct {
         proposer_index: types.ValidatorIndex,
         parent_root: [32]u8,
         deadline_ns: ?i64,
+        max_groups: ?usize,
     ) !ProposalAttestationsResult {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        return self.getProposalAttestationsUnlocked(pre_state, slot, proposer_index, parent_root, deadline_ns);
+        return self.getProposalAttestationsUnlocked(pre_state, slot, proposer_index, parent_root, deadline_ns, max_groups);
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
@@ -5970,6 +5989,7 @@ test "getProposalAttestations: high-target keys survive cap with stale low-targe
         0,
         parent_root,
         elapsed_deadline,
+        null,
     );
     defer {
         for (result.attestations.slice()) |*att| att.deinit();
