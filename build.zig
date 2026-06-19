@@ -569,6 +569,14 @@ pub fn build(b: *Builder) !void {
     stress_quick_step.dependOn(&run_stress_quick.step);
     test_step.dependOn(&run_stress_quick.step);
 
+    const run_stress_locks_quick = b.addRunArtifact(stress_exe);
+    run_stress_locks_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
+    run_stress_locks_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    run_stress_locks_quick.setEnvironmentVariable("ZEAM_STRESS_SKIP_VERIFY", "1");
+    const stress_locks_quick_step = b.step("stress-locks-quick", "Run a 30s stress harness without XMSS verification (CI gate, slice b)");
+    stress_locks_quick_step.dependOn(&run_stress_locks_quick.step);
+    test_step.dependOn(&run_stress_locks_quick.step);
+
     // -----------------------------------------------------------------
     // `stress-saturation` and `stress-quick-saturation`: chain-worker
     // queue saturation harness.
