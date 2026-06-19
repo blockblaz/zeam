@@ -132,6 +132,8 @@ pub const CachedProcessedBlockInfo = struct {
     // for database persistence and skips re-serializing the live SignedBlock, which
     // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
     sszBytes: ?[]const u8 = null,
+    // Used to skip XMSS signature verification during stress tests
+    skipVerify: bool = false,
 };
 
 pub const GossipProcessingResult = struct {
@@ -3746,16 +3748,24 @@ pub const BeamChain = struct {
             // rejected without mutating post state). Uses the shared thread pool when available to
             // parallelize per-attestation verification across CPU workers.
             //
-            // The XMSS pubkey cache is lock-free (`xmss.PublicKeyCache`
-            // uses per-slot atomic CAS). No `pubkey_cache_lock`
-            // acquisition needed here — readers and the STF's own
-            // population path race on the slot's atomic and the loser
-            // frees its handle. An earlier mutex around this block was
-            // the dominant contributor to a ~78ms mean lock hold.
-            // A block carries one merged Type-2 proof, so verification is a single
-            // container.verify (no per-attestation parallel batch).
-            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
+            // The XMSS pubkey cache is lock-free as of P1 of #863
+            // (`xmss.PublicKeyCache` uses per-slot atomic CAS). No
+            // `pubkey_cache_lock` acquisition needed here — readers and the
+            // STF's own population path race on the slot's atomic and the
+            // loser frees its handle. The previous mutex around this block was
+            // the dominant contributor to the ~78ms mean lock hold reported in
+            // #863. A block carries one merged Type-2 proof, so verification is
+            // a single container.verify (no per-attestation parallel batch).
+            //
+            // `skipVerify` — stress-test-only knob (#825). Skips XMSS signature
+            // verification to increase lock-contention rate. Must NEVER be set
+            // by production callers.
+            if (!blockInfo.skipVerify) {
+                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
+            }
 
+            // Lap recorded outside the check block so the metric is emitted even
+            // when verification was skipped.
             step_watch.lap("verify_signatures");
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify).
@@ -4642,174 +4652,43 @@ pub const BeamChain = struct {
         }
     }
 
-    /// Validate incoming attestation before processing.
-    ///
-    /// The time check applies only to the gossip path: admit a vote iff
-    /// `data.slot * INTERVALS_PER_SLOT <= store.time + GOSSIP_DISPARITY_INTERVALS`.
-    /// The bound is in intervals, not slots: a whole-slot margin would let an
-    /// adversary pre-publish next-slot aggregates ahead of any honest validator.
-    ///
-    /// Block-included attestations skip the time check; they are trusted under
-    /// the block's own validation. `is_from_block` is retained as a log marker.
-    /// Cheap O(1) future-slot bound check for gossip attestations —
-    /// extracted so the libxev main thread can fast-drop future-slot
-    /// attestations before dispatching to the chain-worker, keeping the
-    /// libxev hot path doing only constant-time per-message work. The
-    /// check is identical to the one inside
-    /// `validateAttestationData`'s pre-lookup section and is repeated
-    /// there so the worker-thread path remains correct under future
-    /// callers that bypass the libxev fast-drop.
-    pub fn attestationIsTooFarInFuture(self: *Self, data: types.AttestationData) bool {
-        const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
-        const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
-        const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
-        return attestation_start_interval > max_allowed_interval;
-    }
-
-    pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
+    pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) AttestationValidationError!void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
 
-        // Future-slot drop is hoisted to before the proto-node lookups.
-        // The old order ran the lookups first, so an attestation for
-        // `current_slot + 100` referencing future blocks bottomed out at
-        // `UnknownHeadBlock` and the caller dutifully enqueued a
-        // `BlocksByRoot` for that future head — which always 404'd
-        // because the block didn't exist anywhere. Multiplied by 4×
-        // subnet fan-out on aggregators this was a fetch-storm amplifier
-        // and a primary contributor to slot-driver starvation. Rejecting
-        // the attestation here means we never derive a missing root for
-        // it and the fetch is simply never enqueued.
+        // All fork-choice-derivable validation lives in one shared method on
+        // ForkChoice (proto-array existence/slots, source/target/head
+        // ancestry, slot-before-head, and the interval-based future-slot
+        // bound). The future-slot bound applies only to gossip — block-
+        // included attestations are trusted under the block's own validation.
         //
-        // Bound is intervals-based (`GOSSIP_DISPARITY_INTERVALS`, =1) so
-        // we still accept the very first interval of the next slot —
-        // attestations clients legitimately publish at the slot
-        // boundary tick — without bumping the disparity tolerance. The
-        // bound only applies to gossip; block-included attestations are
-        // trusted under the block's own validation.
-        if (!is_from_block and self.attestationIsTooFarInFuture(data)) {
-            self.logger.debug("attestation validation failed: future slot=(slot={d}, time={d})", .{
-                data.slot,
-                self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
-            });
-            return AttestationValidationError.AttestationTooFarInFuture;
-        }
-
-        // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
-        const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
-            self.logger.debug("Attestation validation failed: unknown source block root=0x{x}", .{
-                &data.source.root,
-            });
-            return AttestationValidationError.UnknownSourceBlock;
-        };
-
-        const target_block = self.forkChoice.getProtoNode(data.target.root) orelse {
-            self.logger.debug("attestation validation failed: unknown target block slot={d} root=0x{x}", .{
-                data.target.slot,
-                &data.target.root,
-            });
-            return AttestationValidationError.UnknownTargetBlock;
-        };
-
-        const head_block = self.forkChoice.getProtoNode(data.head.root) orelse {
-            self.logger.debug("attestation validation failed: unknown head block slot={d} root=0x{x}", .{
-                data.head.slot,
-                &data.head.root,
-            });
-            return AttestationValidationError.UnknownHeadBlock;
-        };
-
-        // 2. Validate slot relationships
-        if (source_block.slot > target_block.slot) {
-            self.logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
-                source_block.slot,
-                target_block.slot,
-            });
-            return AttestationValidationError.SourceSlotExceedsTarget;
-        }
-
-        //    Invariant: attestation.source.slot <= attestation.target.slot
-        if (data.source.slot > data.target.slot) {
-            self.logger.debug("attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
-                data.source.slot,
-                data.target.slot,
-            });
-            return AttestationValidationError.SourceCheckpointExceedsTarget;
-        }
-
-        //    Invariant: data.head.slot >= data.target.slot
-        if (data.head.slot < data.target.slot) {
-            self.logger.debug("attestation validation failed: head slot {d} < target slot {d}", .{
-                data.head.slot,
-                data.target.slot,
-            });
-            return AttestationValidationError.HeadOlderThanTarget;
-        }
-
-        //    Invariant: a vote cannot have observed its head before that head existed.
-        if (data.slot < data.head.slot) {
-            self.logger.debug("attestation validation failed: attestation slot {d} < head slot {d}", .{
-                data.slot,
-                data.head.slot,
-            });
-            return AttestationValidationError.AttestationSlotBeforeHead;
-        }
-
-        // 3. Validate checkpoint slots match block slots
-        if (source_block.slot != data.source.slot) {
-            self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
-                source_block.slot,
-                data.source.slot,
-            });
-            return AttestationValidationError.SourceCheckpointSlotMismatch;
-        }
-
-        //    Invariant: target_block.slot == attestation.target.slot
-        if (target_block.slot != data.target.slot) {
-            self.logger.debug("attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
-                target_block.slot,
-                data.target.slot,
-            });
-            return AttestationValidationError.TargetCheckpointSlotMismatch;
-        }
-
-        //    Invariant: head_block.slot == attestation.head.slot
-        if (head_block.slot != data.head.slot) {
-            self.logger.debug("attestation validation failed: head block slot {d} != head checkpoint slot {d}", .{
-                head_block.slot,
-                data.head.slot,
-            });
-            return AttestationValidationError.HeadCheckpointSlotMismatch;
-        }
-
-        // 4. Validate that source, target, and head lie on one parent chain.
+        // The future-slot drop sits before the proto-node lookups inside the
+        // shared method: an attestation for a far-future slot referencing
+        // future blocks would otherwise bottom out at UnknownHeadBlock and
+        // make the caller enqueue a BlocksByRoot for a head that does not
+        // exist anywhere — a fetch-storm amplifier on aggregators.
         //
-        // Fork-choice weight accrues to every ancestor of the attested head, so a
-        // sibling head would steer that weight onto a non-canonical branch while the
-        // FFG vote still rode the canonical source -> target pair.
-        //
-        // Applied unconditionally (including is_from_block): block-embedded
+        // Ancestry is applied on BOTH paths (gossip and block): block-embedded
         // attestations are also fed to the fork-choice tracker via onAttestation,
-        // so gating this on the gossip path would reopen the vote-splitting vector
-        // for attestations smuggled inside a block.
-        if (!self.forkChoice.checkpointIsAncestor(data.source, data.target)) {
-            self.logger.debug("attestation validation failed: source checkpoint slot {d} not ancestor of target slot {d}", .{
+        // so gating it on gossip would reopen the vote-splitting vector for
+        // attestations smuggled inside a block.
+        self.forkChoice.validateAttestationDataForGossip(data, !is_from_block) catch |err| {
+            self.logger.debug("attestation validation failed: error={any} slot={d} source={d} target={d} head={d} is_from_block={any}", .{
+                err,
+                data.slot,
                 data.source.slot,
                 data.target.slot,
-            });
-            return AttestationValidationError.SourceCheckpointNotAncestorOfTarget;
-        }
-
-        if (!self.forkChoice.checkpointIsAncestor(data.target, data.head)) {
-            self.logger.debug("attestation validation failed: target checkpoint slot {d} not ancestor of head slot {d}", .{
-                data.target.slot,
                 data.head.slot,
+                is_from_block,
             });
-            return AttestationValidationError.TargetCheckpointNotAncestorOfHead;
-        }
+            // GossipAttestationValidationError is a strict subset of
+            // AttestationValidationError (identical variant names), so the
+            // error value coerces directly — callers that branch on a specific
+            // reason (e.g. the block-import path enqueueing a BlocksByRoot fetch
+            // on UnknownHeadBlock) still match the same global error value.
+            return err;
+        };
 
-        // (Future-slot bound check is hoisted above the proto-node
-        // lookups — see the comment at the top of this function.)
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
             data.source.slot,
@@ -5860,6 +5739,7 @@ const AttestationValidationError = error{
     AttestationSlotBeforeHead,
     AttestationTooFarInFuture,
     EmptyAggregationBits,
+    InvalidValidatorId,
 };
 pub const BlockValidationError = error{
     UnknownParentBlock,

@@ -565,29 +565,11 @@ fn parseNonNegativeU64(value: JsonValue) !u64 {
 }
 
 fn validateAttestationDataForGossip(driver: *ForkChoiceDriverState, data: types.AttestationData) !void {
-    const source_node = driver.fork_choice.getProtoNode(data.source.root) orelse return error.UnknownSourceBlock;
-    const target_node = driver.fork_choice.getProtoNode(data.target.root) orelse return error.UnknownTargetBlock;
-    const head_node = driver.fork_choice.getProtoNode(data.head.root) orelse return error.UnknownHeadBlock;
-
-    if (data.source.slot > data.target.slot) return error.SourceCheckpointExceedsTarget;
-    if (data.head.slot < data.target.slot) return error.HeadOlderThanTarget;
-    if (data.slot < data.head.slot) return error.AttestationSlotBeforeHead;
-    if (source_node.slot != data.source.slot) return error.SourceCheckpointSlotMismatch;
-    if (target_node.slot != data.target.slot) return error.TargetCheckpointSlotMismatch;
-    if (head_node.slot != data.head.slot) return error.HeadCheckpointSlotMismatch;
-
-    if (!driver.fork_choice.checkpointIsAncestor(data.source, data.target)) {
-        return error.SourceCheckpointNotAncestorOfTarget;
-    }
-    if (!driver.fork_choice.checkpointIsAncestor(data.target, data.head)) {
-        return error.TargetCheckpointNotAncestorOfHead;
-    }
-
-    const time_intervals = driver.fork_choice.fcStore.slot_clock.time.load(.monotonic);
-    const attestation_start_interval = data.slot * node_constants.INTERVALS_PER_SLOT;
-    if (attestation_start_interval > time_intervals + node_constants.GOSSIP_DISPARITY_INTERVALS) {
-        return error.AttestationTooFarInFuture;
-    }
+    // Route through the shared production validator (proto-array existence,
+    // checkpoint slot ordering and matching, source/target/head ancestry,
+    // slot-before-head, and the interval-based future-slot bound). The driver's
+    // callers gate on the gossip path, so check_future_slot = true.
+    try driver.fork_choice.validateAttestationDataForGossip(data, true);
 }
 
 pub fn isProtocolError(err: anyerror) bool {
