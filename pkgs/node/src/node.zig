@@ -3653,7 +3653,7 @@ pub const BeamNode = struct {
             });
             defer self.allocator.free(missing_roots);
 
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.fetchBlockByRoots(missing_roots, 0, null) catch |err| {
                 self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
 
