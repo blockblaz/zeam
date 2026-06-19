@@ -662,7 +662,20 @@ pub const EthLibp2p = struct {
                 .rpc_response_end => |r| self.dispatchRpcResponseEnd(r),
                 .rpc_error_response => |r| self.dispatchRpcError(r),
                 .swarm_closed => return,
-                .gossip_message, .log, .connection_trim_recommended => {},
+                // Events zeam does not act on (discovery / NAT / relay / identify-push
+                // features added in zig-libp2p ≥ v0.1.95). Listed explicitly so a
+                // future Event variant still forces a compile-time review here.
+                .gossip_message,
+                .log,
+                .connection_trim_recommended,
+                .identify_push_peer,
+                .relay_reservation,
+                .dcutr_succeeded,
+                .dcutr_failed,
+                .reachability_changed,
+                .autonat_probe_peer,
+                .peer_discovered,
+                => {},
             }
         }
     }
