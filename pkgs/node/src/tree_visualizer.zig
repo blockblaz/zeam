@@ -418,6 +418,7 @@ fn createTestProtoNode(
         .stateRoot = createTestRoot(0x00),
         .timeliness = true,
         .confirmed = true,
+        .stateFinalizedSlot = 0,
         .parent = parent,
         .weight = 0,
         .bestChild = null,

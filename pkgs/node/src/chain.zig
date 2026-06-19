@@ -2762,12 +2762,12 @@ pub const BeamChain = struct {
         const proposal_atts = blk: {
             if (self.prove_gate.tryLock()) {
                 defer self.prove_gate.unlock();
-                break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
+                break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, parent_root, opts.deadline_ns);
             }
 
             self.logger.info("proposal Type-1 compact: prove_gate busy, using elapsed deadline slot={d}", .{opts.slot});
             const elapsed_deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() - 1);
-            break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, elapsed_deadline_ns);
+            break :blk try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, parent_root, elapsed_deadline_ns);
         };
         _ = payload_agg_timer.observe();
 
@@ -4746,6 +4746,15 @@ pub const BeamChain = struct {
             return AttestationValidationError.HeadOlderThanTarget;
         }
 
+        //    Invariant: a vote cannot have observed its head before that head existed.
+        if (data.slot < data.head.slot) {
+            self.logger.debug("attestation validation failed: attestation slot {d} < head slot {d}", .{
+                data.slot,
+                data.head.slot,
+            });
+            return AttestationValidationError.AttestationSlotBeforeHead;
+        }
+
         // 3. Validate checkpoint slots match block slots
         if (source_block.slot != data.source.slot) {
             self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
@@ -4869,6 +4878,12 @@ pub const BeamChain = struct {
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
+
+        // An aggregate with no participants carries no weight and cannot be
+        // verified against any public key. Reject before signature checks.
+        if (validator_indices.items.len == 0) {
+            return AttestationValidationError.EmptyAggregationBits;
+        }
 
         try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
         self.applyAggregatedAttestationTrackers(signedAggregation.data, validator_indices.items);
@@ -5056,14 +5071,21 @@ pub const BeamChain = struct {
             zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "missing_state" }) catch {};
             return;
         };
-        defer borrow.deinit();
-
-        var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, chain.allocator) catch |err| {
-            chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
+        // Snapshot-then-release: the aggregator runs the projection with
+        // chain-matching OFF, so it needs validators / justified_slots / pending
+        // justifications but NOT historical_block_hashes. cloneForProjection skips
+        // that large field; drop the states lock before the multi-100ms FFI prove.
+        const pre_state = borrow.state.cloneForProjection(chain.allocator) catch |err| {
+            borrow.deinit();
+            chain.logger.warn("failed to clone pre-state for aggregation at slot={d}: {any}", .{ slot, err });
             zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
             return;
         };
-        defer validators_owned.deinit();
+        borrow.deinit();
+        defer {
+            pre_state.deinit();
+            chain.allocator.destroy(pre_state);
+        }
 
         // Log subnet-wise coverage of current new payloads before starting aggregation.
         chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
@@ -5086,8 +5108,10 @@ pub const BeamChain = struct {
         // acquisitions in buildBlockProof / deconstruct).
         chain.prove_gate.lock();
         const aggregations = chain.forkChoice.aggregateForSlots(
-            &validators_owned,
+            &pre_state.validators,
             slot_window_buf[0..slot_window_len],
+            pre_state,
+            @intCast(slot + 1),
             node,
             publishOneAggregate,
         ) catch |err| {
@@ -5324,16 +5348,19 @@ pub const BeamChain = struct {
             chain.logger.info("skipping pre-aggregation for slot={d}: missing state for head root", .{target_slot});
             return;
         };
-        var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, chain.allocator) catch |e| {
+        // Snapshot-then-release: the warm-up runs the projection with chain-matching
+        // OFF, so cloneForProjection skips the large historical_block_hashes field;
+        // never hold a states lock across the multi-100ms FFI prove.
+        const pre_state = borrow.state.cloneForProjection(chain.allocator) catch |e| {
             borrow.deinit();
-            chain.logger.warn("pre-aggregation: clone validators failed slot={d}: {any}", .{ target_slot, e });
+            chain.logger.warn("pre-aggregation: clone pre-state failed slot={d}: {any}", .{ target_slot, e });
             return;
         };
-        // Release the state borrow BEFORE the prove — never hold a states lock across
-        // the multi-100ms FFI (on the --chain-worker=off path the borrow carries
-        // states_lock.shared and would stall block-import; rc-only on the default path).
         borrow.deinit();
-        defer validators_owned.deinit();
+        defer {
+            pre_state.deinit();
+            chain.allocator.destroy(pre_state);
+        }
 
         // No truncating deadline: a 100%-of-interval bound (run-to-completion within
         // the interval). The FFI is uninterruptible anyway; the timeliness guards
@@ -5364,7 +5391,7 @@ pub const BeamChain = struct {
             chain.logger.info("skipping pre-aggregation for slot={d}: reached proposal interval while waiting for prove_gate", .{target_slot});
             return;
         }
-        const aggregations = chain.forkChoice.aggregateProposalKeysForSlots(&validators_owned, window_buf[0..window_len], deadline_ns) catch |e| {
+        const aggregations = chain.forkChoice.aggregateProposalKeysForSlots(&pre_state.validators, window_buf[0..window_len], pre_state, @intCast(target_slot), deadline_ns) catch |e| {
             chain.prove_gate.unlock();
             chain.logger.warn("pre-aggregation: aggregateProposalKeysForSlots failed slot={d}: {any}", .{ target_slot, e });
             return;
@@ -5394,14 +5421,19 @@ pub const BeamChain = struct {
             self.logger.debug("interval-0 re-aggregate: no head state, skipping slot={d}", .{slot});
             return;
         };
-        var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, self.allocator) catch |e| {
+        // Snapshot-then-release (see preAggregateImpl): chain-matching is OFF here,
+        // so cloneForProjection skips historical_block_hashes; release the states
+        // lock before the FFI prove.
+        const pre_state = borrow.state.cloneForProjection(self.allocator) catch |e| {
             borrow.deinit();
-            self.logger.warn("interval-0 re-aggregate: clone validators failed slot={d}: {any}", .{ slot, e });
+            self.logger.warn("interval-0 re-aggregate: clone pre-state failed slot={d}: {any}", .{ slot, e });
             return;
         };
-        // Release the state borrow before the prove (see preAggregateImpl).
         borrow.deinit();
-        defer validators_owned.deinit();
+        defer {
+            pre_state.deinit();
+            self.allocator.destroy(pre_state);
+        }
 
         var window_buf: [2]types.Slot = undefined;
         var window_len: usize = 0;
@@ -5421,7 +5453,7 @@ pub const BeamChain = struct {
             self.logger.info("interval-0 re-aggregate: prove_gate busy, skipping refresh slot={d}", .{slot});
             return;
         }
-        const aggregations = self.forkChoice.aggregateProposalKeysForSlots(&validators_owned, window_buf[0..window_len], deadline_ns) catch |e| {
+        const aggregations = self.forkChoice.aggregateProposalKeysForSlots(&pre_state.validators, window_buf[0..window_len], pre_state, slot, deadline_ns) catch |e| {
             self.prove_gate.unlock();
             self.logger.warn("interval-0 re-aggregate failed slot={d}: {any}", .{ slot, e });
             return;
@@ -5825,7 +5857,9 @@ const AttestationValidationError = error{
     HeadOlderThanTarget,
     SourceCheckpointNotAncestorOfTarget,
     TargetCheckpointNotAncestorOfHead,
+    AttestationSlotBeforeHead,
     AttestationTooFarInFuture,
+    EmptyAggregationBits,
 };
 pub const BlockValidationError = error{
     UnknownParentBlock,
@@ -6424,7 +6458,7 @@ test "attestation validation - comprehensive" {
         .stateRoot = zero_state_root,
         .timeliness = true,
         .confirmed = true,
-    }, 2);
+    }, 2, 0);
 
     // A sibling head at slot 2 whose parent is genesis (skips the canonical slot-1 block).
     const sibling_head_root = [_]u8{0xB2} ** 32;
@@ -6436,7 +6470,7 @@ test "attestation validation - comprehensive" {
         .stateRoot = zero_state_root,
         .timeliness = true,
         .confirmed = true,
-    }, 2);
+    }, 2, 0);
 
     // An orphan head at slot 2 whose parent is not in the store at all.
     const orphan_head_root = [_]u8{0xC3} ** 32;
@@ -6448,7 +6482,7 @@ test "attestation validation - comprehensive" {
         .stateRoot = zero_state_root,
         .timeliness = true,
         .confirmed = true,
-    }, 2);
+    }, 2, 0);
 
     // Test 10: A proper genesis -> slot1 -> slot2 ancestor chain passes.
     {

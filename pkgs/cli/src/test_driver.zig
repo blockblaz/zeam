@@ -571,6 +571,7 @@ fn validateAttestationDataForGossip(driver: *ForkChoiceDriverState, data: types.
 
     if (data.source.slot > data.target.slot) return error.SourceCheckpointExceedsTarget;
     if (data.head.slot < data.target.slot) return error.HeadOlderThanTarget;
+    if (data.slot < data.head.slot) return error.AttestationSlotBeforeHead;
     if (source_node.slot != data.source.slot) return error.SourceCheckpointSlotMismatch;
     if (target_node.slot != data.target.slot) return error.TargetCheckpointSlotMismatch;
     if (head_node.slot != data.head.slot) return error.HeadCheckpointSlotMismatch;

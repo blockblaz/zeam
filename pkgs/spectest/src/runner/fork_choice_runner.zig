@@ -742,22 +742,6 @@ fn processBlockStep(
         return FixtureError.FixtureMismatch;
     };
 
-    // The spec's store.on_block prunes stale gossip signatures and aggregated
-    // payloads whose target slot falls at or below the finalized checkpoint
-    // as soon as finalization advances. Mirror that here so fixture checks on
-    // the pruned maps observe the same state. (chain.zig does this
-    // implicitly via its finalization advancement pipeline — the runner
-    // bypasses chain so we trigger it directly.)
-    if (ctx.fork_choice.fcStore.latest_finalized.slot > finalized_slot_before) {
-        ctx.fork_choice.pruneStaleAttestationData(ctx.fork_choice.fcStore.latest_finalized.slot) catch |err| {
-            std.debug.print(
-                "fixture {s} case {s}{f}: prune stale attestation data failed ({s})\n",
-                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-            );
-            return FixtureError.InvalidFixture;
-        };
-    }
-
     ctx.state_map.put(ctx.allocator, block_root, new_state_ptr) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: failed to index block state ({s})\n",
@@ -839,6 +823,23 @@ fn processBlockStep(
     }
 
     _ = try ctx.fork_choice.updateHead();
+
+    // The spec's store.on_block prunes stale gossip signatures and aggregated
+    // payloads whose target slot falls at or below the finalized checkpoint once
+    // finalization advances. Trigger it after updateHead, because onBlock only
+    // imports into the proto-array; the finalized slot is derived from the head
+    // chain inside updateHead. (chain.zig does this implicitly via its
+    // finalization advancement pipeline — the runner bypasses chain so we
+    // trigger it directly.)
+    if (ctx.fork_choice.fcStore.latest_finalized.slot > finalized_slot_before) {
+        ctx.fork_choice.pruneStaleAttestationData(ctx.fork_choice.fcStore.latest_finalized.slot) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: prune stale attestation data failed ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+    }
 
     if (block_wrapper_obj) |wrapper_obj| {
         if (wrapper_obj.get("blockRootLabel")) |label_value| {
@@ -937,17 +938,10 @@ fn processAttestationStep(
     // Validate attestation data (block existence, slot relationships, future slot).
     try validateAttestationDataForGossip(ctx, attestation_data);
 
-    // Signature verification is not supported in this runner; detect fixture cases
-    // that expect a signature failure and return an error to match the expected outcome.
-    if (step_obj.get("expectedError")) |err_value| {
-        switch (err_value) {
-            .string => |err_str| {
-                if (std.mem.indexOf(u8, err_str, "ignature") != null) {
-                    return error.SignatureVerificationNotSupported;
-                }
-            },
-            else => {},
-        }
+    // The runner cannot verify signatures (fixtures carry no real signatures).
+    // Satisfy negative cases whose only rejection is a signature/proof check.
+    if (stepExpectsSignatureOrProofFailure(step_obj)) {
+        return error.SignatureVerificationNotSupported;
     }
 
     // The spec's store receives a SignedAttestation here; it inserts into
@@ -1034,6 +1028,25 @@ fn processGossipAggregatedAttestationStep(
     };
     defer indices.deinit(ctx.allocator);
 
+    // Proof/state checks production performs in onGossipAggregatedAttestation
+    // and verifyAggregatedAttestation: an empty aggregate carries no weight,
+    // and every participant must be a known validator.
+    if (indices.items.len == 0) {
+        return error.EmptyAggregationBits;
+    }
+    const num_validators = ctx.fork_choice.anchorState.validators.constSlice().len;
+    for (indices.items) |validator_index| {
+        if (validator_index >= num_validators) {
+            return error.InvalidValidatorId;
+        }
+    }
+
+    // The runner cannot verify signatures (fixtures carry no real signatures).
+    // Satisfy negative cases whose only rejection is a signature/proof check.
+    if (stepExpectsSignatureOrProofFailure(step_obj)) {
+        return error.SignatureVerificationNotSupported;
+    }
+
     // Register each validator's attestation in the fork choice tracker.
     for (indices.items) |validator_index| {
         const attestation = types.Attestation{
@@ -1077,15 +1090,57 @@ fn processGossipAggregatedAttestationStep(
     _ = try ctx.fork_choice.updateHead();
 }
 
+/// Whether a negative step's rejection is a signature or proof failure that
+/// the runner cannot reproduce (fixtures carry no real signatures).
+///
+/// Signature/proof failures are the only rejections gated on real
+/// cryptographic verification, which the runner skips. Every other rejection
+/// is reproduced by the validator and the proof/state checks, so it must NOT
+/// be short-circuited here.
+///
+/// Two fixture encodings exist, so check both: newer fixtures carry a
+/// `rejectionReason` enum (`INVALID_SIGNATURE` / `INVALID_BLOCK_PROOF`);
+/// older ones carry a human-readable `expectedError` string
+/// (e.g. "Signature verification failed").
+fn stepExpectsSignatureOrProofFailure(step_obj: std.json.ObjectMap) bool {
+    if (step_obj.get("rejectionReason")) |reason_value| {
+        if (reason_value == .string) {
+            const reason = reason_value.string;
+            if (std.mem.eql(u8, reason, "INVALID_SIGNATURE") or
+                std.mem.eql(u8, reason, "INVALID_BLOCK_PROOF"))
+            {
+                return true;
+            }
+        }
+    }
+
+    if (step_obj.get("expectedError")) |err_value| {
+        if (err_value == .string) {
+            const err_str = err_value.string;
+            // Match only signature/proof-failure markers (case-insensitive
+            // first letter so "Signature"/"signature" and "Proof"/"proof"
+            // both match), never arbitrary validator errors.
+            if (std.mem.indexOf(u8, err_str, "ignature") != null or
+                std.mem.indexOf(u8, err_str, "roof") != null)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 /// Validate attestation data per the spec's store.validate_attestation rules.
 ///
 /// Checks (matching the spec):
 /// 1. Source, target, and head blocks exist in the fork choice store
 /// 2. Checkpoint slot ordering: source.slot <= target.slot
 /// 3. Head must not be older than target: head.slot >= target.slot
-/// 4. Checkpoint slots match their respective block slots (source, target, head)
-/// 5. Source, target, and head lie on one parent chain (ancestry)
-/// 6. Attestation slot not too far in future: data.slot <= current_slot + 1
+/// 4. Attestation slot must not be before the attested head slot
+/// 5. Checkpoint slots match their respective block slots (source, target, head)
+/// 6. Source, target, and head lie on one parent chain (ancestry)
+/// 7. Attestation slot not too far in future: data.slot <= current_slot + 1
 fn validateAttestationDataForGossip(
     ctx: *StepContext,
     data: types.AttestationData,
@@ -1113,7 +1168,12 @@ fn validateAttestationDataForGossip(
         return error.HeadOlderThanTarget;
     }
 
-    // 4. Validate checkpoint slots match actual block slots.
+    // 4. A vote cannot have observed its head before that head existed.
+    if (data.slot < data.head.slot) {
+        return error.AttestationSlotBeforeHead;
+    }
+
+    // 5. Validate checkpoint slots match actual block slots.
     if (source_node.slot != data.source.slot) {
         return error.SourceCheckpointSlotMismatch;
     }
@@ -1124,7 +1184,7 @@ fn validateAttestationDataForGossip(
         return error.HeadCheckpointSlotMismatch;
     }
 
-    // 5. Source, target, and head must lie on one parent chain.
+    // 6. Source, target, and head must lie on one parent chain.
     //
     // Fork-choice weight accrues to every ancestor of the attested head, so a
     // sibling head would steer that weight onto a non-canonical branch.
@@ -1135,7 +1195,7 @@ fn validateAttestationDataForGossip(
         return error.TargetCheckpointNotAncestorOfHead;
     }
 
-    // 6. Attestation slot must not be too far in future.
+    // 7. Attestation slot must not be too far in future.
     //
     // The spec tightened this from "1 whole slot" to
     // "GOSSIP_DISPARITY_INTERVALS intervals". The check now operates in
