@@ -48,3 +48,14 @@ Examples:
 Use comma-separated package names when multiple areas are affected. Keep the description concise.
 
 Do not use the braindead, non-descriptive style `feat`, `chore`, etc... as it is redundant with the github labelling system.
+
+## Ship workflow
+
+When implementation work is **complete** (fixes, features, dependency bumps), **commit and push** without waiting to be asked. Skip this for question-only, review-only, or explicitly read-only tasks.
+
+1. Run the pre-commit checklist above.
+2. Commit each affected repo with the message format above.
+3. Push to the tracked remote branch.
+4. **zig-libp2p → zeam:** commit and push `zig-libp2p` first; tag (`v0.1.N`) when zeam needs the release; `zig fetch` the new ref to get the `build.zig.zon` hash; then commit and push zeam.
+
+Do not commit secrets, local devnet artifacts, or unrelated dirty files. Do not post GitHub comments unless explicitly asked.

@@ -1,3 +1,40 @@
+//! zeam's libp2p networking, built on `zig_libp2p` over QUIC + libp2p TLS.
+//! `EthLibp2p` is the production `NetworkInterface` implementation (init /
+//! deinit / publish / subscribe / subscribeReqResp / subscribePeerEvents),
+//! using `zig_libp2p.host.Host` as the in-process libp2p stack. It replaced
+//! the former Rust `libp2p-glue` FFI path, which has been removed.
+//!
+//! ## What's wired
+//!
+//!   - **QUIC transport** via `zig_libp2p` `QuicRuntime`: per-`listen_address`
+//!     endpoint, dial, multistream-select dispatch on accepted streams.
+//!   - **Gossipsub publish / subscribe over Host**:
+//!       * Per-topic SSZ + snappy block encoding, then `host.publish`.
+//!       * Per-topic decode through the #942 frame-hardening validators in
+//!         `gossip_codec.zig`.
+//!       * Inbound delivery to `GenericGossipHandler` via gossipsub's
+//!         topic-validator hook.
+//!   - **Req/resp** send / register-inbound / response-chunk / end-of-stream /
+//!     error wired onto `Host.sendRequest` and friends, with per-method SSZ
+//!     decode (the wire layer in zig-libp2p handles snappy framing).
+//!   - **Peer-event dispatch** from the driver thread (drains
+//!     `host.nextEvent`) into the `PeerEventHandler`. Peer IDs are
+//!     base58-multihash-encoded to match `eth-beacon-genesis` `/p2p/...` ids.
+//!   - **In-flight RPC failure on peer disconnect**: when a peer drops, every
+//!     pending outbound RPC awaiting a response from it is failed with
+//!     `error.PeerDisconnected`.
+//!   - **Bootnode dial** — `connect_peers` is parsed as a comma-separated
+//!     list of multiaddrs, each registered via `host.registerKnownPeer` and
+//!     added as a gossipsub direct peer. The driver thread calls
+//!     `connection_manager.tick(now_ms)` once per loop so dial attempts (with
+//!     exponential backoff) get scheduled.
+//!   - **Driver thread + shutdown**: `run` parks the calling thread on
+//!     `host.waitUntilReady`, then spawns the event-drain worker; `deinit`
+//!     signals shutdown, joins, then tears down the Host.
+//!   - **Metrics parity**: a per-instance `Metrics` registry feeds gossipsub +
+//!     swarm totals into zeam's `lean_gossip_mesh_peers` gauge /
+//!     `zeam_libp2p_swarm_command_dropped_total` counter on every scrape.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
@@ -5,2049 +42,767 @@ const Thread = std.Thread;
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const xev = @import("xev").Dynamic;
-const multiformats = @import("multiformats");
-const multiaddr_mod = @import("multiaddr");
-const Multiaddr = multiaddr_mod.Multiaddr;
-const uvarint = multiformats.uvarint;
+const snappyz = @import("snappyz");
+
 const zeam_utils = @import("@zeam/utils");
 const zeam_metrics = @import("@zeam/metrics");
-
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
-const snappyz = @import("snappyz");
-const snappyframesz = @import("snappyframesz");
-const node_registry = @import("./node_registry.zig");
-const NodeNameRegistry = node_registry.NodeNameRegistry;
-// Publish-side forensic logging includes the build git SHA so
-// receivers across the fleet can correlate broken-byte receipts back to the
-// exact producer binary.
-const build_options = @import("build_options");
-
-// Gossipsub message-id domain (matches the Rust libp2p-glue implementation).
-const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = .{ 0x01, 0x00, 0x00, 0x00 };
-
-const ServerStreamError = error{
-    StreamAlreadyFinished,
-    InvalidResponseVariant,
-};
-
-/// General RPC message size limit. Used for req/resp protocol messages
-/// (BlocksByRoot, BlocksByRange, Status, etc.) and as a baseline gossip limit
-/// for small messages such as attestations and aggregations.
-///
-/// Sized to match `MAX_GOSSIP_BLOCK_SIZE`: `blocks_by_range` and
-/// `blocks_by_root` carry the same XMSS-heavy blocks as the gossip block
-/// topic, so the RPC cap must accommodate the same per-block payload. A
-/// lower RPC cap (previously 4 MB) caused `error.PayloadTooLarge`
-/// during `buildResponseFrame` for every legitimately-sized block that
-/// fit in gossip but not in the RPC frame check, breaking blocks_by_range
-/// catch-up across all peer clients and preventing finalisation.
-///
-/// TODO: split into per-protocol caps so attestations / aggregations /
-/// Status / Goodbye can keep a tighter ceiling than block-carrying
-/// responses. Tracked separately.
-const MAX_RPC_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
-
-/// Gossip block message size limit.
-///
-/// XMSS/post-quantum signatures are substantially larger than BLS: a single
-/// SingleMessageAggregate can be hundreds of KB, and blocks carry up to
-/// MAX_ATTESTATIONS_DATA (8) attestations each with such a proof. A legitimate
-/// block has been observed at ~9.37 MB, exceeding the 4 MB RPC limit and
-/// triggering error.TooLarge.
-///
-/// Set to 50 MB to accommodate current block sizes with room to grow.
-/// Revisit once a MAX_GOSSIP_BLOCK_SIZE constant is formalised.
-///
-/// TODO: 50 MB × N peers is a real memory-pressure surface; lower it once
-/// the limit is formalised.
-const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
-const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
-
-/// Maximum number of leading bytes inlined into gossip-decode-failure log
-/// lines for the diagnostic preview. 32 bytes is enough to cover any
-/// reasonable framing-magic prefix (snappy-frames magic is 10 bytes; common
-/// snappy-block varint headers are 1–3 bytes plus body tags) while keeping
-/// the log line readable and bounded.
-const GOSSIP_PREVIEW_MAX_BYTES: usize = 32;
-
-/// Fixed-capacity hex preview buffer returned by `byteHexPreview`.
-/// `2 × GOSSIP_PREVIEW_MAX_BYTES` for the hex pair + (N − 1) single-space
-/// separators between pairs. Lives on the caller's stack; `.slice()`
-/// returns the populated prefix.
-const BytePreview = struct {
-    buf: [GOSSIP_PREVIEW_MAX_BYTES * 3]u8 = undefined,
-    len: usize = 0,
-    fn slice(self: *const BytePreview) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
-
-/// Build a `"aa bb cc ..."` hex preview of the first `max_bytes` of `data`
-/// for gossip-decode-failure logs. Returns an empty slice when `data`
-/// is empty. Pure / stack-only; safe to call from FFI gossip ingress
-/// without heap allocation.
-fn byteHexPreview(data: []const u8, max_bytes: usize) BytePreview {
-    var out = BytePreview{};
-    const n = @min(@min(data.len, max_bytes), GOSSIP_PREVIEW_MAX_BYTES);
-    const hex_digits = "0123456789abcdef";
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (i != 0) {
-            out.buf[out.len] = ' ';
-            out.len += 1;
-        }
-        const b = data[i];
-        out.buf[out.len] = hex_digits[(b >> 4) & 0x0f];
-        out.buf[out.len + 1] = hex_digits[b & 0x0f];
-        out.len += 2;
-    }
-    return out;
-}
-
-const FrameDecodeError = error{
-    EmptyFrame,
-    MalformedVarint,
-    PayloadTooLarge,
-    Incomplete,
-};
-
-/// Failure modes returned by the snappy block-format header validators.
-/// Each variant maps to a distinct ops/attacker shape; callers should keep
-/// them distinct in logs and (eventually) metrics.
-const SnappyHeaderValidationError = error{
-    /// Empty buffer — nothing to decode.
-    EmptyMessage,
-    /// Leading varint is corrupt (truncated, oversized, or u64-overflow).
-    InvalidVarint,
-    /// Varint decoded cleanly but declares a payload larger than the limit
-    /// allowed for this protocol/topic. Strict `>` to match the upstream
-    /// `snappyz.decodeWithMax` contract (`if (block.blockLen > max_size)`).
-    /// Pinning that comparison here so a future upstream change to `>=`
-    /// flips the boundary and is caught loudly via this comment plus tests,
-    /// rather than silently disagreeing across a 1-byte gap.
-    DeclaredPayloadTooLarge,
-    /// Header parsed cleanly and declared a non-zero payload, but the
-    /// buffer contains only the header bytes (no body). Distinct from
-    /// `InvalidVarint` because the header itself is well-formed; this is a
-    /// truncated message, not a malformed one.
-    HeaderWithoutBody,
-};
-
-/// Successful decode of a snappy block-format header: the declared
-/// uncompressed length and the number of bytes occupied by the varint
-/// header itself.
-const SnappyHeader = struct {
-    value: usize,
-    length: usize,
-};
-
-const LeanSupportedProtocol = interface.LeanSupportedProtocol;
-
-fn encodeVarint(buffer: *std.ArrayList(u8), allocator: Allocator, value: usize) !void {
-    var scratch: [MAX_VARINT_BYTES]u8 = undefined;
-    const encoded = uvarint.encode(usize, value, &scratch);
-    try buffer.appendSlice(allocator, encoded);
-}
-
-fn decodeVarint(bytes: []const u8) uvarint.VarintParseError!struct { value: usize, length: usize } {
-    const result = try uvarint.decode(usize, bytes);
-    return .{
-        .value = result.value,
-        .length = bytes.len - result.remaining.len,
-    };
-}
-
-/// Validate a snappy block-format header against an arbitrary size limit.
-/// Used by both the gossip path (`validateGossipSnappyHeader`) and the RPC
-/// frame parsers (`validateRpcSnappyHeader`); each caller passes its own
-/// per-protocol/per-topic limit.
-///
-/// On success, returns the decoded length and the header byte count. On
-/// failure, returns one of the `SnappyHeaderValidationError` variants so
-/// callers can attribute different attacker shapes (corrupt varint vs.
-/// oversized claim vs. missing body) in logs and metrics.
-///
-/// Header-only validation: this is *not* a full body integrity check. A
-/// well-formed header followed by a body shorter than `decoded.value`
-/// (but at least one byte) is accepted here — the actual decoder is
-/// authoritative for body checks. We only reject the degenerate case
-/// where the buffer is exactly the header and nothing else, because that
-/// can never compress to a non-zero declared size.
-fn validateSnappyHeader(
-    message_bytes: []const u8,
-    max_size: usize,
-) SnappyHeaderValidationError!SnappyHeader {
-    if (message_bytes.len == 0) return error.EmptyMessage;
-    const decoded = decodeVarint(message_bytes) catch return error.InvalidVarint;
-    if (decoded.value > max_size) return error.DeclaredPayloadTooLarge;
-    // A valid snappy block must have at least the header byte(s) and may have
-    // zero compressed bytes only when the declared uncompressed size is zero.
-    if (decoded.value > 0 and decoded.length == message_bytes.len) {
-        return error.HeaderWithoutBody;
-    }
-    return .{
-        .value = decoded.value,
-        .length = decoded.length,
-    };
-}
-
-/// RPC frame snappy-header validator. Used by `parseRequestFrame` and
-/// `parseResponseFrame` to bound declared sizes before snappy-frame decode.
-/// (Renamed from `validateGossipSnappyHeader`: the original name was
-/// inverted — it was always RPC, never gossip.)
-fn validateRpcSnappyHeader(message_bytes: []const u8) FrameDecodeError!SnappyHeader {
-    return validateSnappyHeader(message_bytes, MAX_RPC_MESSAGE_SIZE) catch |e| switch (e) {
-        error.EmptyMessage => return error.EmptyFrame,
-        error.InvalidVarint => return error.MalformedVarint,
-        error.DeclaredPayloadTooLarge => return error.PayloadTooLarge,
-        // Header-only is not a fatal RPC frame condition: the body bytes
-        // may simply not have arrived yet on this read. Treat as Incomplete.
-        error.HeaderWithoutBody => return error.Incomplete,
-    };
-}
-
-/// Gossip block-format snappy-header validator. Called from
-/// `handleMsgFromRustBridge` before invoking `snappyz.decodeWithMax` so
-/// malformed varint headers and oversized declared sizes are rejected
-/// before any heap allocation. Per-topic `max_size` lets the caller
-/// pass `MAX_GOSSIP_BLOCK_SIZE` for blocks vs. `MAX_RPC_MESSAGE_SIZE`
-/// for attestations/aggregations.
-///
-/// This guard rejects malformed varint headers and oversized declared
-/// sizes; it does not (and cannot) verify body integrity — that's the
-/// decoder's job.
-///
-/// Two-layer defense: keep this guard permanently. It serves three purposes
-/// the upstream zig-snappy library
-/// can't: (a) rejects oversized declared sizes pre-allocation using zeam's
-/// per-topic limits, (b) gives callers a typed error so we can attribute
-/// attacker shapes in logs/metrics, (c) acts as a safety net if a future
-/// upstream version regresses on malformed-input handling. The varint
-/// decode is the only piece that overlaps with the upstream decoder; that
-/// overlap is documented in `handleMsgFromRustBridge`'s call site.
-fn validateGossipSnappyHeader(
-    message_bytes: []const u8,
-    max_size: usize,
-) SnappyHeaderValidationError!SnappyHeader {
-    return validateSnappyHeader(message_bytes, max_size);
-}
-
-/// Build a request frame with varint-encoded uncompressed size followed by snappy-framed payload.
-fn buildRequestFrame(allocator: Allocator, uncompressed_size: usize, snappy_payload: []const u8) ![]u8 {
-    if (uncompressed_size > MAX_RPC_MESSAGE_SIZE) {
-        return error.PayloadTooLarge;
-    }
-
-    var frame = std.ArrayList(u8).empty;
-    errdefer frame.deinit(allocator);
-
-    try encodeVarint(&frame, allocator, uncompressed_size);
-    try frame.appendSlice(allocator, snappy_payload);
-
-    return frame.toOwnedSlice(allocator);
-}
-
-/// Build a response frame with response code, varint-encoded uncompressed size, and snappy-framed payload.
-fn buildResponseFrame(allocator: Allocator, code: u8, uncompressed_size: usize, snappy_payload: []const u8) ![]u8 {
-    if (uncompressed_size > MAX_RPC_MESSAGE_SIZE) {
-        return error.PayloadTooLarge;
-    }
-
-    var frame = std.ArrayList(u8).empty;
-    errdefer frame.deinit(allocator);
-
-    try frame.append(allocator, code);
-    try encodeVarint(&frame, allocator, uncompressed_size);
-    try frame.appendSlice(allocator, snappy_payload);
-
-    return frame.toOwnedSlice(allocator);
-}
-
-fn parseRequestFrame(bytes: []const u8) FrameDecodeError!struct {
-    declared_len: usize,
-    payload: []const u8,
-} {
-    if (bytes.len == 0) {
-        return error.EmptyFrame;
-    }
-
-    const decoded = try validateRpcSnappyHeader(bytes);
-
-    return .{
-        .declared_len = decoded.value,
-        .payload = bytes[decoded.length..],
-    };
-}
-
-fn parseResponseFrame(bytes: []const u8) FrameDecodeError!struct {
-    code: u8,
-    declared_len: usize,
-    payload: []const u8,
-} {
-    if (bytes.len == 0) {
-        return error.EmptyFrame;
-    }
-    if (bytes.len == 1) {
-        return error.Incomplete;
-    }
-
-    const decoded = try validateRpcSnappyHeader(bytes[1..]);
-
-    return .{
-        .code = bytes[0],
-        .declared_len = decoded.value,
-        .payload = bytes[1 + decoded.length ..],
-    };
-}
-
-const ServerStreamContext = struct {
-    zigHandler: *EthLibp2p,
-    channel_id: u64,
-    peer_id: []const u8,
-    method: interface.LeanSupportedProtocol,
-    finished: bool = false,
-};
-
-fn serverStreamGetPeerId(ptr: *anyopaque) ?[]const u8 {
-    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
-    return ctx.peer_id;
-}
-
-fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespResponse) anyerror!void {
-    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
-    if (ctx.finished) {
-        return ServerStreamError.StreamAlreadyFinished;
-    }
-
-    const allocator = ctx.zigHandler.allocator;
-    const response_method = std.meta.activeTag(response.*);
-    const response_method_name = @tagName(response_method);
-    const node_name = ctx.zigHandler.node_registry.getNodeNameFromPeerId(ctx.peer_id);
-    ctx.zigHandler.logger.debug(
-        "network-{d}:: serverStreamSendResponse ctx.method={s} response.tag={s} peer={s}{f}",
-        .{ ctx.zigHandler.params.networkId, @tagName(ctx.method), @tagName(response_method), ctx.peer_id, node_name },
-    );
-
-    if (ctx.method != response_method) {
-        ctx.zigHandler.logger.err(
-            "network-{d}:: serverStreamSendResponse method mismatch: ctx.method={s} response.tag={s}",
-            .{ ctx.zigHandler.params.networkId, @tagName(ctx.method), response_method_name },
-        );
-        return ServerStreamError.InvalidResponseVariant;
-    }
-    const encoded = response.serialize(allocator) catch |err| {
-        ctx.zigHandler.logger.err(
-            "network-{d}:: Failed to serialize {s} response for peer={s}{f} channel={d}: {any}",
-            .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, node_name, ctx.channel_id, err },
-        );
-        return err;
-    };
-    defer allocator.free(encoded);
-
-    const framed = snappyframesz.encode(allocator, encoded) catch |err| {
-        ctx.zigHandler.logger.err(
-            "network-{d}:: Failed to snappy-frame {s} response for peer={s}{f} channel={d}: {any}",
-            .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, node_name, ctx.channel_id, err },
-        );
-        return err;
-    };
-    defer allocator.free(framed);
-
-    const frame = try buildResponseFrame(allocator, 0, encoded.len, framed);
-    defer allocator.free(frame);
-
-    ctx.zigHandler.logger.debug(
-        "network-{d}:: Streaming {s} response to peer={s}{f} channel={d}",
-        .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, node_name, ctx.channel_id },
-    );
-
-    send_rpc_response_chunk(
-        ctx.zigHandler.params.networkId,
-        ctx.channel_id,
-        frame.ptr,
-        frame.len,
-    );
-}
-
-/// Snappy-frame an RPC error `message`, prepend the `code` result byte and the
-/// uncompressed-size varint, and relay the finished frame to the Rust bridge.
-/// Uses the same framing `serverStreamSendResponse` applies to success chunks: the
-/// Rust side only relays the bytes (and closes the stream). A peer must be able
-/// to snappy-decode the payload, so the framing cannot be skipped.
-fn sendRpcErrorFramed(zigHandler: *EthLibp2p, channel_id: u64, code: u8, message: []const u8) void {
-    const allocator = zigHandler.allocator;
-
-    const framed = snappyframesz.encode(allocator, message) catch |err| {
-        zigHandler.logger.err(
-            "network-{d}:: Failed to snappy-frame RPC error for channel={d}: {any}",
-            .{ zigHandler.params.networkId, channel_id, err },
-        );
-        return;
-    };
-    defer allocator.free(framed);
-
-    const frame = buildResponseFrame(allocator, code, message.len, framed) catch |err| {
-        zigHandler.logger.err(
-            "network-{d}:: Failed to build RPC error frame for channel={d}: {any}",
-            .{ zigHandler.params.networkId, channel_id, err },
-        );
-        return;
-    };
-    defer allocator.free(frame);
-
-    send_rpc_error_response(zigHandler.params.networkId, channel_id, frame.ptr, frame.len);
-}
-
-fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerror!void {
-    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
-    if (ctx.finished) {
-        return ServerStreamError.StreamAlreadyFinished;
-    }
-
-    const node_name = ctx.zigHandler.node_registry.getNodeNameFromPeerId(ctx.peer_id);
-    ctx.zigHandler.logger.warn(
-        "network-{d}:: Streaming RPC error to peer={s}{f} channel={d} code={d}: {s}",
-        .{ ctx.zigHandler.params.networkId, ctx.peer_id, node_name, ctx.channel_id, code, message },
-    );
-
-    sendRpcErrorFramed(ctx.zigHandler, ctx.channel_id, @intCast(code), message);
-
-    ctx.finished = true;
-}
-
-fn serverStreamFinish(ptr: *anyopaque) anyerror!void {
-    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
-    if (ctx.finished) {
-        return;
-    }
-
-    send_rpc_end_of_stream(ctx.zigHandler.params.networkId, ctx.channel_id);
-    ctx.finished = true;
-}
-
-fn serverStreamIsFinished(ptr: *anyopaque) bool {
-    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
-    return ctx.finished;
-}
-
-/// 1-of-N sample counter for malformed-message debug dumps. Without this gate,
-/// a peer spamming garbage gossip (e.g. sustained 1k msg/s) would fill the
-/// disk with one debug file per message. We only persist
-/// `1` of every `MALFORMED_DUMP_SAMPLE_RATE` rejections; the rest are logged
-/// inline. The counter is process-local and racy across threads, which is
-/// fine — the goal is *not* exact 1:N sampling, just bounded disk pressure.
-///
-/// Lowered 1024 → 32 for an in-transit-corruption investigation.
-/// Worst-case observed failure rate was ~30 dumps/min
-/// on a single node, at <300 KB per dump → ~9 MB/min on disk, bounded by
-/// the rolling `deserialization_dumps/` cleanup in the ops playbook.
-/// Restore to 1024 once the libp2p-layer corruption is fixed.
-const MALFORMED_DUMP_SAMPLE_RATE: usize = 32;
-var malformed_dump_counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-
-/// Returns true iff the caller should persist this malformed message to disk.
-/// Always persists the very first malformed message of a process so a single
-/// reproducible failure during testing isn't lost behind the sampler.
-fn shouldPersistMalformedDump() bool {
-    const n = malformed_dump_counter.fetchAdd(1, .monotonic);
-    return n == 0 or (n % MALFORMED_DUMP_SAMPLE_RATE) == 0;
-}
-
-/// Writes failed deserialization bytes to disk for debugging purposes.
-/// Logs the outcome (success or failure) itself; returns true on success.
-///
-/// Previously returned `?[]const u8` (the allocated filename) while also doing
-/// `defer allocator.free(filename)` — so callers received a dangling pointer and
-/// segfaulted when logging it.  The fix: log from inside this function and return
-/// a plain bool; callers no longer touch the filename string at all.
-fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    // Create dumps directory if it doesn't exist
-    std.Io.Dir.cwd().createDirPath(io, "deserialization_dumps") catch |e| {
-        logger.err("Failed to create deserialization dumps directory: {any}", .{e});
-        return false;
-    };
-
-    // Generate timestamp-based filename
-    const actual_timestamp = timestamp orelse zeam_utils.unixTimestampSeconds();
-    const filename = std.fmt.allocPrint(allocator, "deserialization_dumps/failed_{s}_{d}.bin", .{ message_type, actual_timestamp }) catch |e| {
-        logger.err("Failed to allocate filename for {s} deserialization dump: {any}", .{ message_type, e });
-        return false;
-    };
-    defer allocator.free(filename);
-
-    // Write bytes to file
-    const file = std.Io.Dir.cwd().createFile(io, filename, .{ .truncate = true }) catch |e| {
-        logger.err("Failed to create file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return false;
-    };
-    defer file.close(io);
-
-    var write_buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &write_buf);
-    writer.interface.writeAll(message_bytes) catch |e| {
-        logger.err("Failed to write {d} bytes to file {s} for {s} deserialization dump: {any}", .{ message_bytes.len, filename, message_type, e });
-        return false;
-    };
-    writer.interface.flush() catch |e| {
-        logger.err("Failed to flush file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return false;
-    };
-
-    // Log while filename is still live (before defer free runs).
-    logger.warn("SSZ deserialization failed for {s} message - written {d} bytes to debug file: {s}", .{ message_type, message_bytes.len, filename });
-    return true;
-}
-
-/// Generic SSZ deserializer for gossip messages. Returns null on failure (with
-/// error logging and debug-file creation), so callers can simply `orelse return`.
-fn deserializeGossipMessage(
-    comptime T: type,
-    comptime label: []const u8,
-    data: []const u8,
-    allocator: Allocator,
-    logger: zeam_utils.ModuleLogger,
-) ?T {
-    var message_data: T = undefined;
-    ssz.deserialize(T, data, &message_data, allocator) catch |e| {
-        logger.err("Error in deserializing the signed {s} message: {any}", .{ label, e });
-        if (!writeFailedBytes(data, label, allocator, null, logger)) {
-            logger.err("{s} deserialization failed - could not create debug file", .{label});
-        }
-        return null;
-    };
-    return message_data;
-}
-
-/// Log + sample-dump a gossip rejection from the snappy-header guard. Each
-/// `SnappyHeaderValidationError` variant maps to a distinct attacker shape:
-/// corrupt varint = malformed bytes, declared-too-large = oversized claim,
-/// header-without-body = truncated stream, empty = degenerate. Keeping these
-/// separate in the log line preserves attribution; collapsing into a single
-/// "malformed snappy header" line (as the original PR did) loses the signal.
-fn rejectMalformedGossip(
-    zigHandler: *EthLibp2p,
-    err: SnappyHeaderValidationError,
-    topic_kind: []const u8,
-    topic_slice: []const u8,
-    sender_peer_id_slice: []const u8,
-    message_bytes: []const u8,
-) void {
-    const reason: []const u8 = switch (err) {
-        error.EmptyMessage => "empty gossip payload",
-        error.InvalidVarint => "corrupt snappy varint header",
-        error.DeclaredPayloadTooLarge => "declared snappy payload exceeds per-topic limit",
-        error.HeaderWithoutBody => "snappy header parsed but body bytes are missing",
-    };
-    const dump_label: []const u8 = switch (err) {
-        error.EmptyMessage => "snappy_empty",
-        error.InvalidVarint => "snappy_varint",
-        error.DeclaredPayloadTooLarge => "snappy_oversized",
-        error.HeaderWithoutBody => "snappy_truncated",
-    };
-    const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
-    // Include the first 32 bytes hex inline so operators can diagnose
-    // framing-format mismatches (e.g. snappy-frames magic `ff 06 00 00 73 4e
-    // 61 50 70 59`) from logs without needing the sample-rate-gated dump file.
-    const preview = byteHexPreview(message_bytes, 32);
-    zigHandler.logger.err(
-        "Rejecting gossip message: {s} (topic={s}, len={d}, peer={s}{f}, first32={s})",
-        .{ reason, topic_slice, message_bytes.len, sender_peer_id_slice, node_name, preview.slice() },
-    );
-    // Dashboard-visible counter so a stuck zeam fleet shows up via
-    // metrics before head_slot drifts off wall-clock.
-    zeam_metrics.incrGossipDecodeFailure(topic_kind, dump_label);
-    if (shouldPersistMalformedDump()) {
-        if (!writeFailedBytes(message_bytes, dump_label, zigHandler.allocator, null, zigHandler.logger)) {
-            zigHandler.logger.err("Failed to persist malformed gossip dump ({s})", .{dump_label});
-        }
-    }
-}
-
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize, sender_peer_id: [*:0]const u8) void {
-    const topic = interface.LeanNetworkTopic.decode(zigHandler.allocator, topic_str) catch |err| {
-        zigHandler.logger.err("Ignoring Invalid topic_id={s} sent in handleMsgFromRustBridge: {any}", .{ std.mem.span(topic_str), err });
-        return;
-    };
-
-    const message_bytes: []const u8 = message_ptr[0..message_len];
-    const sender_peer_id_slice = std.mem.span(sender_peer_id);
-    const topic_slice = std.mem.span(topic_str);
-
-    // Block gossip messages carry XMSS/post-quantum aggregated signatures and
-    // can be large (observed around 9 MB). Block topics decode under
-    // MAX_GOSSIP_BLOCK_SIZE; the smaller-message topics (attestations,
-    // aggregations) decode under MAX_RPC_MESSAGE_SIZE. Both ceilings are
-    // currently equal, so this per-kind switch is presently a no-op — it is
-    // kept as the seam for the tighter per-kind ceilings described below.
-    //
-    // TODO: attestations/aggregations rarely approach these limits. Tighter
-    // per-kind ceilings would let us reject earlier and reduce attacker
-    // amplification. Track separately.
-    const decode_limit: usize = switch (topic.gossip_topic.kind) {
-        .block => MAX_GOSSIP_BLOCK_SIZE,
-        else => MAX_RPC_MESSAGE_SIZE,
-    };
-
-    // Defense-in-depth gate before the third-party decoder. Rejects malformed
-    // varint headers and oversized declared sizes so the gossip thread can't
-    // panic on adversarial input regardless of upstream decoder state. Returns
-    // typed errors so we can attribute attacker shapes (corrupt varint vs.
-    // oversized claim vs. truncated body) in logs and — eventually — metrics.
-    //
-    // Note: this decodes the leading varint, and so does
-    // `snappyz.decodeWithMax` further down. The duplication is intentional and
-    // worth O(10ns) per gossip message; both decoders MUST agree on the same
-    // size-limit comparison (strict `>`, see `SnappyHeaderValidationError`).
-    // If the upstream contract ever changes (e.g. to `>=`), the boundary tests
-    // pinned in the test block below will go red.
-    const topic_kind_label: []const u8 = switch (topic.gossip_topic.kind) {
-        .block => "block",
-        .attestation => "attestation",
-        .aggregation => "aggregation",
-    };
-
-    _ = validateGossipSnappyHeader(message_bytes, decode_limit) catch |e| {
-        rejectMalformedGossip(zigHandler, e, topic_kind_label, topic_slice, sender_peer_id_slice, message_bytes);
-        // TODO: apply a libp2p gossipsub score penalty here so a peer spamming
-        // malformed gossip is ejected by the protocol instead of getting unlimited
-        // free retries. Out of scope for the panic fix; tracked separately.
-        return;
-    };
-
-    const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
-        // Inline first-bytes preview + per-failure counter so a stalled
-        // zeam fleet shows up on dashboards (`zeam_gossip_decode_failures_total`)
-        // and the framing format on the wire is diagnosable from logs alone.
-        //
-        // Producer attribution: sha256(compressed) of the inbound bytes
-        // is the byte-exact fingerprint to look up against the publish-side
-        // `[publish]` log line's `sha256_compressed`. Length alone has
-        // been observed to collide (a captured dump showed length
-        // 284553 match between an ethlambda publish and a zeam inbound, but
-        // sha256 differed — proving in-transit byte mutation rather than
-        // codec interop bug). Adding the hash lets correlation become a
-        // single fleet-wide grep.
-        const preview = byteHexPreview(message_bytes, GOSSIP_PREVIEW_MAX_BYTES);
-        const preview_bytes = @min(message_bytes.len, GOSSIP_PREVIEW_MAX_BYTES);
-        var inbound_sha256: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(message_bytes, &inbound_sha256, .{});
-        zigHandler.logger.err(
-            "Error in snappyz decoding the message for topic={s} (len={d}) sha256_inbound={x} from peer={s}: {any}; first{d}={s}",
-            .{ topic_slice, message_bytes.len, &inbound_sha256, sender_peer_id_slice, e, preview_bytes, preview.slice() },
-        );
-        zeam_metrics.incrGossipDecodeFailure(topic_kind_label, "snappy_decode");
-        if (shouldPersistMalformedDump()) {
-            if (!writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) {
-                zigHandler.logger.err("Snappyz decode failed - could not create debug file", .{});
-            }
-        }
-        return;
-    };
-    defer zigHandler.allocator.free(uncompressed_message);
-
-    // Record gossip message size metrics — observed on uncompressed bytes
-    switch (topic.gossip_topic.kind) {
-        .block => zeam_metrics.lean_gossip_block_size_bytes.record(@floatFromInt(uncompressed_message.len)),
-        .attestation => zeam_metrics.lean_gossip_attestation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
-        .aggregation => zeam_metrics.lean_gossip_aggregation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
-    }
-
-    var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
-        .block => .{ .block = deserializeGossipMessage(
-            types.SignedBlock,
-            "block",
-            uncompressed_message,
-            zigHandler.allocator,
-            zigHandler.logger,
-        ) orelse return },
-        .attestation => blk: {
-            const subnet_id = topic.gossip_topic.subnet_id orelse {
-                zigHandler.logger.err("attestation topic missing subnet id: {s}", .{std.mem.span(topic_str)});
-                return;
-            };
-            const msg = deserializeGossipMessage(
-                types.SignedAttestation,
-                "attestation",
-                uncompressed_message,
-                zigHandler.allocator,
-                zigHandler.logger,
-            ) orelse return;
-            break :blk .{ .attestation = .{ .subnet_id = subnet_id, .message = msg } };
-        },
-        .aggregation => .{ .aggregation = deserializeGossipMessage(
-            types.SignedAggregatedAttestation,
-            "aggregation",
-            uncompressed_message,
-            zigHandler.allocator,
-            zigHandler.logger,
-        ) orelse return },
-    };
-    defer message.deinit();
-
-    const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
-    switch (message) {
-        .block => |signed_block| {
-            const block = signed_block.block;
-            zigHandler.logger.debug(
-                "network-{d}:: received gossip block slot={d} proposer={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
-                .{
-                    zigHandler.params.networkId,
-                    block.slot,
-                    block.proposer_index,
-                    message_bytes.len,
-                    uncompressed_message.len,
-                    sender_peer_id_slice,
-                    node_name,
-                },
-            );
-        },
-        .attestation => |signed_attestation| {
-            const slot = signed_attestation.message.message.slot;
-            const validator_id = signed_attestation.message.validator_id;
-            zigHandler.logger.debug(
-                "network-{d}:: received gossip attestation subnet={d} slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
-                .{
-                    zigHandler.params.networkId,
-                    signed_attestation.subnet_id,
-                    slot,
-                    validator_id,
-                    message_bytes.len,
-                    uncompressed_message.len,
-                    sender_peer_id_slice,
-                    node_name,
-                },
-            );
-        },
-        .aggregation => |signed_aggregation| {
-            zigHandler.logger.debug(
-                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
-                .{
-                    zigHandler.params.networkId,
-                    signed_aggregation.data.slot,
-                    message_bytes.len,
-                    uncompressed_message.len,
-                    sender_peer_id_slice,
-                    node_name,
-                },
-            );
-        },
-    }
-
-    // Debug-only JSON dump (conversion happens only if debug is actually emitted).
-    zigHandler.logger.debug(
-        "network-{d}:: gossip payload json topic={s} from peer={s}{f}: {f}",
-        .{
-            zigHandler.params.networkId,
-            topic_slice,
-            sender_peer_id_slice,
-            node_name,
-            zeam_utils.LazyJson(interface.GossipMessage).init(zigHandler.allocator, &message),
-        },
-    );
-
-    zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice) catch |e| {
-        zigHandler.logger.err("onGossip handling of message failed with error e={any} from sender_peer_id={s}{f}", .{ e, sender_peer_id_slice, node_name });
-    };
-}
-
-export fn handleRPCRequestFromRustBridge(
-    zigHandler: *EthLibp2p,
-    channel_id: u64,
-    peer_id: [*:0]const u8,
-    protocol_id: [*:0]const u8,
-    request_ptr: [*]const u8,
-    request_len: usize,
-) void {
-    const peer_id_slice = std.mem.span(peer_id);
-    const protocol_slice = std.mem.span(protocol_id);
-
-    const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    const rpc_protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
-        zigHandler.logger.warn(
-            "network-{d}:: Unsupported RPC protocol from peer={s}{f} on channel={d}: {s}",
-            .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, protocol_slice },
-        );
-        sendRpcErrorFramed(zigHandler, channel_id, 1, "Unsupported RPC protocol");
-        return;
-    };
-
-    const request_frame: []const u8 = request_ptr[0..request_len];
-
-    const request_frame_info = parseRequestFrame(request_frame) catch |err| {
-        zigHandler.logger.err(
-            "network-{d}:: Invalid RPC request frame from peer={s}{f} protocol={s}: {any}",
-            .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
-        );
-        sendRpcErrorFramed(zigHandler, channel_id, 1, "Invalid RPC request frame");
-        return;
-    };
-
-    const request_bytes = snappyframesz.decode(zigHandler.allocator, request_frame_info.payload) catch |err| {
-        zigHandler.logger.err(
-            "network-{d}:: Failed to decode snappy-framed RPC request from peer={s}{f} protocol={s}: {any}",
-            .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
-        );
-        sendRpcErrorFramed(zigHandler, channel_id, 1, "Failed to decode RPC request");
-        return;
-    };
-    defer zigHandler.allocator.free(request_bytes);
-    if (request_bytes.len != request_frame_info.declared_len) {
-        zigHandler.logger.err(
-            "network-{d}:: Invalid RPC request length from peer={s}{f} protocol={s}: declared={d} decoded={d}",
-            .{
-                zigHandler.params.networkId,
-                peer_id_slice,
-                node_name,
-                protocol_slice,
-                request_frame_info.declared_len,
-                request_bytes.len,
-            },
-        );
-        sendRpcErrorFramed(zigHandler, channel_id, 1, "Invalid RPC request length");
-        return;
-    }
-
-    const method = rpc_protocol;
-    var request = interface.ReqRespRequest.deserialize(zigHandler.allocator, method, request_bytes) catch |err| {
-        const label = method.name();
-        zigHandler.logger.err(
-            "Error in deserializing the {s} RPC request from peer={s}{f}: {any}",
-            .{ label, peer_id_slice, node_name, err },
-        );
-        if (!writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) {
-            zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{f}", .{ label, peer_id_slice, node_name });
-        }
-        sendRpcErrorFramed(zigHandler, channel_id, 1, "Failed to deserialize RPC request");
-        return;
-    };
-    defer request.deinit();
-
-    zigHandler.logger.debug(
-        "network-{d}:: received RPC request peer={s}{f} protocol={s} channel={d} size={d}",
-        .{ zigHandler.params.networkId, peer_id_slice, node_name, rpc_protocol.protocolId(), channel_id, request_bytes.len },
-    );
-
-    // Debug-only JSON dump (conversion happens only if debug is actually emitted).
-    zigHandler.logger.debug(
-        "network-{d}:: rpc request json peer={s}{f} protocol={s} channel={d}: {any}",
-        .{
-            zigHandler.params.networkId,
-            peer_id_slice,
-            node_name,
-            rpc_protocol.protocolId(),
-            channel_id,
-            zeam_utils.LazyJson(interface.ReqRespRequest).init(zigHandler.allocator, &request),
-        },
-    );
-
-    const request_method = std.meta.activeTag(request);
-
-    // Heap-allocate the stream context so its address remains valid even if
-    // a handler (now or in the future) retains the stream for work that
-    // outlives this function call. A stack-allocated context would leave
-    // stream.ptr dangling the moment handleRPCRequestFromRustBridge returns.
-    const stream_context = zigHandler.allocator.create(ServerStreamContext) catch |err| {
-        zigHandler.logger.err(
-            "network-{d}:: Failed to allocate RPC stream context for peer={s}{f} channel={d}: {any}",
-            .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, err },
-        );
-        sendRpcErrorFramed(zigHandler, channel_id, 2, "Internal error allocating stream context");
-        return;
-    };
-    defer zigHandler.allocator.destroy(stream_context);
-    stream_context.* = ServerStreamContext{
-        .zigHandler = zigHandler,
-        .channel_id = channel_id,
-        .peer_id = peer_id_slice,
-        .method = request_method,
-    };
-
-    var stream = interface.ReqRespServerStream{
-        .ptr = stream_context,
-        .sendResponseFn = serverStreamSendResponse,
-        .sendErrorFn = serverStreamSendError,
-        .finishFn = serverStreamFinish,
-        .isFinishedFn = serverStreamIsFinished,
-        .getPeerIdFn = serverStreamGetPeerId,
-    };
-
-    zigHandler.reqrespHandler.onReqRespRequest(&request, stream) catch |e| {
-        zigHandler.logger.err(
-            "network-{d}:: Error while handling RPC request from peer={s}{f} on channel={d}: {any}",
-            .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, e },
-        );
-
-        if (!stream.isFinished()) {
-            const msg = std.fmt.allocPrint(zigHandler.allocator, "Handler error: {any}", .{e}) catch null;
-            if (msg) |owned| {
-                defer zigHandler.allocator.free(owned);
-                stream.sendError(1, owned) catch |send_err| {
-                    zigHandler.logger.err(
-                        "network-{d}:: Failed to send RPC error response for peer={s}{f} channel={d}: {any}",
-                        .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, send_err },
-                    );
-                };
-            } else {
-                stream.finish() catch |finish_err| {
-                    zigHandler.logger.err(
-                        "network-{d}:: Failed to finalize errored RPC stream for peer={s}{f} channel={d}: {any}",
-                        .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, finish_err },
-                    );
-                };
-            }
-        }
-        return;
-    };
-
-    if (!stream.isFinished()) {
-        stream.finish() catch |finish_err| {
-            zigHandler.logger.err(
-                "network-{d}:: Failed to finalize RPC stream for peer={s}{f} channel={d}: {any}",
-                .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, finish_err },
-            );
-        };
-    }
-}
-
-export fn handleRPCResponseFromRustBridge(
-    zigHandler: *EthLibp2p,
-    request_id: u64,
-    peer_id: [*:0]const u8,
-    protocol_id: [*:0]const u8,
-    response_ptr: [*]const u8,
-    response_len: usize,
-) void {
-    const protocol_slice = std.mem.span(protocol_id);
-    const peer_id_slice = std.mem.span(peer_id);
-    const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-
-    var callback_snap = zigHandler.snapshotRpcCallbackForDelivery(request_id) catch |err| {
-        zigHandler.logger.err(
-            "network-{d}:: Failed to snapshot RPC callback for request_id={d} protocol={s} from peer={s}{f}: {any}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name, err },
-        );
-        return;
-    } orelse {
-        zigHandler.logger.warn(
-            "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name },
-        );
-        return;
-    };
-    defer callback_snap.deinit(zigHandler.allocator);
-    const callback_peer_id = callback_snap.peer_id;
-    const callback_node_name = zigHandler.node_registry.getNodeNameFromPeerId(callback_peer_id);
-    const method = callback_snap.method;
-    const handler = callback_snap.handler;
-    const protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
-        zigHandler.notifyRpcErrorFmt(
-            request_id,
-            method,
-            2,
-            "Unsupported RPC protocol in response: {s}",
-            .{protocol_slice},
-        );
-        return;
-    };
-    if (protocol != method) {
-        zigHandler.logger.warn(
-            "network-{d}:: RPC protocol/method mismatch for request_id={d}: protocol={s} method={s} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol.protocolId(), @tagName(method), callback_peer_id, callback_node_name },
-        );
-    }
-
-    const response_frame = response_ptr[0..response_len];
-
-    const parsed_frame = parseResponseFrame(response_frame) catch |err| {
-        zigHandler.notifyRpcErrorFmt(
-            request_id,
-            method,
-            2,
-            "Invalid response frame (protocol={s}): {any}",
-            .{ protocol.protocolId(), err },
-        );
-        return;
-    };
-
-    if (parsed_frame.code != 0) {
-        zigHandler.logger.warn(
-            "network-{d}:: RPC error response for request_id={d} protocol={s} code={d} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol.protocolId(), parsed_frame.code, callback_peer_id, callback_node_name },
-        );
-
-        const owned_message = zigHandler.allocator.dupe(u8, parsed_frame.payload) catch |dup_err| {
-            zigHandler.logger.err(
-                "network-{d}:: Failed to duplicate RPC error payload for request_id={d} from peer={s}{f}: {any}",
-                .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, dup_err },
-            );
-            zigHandler.notifyRpcErrorFmt(
-                request_id,
-                method,
-                @intCast(parsed_frame.code),
-                "Failed to duplicate RPC error payload (protocol={s})",
-                .{protocol_slice},
-            );
-            return;
-        };
-
-        zigHandler.notifyRpcErrorWithOwnedMessage(
-            request_id,
-            method,
-            @intCast(parsed_frame.code),
-            owned_message,
-        );
-        return;
-    }
-
-    const response_bytes = snappyframesz.decode(zigHandler.allocator, parsed_frame.payload) catch |err| {
-        zigHandler.notifyRpcErrorFmt(
-            request_id,
-            method,
-            2,
-            "Failed to decode snappy-framed response (protocol={s}): {any}",
-            .{ protocol.protocolId(), err },
-        );
-        return;
-    };
-    defer zigHandler.allocator.free(response_bytes);
-    if (response_bytes.len != parsed_frame.declared_len) {
-        zigHandler.notifyRpcErrorFmt(
-            request_id,
-            method,
-            2,
-            "Response length mismatch (protocol={s}): declared {d} decoded {d}",
-            .{ protocol.protocolId(), parsed_frame.declared_len, response_bytes.len },
-        );
-        return;
-    }
-
-    const response_union = interface.ReqRespResponse.deserialize(zigHandler.allocator, method, response_bytes) catch |err| {
-        zigHandler.notifyRpcErrorFmt(
-            request_id,
-            method,
-            2,
-            "Failed to deserialize RPC response (protocol={s}): {any}",
-            .{ protocol.protocolId(), err },
-        );
-        return;
-    };
-
-    var event = interface.ReqRespResponseEvent.initSuccess(request_id, method, response_union);
-    defer event.deinit(zigHandler.allocator);
-
-    zigHandler.logger.debug(
-        "network-{d}:: Received RPC response for request_id={d} protocol={s} size={d} from peer={s}{f}",
-        .{ zigHandler.params.networkId, request_id, protocol.protocolId(), response_bytes.len, callback_peer_id, callback_node_name },
-    );
-
-    handler.onReqRespResponse(&event) catch |notify_err| {
-        zigHandler.logger.err(
-            "network-{d}:: Failed to notify RPC success callback for request_id={d} from peer={s}{f}: {any}",
-            .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, notify_err },
-        );
-    };
-}
-
-export fn handleRPCEndOfStreamFromRustBridge(
-    zigHandler: *EthLibp2p,
-    request_id: u64,
-    peer_id: [*:0]const u8,
-    protocol_id: [*:0]const u8,
-) void {
-    const protocol_slice = std.mem.span(protocol_id);
-    const peer_id_slice = std.mem.span(peer_id);
-    const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
-
-    if (zigHandler.takeRpcCallback(request_id)) |callback| {
-        var owned_callback = callback;
-        const method = owned_callback.method;
-        const callback_peer_id = owned_callback.peer_id;
-        const callback_node_name = zigHandler.node_registry.getNodeNameFromPeerId(callback_peer_id);
-
-        var event = interface.ReqRespResponseEvent.initCompleted(request_id, method);
-        defer event.deinit(zigHandler.allocator);
-
-        zigHandler.logger.debug(
-            "network-{d}:: Received RPC end-of-stream for request_id={d} protocol={s} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol_str, callback_peer_id, callback_node_name },
-        );
-
-        owned_callback.notify(&event) catch |notify_err| {
-            zigHandler.logger.err(
-                "network-{d}:: Failed to notify RPC completion for request_id={d}: {any}",
-                .{ zigHandler.params.networkId, request_id, notify_err },
-            );
-        };
-        owned_callback.deinit();
-    } else {
-        zigHandler.logger.warn(
-            "network-{d}:: Received RPC end-of-stream for unknown request_id={d} protocol={s} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol_str, peer_id_slice, node_name },
-        );
-    }
-}
-
-export fn handleRPCErrorFromRustBridge(
-    zigHandler: *EthLibp2p,
-    request_id: u64,
-    protocol_id: [*:0]const u8,
-    code: u32,
-    message_ptr: [*:0]const u8,
-) void {
-    const protocol_slice = std.mem.span(protocol_id);
-    const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
-    const message_slice = std.mem.span(message_ptr);
-
-    if (zigHandler.takeRpcCallback(request_id)) |callback| {
-        var owned_callback = callback;
-        const method = owned_callback.method;
-        const peer_id = owned_callback.peer_id;
-        const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id);
-
-        const owned_message = zigHandler.allocator.dupe(u8, message_slice) catch |alloc_err| {
-            zigHandler.logger.err(
-                "network-{d}:: Failed to duplicate RPC error message for request_id={d} from peer={s}{f}: {any}",
-                .{ zigHandler.params.networkId, request_id, peer_id, node_name, alloc_err },
-            );
-            owned_callback.deinit();
-            return;
-        };
-
-        var event = interface.ReqRespResponseEvent.initError(request_id, method, .{
-            .code = code,
-            .message = owned_message,
-        });
-        defer event.deinit(zigHandler.allocator);
-
-        zigHandler.logger.warn(
-            "network-{d}:: Received RPC error for request_id={d} protocol={s} code={d} from peer={s}{f}",
-            .{ zigHandler.params.networkId, request_id, protocol_str, code, peer_id, node_name },
-        );
-
-        owned_callback.notify(&event) catch |notify_err| {
-            zigHandler.logger.err(
-                "network-{d}:: Failed to notify RPC error for request_id={d} from peer={s}{f}: {any}",
-                .{ zigHandler.params.networkId, request_id, peer_id, node_name, notify_err },
-            );
-        };
-        owned_callback.deinit();
-    } else {
-        zigHandler.logger.warn(
-            "network-{d}:: Dropping RPC error for unknown request_id={d} protocol={s} code={d}",
-            .{ zigHandler.params.networkId, request_id, protocol_str, code },
-        );
-    }
-}
-
-export fn handlePeerConnectedFromRustBridge(
-    zigHandler: *EthLibp2p,
-    peer_id: [*:0]const u8,
-    direction: u32,
-) void {
-    const peer_id_slice = std.mem.span(peer_id);
-    const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
-    zigHandler.logger.info("network-{d}:: Peer connected: {s}{f} direction={s}", .{
-        zigHandler.params.networkId,
-        peer_id_slice,
-        node_name,
-        @tagName(dir),
-    });
-
-    zigHandler.peerEventHandler.onPeerConnected(peer_id_slice, dir) catch |e| {
-        zigHandler.logger.err("network-{d}:: Error handling peer connected event: {any}", .{ zigHandler.params.networkId, e });
-    };
-}
-
-export fn handlePeerDisconnectedFromRustBridge(
-    zigHandler: *EthLibp2p,
-    peer_id: [*:0]const u8,
-    direction: u32,
-    reason: u32,
-) void {
-    const peer_id_slice = std.mem.span(peer_id);
-    const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
-    const rsn = @as(interface.DisconnectionReason, @enumFromInt(reason));
-    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}{f} direction={s} reason={s}", .{
-        zigHandler.params.networkId,
-        peer_id_slice,
-        node_name,
-        @tagName(dir),
-        @tagName(rsn),
-    });
-
-    zigHandler.failInflightRpcsForPeer(peer_id_slice) catch |e| {
-        zigHandler.logger.err(
-            "network-{d}:: Error failing in-flight RPCs for disconnected peer={s}{f}: {any}",
-            .{ zigHandler.params.networkId, peer_id_slice, node_name, e },
-        );
-    };
-
-    zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice, dir, rsn) catch |e| {
-        zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
-    };
-}
-
-export fn handlePeerConnectionFailedFromRustBridge(
-    zigHandler: *EthLibp2p,
-    peer_id: ?[*:0]const u8,
-    direction: u32,
-    result: u32,
-) void {
-    const peer_id_slice = if (peer_id) |p| std.mem.span(p) else "unknown";
-    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
-    const res = @as(interface.ConnectionResult, @enumFromInt(result));
-    zigHandler.logger.info("network-{d}:: Peer connection failed: {s} direction={s} result={s}", .{
-        zigHandler.params.networkId,
-        peer_id_slice,
-        @tagName(dir),
-        @tagName(res),
-    });
-
-    zigHandler.peerEventHandler.onPeerConnectionFailed(peer_id_slice, dir, res) catch |e| {
-        zigHandler.logger.err("network-{d}:: Error handling peer connection failed event: {any}", .{ zigHandler.params.networkId, e });
-    };
-}
-
-// Receive plain log lines from the Rust bridge and emit using Zeam logger with proper node scope
-export fn handleLogFromRustBridge(
-    zigHandler: *EthLibp2p,
-    level: u32,
-    message_ptr: [*]const u8,
-    message_len: usize,
-) void {
-    const message_slice: []const u8 = message_ptr[0..message_len];
-    const trimmed: []const u8 = std.mem.trim(u8, message_slice, " \t\r\n");
-    switch (level) {
-        0 => zigHandler.logger.debug("rust-bridge: {s}", .{trimmed}),
-        1 => zigHandler.logger.info("rust-bridge: {s}", .{trimmed}),
-        2 => zigHandler.logger.warn("rust-bridge: {s}", .{trimmed}),
-        3 => zigHandler.logger.err("rust-bridge: {s}", .{trimmed}),
-        else => zigHandler.logger.debug("rust-bridge:{s}", .{trimmed}),
-    }
-}
-
-export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8) void {
-    const listen_slice = std.mem.span(listen_addresses);
-    zig_handler.allocator.free(listen_slice);
-
-    const connect_slice = std.mem.span(connect_addresses);
-    zig_handler.allocator.free(connect_slice);
-
-    const private_key_slice = std.mem.span(local_private_key);
-    zig_handler.allocator.free(private_key_slice);
-}
-
-/// Must match `CreateNetworkParams` in `rust/libp2p-glue/src/lib.rs` (repr(C)).
-pub const CreateNetworkParams = extern struct {
-    network_id: u32,
-    padding: u32,
-    zig_handler: u64,
-    local_private_key: [*:0]const u8,
-    listen_addresses: [*:0]const u8,
-    connect_addresses: [*:0]const u8,
-};
-
-pub extern fn create_and_run_network(params: *const CreateNetworkParams) callconv(.c) void;
-pub extern fn wait_for_network_ready(
-    network_id: u32,
-    timeout_ms: u64,
-) callconv(.c) bool;
-/// Signal the Rust-side libp2p event loop to exit. After returning, the hosting
-/// bridge thread is guaranteed to unwind soon and can be `join`ed. Safe to call
-/// on a network that was never started or is already stopped (no-op).
-pub extern fn stop_network(network_id: u32) callconv(.c) void;
-/// Returns `true` when the publish was successfully enqueued onto the Rust-side
-/// swarm command channel, `false` when the command was dropped (network not
-/// initialized, channel full / closed, or null topic). Under load the bounded
-/// command channel can drop our own attestations and the caller needs to know
-/// rather than logging "published" unconditionally.
-pub extern fn publish_msg_to_rust_bridge(
-    networkId: u32,
-    topic_str: [*:0]const u8,
-    message_ptr: [*]const u8,
-    message_len: usize,
-) callconv(.c) bool;
-/// Enqueue a gossipsub mesh subscription on the Rust-side swarm command channel.
-/// Returns `true` if the command was enqueued, `false` if dropped (network not
-/// initialized, channel full / closed, or null `topic_str`). Driven from
-/// `EthLibp2p.subscribe`, which keeps `gossip.subscribe` on the Zig side as
-/// the single source of truth for which subnets a node joins.
-pub extern fn subscribe_gossip_topic_to_rust_bridge(
-    networkId: u32,
-    topic_str: [*:0]const u8,
-) callconv(.c) bool;
-pub extern fn send_rpc_request(
-    networkId: u32,
-    peer_id: [*:0]const u8,
-    protocol_tag: u32,
-    request_ptr: [*]const u8,
-    request_len: usize,
-) callconv(.c) u64;
-pub extern fn send_rpc_response_chunk(
-    networkId: u32,
-    channel_id: u64,
-    response_ptr: [*]const u8,
-    response_len: usize,
-) callconv(.c) void;
-pub extern fn send_rpc_end_of_stream(networkId: u32, channel_id: u64) callconv(.c) void;
-pub extern fn send_rpc_error_response(
-    networkId: u32,
-    channel_id: u64,
-    frame_ptr: [*]const u8,
-    frame_len: usize,
-) callconv(.c) void;
-
-/// Tag space for `get_swarm_command_dropped_total`. Matches the
-/// `SwarmCommandDropReason` enum on the Rust side. Stable wire contract:
-/// these tags are passed by value across FFI; do not renumber. Adding a new
-/// reason is fine; existing reasons must keep their tag.
-pub const SwarmCommandDropReason = enum(u32) {
-    full = 0,
-    closed = 1,
-    uninitialized = 2,
-};
-
-/// Returns the cumulative count of swarm commands dropped before reaching the
-/// Rust event loop, for the given reason tag. Counts are global across all
-/// networks; the metrics layer scrapes once per Prometheus hit and turns the
-/// monotonic count into a labeled `zeam_libp2p_swarm_command_dropped_total`
-/// counter via deltas.
-pub extern fn get_swarm_command_dropped_total(reason_tag: u32) callconv(.c) u64;
-
-/// Last cumulative drop count we observed from the Rust side, per reason
-/// (matching `SwarmCommandDropReason`). The scrape refresher computes
-/// `current - last_seen`, calls `incrBy` with the delta, and updates this.
-var swarm_command_drop_last_seen: [3]u64 = .{ 0, 0, 0 };
-
-fn refreshSwarmCommandDropMetric() void {
-    inline for (.{ SwarmCommandDropReason.full, SwarmCommandDropReason.closed, SwarmCommandDropReason.uninitialized }) |reason| {
-        const idx: usize = @intFromEnum(reason);
-        const current = get_swarm_command_dropped_total(@intFromEnum(reason));
-        const last = swarm_command_drop_last_seen[idx];
-        if (current > last) {
-            const delta = current - last;
-            zeam_metrics.metrics.zeam_libp2p_swarm_command_dropped_total.incrBy(
-                .{ .reason = @tagName(reason) },
-                delta,
-            ) catch {};
-            swarm_command_drop_last_seen[idx] = current;
-        }
-    }
-}
-
-/// Current number of remote peers in this node's gossipsub mesh, across all
-/// subscribed topics. Kept fresh from inside the
-/// rust-libp2p swarm task (gossipsub events, connection closes, 1s tick) and
-/// read here on every Prometheus scrape — "on scrape" semantics.
-pub extern fn get_mesh_peers_total(network_id: u32) callconv(.c) u64;
-
-/// `lean_gossip_mesh_peers`.
-///
-/// The Rust glue keeps `MESH_PEERS_TOTAL` as a fixed-size
-/// `[AtomicU64; MAX_NETWORKS]` (slots for `network_id` 0…MAX_NETWORKS-1,
-/// matching the hardcoded slot table in `rust/libp2p-glue/src/lib.rs`).
-/// Sum across every slot rather than tracking a single "active"
-/// network_id in a Zig-side global — the previous design silently
-/// reported only the most recently `init`-ed network's count if more
-/// than one `EthLibp2p` was created in-process (multi-network tests,
-/// future multi-network deployments). Inactive slots are 0 (reset by
-/// `stop_network` and never written for unused ids), so summing is the
-/// correct single-gauge answer for every current usage.
-///
-/// A future per-network label scheme (`client=<name>_<N>`) would emit
-/// one labelled gauge per non-zero slot rather than summing. The
-/// fixed-size atomic shape on the Rust side is what makes that change a
-/// localised follow-up rather than a re-architecture.
-const MESH_PEERS_MAX_NETWORKS: u32 = 3;
-
-fn refreshMeshPeersMetric() void {
-    var total: u64 = 0;
-    var network_id: u32 = 0;
-    while (network_id < MESH_PEERS_MAX_NETWORKS) : (network_id += 1) {
-        total += get_mesh_peers_total(network_id);
-    }
-    zeam_metrics.metrics.lean_gossip_mesh_peers.set(total);
-}
-
-/// Combined scrape refresher for all network-layer metrics. Historically
-/// `registerScrapeRefresher` stored a single callback, so this fan-out
-/// existed because registering each refresher individually would silently
-/// overwrite the previous one. The metrics module now keeps an append-only
-/// list of refreshers, so individual
-/// registration would also be safe — but we keep the fan-out for two
-/// reasons:
-///   * one callback per module makes the registration site (below) easier
-///     to audit;
-///   * adding a new network-layer refresher is a one-liner here without
-///     touching the metrics-module registry capacity.
-/// Add new network-layer refreshers here.
-fn refreshNetworkMetrics() void {
-    refreshSwarmCommandDropMetric();
-    refreshMeshPeersMetric();
-}
-
-/// Arguments for the libp2p Rust runtime thread. Kept in a Zig function so `std.Thread.spawn`
-/// uses a normal Zig entry point; passing `create_and_run_network` (a C symbol) as the spawn
-/// target has been observed to fault on Linux x86_64 (GPF in `Thread.callFn`).
-const CreateNetworkThreadArgs = struct {
-    network_id: u32,
-    handle: *EthLibp2p,
-    local_private_key: [*:0]const u8,
-    listen_addresses: [*:0]const u8,
-    connect_addresses: [*:0]const u8,
-};
-
-fn createAndRunNetworkThread(args: CreateNetworkThreadArgs) void {
-    var c_params: CreateNetworkParams = .{
-        .network_id = args.network_id,
-        .padding = 0,
-        .zig_handler = @intFromPtr(args.handle),
-        .local_private_key = args.local_private_key,
-        .listen_addresses = args.listen_addresses,
-        .connect_addresses = args.connect_addresses,
-    };
-    create_and_run_network(&c_params);
-}
+const NodeNameRegistry = @import("./node_registry.zig").NodeNameRegistry;
+
+const zl = @import("zig_libp2p");
+const Multiaddr = @import("multiaddr").Multiaddr;
+const peer_id_pkg = zl.peer_id;
+
+const Secp256k1 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+
+// Shared snappy + SSZ codec helpers; previously lived inside the legacy
+// `ethlibp2p.zig` and were `pub`'d for reuse. After the Rust-glue
+// teardown those helpers live in their own module so the codec sticks
+// around once the legacy file is deleted.
+const v1 = @import("./gossip_codec.zig");
+
+const MESSAGE_DOMAIN_VALID_SNAPPY: [4]u8 = v1.MESSAGE_DOMAIN_VALID_SNAPPY;
+const MAX_GOSSIP_BLOCK_SIZE: usize = v1.MAX_GOSSIP_BLOCK_SIZE;
+const MAX_RPC_MESSAGE_SIZE: usize = v1.MAX_RPC_MESSAGE_SIZE;
+const GOSSIP_PREVIEW_MAX_BYTES: usize = v1.GOSSIP_PREVIEW_MAX_BYTES;
+
+/// Default per-request response wait used by the legacy path (the Rust glue
+/// embeds a 15s timeout in its req/resp protocol handler). zig-libp2p's
+/// `Host.sendRequest` adds `request_timeout_ms` (default 15_000) onto the
+/// `now_ms` value the embedder passes, so we pass the current wall time
+/// directly and inherit the same 15s deadline.
+const DEFAULT_REQ_TIMEOUT_NOW_MS = 0; // see commentary at `sendRPCRequest`
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
     fork_digest: []const u8,
-    local_private_key: []const u8,
-    listen_addresses: []const Multiaddr,
-    connect_peers: ?[]const Multiaddr,
+    listen_addresses: []const u8 = "",
+    connect_peers: []const u8 = "",
     node_registry: *const NodeNameRegistry,
+    /// 32-byte seed for this node's ECDSA-P-256 host identity. The libp2p
+    /// PeerId derives from this seed, so persisting it across restarts gives
+    /// a stable peer id. When `null` AND `host_identity_key_path` is also
+    /// `null`, a fresh seed is drawn from `std.posix.getrandom` (ephemeral
+    /// identity per run — matches the random-PeerId behaviour of the legacy
+    /// path). Takes precedence over `host_identity_key_path` when both are
+    /// set (used by unit tests that want a fixed in-process identity).
+    host_identity_seed: ?[32]u8 = null,
+    /// Optional path to a file containing a 64-hex-char ASCII representation
+    /// of the 32-byte ECDSA-P-256 host-identity seed (lean-quickstart's
+    /// `--node-key /config/<node>.key` format: 64 hex chars + trailing
+    /// newline). When set and `host_identity_seed` is `null`, init() reads,
+    /// strips whitespace, hex-decodes and uses the resulting 32 bytes as the
+    /// seed — giving a stable PeerId across restarts that MATCHES the
+    /// `/p2p/...` peer id the bootnode list pre-computed from the same key
+    /// file. Without this, the host identity is random per startup and every
+    /// dial fails `PeerIdMismatch` against the expected peer id from the
+    /// dial multiaddr.
+    host_identity_key_path: ?[]const u8 = null,
+};
+
+/// Heap-allocated host signer state that captures the secp256k1 keypair
+/// for the libp2p TLS cert's `SignedKey` DER ECDSA signature. Stored on
+/// `EthLibp2p` so the pointer in `HostIdentityKey.secp256k1.sign_ctx`
+/// stays valid for the lifetime of any cert minted from it.
+///
+/// secp256k1 (NOT Ed25519 or P-256) is the libp2p convention in the lean
+/// ecosystem: every node's identity comes from a 32-byte secp256k1 private
+/// key, the matching compressed pubkey goes into the ENR, and the bootnode
+/// `/p2p/16Uiu2HA...` peer ids in `nodes.yaml` are the libp2p PeerId
+/// derived from `PublicKey{type=SECP256K1, data=<33-byte compressed>}`.
+/// Any other algorithm here would derive a different PeerId from the same
+/// `<node>.key` file and every outbound dial would fail `PeerIdMismatch`
+/// (which is exactly what happened on the Ed25519 path that preceded this).
+const Secp256k1HostSigner = struct {
+    kp: Secp256k1.KeyPair,
+
+    fn sign(
+        ctx: ?*anyopaque,
+        message: []const u8,
+        out_sig: []u8,
+        out_sig_len: *usize,
+    ) anyerror!void {
+        const self: *Secp256k1HostSigner = @ptrCast(@alignCast(ctx.?));
+        // libp2p mandates canonical low-S secp256k1 signatures; verifiers built
+        // on libsecp256k1 (lantern/c-lean-libp2p) reject high-S, so the SignedKey
+        // signature must be normalized or ~half of all handshakes fail.
+        out_sig_len.* = try zl.security.libp2p_tls_cert.signSecp256k1LowSDer(self.kp, message, out_sig);
+    }
+};
+
+/// Zig 0.16 moved secure randomness to `std.Io.randomSecure`, which requires
+/// an `Io` instance the module does not otherwise need. Same fallback shape
+/// as zig-libp2p's gossipsub seed routine: prefer the Linux `getrandom`
+/// syscall, else `arc4random_buf` on libc platforms.
+fn fillRandomBytes(out: []u8) !void {
+    const builtin = @import("builtin");
+    switch (builtin.os.tag) {
+        .linux => {
+            var off: usize = 0;
+            while (off < out.len) {
+                const n = std.os.linux.getrandom(out.ptr + off, out.len - off, 0);
+                if (n == 0) return error.GetRandomFailed;
+                off += n;
+            }
+        },
+        else => {
+            if (@TypeOf(std.c.arc4random_buf) != void) {
+                std.c.arc4random_buf(out.ptr, out.len);
+            } else {
+                return error.NoSecureRandomSource;
+            }
+        },
+    }
+}
+
+/// Read a lean-quickstart `<node>.key` file (64 hex chars + optional
+/// whitespace, e.g. trailing newline) and hex-decode to a 32-byte
+/// ECDSA-P-256 host-identity seed.
+///
+/// lean-quickstart's `spin-node.sh` generates these files via PK's
+/// `eth-beacon-genesis` tool and pre-computes the matching `/p2p/...` peer
+/// ids into `nodes.yaml`. Reading the SAME seed here is what makes our
+/// derived PeerId match the dial-target peer id in the bootnode multiaddrs
+/// — otherwise every outbound dial fails `PeerIdMismatch` because our cert
+/// encodes a random pubkey that doesn't agree with what the dialer expected.
+fn readHostIdentitySeedFromHexFile(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256));
+    defer allocator.free(bytes);
+    // Strip ASCII whitespace (lean-quickstart writes "<64hex>\n").
+    var hex_buf: [64]u8 = undefined;
+    var hex_len: usize = 0;
+    for (bytes) |c| {
+        if (c == '\n' or c == '\r' or c == ' ' or c == '\t') continue;
+        if (hex_len >= 64) return error.HostKeyFileTooLong;
+        hex_buf[hex_len] = c;
+        hex_len += 1;
+    }
+    if (hex_len != 64) return error.HostKeyFileShouldBe64Hex;
+    var seed: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, hex_buf[0..hex_len]);
+    return seed;
+}
+
+/// Per-topic registered handler. The validator hook fans every accepted
+/// inbound gossip message out to every handler subscribed to its topic.
+const TopicSubscription = struct {
+    topic: interface.GossipTopic,
+    encoded: []u8, // owned: the on-the-wire libp2p topic string
 };
 
 pub const EthLibp2p = struct {
     allocator: Allocator,
-    gossipHandler: interface.GenericGossipHandler,
-    peerEventHandler: interface.PeerEventHandler,
-    reqrespHandler: interface.ReqRespRequestHandler,
+    host: *zl.host.Host,
+    /// Per-instance metrics registry owned by this instance. Wired into Host so
+    /// gossipsub + swarm record into it; the scrape refresher reads from it.
+    metrics_registry: *zl.metrics.Metrics,
     params: EthLibp2pParams,
-    rustBridgeThread: ?Thread = null,
-    rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
-    /// Guards `rpcCallbacks` against concurrent mutation from the libxev
-    /// thread (status refresh, block fetch dispatch) and the rust-bridge
-    /// thread (response / EOS / error delivery). Unsynchronized access
-    /// corrupts callback entries and has produced GPEs in onReqRespResponse
-    /// during status RPC bursts.
-    rpc_callbacks_lock: zeam_utils.SyncMutex = .{},
     logger: zeam_utils.ModuleLogger,
-    node_registry: *const NodeNameRegistry,
-    /// Topics successfully joined on the Rust gossipsub mesh at startup.
-    subscribed_gossip_topics: std.ArrayListUnmanaged(interface.GossipTopic) = .empty,
-    subscribed_gossip_topics_lock: zeam_utils.SyncMutex = .{},
+
+    /// Pinned local PeerId so callbacks that need to return it stay
+    /// allocation-free on the hot path.
+    local_peer: zl.identity.PeerId,
+
+    /// Same handler instances the legacy path used. The validator
+    /// callback in `gossipTopicValidator` invokes
+    /// `gossip_handler.onGossip`; the driver thread invokes
+    /// `peer_event_handler.onPeer*` and `reqresp_handler.onReqRespRequest`
+    /// as the corresponding `Swarm.Event` variants arrive.
+    gossip_handler: interface.GenericGossipHandler,
+    peer_event_handler: interface.PeerEventHandler,
+    reqresp_handler: interface.ReqRespRequestHandler,
+
+    subscriptions: std.ArrayListUnmanaged(TopicSubscription) = .empty,
+    subscriptions_lock: zeam_utils.SyncMutex = .{},
+
+    rpc_callbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback) = .empty,
+    rpc_callbacks_lock: zeam_utils.SyncMutex = .{},
+
+    /// Last-seen swarm-drop totals per reason, indexed by
+    /// `@intFromEnum(zl.metrics.SwarmDropReason)`. The scrape refresher
+    /// computes `current - last_seen` and calls `incrBy` with the delta,
+    /// then updates this baseline. Same delta-on-scrape semantic as the
+    /// legacy Rust path.
+    swarm_drop_last_seen: [3]u64 = .{ 0, 0, 0 },
+
+    drain_thread: ?Thread = null,
+    shutdown_flag: std.atomic.Value(bool) = .init(false),
+
+    /// Heap-allocated so the pointer handed to
+    /// `libp2p_tls_cert.HostIdentityKey.secp256k1.sign_ctx` stays valid.
+    host_signer: *Secp256k1HostSigner,
+
+    /// `null` until `run` brings up a QUIC listener; `null` forever if the
+    /// embedder left `listen_addresses` empty.
+    quic_runtime: ?*zl.transport.quic_runtime.QuicRuntime = null,
+
+    /// PEM-encoded TLS cert + key, owned by this instance and BORROWED by
+    /// `QuicRuntime` (which forwards the slices straight into zquic v1.6.6's
+    /// `ServerConfig.cert_pem` / `ClientConfig.client_cert_pem`). The server
+    /// config parses them once during `QuicRuntime.create`, but the client
+    /// config re-parses them on EVERY `dial`, so these buffers must live as
+    /// long as `quic_runtime` — freeing them after `create` returns turns
+    /// every outbound dial into `error.NoCertificate`.
+    tls_cert_pem: ?[]u8 = null,
+    tls_key_pem: ?[]u8 = null,
 
     const Self = @This();
-
-    /// Snapshot of an in-flight RPC callback for response delivery while the
-    /// entry remains registered (streaming success chunks). `peer_id` is owned
-    /// by this snapshot; do not use map pointers after releasing the lock.
-    ///
-    /// `handler.ptr` references the node (`BeamNode` via
-    /// `getReqRespResponseHandler`), not memory owned by `ReqRespRequestCallback`.
-    /// `ReqRespRequestCallback.deinit` only frees `peer_id`, so concurrent
-    /// `cancelInflightRpcCallback` cannot invalidate the handler target.
-    const RpcCallbackDeliverySnapshot = struct {
-        handler: interface.OnReqRespResponseCbHandler,
-        method: interface.LeanSupportedProtocol,
-        peer_id: []const u8,
-
-        fn deinit(self: *RpcCallbackDeliverySnapshot, allocator: Allocator) void {
-            allocator.free(self.peer_id);
-        }
-    };
-
-    fn takeRpcCallback(self: *Self, request_id: u64) ?interface.ReqRespRequestCallback {
-        self.rpc_callbacks_lock.lock();
-        defer self.rpc_callbacks_lock.unlock();
-        if (self.rpcCallbacks.fetchRemove(request_id)) |entry| {
-            return entry.value;
-        }
-        return null;
-    }
-
-    fn snapshotRpcCallbackForDelivery(self: *Self, request_id: u64) !?RpcCallbackDeliverySnapshot {
-        self.rpc_callbacks_lock.lock();
-        defer self.rpc_callbacks_lock.unlock();
-        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
-        const handler = callback_ptr.handler orelse return null;
-        const peer_id = try self.allocator.dupe(u8, callback_ptr.peer_id);
-        return .{
-            .handler = handler,
-            .method = callback_ptr.method,
-            .peer_id = peer_id,
-        };
-    }
-
-    fn getRpcCallbackMethod(self: *Self, request_id: u64) ?interface.LeanSupportedProtocol {
-        self.rpc_callbacks_lock.lock();
-        defer self.rpc_callbacks_lock.unlock();
-        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
-        return callback_ptr.method;
-    }
-
-    fn dupeRpcCallbackPeerId(self: *Self, request_id: u64) !?[]const u8 {
-        self.rpc_callbacks_lock.lock();
-        defer self.rpc_callbacks_lock.unlock();
-        const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse return null;
-        return try self.allocator.dupe(u8, callback_ptr.peer_id);
-    }
-
-    fn putRpcCallback(self: *Self, request_id: u64, callback_entry: interface.ReqRespRequestCallback) !void {
-        self.rpc_callbacks_lock.lock();
-        defer self.rpc_callbacks_lock.unlock();
-        try self.rpcCallbacks.put(self.allocator, request_id, callback_entry);
-    }
-
-    fn cancelInflightRpcCallback(self: *Self, request_id: u64) void {
-        if (self.takeRpcCallback(request_id)) |callback| {
-            var owned_callback = callback;
-            owned_callback.deinit();
-        }
-    }
-
-    fn deinitAllRpcCallbacks(self: *Self) void {
-        self.rpc_callbacks_lock.lock();
-        defer self.rpc_callbacks_lock.unlock();
-        var it = self.rpcCallbacks.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        self.rpcCallbacks.deinit(self.allocator);
-    }
 
     pub fn init(
         allocator: Allocator,
         loop: *xev.Loop,
         params: EthLibp2pParams,
         logger: zeam_utils.ModuleLogger,
-    ) !Self {
+    ) !*Self {
+        // Build a secp256k1 host identity from a 32-byte private-key scalar.
+        // secp256k1 is the libp2p convention in the lean ecosystem: the
+        // bootnode `/p2p/16Uiu2HA...` ids in `nodes.yaml` come from each
+        // node's secp256k1 compressed pubkey (the same key that goes into
+        // the ENR's `secp256k1` field). The `<node>.key` file holds the
+        // 32-byte private-key scalar directly (NOT an Ed25519 or P-256
+        // seed). Using any other algorithm here would derive a different
+        // PeerId and every outbound dial would fail `PeerIdMismatch` —
+        // which is exactly what happened on the Ed25519 path that preceded
+        // this.
+        var host_seed: [32]u8 = blk: {
+            if (params.host_identity_seed) |s| break :blk s;
+            if (params.host_identity_key_path) |p| {
+                break :blk readHostIdentitySeedFromHexFile(allocator, p) catch |e| {
+                    logger.err(
+                        "network-{d}:: failed to read host identity seed from {s}: {any} — falling back to ephemeral random seed (PeerId will not match the bootnode list and every dial will fail PeerIdMismatch)",
+                        .{ params.networkId, p, e },
+                    );
+                    var buf: [32]u8 = undefined;
+                    try fillRandomBytes(&buf);
+                    break :blk buf;
+                };
+            }
+            var buf: [32]u8 = undefined;
+            try fillRandomBytes(&buf);
+            break :blk buf;
+        };
+        const host_sk = Secp256k1.SecretKey.fromBytes(host_seed) catch |e| {
+            logger.err(
+                "network-{d}:: host_identity_seed is not a canonical secp256k1 scalar: {any}",
+                .{ params.networkId, e },
+            );
+            return error.InvalidHostIdentitySeed;
+        };
+        const host_kp = try Secp256k1.KeyPair.fromSecretKey(host_sk);
+
+        const host_signer = try allocator.create(Secp256k1HostSigner);
+        errdefer allocator.destroy(host_signer);
+        host_signer.* = .{ .kp = host_kp };
+
+        // Derive the matching libp2p PeerId from the secp256k1 host pubkey.
+        // For secp256k1 the libp2p PublicKey protobuf's `.data` field is the
+        // 33-byte COMPRESSED SEC1 encoding (header byte 0x02/0x03 + 32-byte
+        // X coordinate). The whole `{type=SECP256K1, data=<33 bytes>}`
+        // protobuf is ~37 bytes — well under the 42-byte inline cap, so
+        // `PeerId.fromPublicKey` produces an identity multihash and the
+        // result is what every libp2p secp256k1 PeerId in the lean ecosystem
+        // (ENR-derived bootnode multiaddrs, etc.) decodes to.
+        var host_pub_compressed: [33]u8 = host_kp.public_key.toCompressedSec1();
+        var host_pk = peer_id_pkg.PublicKey{
+            .type = .SECP256K1,
+            .data = &host_pub_compressed,
+        };
+        const me = try peer_id_pkg.PeerId.fromPublicKey(allocator, &host_pk);
+
+        const metrics_registry = try allocator.create(zl.metrics.Metrics);
+        errdefer allocator.destroy(metrics_registry);
+        metrics_registry.* = .{};
+
+        // Host owns Swarm + Gossipsub + ReqResp + ConnectionManager. The
+        // gossipsub validator hook is registered later (after we know
+        // `self`'s address) via `host.gossipsub.cfg.topic_validator`.
+        const host = try zl.host.Host.create(.{
+            .allocator = allocator,
+            .local_peer = me,
+            .metrics = metrics_registry,
+            .gossipsub = .{ .local_peer_id = me },
+        });
+        errdefer host.destroy();
+
+        var gossip_handler = try interface.GenericGossipHandler.init(
+            allocator,
+            loop,
+            params.networkId,
+            logger,
+            params.node_registry,
+        );
+        errdefer gossip_handler.deinit();
+
+        var peer_event_handler = try interface.PeerEventHandler.init(
+            allocator,
+            params.networkId,
+            logger,
+            params.node_registry,
+        );
+        errdefer peer_event_handler.deinit();
+
+        var reqresp_handler = try interface.ReqRespRequestHandler.init(
+            allocator,
+            params.networkId,
+            logger,
+            params.node_registry,
+        );
+        errdefer reqresp_handler.deinit();
+
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
         const owned_fork_digest = try allocator.dupe(u8, params.fork_digest);
         errdefer allocator.free(owned_fork_digest);
 
-        // Hand the metrics layer a callback so every Prometheus
-        // scrape pulls the latest cumulative drop counts from the Rust side
-        // and turns them into deltas on `zeam_libp2p_swarm_command_dropped_total`.
-        // Counts are global; registering once is enough even with multiple
-        // EthLibp2p instances (the call is idempotent).
-        // Register the network-layer scrape
-        // refresher. `registerScrapeRefresher` is now append-only (the
-        // metrics module keeps a bounded list); we still register a
-        // single network-layer fan-out (`refreshNetworkMetrics`) for
-        // the reasons documented at its definition above. The mesh-peers
-        // refresher inside the fan-out sums across all `network_id`
-        // slots on the Rust side, so we do not need to stash this
-        // instance's `params.networkId` in a Zig-side global.
-        zeam_metrics.registerScrapeRefresher(refreshNetworkMetrics);
-
-        const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger, params.node_registry);
-        errdefer gossip_handler.deinit();
-
-        const peer_event_handler = try interface.PeerEventHandler.init(allocator, params.networkId, logger, params.node_registry);
-        errdefer peer_event_handler.deinit();
-
-        const reqresp_handler = try interface.ReqRespRequestHandler.init(allocator, params.networkId, logger, params.node_registry);
-        errdefer reqresp_handler.deinit();
-
-        return Self{
+        self.* = .{
             .allocator = allocator,
+            .host = host,
+            .metrics_registry = metrics_registry,
             .params = .{
                 .networkId = params.networkId,
                 .fork_digest = owned_fork_digest,
-                .local_private_key = params.local_private_key,
                 .listen_addresses = params.listen_addresses,
                 .connect_peers = params.connect_peers,
                 .node_registry = params.node_registry,
+                .host_identity_seed = host_seed,
             },
-            .gossipHandler = gossip_handler,
-            .peerEventHandler = peer_event_handler,
-            .reqrespHandler = reqresp_handler,
-            .rpcCallbacks = std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback).empty,
             .logger = logger,
-            .node_registry = params.node_registry,
+            .local_peer = me,
+            .gossip_handler = gossip_handler,
+            .peer_event_handler = peer_event_handler,
+            .reqresp_handler = reqresp_handler,
+            .host_signer = host_signer,
         };
+        // Wipe the seed off the stack now that it's in our struct (and the
+        // KeyPair is the only thing that needed the raw bytes).
+        @memset(&host_seed, 0);
+
+        // Wire the gossipsub local-delivery hook now that `self` is stable.
+        // Gossipsub runs this for every accepted-by-dedup inbound message
+        // BEFORE forwarding to mesh peers. We always return `.accept` because
+        // zeam's schema validation runs in the registered handlers (which
+        // decide whether the SSZ payload is well-formed); per-peer
+        // mis-behaviour scoring is the gossipsub runtime's job, not the
+        // validator's.
+        host.gossipsub.cfg.topic_validator = gossipTopicValidator;
+        host.gossipsub.cfg.validator_ctx = @ptrCast(self);
+
+        // Register the per-instance scrape refresher so `lean_gossip_mesh_peers`
+        // (and the per-reason swarm-drop counters) actually surface on
+        // `/metrics`. Without this the gauge stays at its init value (0) even
+        // though the run loop populates `metrics_registry.setMeshPeers` every
+        // tick — the registry is per-instance and only the refresher copies it
+        // into the global zeam metrics record that the scrape handler reads.
+        zeam_metrics.registerScrapeRefresherCtx(@ptrCast(self), &refreshMetrics);
+
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
-        // Signal the Rust libp2p event loop to exit and then wait for the OS
-        // thread to actually unwind before we start tearing down the fields it
-        // might still touch. After `stop_network` the event loop takes its
-        // shutdown arm, drops the swarm, clears the per-network handler
-        // pointer, and returns from `run_eventloop`, which lets the hosting
-        // thread exit; `thread.join` then completes deterministically.
-        //
-        // Ordering matters: we must join before freeing anything reachable
-        // from `zigHandler` (gossip/peer-event/reqresp handlers, param
-        // strings, rpcCallbacks), otherwise an in-flight callback could
-        // dereference already-freed memory.
-        if (self.rustBridgeThread) |thread| {
-            stop_network(self.params.networkId);
-            thread.join();
-            self.rustBridgeThread = null;
+        // Shutdown order mirrors EthLibp2p: signal first, stop the QUIC
+        // transport so no new commands land mid-deinit, then join the drain
+        // thread, then tear down Host + handlers.
+        self.shutdown_flag.store(true, .release);
+        if (self.quic_runtime) |rt| {
+            rt.stop();
+            rt.destroy();
+            self.quic_runtime = null;
+        }
+        // Free the borrowed-by-runtime PEM buffers AFTER `rt.destroy()` —
+        // QuicRuntime holds the slices live until destroy returns.
+        if (self.tls_cert_pem) |pem| {
+            self.allocator.free(pem);
+            self.tls_cert_pem = null;
+        }
+        if (self.tls_key_pem) |pem| {
+            self.allocator.free(pem);
+            self.tls_key_pem = null;
+        }
+        self.host.shutdown();
+        if (self.drain_thread) |t| {
+            t.join();
+            self.drain_thread = null;
         }
 
-        self.gossipHandler.deinit();
-        self.peerEventHandler.deinit();
-
-        self.subscribed_gossip_topics_lock.lock();
-        self.subscribed_gossip_topics.deinit(self.allocator);
-        self.subscribed_gossip_topics_lock.unlock();
-
-        for (self.params.listen_addresses) |addr| addr.deinit();
-        self.allocator.free(self.params.listen_addresses);
-
-        if (self.params.connect_peers) |peers| {
-            for (peers) |addr| addr.deinit();
-            self.allocator.free(peers);
-        }
-
-        self.allocator.free(self.params.fork_digest);
-
-        self.deinitAllRpcCallbacks();
-    }
-
-    pub fn run(self: *Self) !void {
-        const listen_addresses_str = try multiaddrsToString(self.allocator, self.params.listen_addresses);
-        const connect_peers_str = if (self.params.connect_peers) |peers|
-            try multiaddrsToString(self.allocator, peers)
-        else
-            try self.allocator.dupeZ(u8, "");
-        const local_private_key = try self.allocator.dupeZ(u8, self.params.local_private_key);
-
-        // Topic subscriptions are not passed to the Rust bridge at startup.
-        // `EthLibp2p.subscribe` drives them via
-        // `subscribe_gossip_topic_to_rust_bridge` once the swarm command
-        // channel is up, keeping `gossip.subscribe` (called from `BeamNode`)
-        // as the single source of truth for joined subnets. The previous
-        // approach (enumerate every attestation subnet at startup) joined the
-        // mesh to every subnet on every node and defeated the bandwidth
-        // savings of attestation subnets; the intermediate fix (read the
-        // handler map after BeamNode.run()) required a strict startup order
-        // and did not surface late changes to the subscription set.
-        self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetworkThread, .{CreateNetworkThreadArgs{
-            .network_id = self.params.networkId,
-            .handle = self,
-            .local_private_key = local_private_key.ptr,
-            .listen_addresses = listen_addresses_str.ptr,
-            .connect_addresses = connect_peers_str.ptr,
-        }});
-
-        // Wait for the network to be fully initialized before returning
-        // Use a 10 second timeout to avoid hanging indefinitely
-        const timeout_ms: u64 = 10000;
-        self.logger.debug("network-{d}:: Waiting for network initialization to complete...", .{self.params.networkId});
-
-        if (!wait_for_network_ready(self.params.networkId, timeout_ms)) {
-            self.logger.err("network-{d}:: Network failed to initialize within {d}ms timeout", .{ self.params.networkId, timeout_ms });
-            return error.NetworkInitializationTimeout;
-        }
-
-        self.logger.info("network-{d}:: Network initialization complete, ready to send/receive messages", .{self.params.networkId});
-    }
-
-    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!bool {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        // publish
-        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.fork_digest);
-        defer topic.deinit();
-        const topic_str = try topic.encodeZ();
-        defer self.allocator.free(topic_str);
-
-        // TODO: deinit the message later ob once done
-        const message = try data.serialize(self.allocator);
-        defer self.allocator.free(message);
-
-        const compressed_message = try snappyz.encode(self.allocator, message);
-        defer self.allocator.free(compressed_message);
-
-        // Publish-side forensic log. If a peer reports
-        // `snappy.error.Corrupt` on bytes whose sha256 matches the
-        // `sha256_compressed` field below, the producer of those bytes is the
-        // node that emitted this line (identified by `git_sha`). Conversely,
-        // if no producer log matches the broken hash, the corruption
-        // originated downstream (forwarder re-encode or wire-level damage).
-        self.emitPublishForensicLog(data, topic_str, message, compressed_message);
-
-        self.logger.debug("network-{d}:: publishing to rust bridge data={f} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
-        return publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
-    }
-
-    /// Emit a single structured log line capturing the pre-snappy and
-    /// post-snappy hashes of an outbound gossip message plus the gossipsub
-    /// message-id. Intended for cross-fleet log correlation.
-    /// Failures here are swallowed: instrumentation must not block publish.
-    fn emitPublishForensicLog(
-        self: *Self,
-        data: *const interface.GossipMessage,
-        topic_str: [:0]u8,
-        ssz_bytes: []const u8,
-        compressed: []const u8,
-    ) void {
-        // Pre/post-snappy content hashes.
-        var ssz_hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(ssz_bytes, &ssz_hash, .{});
-        var compressed_hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(compressed, &compressed_hash, .{});
-
-        // Gossipsub message_id:
-        //   SHA256(MESSAGE_DOMAIN_VALID_SNAPPY || u64_le(topic_len) || topic || ssz_bytes)[:20]
-        // Uses the same formula as the Rust libp2p-glue side so a producer's
-        // message_id matches what any receiver computes from the same payload.
-        var msg_id_20: [20]u8 = undefined;
         {
-            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-            hasher.update(&MESSAGE_DOMAIN_VALID_SNAPPY);
-            var topic_len_le: [8]u8 = undefined;
-            const topic_slice: []const u8 = topic_str[0..topic_str.len];
-            std.mem.writeInt(u64, &topic_len_le, @as(u64, topic_slice.len), .little);
-            hasher.update(&topic_len_le);
-            hasher.update(topic_slice);
-            hasher.update(ssz_bytes);
-            var digest: [32]u8 = undefined;
-            hasher.final(&digest);
-            @memcpy(&msg_id_20, digest[0..20]);
+            self.subscriptions_lock.lock();
+            defer self.subscriptions_lock.unlock();
+            for (self.subscriptions.items) |s| self.allocator.free(s.encoded);
+            self.subscriptions.deinit(self.allocator);
         }
-
-        // Self-decode roundtrip: a `false` here means the local snappyz
-        // encoder produced a payload its own decoder rejects — strong signal
-        // that the producer (this binary) is the source of broken-snappy.
-        const self_decoded = snappyz.decodeWithMax(self.allocator, compressed, MAX_GOSSIP_BLOCK_SIZE) catch null;
-        defer if (self_decoded) |d| self.allocator.free(d);
-        const self_decode_ok: bool = if (self_decoded) |d| std.mem.eql(u8, d, ssz_bytes) else false;
-
-        // Per-kind fields. Block root is only meaningful for the block kind;
-        // attestation/aggregation leave it zeroed.
-        var slot: u64 = 0;
-        var proposer: u64 = 0;
-        var block_root: [32]u8 = std.mem.zeroes([32]u8);
-        const kind_label: []const u8 = switch (data.*) {
-            .block => |sb| blk: {
-                slot = sb.block.slot;
-                proposer = sb.block.proposer_index;
-                zeam_utils.hashTreeRoot(types.BeamBlock, sb.block, &block_root, self.allocator) catch {};
-                break :blk "block";
-            },
-            .aggregation => |agg| blk: {
-                slot = agg.data.slot;
-                break :blk "aggregation";
-            },
-            .attestation => |att| blk: {
-                slot = att.message.message.slot;
-                break :blk "attestation";
-            },
-        };
-
-        // Periodic publish-side forensic. Kept at debug now that the
-        // upstream snappy / cross-copy investigation is closed and verified.
-        // Switch the network log scope to debug to revive these for triage.
-        self.logger.debug(
-            "[publish] net={d} kind={s} topic={s} slot={d} proposer={d} block_root={x} sha256_ssz={x} sha256_compressed={x} compressed_len={d} self_decode_ok={any} msg_id={x} git_sha={s} snappy_lib=zig-snappy-0.0.5",
-            .{
-                self.params.networkId,
-                kind_label,
-                topic_str,
-                slot,
-                proposer,
-                &block_root,
-                &ssz_hash,
-                &compressed_hash,
-                compressed.len,
-                self_decode_ok,
-                &msg_id_20,
-                build_options.version,
-            },
-        );
-    }
-
-    pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        // Drive the Rust gossipsub mesh subscriptions from the same call site
-        // that registers the in-process Zig handlers. After this, the subnet
-        // set the node joins on the wire is exactly the set whose handlers
-        // are wired up in `gossipHandler.onGossipHandlers`. Caller (BeamNode)
-        // must invoke this AFTER `EthLibp2p.run()` has spawned the rust
-        // bridge thread; `run()`'s `wait_for_network_ready` ensures the swarm
-        // command channel exists by the time `run()` returns.
-        for (topics) |gossip_topic| {
-            if (!self.sendGossipMeshSubscribe(gossip_topic)) {
-                self.logger.err(
-                    "network-{d}:: gossip mesh subscribe dropped for topic={f} (network not ready or swarm command channel full — see rust-bridge logs)",
-                    .{ self.params.networkId, gossip_topic },
-                );
-                return error.GossipMeshSubscribeFailed;
-            }
-            try self.recordSubscribedGossipTopic(gossip_topic);
-        }
-        try self.gossipHandler.subscribe(topics, handler);
-    }
-
-    fn sendGossipMeshSubscribe(self: *Self, gossip_topic: interface.GossipTopic) bool {
-        var topic = interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest) catch return false;
-        defer topic.deinit();
-        const topic_str = topic.encodeZ() catch return false;
-        defer self.allocator.free(topic_str);
-        return subscribe_gossip_topic_to_rust_bridge(self.params.networkId, topic_str.ptr);
-    }
-
-    fn recordSubscribedGossipTopic(self: *Self, gossip_topic: interface.GossipTopic) !void {
-        self.subscribed_gossip_topics_lock.lock();
-        defer self.subscribed_gossip_topics_lock.unlock();
-        for (self.subscribed_gossip_topics.items) |existing| {
-            if (std.meta.eql(existing, gossip_topic)) return;
-        }
-        try self.subscribed_gossip_topics.append(self.allocator, gossip_topic);
-    }
-
-    fn refreshGossipMeshSubscriptions(ptr: *anyopaque) void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        var topics_copy: std.ArrayListUnmanaged(interface.GossipTopic) = .empty;
-        defer topics_copy.deinit(self.allocator);
-        self.subscribed_gossip_topics_lock.lock();
-        topics_copy.appendSlice(self.allocator, self.subscribed_gossip_topics.items) catch {
-            self.subscribed_gossip_topics_lock.unlock();
-            return;
-        };
-        self.subscribed_gossip_topics_lock.unlock();
-
-        var resubscribed: usize = 0;
-        for (topics_copy.items) |gossip_topic| {
-            if (self.sendGossipMeshSubscribe(gossip_topic)) resubscribed += 1;
-        }
-        if (resubscribed > 0) {
-            self.logger.info(
-                "network-{d}:: re-sent gossipsub mesh subscriptions for {d} topic(s)",
-                .{ self.params.networkId, resubscribed },
-            );
-        }
-    }
-
-    fn gossipMeshPeerCount(ptr: *anyopaque) u64 {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        return get_mesh_peers_total(self.params.networkId);
-    }
-
-    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, sender_peer_id);
-    }
-
-    pub fn sendRPCRequest(
-        ptr: *anyopaque,
-        peer_id: []const u8,
-        req: *const interface.ReqRespRequest,
-        callback: ?interface.OnReqRespResponseCbHandler,
-    ) !u64 {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-
-        const peer_id_cstr = try self.allocator.dupeZ(u8, peer_id);
-        defer self.allocator.free(peer_id_cstr);
-
-        const method = std.meta.activeTag(req.*);
-        const protocol_tag: u32 = @as(u32, @intFromEnum(method));
-
-        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        const encoded_message = req.serialize(self.allocator) catch |err| {
-            self.logger.err(
-                "network-{d}:: Failed to serialize RPC request for peer={s}{f} method={s}: {any}",
-                .{ self.params.networkId, peer_id, node_name, @tagName(method), err },
-            );
-            return err;
-        };
-
-        defer self.allocator.free(encoded_message);
-
-        const framed_payload = snappyframesz.encode(self.allocator, encoded_message) catch |err| {
-            self.logger.err(
-                "network-{d}:: Failed to snappy-frame RPC request payload for peer={s}{f} protocol_tag={d}: {any}",
-                .{ self.params.networkId, peer_id, node_name, protocol_tag, err },
-            );
-            return err;
-        };
-        defer self.allocator.free(framed_payload);
-
-        const frame = buildRequestFrame(self.allocator, encoded_message.len, framed_payload) catch |err| {
-            self.logger.err(
-                "network-{d}:: Failed to build RPC request frame for peer={s}{f} protocol_tag={d}: {any}",
-                .{ self.params.networkId, peer_id, node_name, protocol_tag, err },
-            );
-            return err;
-        };
-        defer self.allocator.free(frame);
-
-        const request_id = send_rpc_request(
-            self.params.networkId,
-            peer_id_cstr.ptr,
-            protocol_tag,
-            frame.ptr,
-            frame.len,
-        );
-
-        if (request_id == 0) {
-            // send_rpc_request returns 0 when the Rust-side swarm
-            // command channel is uninitialized / full / closed, i.e. the
-            // request never reached the wire. The Rust layer already logs
-            // the specific reason and bumps `get_swarm_command_dropped_total`,
-            // but surface a Zig-side warn so operators correlating req-resp
-            // timeouts have the dispatch-failure event in the same log stream.
-            self.logger.warn(
-                "network-{d}:: dropping RPC request to peer={s}{f} protocol_tag={d}: rust-bridge swarm command channel rejected enqueue (see preceding rust-bridge error for reason)",
-                .{ self.params.networkId, peer_id, node_name, protocol_tag },
-            );
-            return error.RequestDispatchFailed;
-        }
-
-        if (callback) |handler| {
-            const peer_id_copy = try self.allocator.dupe(u8, peer_id);
-            errdefer self.allocator.free(peer_id_copy);
-            var callback_entry = interface.ReqRespRequestCallback.init(method, self.allocator, handler, peer_id_copy);
-            errdefer callback_entry.deinit();
-
-            self.putRpcCallback(request_id, callback_entry) catch |err| {
-                self.allocator.free(peer_id_copy);
-                self.logger.err(
-                    "network-{d}:: Failed to register RPC callback for request_id={d} peer={s}{f}: {any}",
-                    .{ self.params.networkId, request_id, peer_id, node_name, err },
-                );
-                return err;
-            };
-        }
-
-        return request_id;
-    }
-
-    pub fn cancelInflightRpcCallbackFn(ptr: *anyopaque, request_id: u64) void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        self.cancelInflightRpcCallback(request_id);
-    }
-
-    fn notifyRpcErrorWithOwnedMessage(
-        self: *Self,
-        request_id: u64,
-        method: interface.LeanSupportedProtocol,
-        code: u32,
-        message: []u8,
-    ) void {
-        var event = interface.ReqRespResponseEvent.initError(request_id, method, .{
-            .code = code,
-            .message = message,
-        });
-        defer event.deinit(self.allocator);
-
-        if (self.takeRpcCallback(request_id)) |callback| {
-            var owned_callback = callback;
-            const peer_id = owned_callback.peer_id;
-            const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-            owned_callback.notify(&event) catch |notify_err| {
-                self.logger.err(
-                    "network-{d}:: Failed to deliver RPC error callback for request_id={d} from peer={s}{f}: {any}",
-                    .{ self.params.networkId, request_id, peer_id, node_name, notify_err },
-                );
-            };
-            owned_callback.deinit();
-        } else {
-            self.logger.warn(
-                "network-{d}:: Dropping RPC error for unknown request_id={d}",
-                .{ self.params.networkId, request_id },
-            );
-        }
-    }
-
-    fn notifyRpcErrorFmt(
-        self: *Self,
-        request_id: u64,
-        method: interface.LeanSupportedProtocol,
-        code: u32,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) void {
-        const owned_message = std.fmt.allocPrint(self.allocator, fmt, args) catch |alloc_err| {
-            const peer_id_copy = self.dupeRpcCallbackPeerId(request_id) catch |dup_err| {
-                self.logger.err(
-                    "network-{d}:: Failed to duplicate peer id for RPC error log request_id={d}: {any}",
-                    .{ self.params.networkId, request_id, dup_err },
-                );
-                return;
-            } orelse {
-                self.logger.err(
-                    "network-{d}:: Failed to allocate RPC error message for request_id={d}: {any}",
-                    .{ self.params.networkId, request_id, alloc_err },
-                );
-                return;
-            };
-            defer self.allocator.free(peer_id_copy);
-            const node_name = self.node_registry.getNodeNameFromPeerId(peer_id_copy);
-            self.logger.err(
-                "network-{d}:: Failed to allocate RPC error message for request_id={d} from peer={s}{f}: {any}",
-                .{ self.params.networkId, request_id, peer_id_copy, node_name, alloc_err },
-            );
-            return;
-        };
-
-        self.notifyRpcErrorWithOwnedMessage(request_id, method, code, owned_message);
-    }
-
-    /// Fail every in-flight RPC whose callback is waiting on the given peer.
-    ///
-    /// The Rust bridge already times requests out via REQUEST_TIMEOUT, but that
-    /// window is seconds-to-minutes. When a peer disconnects we know the
-    /// response will never arrive, so notify all matching callbacks with a
-    /// PeerDisconnected failure and drop them from the map immediately. This
-    /// gives callers fast feedback and prevents the callback entries (plus
-    /// their owned peer_id strings) from sitting around until the Rust-side
-    /// timeout fires. `ReqRespRequestCallback.deinit` frees the peer_id buffer.
-    fn failInflightRpcsForPeer(self: *Self, peer_id: []const u8) !void {
-        // Collect request_ids first so we can mutate the map without iterator
-        // invalidation while also holding a reference to each callback's peer_id.
-        var matching: std.ArrayList(u64) = .empty;
-        defer matching.deinit(self.allocator);
-
         {
             self.rpc_callbacks_lock.lock();
             defer self.rpc_callbacks_lock.unlock();
-            var it = self.rpcCallbacks.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
-                    try matching.append(self.allocator, entry.key_ptr.*);
-                }
-            }
+            var it = self.rpc_callbacks.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit();
+            self.rpc_callbacks.deinit(self.allocator);
         }
 
-        // 499 = "Client Closed Request" (nginx-style); closest well-known code
-        // for "peer went away before responding". Distinct from 408 used by the
-        // Rust-side REQUEST_TIMEOUT so callers can tell them apart.
-        const PEER_DISCONNECTED_CODE: u32 = 499;
+        self.allocator.destroy(self.host_signer);
 
-        for (matching.items) |request_id| {
-            const callback_method = self.getRpcCallbackMethod(request_id) orelse continue;
-            self.notifyRpcErrorFmt(
-                request_id,
-                callback_method,
-                PEER_DISCONNECTED_CODE,
-                "peer disconnected before responding (peer={s})",
-                .{peer_id},
+        self.gossip_handler.deinit();
+        self.peer_event_handler.deinit();
+        self.reqresp_handler.deinit();
+        self.host.destroy();
+        self.allocator.destroy(self.metrics_registry);
+        self.allocator.free(self.params.fork_digest);
+        self.allocator.destroy(self);
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.host.startBackground();
+        if (!self.host.waitUntilReady(5_000)) return error.HostNotReady;
+
+        // Bring up the QUIC transport (real on-the-wire path) BEFORE
+        // bootnodes are registered, so dial commands have something to
+        // route through when the connection manager ticks. Skipped when
+        // `listen_addresses` is empty — that's the in-process / unit-test
+        // mode where the gossipsub validator hook is the only delivery
+        // channel.
+        if (self.params.listen_addresses.len > 0) {
+            try self.startQuicTransport();
+        }
+
+        // Register bootnodes now that the host (and, if configured, the
+        // transport) is running.
+        if (self.params.connect_peers.len > 0) {
+            self.registerBootnodes() catch |e| {
+                self.logger.err(
+                    "network-{d}:: bootnode registration failed: {any}",
+                    .{ self.params.networkId, e },
+                );
+            };
+        }
+
+        self.drain_thread = try Thread.spawn(.{}, drainEventsTrampoline, .{self});
+    }
+
+    /// Mints a fresh libp2p TLS cert from this node's secp256k1 host
+    /// identity and starts a `QuicRuntime` on `params.listen_addresses`.
+    /// The cert + key PEMs are handed to zquic in-memory via zig-libp2p
+    /// v0.1.7's `TlsPemSource.pem_bytes` (which routes through zquic
+    /// v1.6.6's `cert_pem` / `key_pem` config fields — see
+    /// ch4r10t33r/zquic#129). The ephemeral cert key is always
+    /// ECDSA-P-256 (set by zig-libp2p's `generateSecp256k1`); the
+    /// SignedKey extension carries the secp256k1 host pubkey. Nothing
+    /// is written to disk.
+    fn startQuicTransport(self: *Self) !void {
+        const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
+        const host_pub_compressed: [33]u8 = self.host_signer.kp.public_key.toCompressedSec1();
+
+        var cert_seed: [32]u8 = undefined;
+        try fillRandomBytes(&cert_seed);
+
+        var gen = try zl.security.libp2p_tls_cert.generate(self.allocator, .{
+            .host_identity = .{
+                .secp256k1 = .{
+                    .public_key_sec1_compressed = host_pub_compressed,
+                    .sign = Secp256k1HostSigner.sign,
+                    .sign_ctx = self.host_signer,
+                },
+            },
+            .not_before_sec = now_sec - 3600,
+            .not_after_sec = now_sec + 365 * 24 * 3600,
+            .cert_key_seed = cert_seed,
+        });
+        defer gen.deinit(self.allocator);
+
+        // The cert + key PEMs are BORROWED by `QuicRuntime` and threaded
+        // into zquic v1.6.6's `ServerConfig.cert_pem` /
+        // `ClientConfig.client_cert_pem`. Server parses once at
+        // `QuicRuntime.create`, but the CLIENT config re-parses on every
+        // `dial` — so these buffers must outlive the runtime. Store them
+        // on `self`; `deinit` frees them after the runtime is torn down.
+        const cert_pem = try zl.security.libp2p_tls_cert.certDerToPem(self.allocator, gen.cert_der);
+        errdefer self.allocator.free(cert_pem);
+        // zig-libp2p v0.1.7 mints an ECDSA-P-256 ephemeral cert key for the
+        // Ed25519 host arm (zquic's vendored TLS lib can't parse Ed25519
+        // PKCS#8 keys), so the matching PEM helper is `ecdsaP256SeedToPem`.
+        const key_pem = try zl.security.libp2p_tls_cert.ecdsaP256SeedToPem(self.allocator, gen.cert_key_seed);
+        errdefer self.allocator.free(key_pem);
+        self.tls_cert_pem = cert_pem;
+        self.tls_key_pem = key_pem;
+
+        const rt = zl.transport.quic_runtime.QuicRuntime.create(.{
+            .allocator = self.allocator,
+            .host = self.host,
+            .tls_pem = .{ .pem_bytes = .{ .cert_pem = cert_pem, .key_pem = key_pem } },
+            .listen_multiaddr = self.params.listen_addresses,
+        }) catch |e| {
+            self.logger.err(
+                "network-{d}:: QuicRuntime.create failed for listen={s}: {any}",
+                .{ self.params.networkId, self.params.listen_addresses, e },
+            );
+            return e;
+        };
+        errdefer rt.destroy();
+        rt.start() catch |e| {
+            self.logger.err(
+                "network-{d}:: QuicRuntime.start failed for listen={s}: {any}",
+                .{ self.params.networkId, self.params.listen_addresses, e },
+            );
+            return e;
+        };
+        self.quic_runtime = rt;
+
+        self.logger.debug(
+            "network-{d}:: QUIC transport up on {s}",
+            .{ self.params.networkId, self.params.listen_addresses },
+        );
+    }
+
+    fn registerBootnodes(self: *Self) !void {
+        var it = std.mem.tokenizeScalar(u8, self.params.connect_peers, ',');
+        while (it.next()) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            const ma = Multiaddr.fromString(self.allocator, trimmed) catch |e| {
+                self.logger.err(
+                    "network-{d}:: invalid bootnode multiaddr {s}: {any}",
+                    .{ self.params.networkId, trimmed, e },
+                );
+                continue;
+            };
+            defer ma.deinit();
+            self.host.registerKnownPeer(&ma, null) catch |e| {
+                self.logger.err(
+                    "network-{d}:: registerKnownPeer({s}) failed: {any}",
+                    .{ self.params.networkId, trimmed, e },
+                );
+                continue;
+            };
+            // Promote bootnodes to gossipsub direct peers so they are always
+            // considered mesh-eligible (bypassing GRAFT/PRUNE oscillation) and
+            // get GRAFTed on the next heartbeat instead of waiting for a full
+            // SUBSCRIBE/GRAFT round trip. Without this, the cold-start mesh
+            // takes 300-500ms longer to form than block-proposal latency
+            // allows on a small devnet, leading to chain forks.
+            if (peerIdFromMultiaddr(&ma)) |peer| {
+                self.host.addDirectPeer(peer) catch |e| {
+                    self.logger.warn(
+                        "network-{d}:: addDirectPeer({s}) failed: {any}",
+                        .{ self.params.networkId, trimmed, e },
+                    );
+                };
+            } else {
+                self.logger.warn(
+                    "network-{d}:: bootnode multiaddr {s} has no /p2p component; cannot mark as direct peer",
+                    .{ self.params.networkId, trimmed },
+                );
+            }
+            self.logger.info(
+                "network-{d}:: registered bootnode {s}",
+                .{ self.params.networkId, trimmed },
             );
         }
     }
 
-    pub fn onRPCRequest(ptr: *anyopaque, data: *interface.ReqRespRequest, stream: interface.ReqRespServerStream) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.reqrespHandler.onReqRespRequest(data, stream);
+    fn peerIdFromMultiaddr(ma: *const Multiaddr) ?peer_id_pkg.PeerId {
+        var iter = ma.iterator();
+        var last: ?peer_id_pkg.PeerId = null;
+        while (iter.next() catch return null) |proto| {
+            switch (proto) {
+                .P2P => |id| last = id,
+                else => {},
+            }
+        }
+        return last;
     }
 
-    pub fn subscribeReqResp(ptr: *anyopaque, handler: interface.OnReqRespRequestCbHandler) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.reqrespHandler.subscribe(handler);
+    fn drainEventsTrampoline(self: *Self) void {
+        self.drainEvents();
     }
 
-    pub fn subscribePeerEvents(ptr: *anyopaque, handler: interface.OnPeerEventCbHandler) anyerror!void {
+    fn drainEvents(self: *Self) void {
+        var last_mesh_log_ms: i64 = 0;
+        while (!self.shutdown_flag.load(.acquire)) {
+            // Drive the connection-manager scheduler so registered known
+            // peers actually get dialed (and re-dialed on back-off).
+            const now_ms = zl.wall_time.milliTimestamp();
+            self.host.connection_manager.tick(now_ms) catch |e| {
+                self.logger.err(
+                    "network-{d}:: connection_manager.tick failed: {any}",
+                    .{ self.params.networkId, e },
+                );
+            };
+
+            // Republish the gossipsub mesh-peer total into the per-instance
+            // metrics registry so the scrape refresher sees a fresh value
+            // even when no swarm events are flowing.
+            const mesh = self.host.gossipsub.meshPeers();
+            self.metrics_registry.setMeshPeers(mesh);
+            // Diagnostic: log mesh size once per second so we can see whether
+            // gossipsub ever forms a mesh. At debug only — operators get the
+            // same signal via the `lean_gossip_mesh_peers` Prometheus gauge,
+            // which the per-instance scrape refresher now populates from this
+            // same `setMeshPeers` write.
+            if (now_ms - last_mesh_log_ms >= 1_000) {
+                self.logger.debug(
+                    "network-{d}:: MESH STATUS mesh_peers={d}",
+                    .{ self.params.networkId, mesh },
+                );
+                last_mesh_log_ms = now_ms;
+            }
+
+            var ev = self.host.nextEvent(50) catch |e| switch (e) {
+                error.Timeout => continue,
+                error.QueueClosed => return,
+            };
+            defer ev.deinit(self.allocator);
+
+            switch (ev) {
+                .peer_connected => |p| self.dispatchPeerConnected(p),
+                .peer_disconnected => |p| self.dispatchPeerDisconnected(p),
+                .peer_connection_failed => |p| self.dispatchPeerConnectionFailed(p),
+                .rpc_request => |r| self.dispatchRpcRequest(r),
+                .rpc_response_chunk => |r| self.dispatchRpcResponseChunk(r),
+                .rpc_response_end => |r| self.dispatchRpcResponseEnd(r),
+                .rpc_error_response => |r| self.dispatchRpcError(r),
+                .swarm_closed => return,
+                // Events zeam does not act on (discovery / NAT / relay / identify-push
+                // features added in zig-libp2p ≥ v0.1.95). Listed explicitly so a
+                // future Event variant still forces a compile-time review here.
+                .gossip_message,
+                .log,
+                .connection_trim_recommended,
+                .identify_push_peer,
+                .relay_reservation,
+                .dcutr_succeeded,
+                .dcutr_failed,
+                .reachability_changed,
+                .autonat_probe_peer,
+                .peer_discovered,
+                => {},
+            }
+        }
+    }
+
+    // ── Public API (same shapes as the legacy EthLibp2p) ──────────────────
+
+    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!bool {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.peerEventHandler.subscribe(handler);
+
+        const gossip_topic = data.getGossipTopic();
+        const lean_topic = try interface.LeanNetworkTopic.init(
+            self.allocator,
+            gossip_topic,
+            .ssz_snappy,
+            self.params.fork_digest,
+        );
+        var topic_owned = lean_topic;
+        defer topic_owned.deinit();
+        const topic_str = try lean_topic.encodeZ();
+        defer self.allocator.free(topic_str);
+
+        var ssz_buf = std.ArrayList(u8).empty;
+        defer ssz_buf.deinit(self.allocator);
+        switch (data.*) {
+            .block => |sb| try ssz.serialize(types.SignedBlock, sb, &ssz_buf, self.allocator),
+            // For attestations the gossip payload is the SignedAttestation
+            // inside the wrapper; the subnet_id is encoded in the topic
+            // string, not the SSZ payload (same as the legacy Rust path).
+            .attestation => |att| try ssz.serialize(types.SignedAttestation, att.message, &ssz_buf, self.allocator),
+            .aggregation => |agg| try ssz.serialize(types.SignedAggregatedAttestation, agg, &ssz_buf, self.allocator),
+        }
+        if (ssz_buf.items.len > MAX_GOSSIP_BLOCK_SIZE) return error.PayloadTooLarge;
+
+        const compressed = try snappyz.encode(self.allocator, ssz_buf.items);
+        defer self.allocator.free(compressed);
+
+        self.logger.debug(
+            "network-{d}:: publish topic={s} ssz={d} compressed={d}",
+            .{ self.params.networkId, topic_str, ssz_buf.items.len, compressed.len },
+        );
+
+        try self.host.publish(topic_str, compressed);
+        return true;
+    }
+
+    pub fn subscribe(
+        ptr: *anyopaque,
+        topics: []interface.GossipTopic,
+        handler: interface.OnGossipCbHandler,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        for (topics) |topic| {
+            const lean_topic = try interface.LeanNetworkTopic.init(
+                self.allocator,
+                topic,
+                .ssz_snappy,
+                self.params.fork_digest,
+            );
+            var owned = lean_topic;
+            defer owned.deinit();
+            const encoded = try lean_topic.encode();
+            errdefer self.allocator.free(encoded);
+
+            try self.host.subscribe(encoded);
+            self.logger.debug(
+                "network-{d}:: SUBSCRIBE topic={s} mesh_peers_after={d}",
+                .{ self.params.networkId, encoded, self.host.gossipsub.meshPeers() },
+            );
+
+            self.subscriptions_lock.lock();
+            try self.subscriptions.append(self.allocator, .{ .topic = topic, .encoded = encoded });
+            self.subscriptions_lock.unlock();
+
+            const gop = try self.gossip_handler.onGossipHandlers.getOrPut(
+                self.allocator,
+                topic,
+            );
+            if (!gop.found_existing) {
+                gop.value_ptr.* = std.ArrayList(interface.OnGossipCbHandler).empty;
+            }
+            try gop.value_ptr.append(self.allocator, handler);
+        }
+    }
+
+    pub fn subscribeReqResp(
+        ptr: *anyopaque,
+        handler: interface.OnReqRespRequestCbHandler,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.reqresp_handler.subscribe(handler);
+    }
+
+    pub fn subscribePeerEvents(
+        ptr: *anyopaque,
+        handler: interface.OnPeerEventCbHandler,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.peer_event_handler.subscribe(handler);
+    }
+
+    /// Base58 multihash encoding of this node's libp2p PeerId — the form
+    /// used in `/p2p/<id>` multiaddr suffixes and the canonical form peers
+    /// see after the TLS handshake. Embedders use this to build the
+    /// `connect_peers` strings for OTHER nodes pointing at this one.
+    /// Caller owns the returned slice.
+    pub fn localPeerIdBase58(self: *Self, allocator: Allocator) ![]u8 {
+        var buf: [128]u8 = undefined;
+        const slice = try self.local_peer.toBase58(&buf);
+        return try allocator.dupe(u8, slice);
+    }
+
+    /// Pure derivation of the libp2p PeerId-as-base58 from a 32-byte
+    /// secp256k1 private-key scalar — same path `init` uses internally,
+    /// but exposed as a free function so embedders can compute peer ids
+    /// BEFORE any `init` runs. Lets a multi-node simulation build
+    /// connect_peers strings for every other node without an init
+    /// ordering dance. Caller owns the returned slice.
+    pub fn peerIdBase58FromSeed(allocator: Allocator, seed: [32]u8) ![]u8 {
+        const sk = try Secp256k1.SecretKey.fromBytes(seed);
+        const kp = try Secp256k1.KeyPair.fromSecretKey(sk);
+        var pub_compressed: [33]u8 = kp.public_key.toCompressedSec1();
+        var pk = peer_id_pkg.PublicKey{ .type = .SECP256K1, .data = &pub_compressed };
+        const pid = try peer_id_pkg.PeerId.fromPublicKey(allocator, &pk);
+        var buf: [128]u8 = undefined;
+        const slice = try pid.toBase58(&buf);
+        return try allocator.dupe(u8, slice);
     }
 
     pub fn getNetworkInterface(self: *Self) NetworkInterface {
@@ -2056,14 +811,14 @@ pub const EthLibp2p = struct {
                 .ptr = self,
                 .publishFn = publish,
                 .subscribeFn = subscribe,
-                .onGossipFn = onGossip,
+                .onGossipFn = onGossipFanOut,
                 .refreshMeshFn = refreshGossipMeshSubscriptions,
                 .meshPeerCountFn = gossipMeshPeerCount,
             },
             .reqresp = .{
                 .ptr = self,
                 .sendRequestFn = sendRPCRequest,
-                .onReqRespRequestFn = onRPCRequest,
+                .onReqRespRequestFn = onReqRespRequestFanOut,
                 .subscribeFn = subscribeReqResp,
                 .cancelInflightRequestFn = cancelInflightRpcCallbackFn,
             },
@@ -2074,300 +829,782 @@ pub const EthLibp2p = struct {
         };
     }
 
-    fn multiaddrsToString(allocator: Allocator, addrs: []const Multiaddr) ![:0]u8 {
-        if (addrs.len == 0) {
-            return try allocator.dupeZ(u8, "");
+    /// Fan-out wrapper used by the `NetworkInterface.gossip.onGossipFn`
+    /// vtable: forwards an inbound `GossipMessage` to the in-process
+    /// gossip-handler (which dispatches to whichever per-topic
+    /// `OnGossipCbHandler`s `subscribe` registered).
+    fn onGossipFanOut(
+        ptr: *anyopaque,
+        data: *interface.GossipMessage,
+        sender_peer_id: []const u8,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.gossip_handler.onGossip(data, sender_peer_id);
+    }
+
+    /// Fan-out wrapper used by the `NetworkInterface.reqresp.onReqRespRequestFn`
+    /// vtable: forwards an inbound `ReqRespRequest` + stream pair to the
+    /// in-process req/resp handler.
+    fn onReqRespRequestFanOut(
+        ptr: *anyopaque,
+        data: *interface.ReqRespRequest,
+        stream: interface.ReqRespServerStream,
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.reqresp_handler.onReqRespRequest(data, stream);
+    }
+
+    /// No-op — the gossipsub mesh in zig-libp2p re-subscribes
+    /// automatically. The legacy Rust path needed manual re-subscribes
+    /// because of an FFI race that doesn't apply here.
+    fn refreshGossipMeshSubscriptions(_: *anyopaque) void {}
+
+    /// Total mesh peer count across all subscribed topics, read from the
+    /// per-instance metrics registry (same source as the
+    /// `lean_gossip_mesh_peers` scrape).
+    fn gossipMeshPeerCount(ptr: *anyopaque) u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.host.gossipsub.meshPeers();
+    }
+
+    // ── Topic-validator hook (gossipsub local-delivery) ───────────────────
+
+    fn gossipTopicValidator(
+        ctx: ?*anyopaque,
+        topic: []const u8,
+        data: []const u8,
+    ) zl.gossipsub.runtime.ValidationResult {
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
+        self.logger.debug(
+            "network-{d}:: INBOUND gossip topic={s} bytes={d} mesh_peers={d}",
+            .{ self.params.networkId, topic, data.len, self.host.gossipsub.meshPeers() },
+        );
+        self.dispatchInboundGossipFrame(topic, data) catch |e| {
+            self.logger.err("inbound dispatch error: {any}", .{e});
+        };
+        return .accept;
+    }
+
+    /// Mirrors `handleMsgFromRustBridge` from the legacy path: decode the
+    /// snappy block, deserialise into a `GossipMessage` variant, hand to
+    /// the registered handler. All the #942 validators live in v1 and are
+    /// invoked here so the wire-byte behaviour is byte-identical.
+    fn dispatchInboundGossipFrame(self: *Self, topic_str: []const u8, message_bytes: []const u8) !void {
+        const topic_z = try self.allocator.dupeZ(u8, topic_str);
+        defer self.allocator.free(topic_z);
+        const topic = interface.LeanNetworkTopic.decode(self.allocator, topic_z.ptr) catch |e| {
+            self.logger.err("ignoring invalid topic={s}: {any}", .{ topic_str, e });
+            return;
+        };
+
+        const decode_limit: usize = switch (topic.gossip_topic.kind) {
+            .block => MAX_GOSSIP_BLOCK_SIZE,
+            else => MAX_RPC_MESSAGE_SIZE,
+        };
+
+        _ = v1.validateGossipSnappyHeader(message_bytes, decode_limit) catch |e| {
+            self.logger.err("#942 header reject topic={s} err={any}", .{ topic_str, e });
+            return;
+        };
+
+        const uncompressed = snappyz.decodeWithMax(self.allocator, message_bytes, decode_limit) catch |e| {
+            const preview = v1.byteHexPreview(message_bytes, GOSSIP_PREVIEW_MAX_BYTES);
+            self.logger.err(
+                "snappy decode failed topic={s} len={d}: {any}; first={s}",
+                .{ topic_str, message_bytes.len, e, preview.slice() },
+            );
+            return;
+        };
+        defer self.allocator.free(uncompressed);
+
+        const message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
+            .block => .{ .block = v1.deserializeGossipMessage(
+                types.SignedBlock,
+                "block",
+                uncompressed,
+                self.allocator,
+                self.logger,
+            ) orelse return },
+            .attestation => blk: {
+                const subnet_id = topic.gossip_topic.subnet_id orelse {
+                    self.logger.err("attestation missing subnet_id: {s}", .{topic_str});
+                    return;
+                };
+                const signed = v1.deserializeGossipMessage(
+                    types.SignedAttestation,
+                    "attestation",
+                    uncompressed,
+                    self.allocator,
+                    self.logger,
+                ) orelse return;
+                break :blk .{ .attestation = .{ .subnet_id = subnet_id, .message = signed } };
+            },
+            .aggregation => .{ .aggregation = v1.deserializeGossipMessage(
+                types.SignedAggregatedAttestation,
+                "aggregation",
+                uncompressed,
+                self.allocator,
+                self.logger,
+            ) orelse return },
+        };
+
+        var owned_message = message;
+        defer owned_message.deinit();
+
+        const sender_peer_id: []const u8 = "";
+        try self.gossip_handler.onGossip(&owned_message, sender_peer_id);
+    }
+
+    // ── Req/resp ──────────────────────────────────────────────────────────
+
+    /// Serialise the typed request via SSZ, ship it to `host.sendRequest`
+    /// (whose wire layer applies the per-spec varint-uncompressed-size +
+    /// snappy framing), and stash the response callback under the returned
+    /// `request_id`. The callback is freed when the stream completes
+    /// (`rpc_response_end` / `rpc_error_response`) or when the peer
+    /// disconnects (`failInflightRpcsForPeer`).
+    pub fn sendRPCRequest(
+        ptr: *anyopaque,
+        peer_id: []const u8,
+        req: *const interface.ReqRespRequest,
+        callback: ?interface.OnReqRespResponseCbHandler,
+    ) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const peer = try zl.identity.PeerId.fromString(self.allocator, peer_id);
+
+        // Convert zeam's LeanSupportedProtocol → zig-libp2p's. The two enums
+        // share discriminants (asserted in `comptime_protocol_alignment` test
+        // below), so a direct int round-trip is safe.
+        const proto: zl.protocol.LeanSupportedProtocol = blk: {
+            const tag: u32 = @intFromEnum(@as(interface.LeanSupportedProtocol, req.*));
+            break :blk zl.protocol.LeanSupportedProtocol.fromInt(tag) orelse return error.UnknownProtocol;
+        };
+
+        const ssz_bytes = try req.serialize(self.allocator);
+        defer self.allocator.free(ssz_bytes);
+
+        // Calls `host.req_resp` directly: zig-libp2p v0.1.3's
+        // `Host.sendRequest` declares its 4th argument as `timeout_ms: u32`
+        // but forwards it as `now_ms: i64` into the req/resp runtime,
+        // which is both a type mismatch (any real wall-time millisecond
+        // value overflows u32 on `@intCast`) and a naming bug. Routing
+        // through the runtime sidesteps both; behaviour is identical to
+        // a correctly-shaped Host.sendRequest. Fix tracked upstream.
+        const now_ms = zl.wall_time.milliTimestamp();
+        const request_id = try self.host.req_resp.sendRequest(
+            peer,
+            proto,
+            ssz_bytes,
+            now_ms,
+        );
+
+        if (callback) |handler| {
+            const peer_id_copy = try self.allocator.dupe(u8, peer_id);
+            errdefer self.allocator.free(peer_id_copy);
+            const method: interface.LeanSupportedProtocol = @enumFromInt(@intFromEnum(req.*));
+            var entry = interface.ReqRespRequestCallback.init(method, self.allocator, handler, peer_id_copy);
+            self.putRpcCallback(request_id, entry) catch |e| {
+                entry.deinit();
+                return e;
+            };
         }
 
-        var addr_strings = std.ArrayList([]const u8).empty;
-        defer {
-            for (addr_strings.items) |addr_str| {
-                allocator.free(addr_str);
+        self.logger.debug(
+            "network-{d}:: sendRPCRequest peer={s} method={s} request_id={d} ssz_len={d}",
+            .{ self.params.networkId, peer_id, @tagName(proto), request_id, ssz_bytes.len },
+        );
+
+        return request_id;
+    }
+
+    pub fn cancelInflightRpcCallbackFn(ptr: *anyopaque, request_id: u64) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.takeRpcCallback(request_id)) |cb| {
+            var owned = cb;
+            owned.deinit();
+        }
+    }
+
+    fn putRpcCallback(self: *Self, request_id: u64, cb: interface.ReqRespRequestCallback) !void {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        try self.rpc_callbacks.put(self.allocator, request_id, cb);
+    }
+
+    fn takeRpcCallback(self: *Self, request_id: u64) ?interface.ReqRespRequestCallback {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        if (self.rpc_callbacks.fetchRemove(request_id)) |kv| return kv.value;
+        return null;
+    }
+
+    /// Snapshot a registered callback (peer_id duped) without removing it —
+    /// for streaming responses where additional chunks may still arrive.
+    /// Returns `null` if no callback is registered for the request_id.
+    fn snapshotRpcCallback(self: *Self, request_id: u64) ?CallbackSnapshot {
+        self.rpc_callbacks_lock.lock();
+        defer self.rpc_callbacks_lock.unlock();
+        const cb = self.rpc_callbacks.get(request_id) orelse return null;
+        // Caller does not need the peer_id copy, only the method + handler.
+        return .{
+            .method = cb.method,
+            .handler = cb.handler,
+        };
+    }
+
+    const CallbackSnapshot = struct {
+        method: interface.LeanSupportedProtocol,
+        handler: ?interface.OnReqRespResponseCbHandler,
+    };
+
+    /// Inbound RPC request: zig-libp2p has already unframed snappy and
+    /// surfaced the raw SSZ payload to us. Register an inbound channel so
+    /// we can route responses back, wrap it in a `ReqRespServerStream`,
+    /// and hand the typed request to the registered handler.
+    fn dispatchRpcRequest(self: *Self, r: zl.swarm.RpcRequest) void {
+        // Translate zig-libp2p protocol enum → zeam interface enum (same
+        // discriminants — asserted in tests).
+        const method: interface.LeanSupportedProtocol = mapInboundProtocol(r.protocol) orelse {
+            self.logger.err(
+                "network-{d}:: inbound rpc unknown protocol tag={d}",
+                .{ self.params.networkId, @intFromEnum(r.protocol) },
+            );
+            return;
+        };
+
+        // Stringify the peer id for the handler / node-name registry.
+        var peer_buf: [128]u8 = undefined;
+        const peer_str = r.peer.toBase58(&peer_buf) catch |e| {
+            self.logger.err(
+                "network-{d}:: inbound rpc peer_id encode failed: {any}",
+                .{ self.params.networkId, e },
+            );
+            return;
+        };
+        const peer_owned = self.allocator.dupe(u8, peer_str) catch |e| {
+            self.logger.err(
+                "network-{d}:: inbound rpc OOM duping peer_id: {any}",
+                .{ self.params.networkId, e },
+            );
+            return;
+        };
+        errdefer self.allocator.free(peer_owned);
+
+        var request = interface.ReqRespRequest.deserialize(self.allocator, method, r.payload) catch |e| {
+            self.logger.err(
+                "network-{d}:: inbound rpc SSZ decode method={s} from={s} failed: {any}",
+                .{ self.params.networkId, @tagName(method), peer_str, e },
+            );
+            self.allocator.free(peer_owned);
+            return;
+        };
+        defer request.deinit();
+
+        const stream_ctx = self.allocator.create(ServerStreamContext) catch |e| {
+            self.logger.err(
+                "network-{d}:: inbound rpc OOM allocating stream context: {any}",
+                .{ self.params.networkId, e },
+            );
+            self.allocator.free(peer_owned);
+            return;
+        };
+        stream_ctx.* = .{
+            .parent = self,
+            .channel_id = r.channel_id,
+            .peer_id = peer_owned,
+            .method = method,
+            .finished = false,
+        };
+
+        const stream: interface.ReqRespServerStream = .{
+            .ptr = stream_ctx,
+            .sendResponseFn = serverStreamSendResponse,
+            .sendErrorFn = serverStreamSendError,
+            .finishFn = serverStreamFinish,
+            .isFinishedFn = serverStreamIsFinished,
+            .getPeerIdFn = serverStreamGetPeerId,
+        };
+
+        // ReqRespRequestHandler.onReqRespRequest fans out to every
+        // subscribed handler and breaks early once the stream is finished.
+        // Handler may retain the stream context; ownership transferred.
+        self.reqresp_handler.onReqRespRequest(&request, stream) catch |e| {
+            self.logger.err(
+                "network-{d}:: inbound rpc handler error method={s} from={s}: {any}",
+                .{ self.params.networkId, @tagName(method), peer_str, e },
+            );
+        };
+
+        // Auto-finish if the handler didn't explicitly close the stream;
+        // matches the legacy behaviour (no leaked channels on incomplete
+        // server handlers).
+        if (!stream_ctx.finished) {
+            serverStreamFinish(stream_ctx) catch |e| {
+                self.logger.err(
+                    "network-{d}:: inbound rpc auto-finish failed: {any}",
+                    .{ self.params.networkId, e },
+                );
+            };
+        }
+        self.allocator.free(stream_ctx.peer_id);
+        self.allocator.destroy(stream_ctx);
+    }
+
+    fn dispatchRpcResponseChunk(self: *Self, r: zl.swarm.RpcResponseChunk) void {
+        const snap = self.snapshotRpcCallback(r.request_id) orelse {
+            // No callback registered — request was either cancelled or
+            // already completed. Drop the chunk silently to match the
+            // legacy path.
+            return;
+        };
+        const handler = snap.handler orelse return;
+
+        const response = interface.ReqRespResponse.deserialize(self.allocator, snap.method, r.chunk) catch |e| {
+            self.logger.err(
+                "network-{d}:: response chunk decode method={s} request_id={d}: {any}",
+                .{ self.params.networkId, @tagName(snap.method), r.request_id, e },
+            );
+            return;
+        };
+
+        var event = interface.ReqRespResponseEvent.initSuccess(r.request_id, snap.method, response);
+        defer event.deinit(self.allocator);
+        handler.onReqRespResponse(&event) catch |e| {
+            self.logger.err(
+                "network-{d}:: response chunk notify request_id={d}: {any}",
+                .{ self.params.networkId, r.request_id, e },
+            );
+        };
+    }
+
+    fn dispatchRpcResponseEnd(self: *Self, r: zl.swarm.RpcResponseEnd) void {
+        var cb = self.takeRpcCallback(r.request_id) orelse return;
+        defer cb.deinit();
+        var event = interface.ReqRespResponseEvent.initCompleted(r.request_id, cb.method);
+        cb.notify(&event) catch |e| {
+            self.logger.err(
+                "network-{d}:: response end notify request_id={d}: {any}",
+                .{ self.params.networkId, r.request_id, e },
+            );
+        };
+    }
+
+    fn dispatchRpcError(self: *Self, r: zl.swarm.RpcError) void {
+        var cb = self.takeRpcCallback(r.request_id) orelse return;
+        defer cb.deinit();
+        const message = self.allocator.dupe(u8, @errorName(r.kind)) catch |e| {
+            self.logger.err(
+                "network-{d}:: response error OOM duping message: {any}",
+                .{ self.params.networkId, e },
+            );
+            return;
+        };
+        var event = interface.ReqRespResponseEvent.initError(
+            r.request_id,
+            cb.method,
+            .{ .code = 1, .message = message },
+        );
+        defer event.deinit(self.allocator);
+        cb.notify(&event) catch |e| {
+            self.logger.err(
+                "network-{d}:: response error notify request_id={d}: {any}",
+                .{ self.params.networkId, r.request_id, e },
+            );
+        };
+    }
+
+    /// Fail every in-flight outbound RPC whose target peer is `peer_id`.
+    /// Called when a peer disconnects, so consumers don't block waiting
+    /// for responses that will never arrive. Matches the legacy
+    /// `failInflightRpcsForPeer` defense.
+    fn failInflightRpcsForPeer(self: *Self, peer_id: []const u8) void {
+        var to_fail: std.ArrayListUnmanaged(u64) = .empty;
+        defer to_fail.deinit(self.allocator);
+
+        {
+            self.rpc_callbacks_lock.lock();
+            defer self.rpc_callbacks_lock.unlock();
+            var it = self.rpc_callbacks.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
+                    to_fail.append(self.allocator, entry.key_ptr.*) catch {
+                        // OOM during snapshot — best-effort: skip and let
+                        // the next callback removal drive eventual cleanup.
+                        return;
+                    };
+                }
             }
-            addr_strings.deinit(allocator);
         }
 
-        for (addrs) |addr| {
-            const addr_str = try addr.toString(allocator);
-            try addr_strings.append(allocator, addr_str);
+        for (to_fail.items) |request_id| {
+            var cb = self.takeRpcCallback(request_id) orelse continue;
+            defer cb.deinit();
+            const message = self.allocator.dupe(u8, "peer disconnected") catch continue;
+            var event = interface.ReqRespResponseEvent.initError(
+                request_id,
+                cb.method,
+                .{ .code = 1, .message = message },
+            );
+            defer event.deinit(self.allocator);
+            cb.notify(&event) catch |e| {
+                self.logger.err(
+                    "network-{d}:: failInflightRpcsForPeer notify request_id={d}: {any}",
+                    .{ self.params.networkId, request_id, e },
+                );
+            };
         }
+    }
 
-        const joined = try std.mem.join(allocator, ",", addr_strings.items);
-        defer allocator.free(joined);
+    // ── Peer events ───────────────────────────────────────────────────────
 
-        const result = try allocator.dupeZ(u8, joined);
+    fn dispatchPeerConnected(self: *Self, p: zl.peer_events.PeerConnectedPayload) void {
+        var buf: [128]u8 = undefined;
+        const peer_str = p.peer.toBase58(&buf) catch |e| {
+            self.logger.err("network-{d}:: peer_connected toBase58 failed: {any}", .{ self.params.networkId, e });
+            return;
+        };
+        const direction = mapDirection(p.direction);
+        self.peer_event_handler.onPeerConnected(peer_str, direction) catch |e| {
+            self.logger.err("network-{d}:: onPeerConnected handler error: {any}", .{ self.params.networkId, e });
+        };
+    }
 
-        return result;
+    fn dispatchPeerDisconnected(self: *Self, p: zl.peer_events.PeerDisconnectedPayload) void {
+        var buf: [128]u8 = undefined;
+        const peer_str = p.peer.toBase58(&buf) catch |e| {
+            self.logger.err("network-{d}:: peer_disconnected toBase58 failed: {any}", .{ self.params.networkId, e });
+            return;
+        };
+        self.failInflightRpcsForPeer(peer_str);
+        const direction = mapDirection(p.direction);
+        const reason = mapDisconnectReason(p.reason);
+        self.peer_event_handler.onPeerDisconnected(peer_str, direction, reason) catch |e| {
+            self.logger.err("network-{d}:: onPeerDisconnected handler error: {any}", .{ self.params.networkId, e });
+        };
+    }
+
+    fn dispatchPeerConnectionFailed(self: *Self, p: zl.peer_events.PeerConnectionFailedPayload) void {
+        var buf: [128]u8 = undefined;
+        const peer_str: []const u8 = if (p.peer) |peer| (peer.toBase58(&buf) catch {
+            self.logger.err("network-{d}:: peer_connection_failed toBase58 failed", .{self.params.networkId});
+            return;
+        }) else "unknown";
+        const direction = mapDirection(p.direction);
+        const result: interface.ConnectionResult = switch (p.result) {
+            .timeout => .timeout,
+            .err => .error_,
+        };
+        self.peer_event_handler.onPeerConnectionFailed(peer_str, direction, result) catch |e| {
+            self.logger.err("network-{d}:: onPeerConnectionFailed handler error: {any}", .{ self.params.networkId, e });
+        };
+    }
+
+    // ── Metrics scrape refresher ──────────────────────────────────────────
+
+    /// Per-instance scrape refresher registered via
+    /// `zeam_metrics.registerScrapeRefresherCtx`. Copies the per-instance
+    /// metrics registry's current state into zeam's global gauge/counter,
+    /// computing deltas for the monotonic swarm-drop counters.
+    pub fn refreshMetrics(ctx: ?*anyopaque) void {
+        if (ctx == null) return;
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
+
+        // Mesh peers gauge. With multiple network instances, last-write-wins —
+        // same caveat as the legacy path's single-`set` semantics.
+        zeam_metrics.metrics.lean_gossip_mesh_peers.set(self.metrics_registry.meshPeers());
+
+        // Swarm-drop counter — delta-on-scrape per reason.
+        inline for (.{
+            zl.metrics.SwarmDropReason.full,
+            zl.metrics.SwarmDropReason.closed,
+            zl.metrics.SwarmDropReason.uninitialized,
+        }) |reason| {
+            const idx: usize = @intFromEnum(reason);
+            const current = self.metrics_registry.swarmCommandDropped(reason);
+            const last = self.swarm_drop_last_seen[idx];
+            if (current > last) {
+                const delta = current - last;
+                zeam_metrics.metrics.zeam_libp2p_swarm_command_dropped_total.incrBy(
+                    .{ .reason = @tagName(reason) },
+                    delta,
+                ) catch {};
+                self.swarm_drop_last_seen[idx] = current;
+            }
+        }
     }
 };
 
-test "validateRpcSnappyHeader rejects oversized declared size" {
-    var scratch: [MAX_VARINT_BYTES]u8 = undefined;
-    const encoded = uvarint.encode(usize, MAX_RPC_MESSAGE_SIZE + 1, &scratch);
-    try std.testing.expectError(error.PayloadTooLarge, validateRpcSnappyHeader(encoded));
-}
+// ── Direction / reason mapping ──────────────────────────────────────────────
 
-test "validateGossipSnappyHeader returns typed errors for each rejection class" {
-    // Regression for Hive `gossip: ignores malformed ssz` (test 390 on
-    // hive.leanroadmap.org / suite 1778305924-...). The simulator publishes
-    // 1024 bytes of 0xef on a valid block topic; an unguarded decoder hit an
-    // `integer overflow` panic in the third-party snappy uvarint and crashed
-    // the network thread, cascading into ~26 follow-up failures as the second
-    // node became unreachable.
-    //
-    // Each sub-case asserts both the rejection AND its specific error variant
-    // so log/metric attribution stays distinct.
-
-    // 1024 bytes of 0xef: the original Hive panic payload. Rejected as
-    // InvalidVarint (every byte is a continuation byte; no terminator).
-    const garbage = [_]u8{0xef} ** 1024;
-    try std.testing.expectError(
-        error.InvalidVarint,
-        validateGossipSnappyHeader(&garbage, MAX_GOSSIP_BLOCK_SIZE),
-    );
-
-    // 11 continuation bytes then a terminator: varint > u64.
-    var long_varint: [12]u8 = undefined;
-    @memset(long_varint[0..11], 0xff);
-    long_varint[11] = 0x01;
-    try std.testing.expectError(
-        error.InvalidVarint,
-        validateGossipSnappyHeader(&long_varint, MAX_GOSSIP_BLOCK_SIZE),
-    );
-
-    // Empty payload.
-    const empty = [_]u8{};
-    try std.testing.expectError(
-        error.EmptyMessage,
-        validateGossipSnappyHeader(&empty, MAX_GOSSIP_BLOCK_SIZE),
-    );
-
-    // Declared size exceeds the per-topic limit (oversized claim).
-    var oversize_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
-    const oversize_header = uvarint.encode(usize, MAX_GOSSIP_BLOCK_SIZE + 1, oversize_buf[0..MAX_VARINT_BYTES]);
-    oversize_buf[oversize_header.len] = 0x00; // payload byte so it isn't header-only
-    try std.testing.expectError(
-        error.DeclaredPayloadTooLarge,
-        validateGossipSnappyHeader(oversize_buf[0 .. oversize_header.len + 1], MAX_GOSSIP_BLOCK_SIZE),
-    );
-
-    // Header-only buffer for a non-zero declared size: header is valid, body
-    // is missing. Distinct error so callers can attribute truncated streams
-    // separately from corrupt headers.
-    var header_only_buf: [MAX_VARINT_BYTES]u8 = undefined;
-    const header_only = uvarint.encode(usize, 32, &header_only_buf);
-    try std.testing.expectError(
-        error.HeaderWithoutBody,
-        validateGossipSnappyHeader(header_only, MAX_GOSSIP_BLOCK_SIZE),
-    );
-
-    // Well-formed header followed by at least one payload byte: accepted.
-    // The validator does *not* check that the body length matches the
-    // declared uncompressed size — that's the decoder's job. See doc comment
-    // on `validateSnappyHeader`.
-    var ok_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
-    const ok_header = uvarint.encode(usize, 32, ok_buf[0..MAX_VARINT_BYTES]);
-    ok_buf[ok_header.len] = 0x00;
-    const ok = try validateGossipSnappyHeader(ok_buf[0 .. ok_header.len + 1], MAX_GOSSIP_BLOCK_SIZE);
-    try std.testing.expectEqual(@as(usize, 32), ok.value);
-
-    // Zero-length declared payload with no body is accepted (snappy can
-    // legitimately describe an empty uncompressed block as just the varint 0).
-    const zero_header = [_]u8{0x00};
-    const zero_ok = try validateGossipSnappyHeader(&zero_header, MAX_GOSSIP_BLOCK_SIZE);
-    try std.testing.expectEqual(@as(usize, 0), zero_ok.value);
-
-    // Body shorter than declared but well-formed header: validator accepts
-    // by design. The decoder is authoritative for body integrity. Pinning
-    // current behaviour so a future change to also enforce body length here
-    // is a deliberate breaking change rather than a silent drift.
-    var short_body_buf: [MAX_VARINT_BYTES + 4]u8 = undefined;
-    const short_body_header = uvarint.encode(usize, 1024, short_body_buf[0..MAX_VARINT_BYTES]);
-    @memset(short_body_buf[short_body_header.len .. short_body_header.len + 4], 0x00);
-    const short_body_ok = try validateGossipSnappyHeader(
-        short_body_buf[0 .. short_body_header.len + 4],
-        MAX_GOSSIP_BLOCK_SIZE,
-    );
-    try std.testing.expectEqual(@as(usize, 1024), short_body_ok.value);
-
-    // Boundary: declared == max_size is accepted (strict `>`); declared ==
-    // max_size + 1 is rejected. Pinned to match upstream
-    // `snappyz.decodeWithMax`'s `if (block.blockLen > max_size)` contract.
-    // If upstream ever flips to `>=` this test will
-    // fail loudly instead of the validator silently disagreeing across a
-    // 1-byte gap.
-    var boundary_buf: [MAX_VARINT_BYTES + 1]u8 = undefined;
-    const at_limit_header = uvarint.encode(usize, MAX_GOSSIP_BLOCK_SIZE, boundary_buf[0..MAX_VARINT_BYTES]);
-    boundary_buf[at_limit_header.len] = 0x00;
-    const at_limit_ok = try validateGossipSnappyHeader(
-        boundary_buf[0 .. at_limit_header.len + 1],
-        MAX_GOSSIP_BLOCK_SIZE,
-    );
-    try std.testing.expectEqual(@as(usize, MAX_GOSSIP_BLOCK_SIZE), at_limit_ok.value);
-}
-
-test "inbound corruption: real on-the-wire bytes must surface as error.Corrupt" {
-    // Captured from a node during a live run. The byte stream arrived at the
-    // receiving node's gossipsub ingress with `compressed_len=284553`
-    // (matching a peer's slot-1 block publish, length 284553) but with a
-    // DIFFERENT sha256 than the peer's published `compressed_sha256=0c83964d…`.
-    //
-    // sha256(this file) = c8700b167c3550add606cdef67ab385d061165c141fd76718bc2a35ff13a496e
-    //
-    // Cross-checked locally: `rust-snap 1.1.1` (the exact same crate version
-    // ethlambda, ream, and grandine all use) also fails to decode these
-    // bytes with `Offset { offset: 2265232849, dst_pos: 98776 }`. That rules
-    // out a zig-snappy ↔ rust-snap interop bug and pins the corruption to
-    // somewhere between the peer's publish and this node's receive — almost
-    // certainly inside the libp2p framing / muxer layer.
-    //
-    // Locking the symptom in as a test means any future "fix" to snappyz
-    // that starts accepting these mangled bytes goes through a deliberate
-    // code review rather than silently masking the upstream transport bug.
-    const corrupt = @embedFile("testdata_issue_942_inbound_corrupt.bin");
-    try std.testing.expectEqual(@as(usize, 284553), corrupt.len);
-    const result = snappyz.decodeWithMax(std.testing.allocator, corrupt, MAX_GOSSIP_BLOCK_SIZE);
-    try std.testing.expectError(error.Corrupt, result);
-}
-
-test "snappyz.decodeWithMax regression canary: 1024 bytes of 0xef must not panic" {
-    // Regression canary: if this test ever panics the
-    // whole test binary instead of returning `error.Corrupt`, the upstream
-    // `zig-snappy` dependency has been downgraded below v0.0.5 and the
-    // uvarint integer-overflow fix is gone. Restore the pin in `build.zig.zon`
-    // before doing anything else — the gossip thread will crash on the next
-    // malformed payload.
-    //
-    // Belt-and-suspenders: even if the dep is rolled back, the
-    // `validateGossipSnappyHeader` test above still ensures the gossip
-    // handler short-circuits before reaching the decoder.
-    const garbage = [_]u8{0xef} ** 1024;
-    const result = snappyz.decodeWithMax(std.testing.allocator, &garbage, MAX_GOSSIP_BLOCK_SIZE);
-    try std.testing.expectError(error.Corrupt, result);
-}
-
-test "byteHexPreview: formats bytes with single-space separator" {
-    // Diagnostic: gossip-decode failure logs include the leading bytes
-    // hex so operators can spot framing-format mismatches (snappy-frames
-    // magic `ff 06 00 00 73 4e 61 50 70 59` vs snappy-block leading varint)
-    // directly from the log line, without needing the sample-rate-gated
-    // dump file. Pinning the format here so a future refactor that switches
-    // separators or capitalisation goes through a deliberate test update.
-    const data = [_]u8{ 0xff, 0x06, 0x00, 0x00, 0x73, 0x4e, 0x61, 0x50 };
-    const p = byteHexPreview(&data, 8);
-    try std.testing.expectEqualSlices(u8, "ff 06 00 00 73 4e 61 50", p.slice());
-}
-
-test "byteHexPreview: truncates to max_bytes" {
-    const data = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
-    const p = byteHexPreview(&data, 3);
-    try std.testing.expectEqualSlices(u8, "aa bb cc", p.slice());
-}
-
-test "byteHexPreview: empty input returns empty slice" {
-    const empty: []const u8 = &.{};
-    const p = byteHexPreview(empty, 32);
-    try std.testing.expectEqual(@as(usize, 0), p.slice().len);
-}
-
-test "byteHexPreview: hard cap at GOSSIP_PREVIEW_MAX_BYTES even if caller asks more" {
-    // The buffer is sized for 32 bytes; if a caller passes max_bytes > 32
-    // (a future code-path bug), we must silently cap to keep stack usage
-    // bounded and not overrun the buffer.
-    const data = [_]u8{0xab} ** 64;
-    const p = byteHexPreview(&data, 100);
-    try std.testing.expectEqual(GOSSIP_PREVIEW_MAX_BYTES, p.slice().len / 3 + 1);
-}
-
-test "snappyz roundtrip: high-entropy 280KB payload (corruption reproduction)" {
-    // Reproduce the gossip-decode-failure pattern in a unit test.
-    //
-    // Observation from the live network under instrumentation:
-    // - Both Zig `snappyz.decodeWithMax` AND Rust `snap::raw::Decoder` reject
-    //   the same gossip payloads with `error.Corrupt` / `Offset { offset:
-    //   62376420, dst_pos: 65866 }`.
-    // - The byte-preview at the FFI boundary matches Rust ↔ Zig (no FFI bug).
-    // - Failures cluster around block / aggregation payloads of ~200-300 KB
-    //   with `dst_pos` errors near 64 KB / 128 KB / power-of-two boundaries.
-    // - The only client family that publishes via `snappyz.encode` is zeam;
-    //   every other client uses Rust `snap::raw::Encoder` which round-trips
-    //   the same payload classes fine. Working hypothesis: `snappyz.encode`
-    //   produces non-standard snappy output for inputs that combine
-    //   high-entropy content with the chunking boundary at
-    //   `maxBlockSize = 65536`.
-    //
-    // The existing snappyz "encode larger than maxBlockSize" test uses a
-    // sequential `b.* = i & 0xff` pattern which is highly compressible and
-    // unlikely to expose the bug. This test uses a fixed-seed PRNG so the
-    // input has STARK-proof-like entropy (≈1.0 byte/byte) at sizes that
-    // straddle the 64 KB chunk boundary multiple times.
-    //
-    // If this test FAILS, we have local reproduction and can debug
-    // `encodeBlock` without network round-trips. If it
-    // PASSES, the wire-side corruption originates elsewhere (peer encoder
-    // outside zeam, or a gossipsub-layer mutation) and we need to capture
-    // a real payload from the wire to drill further.
-    const allocator = std.testing.allocator;
-
-    // 280 KB: crosses the 65536-byte maxBlockSize boundary 4 times, in the
-    // size range of the failing payloads (`data_len=287149` was a
-    // recurring victim in the live capture).
-    const input_size: usize = 280 * 1024;
-    const input = try allocator.alloc(u8, input_size);
-    defer allocator.free(input);
-
-    // Fixed seed so the failure (if any) is reproducible across runs and CI.
-    var prng = std.Random.DefaultPrng.init(0x0942_5141_5252_4754);
-    prng.random().bytes(input);
-
-    const encoded = try snappyz.encode(allocator, input);
-    defer allocator.free(encoded);
-
-    const decoded = snappyz.decodeWithMax(allocator, encoded, MAX_GOSSIP_BLOCK_SIZE) catch |err| {
-        std.debug.print(
-            "\nsnappyz roundtrip FAILED on {d}KB high-entropy input: {any}\n" ++
-                "  encoded size: {d} bytes\n" ++
-                "  first 16 encoded bytes: {x}\n",
-            .{ input_size / 1024, err, encoded.len, encoded[0..@min(16, encoded.len)] },
-        );
-        return err;
+/// Zig-libp2p protocol enum → zeam interface enum. The two share
+/// discriminants (tested), but the interface side has no `fromInt`
+/// constructor, so we keep this single mapping point and guard against a
+/// future discriminant drift on either side.
+fn mapInboundProtocol(p: zl.protocol.LeanSupportedProtocol) ?interface.LeanSupportedProtocol {
+    return switch (p) {
+        .blocks_by_root => .blocks_by_root,
+        .status => .status,
+        .blocks_by_range => .blocks_by_range,
     };
-    defer allocator.free(decoded);
-
-    try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "snappyz roundtrip: high-entropy 64KB-boundary spans" {
-    // Targeted variant of the test above: try several input sizes just below,
-    // exactly at, and just above `maxBlockSize = 65536` (and 2× / 3× that)
-    // so a failure modes that's specific to a single boundary crossing
-    // shows up as one of the sub-cases.
-    const allocator = std.testing.allocator;
-    const sizes_to_try = [_]usize{
-        65535, // last byte that fits in one chunk
-        65536, // exactly maxBlockSize
-        65537, // first byte spilling into a second chunk
-        131071,
-        131072, // 2 × maxBlockSize
-        131073,
-        196608, // 3 × maxBlockSize
-        196609,
+fn mapDirection(d: zl.peer_events.Direction) interface.PeerDirection {
+    return switch (d) {
+        .inbound => .inbound,
+        .outbound => .outbound,
+        .unknown => .unknown,
     };
-    for (sizes_to_try) |sz| {
-        const input = try allocator.alloc(u8, sz);
-        defer allocator.free(input);
-        var prng = std.Random.DefaultPrng.init(0xDEADBEEF_CAFEBABE);
-        prng.random().bytes(input);
+}
 
-        const encoded = try snappyz.encode(allocator, input);
-        defer allocator.free(encoded);
+fn mapDisconnectReason(r: zl.peer_events.DisconnectReason) interface.DisconnectionReason {
+    return switch (r) {
+        .timeout => .timeout,
+        .remote_close => .remote_close,
+        .local_close => .local_close,
+        .err => .error_,
+    };
+}
 
-        const decoded = snappyz.decodeWithMax(allocator, encoded, MAX_GOSSIP_BLOCK_SIZE) catch |err| {
-            std.debug.print("\nFAILED at size={d}: {any}\n", .{ sz, err });
-            return err;
-        };
-        defer allocator.free(decoded);
+// ── Server-stream context (outbound responses to inbound RPCs) ─────────────
 
-        try std.testing.expectEqualSlices(u8, input, decoded);
-    }
+const ServerStreamContext = struct {
+    parent: *EthLibp2p,
+    channel_id: u64,
+    peer_id: []const u8,
+    method: interface.LeanSupportedProtocol,
+    finished: bool,
+};
+
+fn serverStreamGetPeerId(ptr: *anyopaque) ?[]const u8 {
+    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
+    return ctx.peer_id;
+}
+
+fn serverStreamIsFinished(ptr: *anyopaque) bool {
+    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
+    return ctx.finished;
+}
+
+fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespResponse) anyerror!void {
+    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
+    if (ctx.finished) return error.StreamFinished;
+
+    const ssz_bytes = try response.serialize(ctx.parent.allocator);
+    defer ctx.parent.allocator.free(ssz_bytes);
+    const now_ms = zl.wall_time.milliTimestamp();
+    try ctx.parent.host.sendResponseChunk(ctx.channel_id, ssz_bytes, now_ms);
+}
+
+fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerror!void {
+    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
+    if (ctx.finished) return error.StreamFinished;
+    _ = code;
+    try ctx.parent.host.sendErrorResponse(ctx.channel_id, message);
+    ctx.finished = true;
+}
+
+fn serverStreamFinish(ptr: *anyopaque) anyerror!void {
+    const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
+    if (ctx.finished) return;
+    try ctx.parent.host.finishResponseStream(ctx.channel_id);
+    ctx.finished = true;
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "EthLibp2p init / deinit smoke" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var registry = NodeNameRegistry.init(a);
+    defer registry.deinit();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+
+    var net = try EthLibp2p.init(a, &loop, .{
+        .networkId = 0,
+        .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
+        .listen_addresses = "",
+        .connect_peers = "",
+        .node_registry = &registry,
+    }, logger);
+    defer net.deinit();
+
+    try net.run();
+    try testing.expect(net.host.isReady());
+}
+
+test "EthLibp2p protocol enum discriminants match zig-libp2p" {
+    // Critical for the `@intFromEnum` round-trip in dispatchRpcRequest +
+    // sendRPCRequest. If these ever drift, both directions of req/resp
+    // routing break silently.
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(interface.LeanSupportedProtocol.blocks_by_root)),
+        @as(u32, @intFromEnum(zl.protocol.LeanSupportedProtocol.blocks_by_root)),
+    );
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(interface.LeanSupportedProtocol.status)),
+        @as(u32, @intFromEnum(zl.protocol.LeanSupportedProtocol.status)),
+    );
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(interface.LeanSupportedProtocol.blocks_by_range)),
+        @as(u32, @intFromEnum(zl.protocol.LeanSupportedProtocol.blocks_by_range)),
+    );
+}
+
+test "EthLibp2p direction mapping is total + 1:1" {
+    try testing.expectEqual(interface.PeerDirection.inbound, mapDirection(.inbound));
+    try testing.expectEqual(interface.PeerDirection.outbound, mapDirection(.outbound));
+    try testing.expectEqual(interface.PeerDirection.unknown, mapDirection(.unknown));
+}
+
+test "EthLibp2p disconnect reason mapping is total" {
+    try testing.expectEqual(interface.DisconnectionReason.timeout, mapDisconnectReason(.timeout));
+    try testing.expectEqual(interface.DisconnectionReason.remote_close, mapDisconnectReason(.remote_close));
+    try testing.expectEqual(interface.DisconnectionReason.local_close, mapDisconnectReason(.local_close));
+    try testing.expectEqual(interface.DisconnectionReason.error_, mapDisconnectReason(.err));
+}
+
+test "EthLibp2p peer-event dispatch fires registered handler" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var registry = NodeNameRegistry.init(a);
+    defer registry.deinit();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+
+    var net = try EthLibp2p.init(a, &loop, .{
+        .networkId = 0,
+        .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
+        .node_registry = &registry,
+    }, logger);
+    defer net.deinit();
+
+    // Subscribe a counting handler before run() so we capture both replays
+    // and live events.
+    const Counter = struct {
+        connected: u32 = 0,
+        disconnected: u32 = 0,
+        failed: u32 = 0,
+        var instance: @This() = .{};
+
+        fn onConnected(_: *anyopaque, _: []const u8, _: interface.PeerDirection) anyerror!void {
+            instance.connected += 1;
+        }
+        fn onDisconnected(_: *anyopaque, _: []const u8, _: interface.PeerDirection, _: interface.DisconnectionReason) anyerror!void {
+            instance.disconnected += 1;
+        }
+        fn onFailed(_: *anyopaque, _: []const u8, _: interface.PeerDirection, _: interface.ConnectionResult) anyerror!void {
+            instance.failed += 1;
+        }
+    };
+    Counter.instance = .{};
+
+    try net.peer_event_handler.subscribe(.{
+        .ptr = &Counter.instance,
+        .onPeerConnectedCb = Counter.onConnected,
+        .onPeerDisconnectedCb = Counter.onDisconnected,
+        .onPeerConnectionFailedCb = Counter.onFailed,
+    });
+
+    // Drive the dispatchers directly (no need to go through the drain
+    // thread — that exercises Host.nextEvent which has its own integration
+    // path; here we want the wiring assertion to be deterministic).
+    const peer = try zl.identity.PeerId.random();
+    net.dispatchPeerConnected(.{ .peer = peer, .direction = .outbound });
+    net.dispatchPeerDisconnected(.{ .peer = peer, .direction = .outbound, .reason = .remote_close });
+    net.dispatchPeerConnectionFailed(.{ .peer = peer, .direction = .outbound, .result = .timeout });
+
+    try testing.expectEqual(@as(u32, 1), Counter.instance.connected);
+    try testing.expectEqual(@as(u32, 1), Counter.instance.disconnected);
+    try testing.expectEqual(@as(u32, 1), Counter.instance.failed);
+}
+
+test "EthLibp2p brings up QuicRuntime when listen_addresses is set" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var registry = NodeNameRegistry.init(a);
+    defer registry.deinit();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+
+    // Deterministic host identity so we can assert this never relies on a
+    // particular peer id — only that bring-up succeeds end-to-end.
+    var net = try EthLibp2p.init(a, &loop, .{
+        .networkId = 0,
+        .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
+        .listen_addresses = "/ip4/127.0.0.1/udp/0/quic-v1",
+        .node_registry = &registry,
+        .host_identity_seed = [_]u8{0xAB} ** 32,
+    }, logger);
+    defer net.deinit();
+
+    try net.run();
+    try testing.expect(net.host.isReady());
+
+    // The runtime is up; it owns a bound UDP socket on a kernel-assigned
+    // port. We don't open an outbound dial here — the QuicRuntime loopback
+    // test in zig-libp2p already gates that path. This test asserts the
+    // glue (in-memory cert mint + zero-copy PEM hand-off + start) lands
+    // without panicking or leaking, which is exactly what would block
+    // embedders today.
+    try testing.expect(net.quic_runtime != null);
+    try testing.expect(net.quic_runtime.?.boundUdpPortIpv4() != null);
+    try testing.expect(net.quic_runtime.?.boundUdpPortIpv4().? != 0);
+}
+
+test "EthLibp2p bootnode multiaddr parsing tolerates whitespace + empty entries" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var registry = NodeNameRegistry.init(a);
+    defer registry.deinit();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+
+    // One valid multiaddr, one invalid, one empty (after split). The
+    // invalid one should log + skip without aborting; the valid one
+    // should land in the connection manager's known-peer table.
+    const peers = "/ip4/127.0.0.1/udp/9000/quic-v1, , not-a-multiaddr";
+
+    var net = try EthLibp2p.init(a, &loop, .{
+        .networkId = 0,
+        .fork_digest = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd },
+        .connect_peers = peers,
+        .node_registry = &registry,
+    }, logger);
+    defer net.deinit();
+
+    try net.run();
+    try testing.expect(net.host.isReady());
+    // The valid bootnode is registered; the failing parses log a warning
+    // and continue. The connection manager's tick() in the drain thread
+    // would now schedule a dial — but with v0.1.0's dial stub it'll
+    // immediately fail-stub. We don't assert on dial outcome here (that
+    // requires the QuicListener bring-up).
 }

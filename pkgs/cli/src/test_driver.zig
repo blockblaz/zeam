@@ -686,7 +686,7 @@ fn processBlockStep(
             }
         }
 
-        driver.fork_choice.storeAggregatedPayload(&agg_att.data, proof_template, true) catch {};
+        driver.fork_choice.storeAggregatedPayload(&agg_att.data, proof_template, true, .block_payload) catch {};
 
         // Register individual attestations in the fork-choice tracker
         var indices2 = types.aggregationBitsToValidatorIndices(&agg_att.aggregation_bits, driver.allocator) catch continue;
@@ -848,7 +848,7 @@ fn processGossipAggregatedAttestationStep(
     }
 
     // Register as aggregated payload in fork-choice
-    driver.fork_choice.storeAggregatedPayload(&att_data, proof_template, false) catch |err| {
+    driver.fork_choice.storeAggregatedPayload(&att_data, proof_template, false, .block_payload) catch |err| {
         std.debug.print("test_driver: gossipAggregatedAttestation storeAggregatedPayload failed: {s}\n", .{@errorName(err)});
         return err;
     };
