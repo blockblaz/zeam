@@ -98,7 +98,15 @@ pub const ValidatorClient = struct {
                 self.chain.submitPropose(node, slot, proposer_id);
                 return null;
             },
-            1 => return self.mayBeDoAttestation(slot),
+            1 => {
+                // Offload attestation construct+sign+publish to a thread_pool worker
+                // (#863): per-validator XMSS signing is ~0.3s/interval and dominates
+                // onInterval.tick when replayed across the libxev catch-up loop. The
+                // worker publishes itself, so this emits no synchronous output — same
+                // shape as interval 0's submitPropose above.
+                self.chain.submitAttestOnInterval(node, slot);
+                return null;
+            },
             2 => return null,
             3 => return null,
             4 => return null,

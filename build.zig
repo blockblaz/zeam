@@ -335,8 +335,19 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
     zeam_network.addImport("@zeam/metrics", zeam_metrics);
-    // The publish-side forensic log line in `ethlibp2p.zig`
-    // includes the build git SHA so receivers across the fleet can correlate
+
+    // zig-libp2p — pure-Zig libp2p stack. The legacy `ethlibp2p.zig`
+    // / `rust/libp2p-glue/` path was deleted; this is the only libp2p
+    // implementation now. `ethlibp2p.zig` consumes it via
+    // `@import("zig_libp2p")`.
+    const zig_libp2p_dep = b.dependency("zig_libp2p", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_network.addImport("zig_libp2p", zig_libp2p_dep.module("zig_libp2p"));
+
+    // The publish-side forensic log line in v2 includes the build git SHA
+    // so receivers across the fleet can correlate
     // broken-byte receipts back to the exact producer binary.
     zeam_network.addImport("build_options", build_options_module);
 
@@ -557,6 +568,14 @@ pub fn build(b: *Builder) !void {
     const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate)");
     stress_quick_step.dependOn(&run_stress_quick.step);
     test_step.dependOn(&run_stress_quick.step);
+
+    const run_stress_locks_quick = b.addRunArtifact(stress_exe);
+    run_stress_locks_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
+    run_stress_locks_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    run_stress_locks_quick.setEnvironmentVariable("ZEAM_STRESS_SKIP_VERIFY", "1");
+    const stress_locks_quick_step = b.step("stress-locks-quick", "Run a 30s stress harness without XMSS verification (CI gate, slice b)");
+    stress_locks_quick_step.dependOn(&run_stress_locks_quick.step);
+    test_step.dependOn(&run_stress_locks_quick.step);
 
     // -----------------------------------------------------------------
     // `stress-saturation` and `stress-quick-saturation`: chain-worker
@@ -944,7 +963,7 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice, no_je
     // lib.rs cfg excludes the zkVM provers, which ship their own). Enable its
     // cargo feature here, unless -Dno-jemalloc was passed (e.g. for the Shadow
     // simulator, where jemalloc deadlocks the shim — system allocator instead).
-    const multisig_features = if (no_jemalloc) "libp2p,hashsig,multisig" else "libp2p,hashsig,multisig,jemalloc";
+    const multisig_features = if (no_jemalloc) "hashsig,multisig" else "hashsig,multisig,jemalloc";
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
             "rustup",    "run",                   "nightly",          "cargo",
@@ -956,19 +975,19 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice, no_je
             "rustup",    "run",                   "nightly",       "cargo",
             "-C",        path,                    "-Z",            "unstable-options",
             "build",     "--profile",             "risc0-release", "-p",
-            "zeam-glue", "--no-default-features", "--features",    "libp2p,hashsig,multisig,risc0",
+            "zeam-glue", "--no-default-features", "--features",    "hashsig,multisig,risc0",
         }),
         .openvm => b.addSystemCommand(&.{
             "rustup",    "run",                   "nightly",        "cargo",
             "-C",        path,                    "-Z",             "unstable-options",
             "build",     "--profile",             "openvm-release", "-p",
-            "zeam-glue", "--no-default-features", "--features",     "libp2p,hashsig,multisig,openvm",
+            "zeam-glue", "--no-default-features", "--features",     "hashsig,multisig,openvm",
         }),
         .all => b.addSystemCommand(&.{
-            "rustup",                "run",        "nightly",                              "cargo",
-            "-C",                    path,         "-Z",                                   "unstable-options",
-            "build",                 "--release",  "-p",                                   "zeam-glue",
-            "--no-default-features", "--features", "libp2p,hashsig,multisig,risc0,openvm",
+            "rustup",                "run",        "nightly",                       "cargo",
+            "-C",                    path,         "-Z",                            "unstable-options",
+            "build",                 "--release",  "-p",                            "zeam-glue",
+            "--no-default-features", "--features", "hashsig,multisig,risc0,openvm",
         }),
     };
 

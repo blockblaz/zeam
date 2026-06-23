@@ -17,6 +17,7 @@ zig-cache/
 
 # Rust/Cargo artifacts
 target/
+**/target/
 **/*.rs.bk
 
 # IDE and editor files
