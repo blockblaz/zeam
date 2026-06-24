@@ -85,6 +85,11 @@ pub fn build(b: *Builder) !void {
     // lock, which self-deadlocks (shadow/shadow#3763).
     const no_jemalloc = b.option(bool, "no-jemalloc", "Disable the jemalloc global allocator (use the system allocator). Required under the Shadow simulator, whose shim deadlocks with jemalloc's init.") orelse false;
 
+    // Build the libp2p/QUIC transport for the Shadow simulator: forwarded into the
+    // zig_libp2p dependency, which routes it to zquic so it links libc and sends
+    // clock/getrandom/UDP through libc for Shadow's preload shim to intercept.
+    const shadow = b.option(bool, "shadow", "Build the libp2p/QUIC transport for the Shadow simulator (forwards -Dshadow=true to zquic).") orelse false;
+
     const build_rust_lib_steps = build_rust_project(b, "rust", prover, no_jemalloc);
 
     // LTO option (disabled by default for faster builds)
@@ -343,6 +348,7 @@ pub fn build(b: *Builder) !void {
     const zig_libp2p_dep = b.dependency("zig_libp2p", .{
         .target = target,
         .optimize = optimize,
+        .shadow = shadow,
     });
     zeam_network.addImport("zig_libp2p", zig_libp2p_dep.module("zig_libp2p"));
 
