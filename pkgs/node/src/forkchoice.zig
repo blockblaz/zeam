@@ -2053,9 +2053,34 @@ pub const ForkChoice = struct {
         try self.attestations.put(validator_id, attestation_tracker);
     }
 
+    /// Source of an externally-supplied aggregated payload — drives the
+    /// `source_gossip_participants` / `source_payload_participants` attribution
+    /// surfaced in the per-slot "block proposal … coverage:" log and in the
+    /// `lean_aggregate_*` Prometheus families. Locally-produced aggregates
+    /// from `commitOneAggregateResult` compute their attribution from the live
+    /// payload + raw-gossip maps; this enum is for the inbound paths that
+    /// import an already-built aggregate from elsewhere.
+    pub const AggregatePayloadSource = enum {
+        /// Aggregate read out of a block body (or recovered from a Type-2
+        /// block deconstruction). Counts every covered validator on the
+        /// `payloads` line of the proposer coverage log.
+        block_payload,
+        /// Aggregate that arrived on the `/aggregation/*` gossip topic.
+        /// Counts every covered validator on the `gossip` line.
+        gossip,
+    };
+
     /// Store an aggregated signature proof keyed by AttestationData.
     /// If is_from_block, stores in latest_known_aggregated_payloads (immediately available for block building).
     /// Otherwise, stores in latest_new_aggregated_payloads (promoted to known via periodic ticks).
+    ///
+    /// `source` drives the per-validator source attribution that
+    /// `collectSourceCoverageFromPayloadsForData` reads when building the
+    /// proposer coverage log; without it every imported aggregate (including
+    /// live-gossip `/aggregation/*` arrivals) falls into the "unknown/legacy"
+    /// branch and is mis-attributed to `payloads`, which is what made
+    /// `gossip=none` show up on every proposal even after the gossip mesh
+    /// was actually delivering aggregates.
     ///
     /// Clones `proof` into fork choice; callers retain ownership of the passed-in value
     /// (required for gossip/chain-worker paths that deinit the surrounding message later).
@@ -2064,10 +2089,26 @@ pub const ForkChoice = struct {
         attestation_data: *const types.AttestationData,
         proof: types.SingleMessageAggregate,
         is_from_block: bool,
+        source: AggregatePayloadSource,
     ) !void {
         var cloned_proof = try zeam_utils.clone(types.SingleMessageAggregate, &proof, self.allocator);
         var cloned_proof_owned = true;
         errdefer if (cloned_proof_owned) cloned_proof.deinit();
+
+        // Clone `proof.participants` into the matching source-attribution slot
+        // so `collectSourceCoverageFromPayloadsForData` can credit the right
+        // source. Block-payload imports use the existing "unknown source ⇒
+        // payload-originated" else-branch in the collector and don't need an
+        // explicit clone here; gossip imports do.
+        var source_gossip_bits: ?types.AggregationBits = null;
+        var source_gossip_bits_owned = false;
+        errdefer if (source_gossip_bits_owned) {
+            if (source_gossip_bits) |*bits| bits.deinit();
+        };
+        if (source == .gossip) {
+            source_gossip_bits = try zeam_utils.clone(types.AggregationBits, &proof.participants, self.allocator);
+            source_gossip_bits_owned = true;
+        }
 
         {
             self.signatures_mutex.lock();
@@ -2086,8 +2127,10 @@ pub const ForkChoice = struct {
             try gop.value_ptr.append(self.allocator, .{
                 .slot = attestation_data.slot,
                 .proof = cloned_proof,
+                .source_gossip_participants = source_gossip_bits,
             });
             cloned_proof_owned = false;
+            source_gossip_bits_owned = false;
 
             if (is_from_block) {
                 if (self.latest_block_aggregated_payloads_slot == null or self.latest_block_aggregated_payloads_slot.? != attestation_data.slot) {
@@ -2668,32 +2711,20 @@ pub const ForkChoice = struct {
         att_data: types.AttestationData,
         signature: types.SingleMessageAggregate,
     ) !?types.SignedAggregatedAttestation {
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-
+        // #863: keep the worker's `signatures_mutex` hold minimal so the libxev
+        // interval-4 tick (`acceptNewAttestations`) does not stall for seconds
+        // waiting behind this commit on the aggregator. The SSZ serialize/
+        // deserialize of the proof is worker-local and touches no shared map,
+        // so it runs LOCK-FREE; only the duplicate check, source attribution
+        // (which reads the payload/signature maps) and the payload-map mutation
+        // are taken under the lock below.
         var owned_signature = signature;
         var signature_live = true;
         errdefer if (signature_live) owned_signature.deinit();
 
-        if (shouldSuppressDuplicateAggregateCommit(snap, att_data, &self.attestation_signatures)) {
-            self.logger.debug(
-                "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
-                .{att_data.slot},
-            );
-            owned_signature.deinit();
-            signature_live = false;
-            return null;
-        }
-
-        var source_payload_bits = try types.AggregationBits.init(self.allocator);
-        var source_payload_bits_owned = true;
-        errdefer if (source_payload_bits_owned) source_payload_bits.deinit();
-        var source_gossip_bits = try types.AggregationBits.init(self.allocator);
-        var source_gossip_bits_owned = true;
-        errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
         // ssz.serialize corrupts the source value; serialize once, deinit the
         // worker proof, then deserialize separate copies for store and publish
-        // so no fallible step runs while signature_live is true.
+        // so no fallible step runs while signature_live is true. All lock-free.
         var stored_proof: types.SingleMessageAggregate = undefined;
         var stored_proof_owned = false;
         errdefer if (stored_proof_owned) stored_proof.deinit();
@@ -2708,67 +2739,96 @@ pub const ForkChoice = struct {
         try ssz.deserialize(types.SingleMessageAggregate, proof_bytes, &stored_proof, self.allocator);
         stored_proof_owned = true;
 
-        try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
-
         var participant_count: u64 = 0;
         for (0..stored_proof.participants.len()) |i| {
             if (stored_proof.participants.get(i) catch false) participant_count += 1;
         }
 
-        const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-
-        // Drop any existing stored aggregate whose participants are fully
-        // contained in the new one (deferred-aggregation path). With
-        // the live-raws change below, successive aggregator ticks re-prove
-        // flat over a growing raw set, so the new aggregate normally
-        // dominates every prior aggregate for this att_data. Without this
-        // pass the payload list would accumulate one strictly-dominated
-        // entry per tick until finalization pruned them.
+        // Locked phase: everything that reads/writes the shared signature and
+        // aggregated-payload maps. The block-scoped `defer unlock` releases on
+        // every exit (the suppress-case early return and any `try` error);
+        // the outer errdefer frees `stored_proof` if we bail before handoff.
         {
-            var idx: usize = 0;
-            while (idx < gop.value_ptr.items.len) {
-                if (types.participantsContainsAll(stored_proof.participants, gop.value_ptr.items[idx].proof.participants)) {
-                    var dropped = gop.value_ptr.swapRemove(idx);
-                    dropped.proof.deinit();
-                    if (dropped.source_payload_participants) |*bits| bits.deinit();
-                    if (dropped.source_gossip_participants) |*bits| bits.deinit();
-                } else {
-                    idx += 1;
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+
+            if (shouldSuppressDuplicateAggregateCommit(snap, att_data, &self.attestation_signatures)) {
+                self.logger.debug(
+                    "suppress duplicate aggregate commit att_data slot={d} (snapshot gossip already consumed)",
+                    .{att_data.slot},
+                );
+                // `return null` is a normal (non-error) return, so the outer
+                // `errdefer` on stored_proof does NOT run — free it explicitly
+                // to avoid leaking the deserialized proof on the suppress path.
+                stored_proof.deinit();
+                stored_proof_owned = false;
+                return null;
+            }
+
+            var source_payload_bits = try types.AggregationBits.init(self.allocator);
+            var source_payload_bits_owned = true;
+            errdefer if (source_payload_bits_owned) source_payload_bits.deinit();
+            var source_gossip_bits = try types.AggregationBits.init(self.allocator);
+            var source_gossip_bits_owned = true;
+            errdefer if (source_gossip_bits_owned) source_gossip_bits.deinit();
+
+            try self.buildAggregateSourceAttribution(att_data, &stored_proof, &source_payload_bits, &source_gossip_bits);
+
+            const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+
+            // Drop any existing stored aggregate whose participants are fully
+            // contained in the new one (deferred-aggregation path). With
+            // the live-raws change below, successive aggregator ticks re-prove
+            // flat over a growing raw set, so the new aggregate normally
+            // dominates every prior aggregate for this att_data. Without this
+            // pass the payload list would accumulate one strictly-dominated
+            // entry per tick until finalization pruned them.
+            {
+                var idx: usize = 0;
+                while (idx < gop.value_ptr.items.len) {
+                    if (types.participantsContainsAll(stored_proof.participants, gop.value_ptr.items[idx].proof.participants)) {
+                        var dropped = gop.value_ptr.swapRemove(idx);
+                        dropped.proof.deinit();
+                        if (dropped.source_payload_participants) |*bits| bits.deinit();
+                        if (dropped.source_gossip_participants) |*bits| bits.deinit();
+                    } else {
+                        idx += 1;
+                    }
                 }
             }
-        }
 
-        try gop.value_ptr.append(self.allocator, .{
-            .slot = att_data.slot,
-            .proof = stored_proof,
-            .source_payload_participants = source_payload_bits,
-            .source_gossip_participants = source_gossip_bits,
-        });
-        stored_proof_owned = false;
-        source_payload_bits_owned = false;
-        source_gossip_bits_owned = false;
+            try gop.value_ptr.append(self.allocator, .{
+                .slot = att_data.slot,
+                .proof = stored_proof,
+                .source_payload_participants = source_payload_bits,
+                .source_gossip_participants = source_gossip_bits,
+            });
+            stored_proof_owned = false;
+            source_payload_bits_owned = false;
+            source_gossip_bits_owned = false;
 
-        // Drop the snapshot's per-att_data inner map (snapshot ownership only).
-        //
-        // The previous implementation also deleted the snapshot's vids from the
-        // LIVE `attestation_signatures` map, freeing memory but forcing every
-        // subsequent aggregator tick to recursively merge the just-committed
-        // aggregate (now sitting in `latest_new_aggregated_payloads`) with any
-        // newly-arrived raws. That merge fires `rec_xmss_aggregate` with
-        // children, which costs ~4.5 s on the aggregator vs ~0.5 s for
-        // an equivalent flat re-prove (99.97% of cost is
-        // the STARK kernel, recursive proves dominate the p95 tail).
-        //
-        // Keeping raws live lets `prepareAggregateAttData` flat-re-prove over
-        // the larger raw set on later ticks; the `anyStoredProofCoversAll`
-        // pre-check there short-circuits when nothing new has arrived, so we
-        // do not re-aggregate redundantly. Memory is still bounded — the
-        // finalization-driven prune at `pruneStaleSignatures` removes
-        // signatures whose `head.slot <= finalized_slot`, same as before.
-        if (snap.signatures.fetchRemove(att_data)) |snap_inner_kv| {
-            var snap_inner = snap_inner_kv.value;
-            snap_inner.deinit();
+            // Drop the snapshot's per-att_data inner map (snapshot ownership only).
+            //
+            // The previous implementation also deleted the snapshot's vids from the
+            // LIVE `attestation_signatures` map, freeing memory but forcing every
+            // subsequent aggregator tick to recursively merge the just-committed
+            // aggregate (now sitting in `latest_new_aggregated_payloads`) with any
+            // newly-arrived raws. That merge fires `rec_xmss_aggregate` with
+            // children, which costs ~4.5 s on the aggregator vs ~0.5 s for
+            // an equivalent flat re-prove (99.97% of cost is
+            // the STARK kernel, recursive proves dominate the p95 tail).
+            //
+            // Keeping raws live lets `prepareAggregateAttData` flat-re-prove over
+            // the larger raw set on later ticks; the `anyStoredProofCoversAll`
+            // pre-check there short-circuits when nothing new has arrived, so we
+            // do not re-aggregate redundantly. Memory is still bounded — the
+            // finalization-driven prune at `pruneStaleSignatures` removes
+            // signatures whose `target.slot <= finalized_slot`, same as before.
+            if (snap.signatures.fetchRemove(att_data)) |snap_inner_kv| {
+                var snap_inner = snap_inner_kv.value;
+                snap_inner.deinit();
+            }
         }
 
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incr();
@@ -4424,7 +4484,7 @@ fn stageAggregatedAttestation(
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
 
-    try fork_choice.storeAggregatedPayload(&signed_attestation.message, proof, false);
+    try fork_choice.storeAggregatedPayload(&signed_attestation.message, proof, false, .block_payload);
 }
 
 // Rebase tests build ForkChoice structs in helper functions that outlive the helper scope.
@@ -5183,8 +5243,15 @@ fn collectSourceCoverageFromPayloadsForData(
             for (0..source_payload.len()) |validator_index| {
                 markCoverageValidatorOnly(source_payload, validator_index, committee_count, payload_seen);
             }
-        } else {
-            // Unknown/legacy source: treat the child payload itself as payload-originated.
+        } else if (stored.source_gossip_participants == null) {
+            // Unknown/legacy source: when NEITHER attribution field is set,
+            // treat the child payload itself as payload-originated. A
+            // gossip-attributed payload (source_gossip_participants != null,
+            // source_payload_participants == null) must NOT fall into this
+            // branch, otherwise every gossip-imported validator would also
+            // be credited as payload-originated and the proposer-coverage
+            // formatter (which prefers `payload_seen` over `gossip_available`)
+            // would surface `gossip=none` despite live gossip aggregates.
             for (0..stored.proof.participants.len()) |validator_index| {
                 markCoverageValidatorOnly(stored.proof.participants, validator_index, committee_count, payload_seen);
             }
@@ -5621,7 +5688,7 @@ test "getProposalAttestations: high-target keys survive cap with stale low-targe
         var proof = try types.SingleMessageAggregate.init(allocator);
         defer proof.deinit();
         try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
-        try ctx.fork_choice.storeAggregatedPayload(data, proof, true);
+        try ctx.fork_choice.storeAggregatedPayload(data, proof, true, .block_payload);
     }
 
     // Use an already-elapsed deadline so this selection-level regression test

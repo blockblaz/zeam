@@ -15,7 +15,6 @@ edition = "2021"
 # Funnelling every glue rlib through a single staticlib emits the shim once.
 
 [dependencies]
-libp2p-glue   = { path = "../libp2p-glue",   optional = true }
 hashsig-glue  = { path = "../hashsig-glue",  optional = true }
 multisig-glue = { path = "../multisig-glue", optional = true }
 risc0-glue    = { path = "../risc0-glue",    optional = true }
@@ -32,7 +31,6 @@ tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_support
 [features]
 # Features are intentionally additive and have no defaults so `build.zig`
 # can opt into exactly the set that matches the requested `-Dprover=...`.
-libp2p   = ["dep:libp2p-glue"]
 hashsig  = ["dep:hashsig-glue"]
 multisig = ["dep:multisig-glue"]
 risc0    = ["dep:risc0-glue"]

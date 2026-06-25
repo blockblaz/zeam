@@ -829,7 +829,7 @@ fn processBlockStep(
             validator_ids[i] = @intCast(vi);
         }
 
-        ctx.fork_choice.storeAggregatedPayload(&aggregated_attestation.data, proof_template, true) catch |err| {
+        ctx.fork_choice.storeAggregatedPayload(&aggregated_attestation.data, proof_template, true, .block_payload) catch |err| {
             std.debug.print(
                 "fixture {s} case {s}{f}: failed to store aggregated payload ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -1113,7 +1113,7 @@ fn processGossipAggregatedAttestationStep(
     proof.participants.deinit();
     proof.participants = cloned_bits;
 
-    ctx.fork_choice.storeAggregatedPayload(&attestation_data, proof, false) catch |err| {
+    ctx.fork_choice.storeAggregatedPayload(&attestation_data, proof, false, .block_payload) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{f}: failed to store aggregated payload ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
