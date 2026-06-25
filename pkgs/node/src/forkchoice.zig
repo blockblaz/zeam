@@ -1480,6 +1480,7 @@ pub const ForkChoice = struct {
         slot: types.Slot,
         parent_root: [32]u8,
         deadline_ns: ?i64,
+        allow_type1_compaction: bool,
     ) !ProposalAttestationsResult {
         var agg_attestations = try types.AggregatedAttestations.init(self.allocator);
         var agg_att_cleanup = true;
@@ -1594,11 +1595,17 @@ pub const ForkChoice = struct {
                 try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
                 try attestation_signatures.append(cloned_proof);
                 child_payloads_consumed += 1;
+
+                // Interval-0 block production must not start Type-1 aggregation.
+                // In that mode, package the best already-warmed Type-1 proof for
+                // this AttestationData and leave any further coverage for a later
+                // interval-4 warm-up.
+                if (!allow_type1_compaction) break;
             }
         }
         observeProposalBuildPhase("select_payloads", select_start_ns);
 
-        if (agg_attestations.constSlice().len > 0) {
+        if (allow_type1_compaction and agg_attestations.constSlice().len > 0) {
             // Compact: merge proofs sharing the same AttestationData into one so
             // each AttestationData appears at most once. Runs exactly ONCE now —
             // the projection replaced the per-justification fixed-point loop.
@@ -2562,9 +2569,10 @@ pub const ForkChoice = struct {
 
         // Pre-dispatch deadline gate. The FFI prove is uninterruptible, so a
         // deadline can only prevent STARTING the prove batch (mirrors
-        // compactAttestations' loop-boundary check), never truncate mid-FFI. The
-        // interval-4 warm-up passes a 100%-of-interval deadline (never trips); the
-        // interval-0 re-aggregate passes the tight type1_aggregation_deadline_pct.
+        // compactAttestations' loop-boundary check), never truncate mid-FFI.
+        // Interval-4 warm-up is the only proposal Type-1 window; interval-0 block
+        // packaging uses `getProposalAttestationsPreAggregated` and does not enter
+        // this path.
         if (deadline_ns) |d| {
             if (zeam_utils.monotonicTimestampNs() >= @as(i128, d)) {
                 self.logger.debug("aggregateUnlocked: past deadline, skipping {d} selected key(s)", .{selected_keys.len});
@@ -2595,8 +2603,8 @@ pub const ForkChoice = struct {
 
         if (force_serial or selected_keys.len <= 1) {
             // Serial prove on the calling worker (no nested ThreadPool dispatch).
-            // Covers the single-key fast path AND the proposer warm-up /
-            // re-aggregate (`force_serial`), which proves up to the cap serially.
+            // Covers the single-key fast path AND the proposer warm-up
+            // (`force_serial`), which proves up to the cap serially.
             // Dispatching that batch through
             // `computeAggregatedSignaturesForKeys` would run each prove's internal
             // rayon on top of the ThreadPool fan-out — the ThreadPool x rayon
@@ -2604,8 +2612,9 @@ pub const ForkChoice = struct {
             // few-core box each prove runs slower and the batch can exceed its
             // serial cost. The warm-up owns a full interval, so serial proving
             // (each prove gets the whole rayon budget) is correct and faster. The
-            // deadline is re-checked per key so a tight interval-0 budget bounds the
-            // batch (the FFI is uninterruptible, so this only gates STARTING a key).
+            // deadline is re-checked per key so the interval-4 warm-up budget
+            // bounds the batch (the FFI is uninterruptible, so this only gates
+            // STARTING a key).
             for (selected_keys) |key| {
                 if (deadline_ns) |d| {
                     if (zeam_utils.monotonicTimestampNs() >= @as(i128, d)) {
@@ -2898,9 +2907,9 @@ pub const ForkChoice = struct {
         return self.aggregateUnlocked(validators, slots, pre_state, proposal_slot, cap, false, null, publish_ctx, publish_fn);
     }
 
-    /// Proposer warm-up / interval-0 re-aggregate: aggregate the att_data a block
-    /// at `proposal_slot` (on `pre_state`) would select — the same projection used
-    /// by block production, capped at `max_attestations_data` — into
+    /// Proposer warm-up: aggregate the att_data a block at `proposal_slot`
+    /// (on `pre_state`) would select — the same projection used by block
+    /// production, capped at `max_attestations_data` — into
     /// `latest_new_aggregated_payloads`, bounded by a pre-dispatch `deadline_ns`
     /// (the FFI itself is uninterruptible). Proves serially: the warm-up owns a full
     /// interval, so each prove gets the whole rayon budget (avoids #925
@@ -3202,7 +3211,22 @@ pub const ForkChoice = struct {
     ) !ProposalAttestationsResult {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        return self.getProposalAttestationsUnlocked(pre_state, slot, parent_root, deadline_ns);
+        return self.getProposalAttestationsUnlocked(pre_state, slot, parent_root, deadline_ns, true);
+    }
+
+    /// Build the proposer's attestation list without starting any Type-1 work.
+    /// Interval-4 is the only Type-1 aggregation window; interval-0 only packages
+    /// already-warmed Type-1 proofs so it can proceed directly to signing and the
+    /// Type-2 block proof.
+    pub fn getProposalAttestationsPreAggregated(
+        self: *Self,
+        pre_state: *const types.BeamState,
+        slot: types.Slot,
+        parent_root: [32]u8,
+    ) !ProposalAttestationsResult {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getProposalAttestationsUnlocked(pre_state, slot, parent_root, null, false);
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {

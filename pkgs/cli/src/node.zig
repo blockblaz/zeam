@@ -125,8 +125,8 @@ pub const NodeOptions = struct {
     /// free of this filtering). Surfaced as `--min-aggregation-inputs` on the
     /// `zeam node` CLI; default is `default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
-    /// Percentage of the proposal interval allocated as the build-worker
-    /// deadline budget.
+    /// Percentage of the proposal interval allocated to interval-4 Type-1
+    /// warm-up. Interval-0 proposal packaging does not run Type-1 aggregation.
     type1_aggregation_deadline_pct: u32 = node_lib.default_type1_aggregation_deadline_pct,
     /// Cap on the number of child STARK proofs merged with raw signatures
     /// by the aggregator-worker path. Threaded through to
