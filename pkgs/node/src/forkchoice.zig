@@ -1523,7 +1523,7 @@ pub const ForkChoice = struct {
                 if (att_data.target.slot <= att_data.source.slot) continue;
                 const voters = try self.allocator.alloc(u8, num_validators);
                 @memset(voters, 0);
-                unionPayloadParticipants(entry.value_ptr.*, voters);
+                proposalCandidateParticipants(entry.value_ptr.*, voters, allow_type1_compaction);
                 candidates.append(self.allocator, .{ .att_data = att_data, .voters = voters }) catch |e| {
                     self.allocator.free(voters);
                     return e;
@@ -4761,6 +4761,52 @@ fn unionPayloadParticipants(maybe_list: ?AggregatedPayloadsList, out: []u8) void
     }
 }
 
+fn copyPayloadParticipants(stored: *const types.StoredAggregatedPayload, out: []u8) void {
+    const p = &stored.proof.participants;
+    const plen = p.len();
+    var i: usize = 0;
+    while (i < plen and i < out.len) : (i += 1) {
+        if (p.get(i) catch false) out[i] = 1;
+    }
+}
+
+fn payloadParticipantCount(stored: *const types.StoredAggregatedPayload, limit: usize) usize {
+    const p = &stored.proof.participants;
+    const plen = @min(p.len(), limit);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < plen) : (i += 1) {
+        if (p.get(i) catch false) count += 1;
+    }
+    return count;
+}
+
+/// Build the proposal selector's voter set from stored Type-1 payloads.
+///
+/// When proposal-time compaction is enabled, the block can merge every stored
+/// proof for an AttestationData, so the projection may count their union. When
+/// compaction is disabled, interval-0 can include only one already-warmed proof
+/// for that AttestationData; model the same first-largest proof the packaging
+/// loop chooses from an initially empty coverage set.
+fn proposalCandidateParticipants(maybe_list: ?AggregatedPayloadsList, out: []u8, allow_type1_compaction: bool) void {
+    const list = maybe_list orelse return;
+    if (allow_type1_compaction) {
+        unionPayloadParticipants(list, out);
+        return;
+    }
+
+    var best: ?usize = null;
+    var best_count: usize = 0;
+    for (list.items, 0..) |*stored, idx| {
+        const count = payloadParticipantCount(stored, out.len);
+        if (count > best_count) {
+            best = idx;
+            best_count = count;
+        }
+    }
+    if (best) |idx| copyPayloadParticipants(&list.items[idx], out);
+}
+
 /// Union of all validator indices available for `key` in the snapshot — raw
 /// gossip signature voters plus every proof's participants across new and known
 /// payloads — written as 1-per-validator into `out` (len == num_validators,
@@ -4856,6 +4902,32 @@ fn makeStoredPayloadForTest(allocator: Allocator, slot: types.Slot, covered_vids
         try types.aggregationBitsSet(&proof.participants, vid, true);
     }
     return .{ .slot = slot, .proof = proof };
+}
+
+test "proposalCandidateParticipants models union only when compaction is enabled" {
+    const allocator = std.testing.allocator;
+
+    var list: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &list);
+
+    {
+        var payload = try makeStoredPayloadForTest(allocator, 1, &.{ 0, 1 });
+        errdefer payload.proof.deinit();
+        try list.append(allocator, payload);
+    }
+    {
+        var payload = try makeStoredPayloadForTest(allocator, 1, &.{ 2, 3, 4 });
+        errdefer payload.proof.deinit();
+        try list.append(allocator, payload);
+    }
+
+    var out = [_]u8{0} ** 5;
+    proposalCandidateParticipants(list, out[0..], false);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 1, 1 }, out[0..]);
+
+    @memset(out[0..], 0);
+    proposalCandidateParticipants(list, out[0..], true);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1, 1 }, out[0..]);
 }
 
 test "snapshotKeyFullyCovered (#985): payload-only key with two payloads is mergeable, not covered" {
