@@ -125,9 +125,9 @@ pub const NodeOptions = struct {
     /// free of this filtering). Surfaced as `--min-aggregation-inputs` on the
     /// `zeam node` CLI; default is `default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
-    /// Percentage of the proposal interval allocated as the build-worker
-    /// deadline budget.
-    proposal_deadline_pct: u32 = node_lib.default_proposal_deadline_pct,
+    /// Percentage of the proposal interval allocated to interval-4 Type-1
+    /// warm-up. Interval-0 proposal packaging does not run Type-1 aggregation.
+    type1_aggregation_deadline_pct: u32 = node_lib.default_type1_aggregation_deadline_pct,
     /// Cap on the number of child STARK proofs merged with raw signatures
     /// by the aggregator-worker path. Threaded through to
     /// `ForkChoice.max_aggregation_children` and applied by
@@ -660,7 +660,7 @@ pub const Node = struct {
             .max_aggregation_children = options.max_aggregation_children,
             .max_aggregations_per_tick = options.max_aggregations_per_tick,
             .aggregate_max_inflight = aggregate_max_inflight,
-            .proposal_deadline_pct = options.proposal_deadline_pct,
+            .type1_aggregation_deadline_pct = options.type1_aggregation_deadline_pct,
         });
         errdefer self.beam_node.deinit();
 

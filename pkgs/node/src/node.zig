@@ -71,8 +71,8 @@ const NodeOpts = struct {
     max_aggregations_per_tick: u32 = types.default_max_aggregations_per_tick,
     /// Soft cap on concurrent aggregate workers (`BeamChain.aggregate_inflight`).
     aggregate_max_inflight: u32 = 4,
-    /// See `chainFactory.ChainOpts.proposal_deadline_pct`.
-    proposal_deadline_pct: u32 = chainFactory.default_proposal_deadline_pct,
+    /// See `chainFactory.ChainOpts.type1_aggregation_deadline_pct`.
+    type1_aggregation_deadline_pct: u32 = chainFactory.default_type1_aggregation_deadline_pct,
 };
 
 /// blocks_by_root retry backoff (interop storm fix). A requested block root that no peer can
@@ -238,7 +238,7 @@ pub const BeamNode = struct {
                 .max_aggregation_children = opts.max_aggregation_children,
                 .max_aggregations_per_tick = opts.max_aggregations_per_tick,
                 .aggregate_max_inflight = opts.aggregate_max_inflight,
-                .proposal_deadline_pct = opts.proposal_deadline_pct,
+                .type1_aggregation_deadline_pct = opts.type1_aggregation_deadline_pct,
             },
             network.connected_peers,
         ) catch |init_err| {

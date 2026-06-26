@@ -618,6 +618,45 @@ pub const BeamState = struct {
         self.justifications_validators.deinit();
     }
 
+    /// Allocate an owned partial clone for the projection-based attestation_data
+    /// selector when it runs with chain-matching OFF (the interval-2 aggregator
+    /// and interval-4 warm-up). That path reads only validators, justified_slots,
+    /// the justified/finalized checkpoints and the pending justifications — never
+    /// `historical_block_hashes`, the chain's largest field — so this skips cloning
+    /// it (leaves it empty) to avoid multi-MB copies on every aggregation tick.
+    /// Deinit with `deinit()` + `allocator.destroy()` like any owned BeamState.
+    /// MUST NOT be used where the selector needs chain-matching (the block
+    /// builder), which reads `historical_block_hashes`.
+    pub fn cloneForProjection(self: *const Self, allocator: Allocator) !*Self {
+        const out = try allocator.create(Self);
+        errdefer allocator.destroy(out);
+
+        var validators = try zeam_utils.clone(Validators, &self.validators, allocator);
+        errdefer validators.deinit();
+        var justified_slots = try zeam_utils.clone(JustifiedSlots, &self.justified_slots, allocator);
+        errdefer justified_slots.deinit();
+        var justifications_roots = try zeam_utils.clone(JustificationRoots, &self.justifications_roots, allocator);
+        errdefer justifications_roots.deinit();
+        var justifications_validators = try zeam_utils.clone(JustificationValidators, &self.justifications_validators, allocator);
+        errdefer justifications_validators.deinit();
+        var historical_block_hashes = try HistoricalBlockHashes.init(allocator);
+        errdefer historical_block_hashes.deinit();
+
+        out.* = .{
+            .config = self.config,
+            .slot = self.slot,
+            .latest_block_header = self.latest_block_header,
+            .latest_justified = self.latest_justified,
+            .latest_finalized = self.latest_finalized,
+            .historical_block_hashes = historical_block_hashes,
+            .justified_slots = justified_slots,
+            .validators = validators,
+            .justifications_roots = justifications_roots,
+            .justifications_validators = justifications_validators,
+        };
+        return out;
+    }
+
     pub fn toJson(self: *const BeamState, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.empty;
         try obj.put(allocator, "config", try self.config.toJson(allocator));
@@ -916,6 +955,39 @@ test "process_attestations silently skips pre-finalized target attestations" {
 
     // Must succeed: the pre-finalized attestation is skipped, not an error.
     try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+}
+
+test "cloneForProjection clones projection fields and leaves historical_block_hashes empty" {
+    const allocator = std.testing.allocator;
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+
+    var state = try makeGenesisState(allocator, 3);
+    defer state.deinit();
+
+    // Advance a slot so historical_block_hashes is non-empty — the partial clone
+    // must still diverge from a full clone only on that field.
+    try state.process_slots(allocator, 1, logger);
+    var block_1 = try makeBlock(allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_1.deinit();
+    try state.process_block(allocator, block_1, logger, null);
+    try std.testing.expect(state.historical_block_hashes.len() > 0);
+
+    const cloned = try state.cloneForProjection(allocator);
+    defer {
+        cloned.deinit();
+        allocator.destroy(cloned);
+    }
+
+    // Projection-relevant fields cloned faithfully; historical_block_hashes empty.
+    try std.testing.expectEqual(state.validatorCount(), cloned.validatorCount());
+    try std.testing.expectEqual(@as(usize, 0), cloned.historical_block_hashes.len());
+    try std.testing.expectEqual(state.justified_slots.len(), cloned.justified_slots.len());
+    try std.testing.expectEqual(state.latest_finalized.slot, cloned.latest_finalized.slot);
+    try std.testing.expectEqual(state.latest_justified.slot, cloned.latest_justified.slot);
+    try std.testing.expectEqual(state.justifications_roots.len(), cloned.justifications_roots.len());
+    try std.testing.expectEqual(state.justifications_validators.len(), cloned.justifications_validators.len());
+    // Both deinit cleanly under std.testing.allocator => deep copy, no leak / double-free.
 }
 
 test "process_attestations silently skips head root off the canonical chain" {
