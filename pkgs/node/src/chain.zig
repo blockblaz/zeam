@@ -2980,11 +2980,20 @@ pub const BeamChain = struct {
 
         self.logger.info("calculated target for attestations at slot={d}: {s}", .{ slot, target_str });
 
+        // Source must match the head we're voting on: use the head state's own
+        // latest_justified, not the fork-choice store's global-max justified
+        // (fcStore.latest_justified is the running max across all processed blocks and
+        // can run ahead of this head). This keeps the signed attestation's source
+        // consistent with the chain it attests to.
+        var head_borrow = self.statesGet(head_proto.blockRoot) orelse return error.MissingHeadState;
+        const source = head_borrow.state.latest_justified;
+        head_borrow.deinit();
+
         const attestation_data = types.AttestationData{
             .slot = slot,
             .head = head,
             .target = target,
-            .source = self.forkChoice.getLatestJustified(),
+            .source = source,
         };
 
         return attestation_data;
