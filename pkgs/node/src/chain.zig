@@ -5650,10 +5650,20 @@ pub const BeamChain = struct {
         // `shouldCatchUpFromPeerStatus` directly so a peer that reports
         // a higher head triggers catch-up without a state transition.
 
-        // Our head or finalization is behind peer finalization.
-        // Include the exact peers whose finalized slots make this node report
-        // `peers_materially_ahead`, so logs can name the source of the decision.
-        const behind_peer_finalization = our_head_slot < max_peer_finalized_slot or our_finalized_slot < max_peer_finalized_slot;
+        // Materially behind == DEEP SYNC: we are missing finalized blocks a peer
+        // already has, i.e. our HEAD is behind the peer's finalized slot. Gate ONLY
+        // on head lag.
+        //
+        // A finalized lag with a SYNCED head (our_head_slot >= max_peer_finalized_slot
+        // but our_finalized_slot < max_peer_finalized_slot) is NOT deep sync — we
+        // already hold every block the peer has finalized; we simply haven't
+        // locally finalized that far yet. That is a consensus OUTCOME, not a data
+        // gap, and the cure is to PARTICIPATE (aggregate/attest/propose), not skip.
+        // Gating on `our_finalized_slot < max_peer_finalized_slot` here deadlocks:
+        // a node at head=337/finalized=0 with a peer at finalized=6 skips
+        // aggregation forever, so finalization never advances and it stays "behind"
+        // (live: all 32 nodes head-synced, justified frozen at 9, finalized 0–6).
+        const behind_peer_finalization = our_head_slot < max_peer_finalized_slot;
         if (behind_peer_finalization) {
             var info = self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
             var cause_guard = self.connected_peers.iterateLocked();
@@ -5662,7 +5672,7 @@ pub const BeamChain = struct {
             while (cause_iter.next()) |entry| {
                 const peer_info = entry.value_ptr;
                 if (peer_info.latest_status) |status| {
-                    if (status.finalized_slot > our_head_slot or status.finalized_slot > our_finalized_slot) {
+                    if (status.finalized_slot > our_head_slot) {
                         info.peers_materially_ahead.addPeer(peer_info.peer_id, status.finalized_slot);
                     }
                 }
