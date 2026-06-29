@@ -62,7 +62,7 @@
         },
         .zig_libp2p = .{
             .url = "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.2.63.tar.gz",
-            .hash = "zig_libp2p-0.2.62-lil2hNS3KQBlOtyx0ZDepR6YkRfqrSgolr0XQowL6hPU",
+            .hash = "zig_libp2p-0.2.63-lil2hAXPKQDQhZJ51wvZN4M39B_JU-sSEYaSP0KOgRax",
         },
     },
     .paths = .{""},
