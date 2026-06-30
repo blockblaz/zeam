@@ -3912,6 +3912,14 @@ pub const BeamChain = struct {
                 }
             }
 
+            // Snapshot the finalized slot once for the loop's stale-fetch guard
+            // below. The lean spec's `prune_stale_attestation_data` treats an
+            // attestation whose `head.slot <= latest_finalized.slot` as STALE
+            // (it can't move fork choice), and the store prunes all block/state
+            // history below finalized — so a `blocks-by-root` fetch for such a
+            // head root is futile (the block is pruned and unservable).
+            const finalized_slot_for_fetch_guard = self.forkChoice.getLatestFinalized().slot;
+
             for (aggregated_attestations) |aggregated_attestation| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
@@ -3920,7 +3928,18 @@ pub const BeamChain = struct {
                 self.validateAttestationData(aggregated_attestation.data, true) catch |e| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     if (e == AttestationValidationError.UnknownHeadBlock) {
-                        try missing_roots.append(self.allocator, aggregated_attestation.data.head.root);
+                        // Only enqueue a fetch for a head root we could plausibly
+                        // be served. `validate_attestation` REJECTS unknown
+                        // source/target/head (it never fetches) — the fetch here
+                        // is zeam's own sync helper, not spec. Skip it when the
+                        // head is at/below finalized (spec staleness key
+                        // `head.slot <= latest_finalized.slot`): that block is
+                        // pruned and the fetch only drives a futile req/resp
+                        // storm. The attestation is still dropped exactly as
+                        // before — only the fetch is suppressed.
+                        if (aggregated_attestation.data.head.slot > finalized_slot_for_fetch_guard) {
+                            try missing_roots.append(self.allocator, aggregated_attestation.data.head.root);
+                        }
                     }
                     self.logger.err("invalid aggregated attestation data in block: error={any}", .{e});
                     continue;
@@ -4752,7 +4771,20 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        try self.validateAttestationData(signedAggregation.data, false);
+        // Cross-client aggregate-ingest diagnostics: a foreign-subnet aggregate
+        // that fails fork-choice validation is otherwise dropped silently
+        // (node.zig warns only on Unknown*Block-when-not-pending; every other
+        // GossipAttestationValidationError variant propagates as a bare error).
+        // Surface the exact variant + checkpoint fields so a cross-impl
+        // AttestationData/Checkpoint convention mismatch is diagnosable from logs.
+        const ad = signedAggregation.data;
+        self.validateAttestationData(ad, false) catch |err| {
+            self.logger.debug(
+                "aggregate-ingest validation failed err={any} slot={d} source=(0x{x},slot={d}) target=(0x{x},slot={d}) head=(0x{x},slot={d})",
+                .{ err, ad.slot, &ad.source.root, ad.source.slot, &ad.target.root, ad.target.slot, &ad.head.root, ad.head.slot },
+            );
+            return err;
+        };
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);

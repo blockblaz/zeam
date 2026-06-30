@@ -39,9 +39,12 @@ fn quicAwareLogFn(
     args: anytype,
 ) void {
     if (comptime isQuicStackScope(scope)) {
-        // Levels are err=0, warn=1, info=2, debug=3.  We only gate the
-        // chattier levels (>= info); warn/err always pass through.
-        if (comptime @intFromEnum(level) >= @intFromEnum(std.log.Level.info)) {
+        // Levels are err=0, warn=1, info=2, debug=3.  Gate warn/info/debug
+        // behind DEBUG_QUIC (rust-libp2p principle: the QUIC transport's
+        // backpressure/outbox/SLOW-drive chatter is operational noise, off by
+        // default — set DEBUG_QUIC to surface it). Only err always passes
+        // through so a genuine fatal transport failure stays visible.
+        if (comptime @intFromEnum(level) >= @intFromEnum(std.log.Level.warn)) {
             if (!quic_debug_enabled.load(.monotonic)) return;
         }
     }
