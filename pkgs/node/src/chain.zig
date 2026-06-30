@@ -4752,7 +4752,20 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        try self.validateAttestationData(signedAggregation.data, false);
+        // Cross-client aggregate-ingest diagnostics: a foreign-subnet aggregate
+        // that fails fork-choice validation is otherwise dropped silently
+        // (node.zig warns only on Unknown*Block-when-not-pending; every other
+        // GossipAttestationValidationError variant propagates as a bare error).
+        // Surface the exact variant + checkpoint fields so a cross-impl
+        // AttestationData/Checkpoint convention mismatch is diagnosable from logs.
+        const ad = signedAggregation.data;
+        self.validateAttestationData(ad, false) catch |err| {
+            self.logger.warn(
+                "aggregate-ingest validation failed err={any} slot={d} source=(0x{x},slot={d}) target=(0x{x},slot={d}) head=(0x{x},slot={d})",
+                .{ err, ad.slot, &ad.source.root, ad.source.slot, &ad.target.root, ad.target.slot, &ad.head.root, ad.head.slot },
+            );
+            return err;
+        };
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
