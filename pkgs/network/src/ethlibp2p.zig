@@ -491,6 +491,7 @@ pub const EthLibp2p = struct {
     /// is written to disk.
     fn startQuicTransport(self: *Self) !void {
         const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
+        _ = now_sec;
         const host_pub_compressed: [33]u8 = self.host_signer.kp.public_key.toCompressedSec1();
 
         var cert_seed: [32]u8 = undefined;
@@ -504,8 +505,8 @@ pub const EthLibp2p = struct {
                     .sign_ctx = self.host_signer,
                 },
             },
-            .not_before_sec = now_sec - 3600,
-            .not_after_sec = now_sec + 365 * 24 * 3600,
+            .not_before_sec = 315_532_800, // 1980; wide fixed window (Shadow startup clock reads ~0)
+            .not_after_sec = 7_258_118_400, // 2200
             .cert_key_seed = cert_seed,
         });
         defer gen.deinit(self.allocator);
