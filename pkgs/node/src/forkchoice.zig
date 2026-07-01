@@ -1338,7 +1338,9 @@ pub const ForkChoice = struct {
     /// target.root. The finalization prune is intentionally omitted: any target
     /// whose slot is at/behind the new finalized boundary is treated as
     /// already-justified by the eligibility filter, so a stale voter bucket can
-    /// never be re-counted (see plan note).
+    /// never be re-counted (see plan note). Returns true iff this pick pushed its
+    /// target over 2/3 and newly justified it (i.e. moved justification forward);
+    /// callers use this to trim trailing picks that don't move finality.
     fn projectionSettle(
         allocator: Allocator,
         votes: *std.AutoHashMapUnmanaged(types.Root, []u8),
@@ -1346,13 +1348,13 @@ pub const ForkChoice = struct {
         finalized_slot: *types.Slot,
         ad: types.AttestationData,
         num_validators: usize,
-    ) !void {
-        const entry = votes.get(ad.target.root) orelse return;
+    ) !bool {
+        const entry = votes.get(ad.target.root) orelse return false;
         var count: usize = 0;
         for (entry) |b| {
             if (b != 0) count += 1;
         }
-        if (3 * count < 2 * num_validators) return;
+        if (3 * count < 2 * num_validators) return false;
 
         // Justify the target.
         setSlotJustifiedForBuild(finalized_slot.*, js, ad.target.slot, true);
@@ -1367,6 +1369,7 @@ pub const ForkChoice = struct {
             const delta: types.Slot = finalized_slot.* - old_finalized;
             try shiftJustifiedSlotsForBuild(js, delta, allocator);
         }
+        return true;
     }
 
     /// Shared projection-based attestation_data selector — the core of PR #1149's
@@ -1389,6 +1392,7 @@ pub const ForkChoice = struct {
         candidates: []const ProjectionCandidate,
         cap: usize,
         require_chain_match: bool,
+        drop_non_advancing_tail: bool,
         out: []types.AttestationData,
     ) ![]types.AttestationData {
         const allocator = self.allocator;
@@ -1415,6 +1419,11 @@ pub const ForkChoice = struct {
 
         const max_select = @min(cap, out.len);
         var selected_len: usize = 0;
+        // Highest prefix length at which a pick actually moved justification/
+        // finalization forward. When drop_non_advancing_tail is set (block
+        // building), we return only out[0..last_advance_len]: trailing picks that
+        // don't cross 2/3 add nothing to this block's finality and are dropped.
+        var last_advance_len: usize = 0;
 
         while (selected_len < max_select) {
             // Scan: pick the single best eligible candidate by tier priority
@@ -1468,10 +1477,13 @@ pub const ForkChoice = struct {
             // Accumulate voters by target.root (R3) and settle induced
             // justification/finalization (R7) before the next round's re-scan.
             try projectionAddVoters(allocator, &votes, ad.target.root, cand.voters, num_validators);
-            try projectionSettle(allocator, &votes, &proj_justified_slots, &proj_finalized_slot, ad, num_validators);
+            if (try projectionSettle(allocator, &votes, &proj_justified_slots, &proj_finalized_slot, ad, num_validators)) {
+                last_advance_len = selected_len;
+            }
         }
 
-        return out[0..selected_len];
+        const final_len = if (drop_non_advancing_tail) last_advance_len else selected_len;
+        return out[0..final_len];
     }
 
     fn getProposalAttestationsUnlocked(
@@ -1516,11 +1528,19 @@ pub const ForkChoice = struct {
             for (candidates.items) |c| self.allocator.free(c.voters);
             candidates.deinit(self.allocator);
         }
+        // Only attestations sourced at the CURRENT justified checkpoint the block
+        // extends can justify a new target on top of it and so move
+        // justification/finalization forward; packing anything else is wasted block
+        // space. Use pre_state.latest_justified (the head state the proposer builds
+        // on, which equals the fork-choice store's justified at the canonical head)
+        // — the STF-consistent reference the rest of this selector already uses.
+        const pre_state_justified = pre_state.latest_justified;
         {
             var payload_it = self.latest_known_aggregated_payloads.iterator();
             while (payload_it.next()) |entry| {
                 const att_data = entry.key_ptr.*;
                 if (att_data.target.slot <= att_data.source.slot) continue;
+                if (!att_data.source.eql(&pre_state_justified)) continue;
                 const voters = try self.allocator.alloc(u8, num_validators);
                 @memset(voters, 0);
                 proposalCandidateParticipants(entry.value_ptr.*, voters, allow_type1_compaction);
@@ -1543,6 +1563,7 @@ pub const ForkChoice = struct {
             candidates.items,
             cap,
             true, // require_chain_match: builder must never select what the STF would drop
+            true, // drop_non_advancing_tail: pack only attestations that move justification/finalization
             out_keys,
         );
 
@@ -2555,6 +2576,9 @@ pub const ForkChoice = struct {
         // = false: the aggregator pre-aggregates available gossip prioritized by
         // finalize > justify > build, and the proposer re-runs the projection WITH
         // chain-matching at block time as the authoritative filter.
+        // drop_non_advancing_tail = false: the aggregator intentionally pre-builds
+        // build-tier aggregates so they are ready to gossip/include later; only the
+        // proposer trims non-advancing picks from the block it actually produces.
         const key_buf = try self.allocator.alloc(types.AttestationData, cap);
         defer self.allocator.free(key_buf);
         var selected_keys = try self.selectProjectionAttestationData(
@@ -2563,6 +2587,7 @@ pub const ForkChoice = struct {
             proposal_slot,
             candidates.items,
             cap,
+            false,
             false,
             key_buf,
         );
@@ -5780,10 +5805,19 @@ test "getProposalAttestations: high-target keys survive cap with stale low-targe
         };
     }
 
+    // High-target keys (i >= 8) each carry a supermajority (22 of 32 validators
+    // >= 2/3) so that under the finality-advancing pack filter each one justifies
+    // its own target and is included. The stale low-target keys carry a single
+    // voter, never cross 2/3, and are therefore dropped as non-advancing.
     for (&att_data, 0..) |*data, i| {
         var proof = try types.SingleMessageAggregate.init(allocator);
         defer proof.deinit();
-        try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
+        if (i >= 8) {
+            var v: usize = 0;
+            while (v < 22) : (v += 1) try types.aggregationBitsSet(&proof.participants, @intCast(v), true);
+        } else {
+            try types.aggregationBitsSet(&proof.participants, @intCast(i), true);
+        }
         try ctx.fork_choice.storeAggregatedPayload(data, proof, true, .block_payload);
     }
 
@@ -5803,7 +5837,10 @@ test "getProposalAttestations: high-target keys survive cap with stale low-targe
         result.signatures.deinit();
     }
 
-    try std.testing.expectEqual(@as(usize, ctx.fork_choice.config.spec.max_attestations_data), result.attestations.constSlice().len);
+    // Strict finality-advancing packing: only the four supermajority high-target
+    // keys justify their targets and are included; the stale sub-threshold
+    // low-target keys move neither justification nor finalization and are dropped.
+    try std.testing.expectEqual(@as(usize, 4), result.attestations.constSlice().len);
 
     var high_target_count: usize = 0;
     for (result.attestations.constSlice()) |att| {
@@ -5893,6 +5930,7 @@ test "selectProjectionAttestationData: split votes across distinct att_data with
         &candidates,
         8,
         true, // require_chain_match
+        false, // drop_non_advancing_tail: assert the full chained selection
         &out,
     );
 
@@ -5920,6 +5958,7 @@ test "selectProjectionAttestationData: split votes across distinct att_data with
         &partial,
         8,
         true,
+        false, // drop_non_advancing_tail
         &out2,
     );
     try std.testing.expectEqual(@as(usize, 1), selected_partial.len);

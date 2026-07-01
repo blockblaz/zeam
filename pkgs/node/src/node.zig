@@ -308,6 +308,7 @@ pub const BeamNode = struct {
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
         chain.setImportedBlockCallback(self, handleChainImportedBlock);
         chain.setRejectedBlockCallback(self, handleChainRejectedBlock);
+        chain.setPublishAggregateCallback(self, handlePublishDeconstructedAggregate);
 
         network_init_cleanup = false;
     }
@@ -896,6 +897,19 @@ pub const BeamNode = struct {
                 _ = self.network.pruneCachedBlocks(block_root, null);
             },
         }
+    }
+
+    /// Publish one per-attestation aggregate recovered by the chain's
+    /// `onBlock` re-aggregation path (aggregators only). Forwards to
+    /// `publishCommittedAggregation`, which records metrics, updates
+    /// attestation trackers, gossips on the `aggregation` topic (no XMSS
+    /// re-verify), and deinits the passed value. See
+    /// `BeamChain.PublishAggregateFn` / `publish_aggregate` for the
+    /// ownership + threading contract (same off-loop worker context the
+    /// aggregate worker already uses for `publishCommittedAggregation`).
+    fn handlePublishDeconstructedAggregate(ptr: *anyopaque, signed: types.SignedAggregatedAttestation) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.publishCommittedAggregation(signed);
     }
 
     /// Producer side identification for `replayPendingAttestationsAsync`

@@ -399,6 +399,21 @@ pub const BeamChain = struct {
     // `cacheBlockAndFetchParent`).
     rejected_block: ?BlockCallback(RejectedBlockFn) = null,
 
+    // -- deconstructed-aggregate publish backchannel ---------------------
+    //
+    // Fires from the `onBlock` re-aggregation path (aggregators only) for
+    // each per-attestation Type-1 recovered by splitting the imported
+    // block's merged Type-2 proof. Lets the libxev-side node publish the
+    // recovered proof as a `SignedAggregatedAttestation` on the aggregation
+    // gossip topic (the chain has no `node` pointer in `onBlock`).
+    //
+    // Ownership: the callback takes ownership of the passed
+    // `SignedAggregatedAttestation` (owned-proof clone) and MUST deinit it
+    // — `BeamNode.publishCommittedAggregation` already does. Threading: same
+    // off-loop chain-worker / propose-worker context as the aggregate worker,
+    // which already calls `publishCommittedAggregation` from a pool worker.
+    publish_aggregate: ?BlockCallback(PublishAggregateFn) = null,
+
     // Queue for blocks that arrived before forkchoice had ticked to their slot.
     // When a peer gossips a block for the current slot before our local interval
     // timer fires, the forkchoice rejects it with FutureSlot.  We hold such
@@ -613,6 +628,17 @@ pub const BeamChain = struct {
         signed_block: *const types.SignedBlock,
         block_root: types.Root,
         reason: RejectedBlockReason,
+    ) void;
+
+    /// Callback fired from the `onBlock` re-aggregation path for each
+    /// per-attestation Type-1 recovered by deconstructing the imported
+    /// block's Type-2 proof. The recipient publishes it to the aggregation
+    /// gossip topic. **Ownership of `signed` (and its proof clone) transfers
+    /// to the callback**, which MUST deinit it. See the `publish_aggregate`
+    /// field doc for the threading contract.
+    pub const PublishAggregateFn = *const fn (
+        ctx: *anyopaque,
+        signed: types.SignedAggregatedAttestation,
     ) void;
 
     const Self = @This();
@@ -1728,6 +1754,14 @@ pub const BeamChain = struct {
     /// registration contract as `setImportedBlockCallback`.
     pub fn setRejectedBlockCallback(self: *Self, ctx: *anyopaque, func: RejectedBlockFn) void {
         self.rejected_block = .{ .ctx = ctx, .func = func };
+    }
+
+    /// Register the deconstructed-aggregate publish backchannel. Fires from
+    /// the `onBlock` re-aggregation path (aggregators only). Same registration
+    /// contract as `setImportedBlockCallback`; see the `publish_aggregate`
+    /// field doc and `PublishAggregateFn` for threading and ownership.
+    pub fn setPublishAggregateCallback(self: *Self, ctx: *anyopaque, func: PublishAggregateFn) void {
+        self.publish_aggregate = .{ .ctx = ctx, .func = func };
     }
 
     pub fn deinit(self: *Self) void {
@@ -2950,6 +2984,8 @@ pub const BeamChain = struct {
     }
 
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
+        const construct_timer = zeam_metrics.lean_attestation_construction_time_seconds.start();
+        defer _ = construct_timer.observe();
         const slot = opts.slot;
 
         const head_proto = self.forkChoice.getHead();
@@ -3966,31 +4002,49 @@ pub const BeamChain = struct {
             }
 
             // Re-aggregation: split the block's single Type-2 proof back into a Type-1 per selected
-            // body attestation and store them in latest_new so a later aggregator/proposer can fold
-            // the block's coverage into its own aggregate. Selection is gated to keep the (expensive
-            // recursive-STARK) split off the critical path:
+            // body attestation, store them in latest_new so a later aggregator/proposer can fold the
+            // block's coverage into its own aggregate, and publish each to the network so peers can
+            // do the same. Selection is gated to keep the (expensive recursive-STARK) split off the
+            // critical path and confined to attestations that actually matter for finality:
+            //   * aggregators only — non-aggregators neither aggregate nor publish, so deconstructing
+            //     on them only burns prove work; only an aggregator turns the recovered Type-1s into
+            //     published aggregates;
             //   * in-sync only — a syncing node is replaying history, not contributing aggregates;
-            //   * skip target.slot <= latest_justified.slot — already-decided coverage adds nothing;
+            //   * source must match the block's parent-state justified checkpoint — under 3SF only
+            //     attestations sourced at the current justified checkpoint can justify a new target on
+            //     top of it and move finalization forward, so anything else cannot help;
             //   * skip attestations the local pools already fully cover — re-deriving a Type-1 we
-            //     already hold is wasted prove work;
+            //     already hold is wasted prove work (also dampens duplicate publishes once a peer's
+            //     published aggregate is gossiped back);
             //   * cap at MAX_REAGGREGATIONS_PER_BLOCK splits per import.
             // This path is already off the libxev loop (chain-worker for gossip blocks, propose
             // worker for locally produced ones). Best-effort: a split failure is logged, never fatal.
             reagg: {
+                if (!self.isAggregator()) break :reagg;
                 switch (self.getSyncStatus()) {
                     .synced => {},
                     else => break :reagg,
                 }
                 if (aggregated_attestations.len == 0) break :reagg;
 
-                const justified_slot = self.forkChoice.getLatestJustified().slot;
+                var parent_justified: types.Checkpoint = undefined;
+                {
+                    var parent_borrow = self.statesGet(block.parent_root) orelse {
+                        self.logger.warn("skipping block Type-2 re-aggregation because parent state is missing (root=0x{x}, parent=0x{x})", .{ &block_root, &block.parent_root });
+                        break :reagg;
+                    };
+                    defer parent_borrow.assertReleasedOrPanic();
+                    defer parent_borrow.deinit();
+                    parent_justified = parent_borrow.state.latest_justified;
+                }
+
                 var split_mask = self.allocator.alloc(bool, aggregated_attestations.len) catch break :reagg;
                 defer self.allocator.free(split_mask);
                 var selected: usize = 0;
                 for (aggregated_attestations, 0..) |agg_att, i| {
                     split_mask[i] = false;
                     if (selected >= MAX_REAGGREGATIONS_PER_BLOCK) continue;
-                    if (agg_att.data.target.slot <= justified_slot) continue;
+                    if (!agg_att.data.source.eql(&parent_justified)) continue;
                     if (self.forkChoice.blockAttestationFullyCoveredLocally(&agg_att.data, &agg_att.aggregation_bits)) continue;
                     split_mask[i] = true;
                     selected += 1;
@@ -4006,6 +4060,7 @@ pub const BeamChain = struct {
                 // rayon budget. No forkChoice.mutex is held here (the surrounding forkchoice calls
                 // each lock internally), so prove_gate is a leaf acquisition — no deadlock.
                 self.prove_gate.lock();
+                const deconstruct_timer = zeam_metrics.zeam_block_proof_deconstruct_time_seconds.start();
                 const deco_result = types.deconstructType2BlockProof(
                     self.allocator,
                     &post_state.validators,
@@ -4015,6 +4070,7 @@ pub const BeamChain = struct {
                     split_mask,
                     &recovered_list,
                 );
+                _ = deconstruct_timer.observe();
                 self.prove_gate.unlock();
                 deco_result catch |e| {
                     self.logger.warn("failed to deconstruct block Type-2 proof for re-aggregation (root=0x{x}): {any}", .{ &block_root, e });
@@ -4022,7 +4078,10 @@ pub const BeamChain = struct {
                 };
                 // recovered_list holds one Type-1 per MASKED attestation, in body order; walk the
                 // mask in lockstep to pair each recovered proof with its attestation data. Store to
-                // latest_new (is_from_block=false) so it re-enters the aggregation pool.
+                // latest_new (is_from_block=false) so it re-enters the local aggregation pool, AND
+                // publish it to the network so peers can fold the block's coverage into their own
+                // aggregates. deconstructType2BlockProof restored each Type-1's participants from the
+                // block attestation's aggregation_bits, so it maps straight onto a published aggregate.
                 var rec_idx: usize = 0;
                 for (aggregated_attestations, 0..) |agg_att, i| {
                     if (!split_mask[i]) continue;
@@ -4033,8 +4092,25 @@ pub const BeamChain = struct {
                     };
                     rec_idx += 1;
                     self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false, .block_payload) catch |e| {
+                        // Only publish coverage we also kept locally: on a store failure
+                        // skip publishing so peers never receive an aggregate this node
+                        // does not hold in its own pool.
                         self.logger.warn("failed to store re-aggregated payload for block attestation index={d}: {any}", .{ i, e });
+                        continue;
                     };
+                    // Publish via the wired node callback. Hand over an OWNED clone of the proof:
+                    // the publish path deinits its copy, while recovered_list separately deinits `t1`
+                    // in its defer above — they must not share the proof allocation.
+                    if (self.publish_aggregate) |cb| {
+                        var proof_copy = zeam_utils.clone(types.SingleMessageAggregate, &t1, self.allocator) catch {
+                            self.logger.warn("failed to clone recovered proof for publish (block attestation index={d})", .{i});
+                            continue;
+                        };
+                        var published = false;
+                        defer if (!published) proof_copy.deinit();
+                        cb.func(cb.ctx, .{ .data = agg_att.data, .proof = proof_copy });
+                        published = true;
+                    }
                 }
             }
 
@@ -7389,12 +7465,15 @@ fn setupJustifiedSourceTestChain(allocator: std.mem.Allocator, n_blocks: usize) 
     };
 }
 
-test "produceBlock - older-but-justified source is accepted" {
-    // build_block must accept any attestation whose
-    // source *slot* is in justified_slots, not just the most recent justified
-    // checkpoint's root. This test places an attestation whose source is an
-    // older justified slot (not the latest_justified checkpoint) and verifies
-    // it ends up in the produced block.
+test "produceBlock - only latest-justified source is packed, older-justified source dropped" {
+    // Finality-advancing pack filter: block building includes ONLY attestations
+    // whose source is the CURRENT (latest) justified checkpoint — those are the
+    // only ones that can justify a new target on top of it and move finality
+    // forward. An attestation whose source is an OLDER justified slot (still in
+    // justified_slots, but not the latest checkpoint) is now dropped. This test
+    // stores both — a full-coverage latest-source attestation (which justifies
+    // its target and must be packed) and a full-coverage older-source attestation
+    // (which must be dropped) — and asserts only the former survives.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -7423,26 +7502,40 @@ test "produceBlock - older-but-justified source is accepted" {
     // without going through states.get (avoids unsafe raw pointer access).
     const justified_cp = mock_chain.latestJustified[4];
     const justified_slot: types.Slot = justified_cp.slot;
-    try std.testing.expect(justified_slot >= 1);
+    // Need a distinct, still-justified older slot below the latest, and the
+    // parent (slot 4) as an advanceable target above the latest justified.
+    try std.testing.expect(justified_slot >= 2);
+    try std.testing.expect(justified_slot < 4);
 
-    // Craft an attestation with an *older* justified source slot (not the latest).
-    // Under the old root-equality filter this would be dropped; under the new
-    // slot-based filter it must be included.
-    const older_justified_slot: types.Slot = if (justified_slot > 1) justified_slot - 1 else justified_slot;
+    const older_justified_slot: types.Slot = justified_slot - 1;
     const older_source_root = mock_chain.blockRoots[older_justified_slot];
     const proposal_slot: types.Slot = 5;
     const parent_root = mock_chain.blockRoots[4];
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
 
-    const att_data_older_source = types.AttestationData{
+    // Latest-justified-source attestation with full coverage: justifies target
+    // slot 4 (moves justification forward) and must be packed.
+    const att_latest_source = types.AttestationData{
+        .slot = proposal_slot - 1,
+        .head = .{ .root = parent_root, .slot = 4 },
+        .target = .{ .root = parent_root, .slot = 4 },
+        .source = .{ .root = justified_cp.root, .slot = justified_slot },
+    };
+    var proof_latest = try types.SingleMessageAggregate.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_latest.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_latest_source, proof_latest, true, .block_payload);
+
+    // Older-justified-source attestation with full coverage: source is not the
+    // latest justified checkpoint, so the pack filter must drop it.
+    const att_older_source = types.AttestationData{
         .slot = proposal_slot - 1,
         .head = .{ .root = parent_root, .slot = 4 },
         .target = .{ .root = parent_root, .slot = 4 },
         .source = .{ .root = older_source_root, .slot = older_justified_slot },
     };
-    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
-    var proof = try types.SingleMessageAggregate.init(allocator);
-    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true, .block_payload);
+    var proof_older = try types.SingleMessageAggregate.init(allocator);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_older.participants, i, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_older_source, proof_older, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7451,15 +7544,22 @@ test "produceBlock - older-but-justified source is accepted" {
     defer @constCast(&produced).deinit();
 
     const atts = produced.block.body.attestations.constSlice();
+    var found_latest = false;
     var found_older = false;
     for (atts) |att| {
+        if (att.data.source.slot == justified_slot and
+            std.mem.eql(u8, &att.data.source.root, &justified_cp.root))
+        {
+            found_latest = true;
+        }
         if (att.data.source.slot == older_justified_slot and
             std.mem.eql(u8, &att.data.source.root, &older_source_root))
         {
             found_older = true;
         }
     }
-    try std.testing.expect(found_older);
+    try std.testing.expect(found_latest);
+    try std.testing.expect(!found_older);
 }
 
 test "produceBlock - interval 0 packages one warmed Type-1 proof without compaction" {
@@ -7491,25 +7591,28 @@ test "produceBlock - interval 0 packages one warmed Type-1 proof without compact
 
     const justified_cp = mock_chain.latestJustified[4];
     const justified_slot: types.Slot = justified_cp.slot;
-    const older_justified_slot: types.Slot = if (justified_slot > 1) justified_slot - 1 else justified_slot;
-    const older_source_root = mock_chain.blockRoots[older_justified_slot];
+    try std.testing.expect(justified_slot < 4); // parent slot 4 is an advanceable target
     const proposal_slot: types.Slot = 5;
     const parent_root = mock_chain.blockRoots[4];
     const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
 
+    // Source at the latest justified checkpoint (required by the finality-advancing
+    // pack filter) and target the parent so this attestation justifies slot 4.
     const att_data = types.AttestationData{
         .slot = proposal_slot - 1,
         .head = .{ .root = parent_root, .slot = 4 },
         .target = .{ .root = parent_root, .slot = 4 },
-        .source = .{ .root = older_source_root, .slot = older_justified_slot },
+        .source = .{ .root = justified_cp.root, .slot = justified_slot },
     };
     const proposer_index = proposal_slot % num_validators;
 
-    // Two disjoint proofs for the SAME att_data would require compactAttestations
-    // to merge into one full-coverage Type-1. Interval 0 now skips that FFI and
-    // carries only one of the already-warmed proofs.
+    // proof_a already carries the full-coverage supermajority for att_data, so it
+    // alone justifies the target and the finality-advancing filter includes it.
+    // A second disjoint partial proof for the SAME att_data exists; interval 0 must
+    // pack the already-warmed full-coverage proof directly and NOT start Type-1
+    // compaction FFI to merge the two.
     var proof_a = try types.SingleMessageAggregate.init(allocator);
-    try types.aggregationBitsSet(&proof_a.participants, 0, true);
+    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_a.participants, i, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true, .block_payload);
     var proof_b = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_b.participants, 1, true);

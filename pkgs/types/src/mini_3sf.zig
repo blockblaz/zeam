@@ -16,6 +16,13 @@ pub const Checkpoint = struct {
     root: Root,
     slot: Slot,
 
+    /// Structural equality on the identifying fields (slot then root). Used by
+    /// the finality-advancing attestation-source filters in block building and
+    /// on_block re-aggregation.
+    pub fn eql(self: *const Checkpoint, other: *const Checkpoint) bool {
+        return self.slot == other.slot and std.mem.eql(u8, &self.root, &other.root);
+    }
+
     pub fn toJson(self: *const Checkpoint, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.empty;
         try obj.put(allocator, "root", json.Value{ .string = try bytesToHex(allocator, &self.root) });
