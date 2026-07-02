@@ -269,11 +269,11 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         // useful comparison window is the early-chain bootstrap where
         // divergence either does or doesn't happen.
         if (block.slot <= POSTSTATE_DIAG_SLOT_MAX) {
-            opts.logger.info(
+            opts.logger.debug(
                 "PostStateMatch slot={d} state_root={x}",
                 .{ block.slot, &state_root },
             );
-            logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger, "PostStateMatch", .info_level);
+            logBeamStatePerFieldRoots(allocator, state, block.slot, opts.logger, "PostStateMatch", .debug_level);
         }
     }
 }
@@ -289,9 +289,11 @@ const POSTSTATE_DIAG_SLOT_MAX: u64 = 80;
 
 /// Log level selector for `logBeamStatePerFieldRoots`.
 /// Failure-side calls log at `err` to surface alongside the underlying
-/// state-root mismatch; success-side calls log at `info` so they don't
-/// drown out real errors but stay visible in operator logs.
-const PerFieldLogLevel = enum { err_level, info_level };
+/// state-root mismatch; success-side calls log at `debug` so they stay
+/// available for diagnostic deep-dives without polluting normal operator
+/// info-level output (one ~250-char line per slot for the first
+/// `POSTSTATE_DIAG_SLOT_MAX` slots is too noisy at info).
+const PerFieldLogLevel = enum { err_level, info_level, debug_level };
 
 /// Emit per-field hashTreeRoots of a post-state. Called
 /// from two sites in `apply_transition`:
@@ -300,7 +302,8 @@ const PerFieldLogLevel = enum { err_level, info_level };
 ///   * Success side — for `block.slot <= POSTSTATE_DIAG_SLOT_MAX`, as a
 ///     ground-truth baseline so the failure case can be compared per-field
 ///     against the last known good post-state. `tag = "PostStateMatch"`,
-///     `level = .info_level`.
+///     `level = .debug_level` (`.info_level` is also available for callers
+///     that want the baseline surfaced at info).
 /// Errors during per-field hashing are logged-and-swallowed at err level
 /// regardless of the caller's chosen level — they indicate a genuine
 /// runtime fault and must not be masked by an info-tagged invocation.
@@ -380,5 +383,6 @@ fn logBeamStatePerFieldRoots(
     switch (level) {
         .err_level => logger.err(fmt, args),
         .info_level => logger.info(fmt, args),
+        .debug_level => logger.debug(fmt, args),
     }
 }

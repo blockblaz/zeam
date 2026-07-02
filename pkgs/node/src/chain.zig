@@ -56,11 +56,6 @@ const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
-    /// Optional monotonic-ns cutoff for the single-message attestation aggregation
-    /// phase (`getProposalAttestations`). `null` = unbounded. `proposeImpl` derives
-    /// this from `proposal_deadline_pct` so the proposer caps gathering and leaves the
-    /// rest of the interval for block signing and the Type-2 multi-message merge.
-    deadline_ns: ?i64 = null,
 
     pub fn format(self: BlockProductionParams, writer: anytype) !void {
         try writer.print("BlockProductionParams{{ slot={d}, proposer_index={d} }}", .{ self.slot, self.proposer_index });
@@ -106,21 +101,19 @@ pub const ChainOpts = struct {
     /// slot filter is `{slot-1, slot}`, so aggregations for further-back slots
     /// are wasted work. See `BeamChain.aggregateImpl`.
     aggregate_max_inflight: u32 = 4,
-    /// Share of one proposal interval (`SECONDS_PER_INTERVAL_MS`) budgeted to
-    /// the block build + attestation-aggregation worker. This is an
-    /// INTRA-interval time budget, not a cross-interval split: the worker
-    /// self-truncates at `pct%` of the interval, and the remaining
-    /// `(100-pct)%` of the SAME interval is reserved for the finalize step
-    /// (STF over the harvested partial body + propose-side sign + gossip
-    /// publish), so the signed block is ready before the attestation interval.
+    /// Percentage of one proposal interval (`SECONDS_PER_INTERVAL_MS`, default
+    /// 800ms) budgeted to the interval-4 proposer warm-up Type-1 work. Interval-0
+    /// does not start Type-1 aggregation; it only packages already-warmed Type-1
+    /// proofs before signing and Type-2 merge.
     ///
-    /// Default 90: ~720ms aggregation budget + ~80ms finalize/sign budget at
-    /// the default 800ms interval.
-    proposal_deadline_pct: u32 = default_proposal_deadline_pct,
+    /// Default 100: full interval-4 warm-up budget at the default 800ms interval.
+    /// The FFI is uninterruptible, so this gates starting the next selected key,
+    /// not an already-running proof.
+    type1_aggregation_deadline_pct: u32 = default_type1_aggregation_deadline_pct,
 };
 
-/// Default value for `ChainOpts.proposal_deadline_pct`
-pub const default_proposal_deadline_pct: u32 = 50;
+/// Default value for `ChainOpts.type1_aggregation_deadline_pct`
+pub const default_type1_aggregation_deadline_pct: u32 = 100;
 
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
@@ -130,6 +123,8 @@ pub const CachedProcessedBlockInfo = struct {
     // for database persistence and skips re-serializing the live SignedBlock, which
     // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
     sszBytes: ?[]const u8 = null,
+    // Used to skip XMSS signature verification during stress tests
+    skipVerify: bool = false,
 };
 
 pub const GossipProcessingResult = struct {
@@ -469,21 +464,49 @@ pub const BeamChain = struct {
     /// Joined at `deinit` so propose workers cannot outlive chain state.
     propose_wg: WaitGroup = .{},
 
+    /// Interval-4 proposer pre-aggregation. The node that will propose slot N
+    /// runs its Type-1 attestation aggregation one interval early (interval-in-slot
+    /// 4 of slot N-1) so the interval-0 proposal can skip the Type-1 compact and
+    /// start the Type-2 merge immediately. Single-flight like `propose_inflight`
+    /// (cap 1); `preAggregateImpl` decrements on exit.
+    preagg_inflight: std.atomic.Value(u32) = .init(0),
+
+    /// Joined at `deinit` so a pre-aggregation worker cannot outlive chain state.
+    preagg_wg: WaitGroup = .{},
+
+    /// Per-validator XMSS `signAttestation` runs ~0.3s/interval and, replayed
+    /// across the libxev catch-up loop, dominates `onInterval.tick` (the #863
+    /// slot-driver stall — confirmed by per-site instrumentation). `submitAttestOnInterval`
+    /// offloads the whole attestation duty (gate + constructAttestationData + sign +
+    /// publish) to a `thread_pool` worker, mirroring `submitPropose`. Single-flight:
+    /// at most one runs; a second trigger is dropped (the next slot re-attests).
+    /// `attestImpl` decrements on exit.
+    attest_inflight: std.atomic.Value(u32) = .init(0),
+
+    /// Joined at `deinit` so attestation workers cannot outlive chain state.
+    attest_wg: WaitGroup = .{},
+
     /// Serialize the rayon-heavy recursive-STARK proves so each gets the full rayon thread
-    /// budget instead of fighting for it. Three paths now enter the prover concurrently — the
-    /// propose worker (Type-2 merge in `buildBlockProof`), the aggregate worker
-    /// (`aggregateForSlots`), and block import (`deconstructType2BlockProof`). Without this gate
-    /// they over-subscribe rayon and each prove runs ~Nx slower, which inflates block latency and
-    /// makes safe_target lag (breaking finalization). Acquired ONLY around the leaf FFI prove (no
-    /// other zeam lock co-held) or, for aggregate, as the OUTERMOST lock before forkChoice.mutex —
-    /// never `fcmutex -> prove_gate` — so there is no lock cycle.
+    /// budget instead of fighting for it AND so aggregation is a singleton per unit of work:
+    /// every Type-1 / Type-2 prove path holds this gate, so no two ever execute simultaneously
+    /// (in particular, no two Type-1 aggregations on the same attestation_data — the snapshot +
+    /// `anyStoredProofCoversAll` skip then dedups across passes). The prove paths are — the
+    /// interval-2 aggregate worker (`aggregateForSlots`, Type-1), the interval-4 proposer warm-up
+    /// (`preAggregateImpl` -> `aggregateProposalKeysForSlots`, Type-1), the propose worker
+    /// (Type-2 merge in `buildBlockProof`), and block import (`deconstructType2BlockProof`,
+    /// Type-2 verify). Interval-0 proposal packaging intentionally does not start Type-1 work.
+    /// Without this gate those prove paths
+    /// over-subscribe rayon and each prove runs ~Nx slower, which inflates block latency and makes
+    /// safe_target lag (breaking finalization). Acquired ONLY around the leaf FFI prove (no other
+    /// zeam lock co-held) or, for the att-aggregation paths, as the OUTERMOST lock before
+    /// forkChoice.mutex — never `fcmutex -> prove_gate` — so there is no lock cycle.
     prove_gate: zeam_utils.SyncMutex = .{},
 
-    /// See `ChainOpts.proposal_deadline_pct`. Surfaced as a config knob
-    /// (CLI `--proposal-deadline-pct`) and stored here; devnet5's off-loop
-    /// `proposeImpl` derives the single-message aggregation `deadline_ns` from
-    /// it (this percent of the proposal interval).
-    proposal_deadline_pct: u32,
+    /// See `ChainOpts.type1_aggregation_deadline_pct`. Surfaced as a config knob
+    /// (CLI `--type1-aggregation-deadline-pct`) and stored here; the interval-4
+    /// warm-up derives its single-message (Type-1) deadline from it. Interval-0
+    /// proposal packaging does not acquire this gate for Type-1 work.
+    type1_aggregation_deadline_pct: u32,
 
     /// Optional chain-worker thread (slice c-2b commit 3 of #803).
     /// When non-null, `BeamChain` exposes the `submit*` family of
@@ -668,8 +691,10 @@ pub const BeamChain = struct {
             .aggregate_reschedule_intervals = .init(0),
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
+            .attest_inflight = .init(0),
+            .attest_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
-            .proposal_deadline_pct = opts.proposal_deadline_pct,
+            .type1_aggregation_deadline_pct = opts.type1_aggregation_deadline_pct,
             // Pending attestation / aggregated-attestation buffers — empty
             // at init; FIFO-bounded by constants.MAX_PENDING_ATTESTATIONS in
             // the enqueue helpers.
@@ -1721,6 +1746,14 @@ pub const BeamChain = struct {
         // publishBlock) — they reference chain state and must not outlive it.
         self.thread_pool.waitAndWork(&self.propose_wg);
 
+        // Join in-flight interval-4 pre-aggregation workers before tearing down
+        // the chain state they aggregate against.
+        self.thread_pool.waitAndWork(&self.preagg_wg);
+
+        // Same for in-flight attestation workers (constructAttestationData + sign +
+        // publishAttestation) — they reference chain/validator state.
+        self.thread_pool.waitAndWork(&self.attest_wg);
+
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
         // `stop()` is idempotent and joins the worker thread; after
@@ -2723,9 +2756,11 @@ pub const BeamChain = struct {
         post_state.* = try zeam_utils.clone(types.BeamState, pre_snapshot, self.allocator);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
-        // FFI call against the owned snapshot — no lock held during this
-        // window.
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root, opts.deadline_ns);
+        // Interval-0 does no Type-1 aggregation. The interval-4 proposer warm-up
+        // is the only Type-1 aggregation window; proposal-time packaging just
+        // selects already-warmed Type-1 proofs from latest_known, then proceeds to
+        // block signing and the Type-2 merge.
+        const proposal_atts = try self.forkChoice.getProposalAttestationsPreAggregated(pre_snapshot, opts.slot, parent_root);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -2945,11 +2980,20 @@ pub const BeamChain = struct {
 
         self.logger.info("calculated target for attestations at slot={d}: {s}", .{ slot, target_str });
 
+        // Source must match the head we're voting on: use the head state's own
+        // latest_justified, not the fork-choice store's global-max justified
+        // (fcStore.latest_justified is the running max across all processed blocks and
+        // can run ahead of this head). This keeps the signed attestation's source
+        // consistent with the chain it attests to.
+        var head_borrow = self.statesGet(head_proto.blockRoot) orelse return error.MissingHeadState;
+        const source = head_borrow.state.latest_justified;
+        head_borrow.deinit();
+
         const attestation_data = types.AttestationData{
             .slot = slot,
             .head = head,
             .target = target,
-            .source = self.forkChoice.getLatestJustified(),
+            .source = source,
         };
 
         return attestation_data;
@@ -3703,16 +3747,24 @@ pub const BeamChain = struct {
             // rejected without mutating post state). Uses the shared thread pool when available to
             // parallelize per-attestation verification across CPU workers.
             //
-            // The XMSS pubkey cache is lock-free (`xmss.PublicKeyCache`
-            // uses per-slot atomic CAS). No `pubkey_cache_lock`
-            // acquisition needed here — readers and the STF's own
-            // population path race on the slot's atomic and the loser
-            // frees its handle. An earlier mutex around this block was
-            // the dominant contributor to a ~78ms mean lock hold.
-            // A block carries one merged Type-2 proof, so verification is a single
-            // container.verify (no per-attestation parallel batch).
-            try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
+            // The XMSS pubkey cache is lock-free as of P1 of #863
+            // (`xmss.PublicKeyCache` uses per-slot atomic CAS). No
+            // `pubkey_cache_lock` acquisition needed here — readers and the
+            // STF's own population path race on the slot's atomic and the
+            // loser frees its handle. The previous mutex around this block was
+            // the dominant contributor to the ~78ms mean lock hold reported in
+            // #863. A block carries one merged Type-2 proof, so verification is
+            // a single container.verify (no per-attestation parallel batch).
+            //
+            // `skipVerify` — stress-test-only knob (#825). Skips XMSS signature
+            // verification to increase lock-contention rate. Must NEVER be set
+            // by production callers.
+            if (!blockInfo.skipVerify) {
+                try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, null);
+            }
 
+            // Lap recorded outside the check block so the metric is emitted even
+            // when verification was skipped.
             step_watch.lap("verify_signatures");
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify).
@@ -3860,6 +3912,14 @@ pub const BeamChain = struct {
                 }
             }
 
+            // Snapshot the finalized slot once for the loop's stale-fetch guard
+            // below. The lean spec's `prune_stale_attestation_data` treats an
+            // attestation whose `head.slot <= latest_finalized.slot` as STALE
+            // (it can't move fork choice), and the store prunes all block/state
+            // history below finalized — so a `blocks-by-root` fetch for such a
+            // head root is futile (the block is pruned and unservable).
+            const finalized_slot_for_fetch_guard = self.forkChoice.getLatestFinalized().slot;
+
             for (aggregated_attestations) |aggregated_attestation| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
@@ -3868,7 +3928,18 @@ pub const BeamChain = struct {
                 self.validateAttestationData(aggregated_attestation.data, true) catch |e| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     if (e == AttestationValidationError.UnknownHeadBlock) {
-                        try missing_roots.append(self.allocator, aggregated_attestation.data.head.root);
+                        // Only enqueue a fetch for a head root we could plausibly
+                        // be served. `validate_attestation` REJECTS unknown
+                        // source/target/head (it never fetches) — the fetch here
+                        // is zeam's own sync helper, not spec. Skip it when the
+                        // head is at/below finalized (spec staleness key
+                        // `head.slot <= latest_finalized.slot`): that block is
+                        // pruned and the fetch only drives a futile req/resp
+                        // storm. The attestation is still dropped exactly as
+                        // before — only the fetch is suppressed.
+                        if (aggregated_attestation.data.head.slot > finalized_slot_for_fetch_guard) {
+                            try missing_roots.append(self.allocator, aggregated_attestation.data.head.root);
+                        }
                     }
                     self.logger.err("invalid aggregated attestation data in block: error={any}", .{e});
                     continue;
@@ -3961,7 +4032,7 @@ pub const BeamChain = struct {
                         continue;
                     };
                     rec_idx += 1;
-                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false) catch |e| {
+                    self.forkChoice.storeAggregatedPayload(&agg_att.data, t1, false, .block_payload) catch |e| {
                         self.logger.warn("failed to store re-aggregated payload for block attestation index={d}: {any}", .{ i, e });
                     };
                 }
@@ -4599,139 +4670,43 @@ pub const BeamChain = struct {
         }
     }
 
-    /// Validate incoming attestation before processing.
-    ///
-    /// The time check applies only to the gossip path: admit a vote iff
-    /// `data.slot * INTERVALS_PER_SLOT <= store.time + GOSSIP_DISPARITY_INTERVALS`.
-    /// The bound is in intervals, not slots: a whole-slot margin would let an
-    /// adversary pre-publish next-slot aggregates ahead of any honest validator.
-    ///
-    /// Block-included attestations skip the time check; they are trusted under
-    /// the block's own validation. `is_from_block` is retained as a log marker.
-    /// Cheap O(1) future-slot bound check for gossip attestations —
-    /// extracted so the libxev main thread can fast-drop future-slot
-    /// attestations before dispatching to the chain-worker, keeping the
-    /// libxev hot path doing only constant-time per-message work. The
-    /// check is identical to the one inside
-    /// `validateAttestationData`'s pre-lookup section and is repeated
-    /// there so the worker-thread path remains correct under future
-    /// callers that bypass the libxev fast-drop.
-    pub fn attestationIsTooFarInFuture(self: *Self, data: types.AttestationData) bool {
-        const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
-        const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
-        const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
-        return attestation_start_interval > max_allowed_interval;
-    }
-
-    pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
+    pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) AttestationValidationError!void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
 
-        // Future-slot drop is hoisted to before the proto-node lookups.
-        // The old order ran the lookups first, so an attestation for
-        // `current_slot + 100` referencing future blocks bottomed out at
-        // `UnknownHeadBlock` and the caller dutifully enqueued a
-        // `BlocksByRoot` for that future head — which always 404'd
-        // because the block didn't exist anywhere. Multiplied by 4×
-        // subnet fan-out on aggregators this was a fetch-storm amplifier
-        // and a primary contributor to slot-driver starvation. Rejecting
-        // the attestation here means we never derive a missing root for
-        // it and the fetch is simply never enqueued.
+        // All fork-choice-derivable validation lives in one shared method on
+        // ForkChoice (proto-array existence/slots, source/target/head
+        // ancestry, slot-before-head, and the interval-based future-slot
+        // bound). The future-slot bound applies only to gossip — block-
+        // included attestations are trusted under the block's own validation.
         //
-        // Bound is intervals-based (`GOSSIP_DISPARITY_INTERVALS`, =1) so
-        // we still accept the very first interval of the next slot —
-        // attestations clients legitimately publish at the slot
-        // boundary tick — without bumping the disparity tolerance. The
-        // bound only applies to gossip; block-included attestations are
-        // trusted under the block's own validation.
-        if (!is_from_block and self.attestationIsTooFarInFuture(data)) {
-            self.logger.debug("attestation validation failed: future slot=(slot={d}, time={d})", .{
+        // The future-slot drop sits before the proto-node lookups inside the
+        // shared method: an attestation for a far-future slot referencing
+        // future blocks would otherwise bottom out at UnknownHeadBlock and
+        // make the caller enqueue a BlocksByRoot for a head that does not
+        // exist anywhere — a fetch-storm amplifier on aggregators.
+        //
+        // Ancestry is applied on BOTH paths (gossip and block): block-embedded
+        // attestations are also fed to the fork-choice tracker via onAttestation,
+        // so gating it on gossip would reopen the vote-splitting vector for
+        // attestations smuggled inside a block.
+        self.forkChoice.validateAttestationDataForGossip(data, !is_from_block) catch |err| {
+            self.logger.debug("attestation validation failed: error={any} slot={d} source={d} target={d} head={d} is_from_block={any}", .{
+                err,
                 data.slot,
-                self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
-            });
-            return AttestationValidationError.AttestationTooFarInFuture;
-        }
-
-        // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
-        const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
-            self.logger.debug("Attestation validation failed: unknown source block root=0x{x}", .{
-                &data.source.root,
-            });
-            return AttestationValidationError.UnknownSourceBlock;
-        };
-
-        const target_block = self.forkChoice.getProtoNode(data.target.root) orelse {
-            self.logger.debug("attestation validation failed: unknown target block slot={d} root=0x{x}", .{
-                data.target.slot,
-                &data.target.root,
-            });
-            return AttestationValidationError.UnknownTargetBlock;
-        };
-
-        const head_block = self.forkChoice.getProtoNode(data.head.root) orelse {
-            self.logger.debug("attestation validation failed: unknown head block slot={d} root=0x{x}", .{
-                data.head.slot,
-                &data.head.root,
-            });
-            return AttestationValidationError.UnknownHeadBlock;
-        };
-
-        // 2. Validate slot relationships
-        if (source_block.slot > target_block.slot) {
-            self.logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
-                source_block.slot,
-                target_block.slot,
-            });
-            return AttestationValidationError.SourceSlotExceedsTarget;
-        }
-
-        //    Invariant: attestation.source.slot <= attestation.target.slot
-        if (data.source.slot > data.target.slot) {
-            self.logger.debug("attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
                 data.source.slot,
                 data.target.slot,
-            });
-            return AttestationValidationError.SourceCheckpointExceedsTarget;
-        }
-
-        //    Invariant: data.head.slot >= data.target.slot
-        if (data.head.slot < data.target.slot) {
-            self.logger.debug("attestation validation failed: head slot {d} < target slot {d}", .{
                 data.head.slot,
-                data.target.slot,
+                is_from_block,
             });
-            return AttestationValidationError.HeadOlderThanTarget;
-        }
+            // GossipAttestationValidationError is a strict subset of
+            // AttestationValidationError (identical variant names), so the
+            // error value coerces directly — callers that branch on a specific
+            // reason (e.g. the block-import path enqueueing a BlocksByRoot fetch
+            // on UnknownHeadBlock) still match the same global error value.
+            return err;
+        };
 
-        // 3. Validate checkpoint slots match block slots
-        if (source_block.slot != data.source.slot) {
-            self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
-                source_block.slot,
-                data.source.slot,
-            });
-            return AttestationValidationError.SourceCheckpointSlotMismatch;
-        }
-
-        //    Invariant: target_block.slot == attestation.target.slot
-        if (target_block.slot != data.target.slot) {
-            self.logger.debug("attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
-                target_block.slot,
-                data.target.slot,
-            });
-            return AttestationValidationError.TargetCheckpointSlotMismatch;
-        }
-
-        //    Invariant: head_block.slot == attestation.head.slot
-        if (head_block.slot != data.head.slot) {
-            self.logger.debug("attestation validation failed: head block slot {d} != head checkpoint slot {d}", .{
-                head_block.slot,
-                data.head.slot,
-            });
-            return AttestationValidationError.HeadCheckpointSlotMismatch;
-        }
-
-        // (Future-slot bound check is hoisted above the proto-node
-        // lookups — see the comment at the top of this function.)
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
             data.source.slot,
@@ -4796,14 +4771,33 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        try self.validateAttestationData(signedAggregation.data, false);
+        // Cross-client aggregate-ingest diagnostics: a foreign-subnet aggregate
+        // that fails fork-choice validation is otherwise dropped silently
+        // (node.zig warns only on Unknown*Block-when-not-pending; every other
+        // GossipAttestationValidationError variant propagates as a bare error).
+        // Surface the exact variant + checkpoint fields so a cross-impl
+        // AttestationData/Checkpoint convention mismatch is diagnosable from logs.
+        const ad = signedAggregation.data;
+        self.validateAttestationData(ad, false) catch |err| {
+            self.logger.debug(
+                "aggregate-ingest validation failed err={any} slot={d} source=(0x{x},slot={d}) target=(0x{x},slot={d}) head=(0x{x},slot={d})",
+                .{ err, ad.slot, &ad.source.root, ad.source.slot, &ad.target.root, ad.target.slot, &ad.head.root, ad.head.slot },
+            );
+            return err;
+        };
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
+        // An aggregate with no participants carries no weight and cannot be
+        // verified against any public key. Reject before signature checks.
+        if (validator_indices.items.len == 0) {
+            return AttestationValidationError.EmptyAggregationBits;
+        }
+
         try self.verifyAggregatedAttestation(signedAggregation, validator_indices.items);
         self.applyAggregatedAttestationTrackers(signedAggregation.data, validator_indices.items);
-        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
+        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false, .gossip);
     }
 
     fn verifyAggregatedAttestation(
@@ -4987,14 +4981,21 @@ pub const BeamChain = struct {
             zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "missing_state" }) catch {};
             return;
         };
-        defer borrow.deinit();
-
-        var validators_owned = zeam_utils.clone(types.Validators, &borrow.state.validators, chain.allocator) catch |err| {
-            chain.logger.warn("failed to clone validators for aggregation at slot={d}: {any}", .{ slot, err });
+        // Snapshot-then-release: the aggregator runs the projection with
+        // chain-matching OFF, so it needs validators / justified_slots / pending
+        // justifications but NOT historical_block_hashes. cloneForProjection skips
+        // that large field; drop the states lock before the multi-100ms FFI prove.
+        const pre_state = borrow.state.cloneForProjection(chain.allocator) catch |err| {
+            borrow.deinit();
+            chain.logger.warn("failed to clone pre-state for aggregation at slot={d}: {any}", .{ slot, err });
             zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
             return;
         };
-        defer validators_owned.deinit();
+        borrow.deinit();
+        defer {
+            pre_state.deinit();
+            chain.allocator.destroy(pre_state);
+        }
 
         // Log subnet-wise coverage of current new payloads before starting aggregation.
         chain.forkChoice.logNewPayloadsCoverageForAggregation(@intCast(slot));
@@ -5017,8 +5018,10 @@ pub const BeamChain = struct {
         // acquisitions in buildBlockProof / deconstruct).
         chain.prove_gate.lock();
         const aggregations = chain.forkChoice.aggregateForSlots(
-            &validators_owned,
+            &pre_state.validators,
             slot_window_buf[0..slot_window_len],
+            pre_state,
+            @intCast(slot + 1),
             node,
             publishOneAggregate,
         ) catch |err| {
@@ -5114,17 +5117,7 @@ pub const BeamChain = struct {
 
         const validator = if (node.validator) |*v| v else return;
 
-        // Cap single-message attestation aggregation at `proposal_deadline_pct`% of the
-        // proposal interval, reserving the remainder for block signing and the Type-2
-        // multi-message merge. A timely block with fewer attestation_data beats a late
-        // block carrying more — the off-loop merge is the dominant cost, so we bound the
-        // controllable gathering phase rather than the merge. Clamp to [0, 99] so the
-        // sign/merge step always keeps headroom (same form as main's produceBlockWorker).
-        const pct_clamped: i64 = @intCast(@min(chain.proposal_deadline_pct, 99));
-        const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
-        const deadline_ns: i64 = @intCast(zeam_utils.monotonicTimestampNs() + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
-
-        var produced_block = chain.produceBlock(.{ .slot = slot, .proposer_index = proposer_id, .deadline_ns = deadline_ns }) catch |e| {
+        var produced_block = chain.produceBlock(.{ .slot = slot, .proposer_index = proposer_id }) catch |e| {
             chain.logger.err("propose worker: produceBlock failed slot={d}: {any}", .{ slot, e });
             return;
         };
@@ -5179,6 +5172,191 @@ pub const BeamChain = struct {
         };
         proposer_result = "success";
         chain.logger.info("published block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+    }
+
+    /// Trigger off-loop interval-4 proposer pre-aggregation for an
+    /// already-resolved next-slot proposer duty. The "do I propose `target_slot`?"
+    /// decision is the validator client's (`ValidatorClient.onInterval` interval-4
+    /// arm resolves it via `getSlotProposer(slot+1)`); this owns only chain-state
+    /// gating + the off-loop dispatch, and returns within microseconds. Mirrors
+    /// `submitPropose`. At most one pre-aggregation is in flight; a second trigger
+    /// is dropped (the next slot re-warms). `preAggregateImpl` decrements on exit.
+    pub fn submitPreAggregate(self: *Self, target_slot: usize, proposer_id: usize) void {
+        // Sync gating, identical to submitPropose (including the pre-finalization
+        // cold-start exception). A pre-agg that bails is harmless: the interval-0
+        // proposal will still package whatever Type-1 proofs are already known.
+        switch (self.getSyncStatus()) {
+            .synced => {},
+            .no_peers => {},
+            .fc_initing => {
+                self.logger.info("skipping pre-aggregation for slot={d} proposer={d}: forkchoice still initing", .{ target_slot, proposer_id });
+                return;
+            },
+            .peers_materially_ahead => |info| {
+                if (info.finalized_slot == 0 and info.max_peer_finalized_slot == 0) {
+                    // Pre-finalization cold start: still warm latest_new to help
+                    // reach a first justification.
+                } else {
+                    self.logBehindPeersDebug("skipping pre-aggregation", info);
+                    return;
+                }
+            },
+        }
+
+        // Single-flight: at most one pre-aggregation at a time. fetchAdd-then-compare
+        // is a soft ceiling, released on every early return below.
+        const prev = self.preagg_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= 1) {
+            _ = self.preagg_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("skipping pre-aggregation for slot={d}: previous pre-aggregation still in flight", .{target_slot});
+            return;
+        }
+
+        self.thread_pool.spawnWg(&self.preagg_wg, preAggregateImpl, .{ self, target_slot, proposer_id }) catch {
+            _ = self.preagg_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue pre-aggregation for slot={d}; skipping", .{target_slot});
+            return;
+        };
+    }
+
+    /// Off-loop attestation duty: dispatch construct+sign+publish to a `thread_pool`
+    /// worker so the ~0.3s/interval per-validator XMSS signing does not block the
+    /// libxev slot loop (the #863 stall, confirmed by `onInterval.validator` site
+    /// instrumentation). Mirrors `submitPropose`. Single-flight; a second trigger
+    /// while one is in flight is dropped (the next slot re-attests). Returns within
+    /// microseconds — `attestImpl` does the work and publishes itself.
+    pub fn submitAttestOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, slot: usize) void {
+        const prev = self.attest_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= 1) {
+            _ = self.attest_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("skipping attestation for slot={d}: previous attestation still in flight", .{slot});
+            return;
+        }
+
+        self.thread_pool.spawnWg(&self.attest_wg, attestImpl, .{ self, node, slot }) catch {
+            _ = self.attest_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue attestation for slot={d}; skipping", .{slot});
+            return;
+        };
+    }
+
+    /// Worker body for interval-4 proposer pre-aggregation (runs on a shared
+    /// `ThreadPool` worker). Aggregates EVERY proposal-eligible att_data for the
+    /// upcoming proposal's slot window into `latest_new_aggregated_payloads` via the
+    /// aggregator path (so `anyStoredProofCoversAll` skips already-covered keys), so
+    /// the interval-0 proposal finds per-att_data aggregates ready. Derives the head
+    /// READ-ONLY (never ticks the FC clock). Does NO Type-2 work and publishes nothing.
+    fn preAggregateImpl(chain: *Self, target_slot: usize, proposer_id: usize) void {
+        defer _ = chain.preagg_inflight.fetchSub(1, .acq_rel);
+
+        // Timeliness guard: bail if the chain already reached interval 0 of
+        // target_slot — the proposal is happening now (or already happened), so the
+        // warm-up is wasted and would only contend on prove_gate with the proposal.
+        // Re-checked after prove_gate is acquired. Mirrors aggregateImpl's clock read.
+        const target_propose_time: u64 = @intCast(target_slot * constants.INTERVALS_PER_SLOT);
+        if (chain.forkChoice.fcStore.slot_clock.time.load(.monotonic) >= target_propose_time) {
+            chain.logger.info("skipping pre-aggregation for slot={d}: already at/after its proposal interval", .{target_slot});
+            return;
+        }
+
+        // Read-only head: getHead() takes only forkChoice.mutex.lockShared and does
+        // NOT tick the clock. getProposalHead(target_slot) WOULD tick the FC clock to
+        // interval 0 a full interval early, so it must not be used here. We need only
+        // the head's validators (cheap clone, no full BeamState snapshot).
+        const head_root = chain.forkChoice.getHead().blockRoot;
+        var borrow = chain.statesGet(head_root) orelse {
+            chain.logger.info("skipping pre-aggregation for slot={d}: missing state for head root", .{target_slot});
+            return;
+        };
+        // Snapshot-then-release: the warm-up runs the projection with chain-matching
+        // OFF, so cloneForProjection skips the large historical_block_hashes field;
+        // never hold a states lock across the multi-100ms FFI prove.
+        const pre_state = borrow.state.cloneForProjection(chain.allocator) catch |e| {
+            borrow.deinit();
+            chain.logger.warn("pre-aggregation: clone pre-state failed slot={d}: {any}", .{ target_slot, e });
+            return;
+        };
+        borrow.deinit();
+        defer {
+            pre_state.deinit();
+            chain.allocator.destroy(pre_state);
+        }
+
+        // Interval-4 warm-up deadline. The FFI is uninterruptible anyway; this
+        // only gates starting the next selected key, while the timeliness guards
+        // above + below keep a late start from bleeding into the proposal.
+        const start_ns = zeam_utils.monotonicTimestampNs();
+        const pct_clamped: i64 = @intCast(@min(chain.type1_aggregation_deadline_pct, 100));
+        const budget_ms: i64 = @divFloor(@as(i64, constants.SECONDS_PER_INTERVAL_MS) * pct_clamped, 100);
+        const deadline_ns: i64 = @intCast(start_ns + @as(i128, budget_ms) * @as(i128, std.time.ns_per_ms));
+
+        // Slot window {target_slot-1, target_slot}, same shape the aggregator uses.
+        var window_buf: [2]types.Slot = undefined;
+        var window_len: usize = 0;
+        if (target_slot > 0) {
+            window_buf[window_len] = @intCast(target_slot - 1);
+            window_len += 1;
+        }
+        window_buf[window_len] = @intCast(target_slot);
+        window_len += 1;
+
+        // Serialize against the aggregate / propose-merge / deconstruct proves
+        // (prove_gate OUTERMOST -> forkChoice.mutex inside aggregateUnlocked).
+        // Opportunistic: a busy gate means another prove is running, so skip rather
+        // than wait and risk starting too close to the proposal.
+        if (!chain.prove_gate.tryLock()) {
+            chain.logger.info("skipping pre-aggregation for slot={d}: prove_gate busy", .{target_slot});
+            return;
+        }
+        if (chain.forkChoice.fcStore.slot_clock.time.load(.monotonic) >= target_propose_time) {
+            chain.prove_gate.unlock();
+            chain.logger.info("skipping pre-aggregation for slot={d}: reached proposal interval while waiting for prove_gate", .{target_slot});
+            return;
+        }
+        const aggregations = chain.forkChoice.aggregateProposalKeysForSlots(&pre_state.validators, window_buf[0..window_len], pre_state, @intCast(target_slot), deadline_ns) catch |e| {
+            chain.prove_gate.unlock();
+            chain.logger.warn("pre-aggregation: aggregateProposalKeysForSlots failed slot={d}: {any}", .{ target_slot, e });
+            return;
+        };
+        chain.prove_gate.unlock();
+        // Warm-up commits aggregates into latest_new inside aggregateUnlocked; the
+        // returned aggregates are not gossiped (proposer warm-up), just freed.
+        defer {
+            for (aggregations) |*a| a.deinit();
+            chain.allocator.free(aggregations);
+        }
+
+        const elapsed_s: f32 = @as(f32, @floatFromInt(zeam_utils.monotonicTimestampNs() - start_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+        chain.logger.info("pre-aggregated Type-1 for slot={d} proposer={d} att_data={d} took={d:.3}s", .{ target_slot, proposer_id, aggregations.len, elapsed_s });
+    }
+
+    /// Worker body for off-loop attestation. `mayBeDoAttestation` performs the sync
+    /// gate, builds `AttestationData` (read-only fork-choice under the shared lock)
+    /// and per-validator XMSS signs; this then publishes each signed attestation
+    /// directly — the same publish the libxev loop used to do. Worker-safe: signing
+    /// reads only immutable `*const` keys; `publishAttestation` is internally locked
+    /// and the libp2p publish is Send+Sync (same contract as the aggregate worker).
+    fn attestImpl(chain: *Self, node: *@import("./node.zig").BeamNode, slot: usize) void {
+        defer _ = chain.attest_inflight.fetchSub(1, .acq_rel);
+        const validator = if (node.validator) |*v| v else return;
+
+        var maybe_output = validator.mayBeDoAttestation(slot) catch |e| {
+            chain.logger.err("attestation worker: mayBeDoAttestation failed slot={d}: {any}", .{ slot, e });
+            return;
+        };
+        if (maybe_output) |*output| {
+            defer output.deinit();
+            for (output.gossip_messages.items) |gossip_msg| {
+                switch (gossip_msg) {
+                    .attestation => |signed_attestation| {
+                        node.publishAttestation(signed_attestation) catch |e| {
+                            chain.logger.err("attestation worker: publishAttestation failed slot={d}: {any}", .{ slot, e });
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 
     /// Find the subnet of the first set participant in `participants`.
@@ -5504,10 +5682,20 @@ pub const BeamChain = struct {
         // `shouldCatchUpFromPeerStatus` directly so a peer that reports
         // a higher head triggers catch-up without a state transition.
 
-        // Our head or finalization is behind peer finalization.
-        // Include the exact peers whose finalized slots make this node report
-        // `peers_materially_ahead`, so logs can name the source of the decision.
-        const behind_peer_finalization = our_head_slot < max_peer_finalized_slot or our_finalized_slot < max_peer_finalized_slot;
+        // Materially behind == DEEP SYNC: we are missing finalized blocks a peer
+        // already has, i.e. our HEAD is behind the peer's finalized slot. Gate ONLY
+        // on head lag.
+        //
+        // A finalized lag with a SYNCED head (our_head_slot >= max_peer_finalized_slot
+        // but our_finalized_slot < max_peer_finalized_slot) is NOT deep sync — we
+        // already hold every block the peer has finalized; we simply haven't
+        // locally finalized that far yet. That is a consensus OUTCOME, not a data
+        // gap, and the cure is to PARTICIPATE (aggregate/attest/propose), not skip.
+        // Gating on `our_finalized_slot < max_peer_finalized_slot` here deadlocks:
+        // a node at head=337/finalized=0 with a peer at finalized=6 skips
+        // aggregation forever, so finalization never advances and it stays "behind"
+        // (live: all 32 nodes head-synced, justified frozen at 9, finalized 0–6).
+        const behind_peer_finalization = our_head_slot < max_peer_finalized_slot;
         if (behind_peer_finalization) {
             var info = self.behindPeersStatus(our_head_slot, our_finalized_slot, max_peer_finalized_slot);
             var cause_guard = self.connected_peers.iterateLocked();
@@ -5516,7 +5704,7 @@ pub const BeamChain = struct {
             while (cause_iter.next()) |entry| {
                 const peer_info = entry.value_ptr;
                 if (peer_info.latest_status) |status| {
-                    if (status.finalized_slot > our_head_slot or status.finalized_slot > our_finalized_slot) {
+                    if (status.finalized_slot > our_head_slot) {
                         info.peers_materially_ahead.addPeer(peer_info.peer_id, status.finalized_slot);
                     }
                 }
@@ -5571,7 +5759,12 @@ const AttestationValidationError = error{
     TargetCheckpointSlotMismatch,
     HeadCheckpointSlotMismatch,
     HeadOlderThanTarget,
+    SourceCheckpointNotAncestorOfTarget,
+    TargetCheckpointNotAncestorOfHead,
+    AttestationSlotBeforeHead,
     AttestationTooFarInFuture,
+    EmptyAggregationBits,
+    InvalidValidatorId,
 };
 pub const BlockValidationError = error{
     UnknownParentBlock,
@@ -6152,6 +6345,117 @@ test "attestation validation - comprehensive" {
             .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(future_attestation.message, false));
+    }
+
+    // Insert sibling/orphan blocks so we can exercise the checkpoint ancestry checks.
+    // The mock chain is linear (genesis -> slot1 -> slot2); these synthetic blocks add
+    // off-chain branches that share neither parent chain with the canonical slot-2 block.
+    const genesis_root = mock_chain.blockRoots[0];
+    const zero_state_root = [_]u8{0} ** 32;
+
+    // A sibling at slot 1 whose parent is genesis (a peer of the canonical slot-1 block).
+    const sibling_slot1_root = [_]u8{0xA1} ** 32;
+    try beam_chain.forkChoice.protoArray.onBlock(types.ProtoBlock{
+        .slot = 1,
+        .proposer_index = 0,
+        .blockRoot = sibling_slot1_root,
+        .parentRoot = genesis_root,
+        .stateRoot = zero_state_root,
+        .timeliness = true,
+        .confirmed = true,
+    }, 2, 0);
+
+    // A sibling head at slot 2 whose parent is genesis (skips the canonical slot-1 block).
+    const sibling_head_root = [_]u8{0xB2} ** 32;
+    try beam_chain.forkChoice.protoArray.onBlock(types.ProtoBlock{
+        .slot = 2,
+        .proposer_index = 0,
+        .blockRoot = sibling_head_root,
+        .parentRoot = genesis_root,
+        .stateRoot = zero_state_root,
+        .timeliness = true,
+        .confirmed = true,
+    }, 2, 0);
+
+    // An orphan head at slot 2 whose parent is not in the store at all.
+    const orphan_head_root = [_]u8{0xC3} ** 32;
+    try beam_chain.forkChoice.protoArray.onBlock(types.ProtoBlock{
+        .slot = 2,
+        .proposer_index = 0,
+        .blockRoot = orphan_head_root,
+        .parentRoot = [_]u8{0x99} ** 32,
+        .stateRoot = zero_state_root,
+        .timeliness = true,
+        .confirmed = true,
+    }, 2, 0);
+
+    // Test 10: A proper genesis -> slot1 -> slot2 ancestor chain passes.
+    {
+        const valid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+                .source = types.Checkpoint{ .root = genesis_root, .slot = 0 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try beam_chain.validateAttestationData(valid_attestation.message, false);
+    }
+
+    // Test 11: A source on a sibling branch is not an ancestor of the canonical target.
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+                .source = types.Checkpoint{ .root = sibling_slot1_root, .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(
+            error.SourceCheckpointNotAncestorOfTarget,
+            beam_chain.validateAttestationData(invalid_attestation.message, false),
+        );
+    }
+
+    // Test 12: A head on a sibling branch is not a descendant of the canonical target.
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = sibling_head_root, .slot = 2 },
+                .source = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(
+            error.TargetCheckpointNotAncestorOfHead,
+            beam_chain.validateAttestationData(invalid_attestation.message, false),
+        );
+    }
+
+    // Test 13: A head whose parent chain leaves the store cannot prove ancestry.
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = orphan_head_root, .slot = 2 },
+                .source = types.Checkpoint{ .root = genesis_root, .slot = 0 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(
+            error.TargetCheckpointNotAncestorOfHead,
+            beam_chain.validateAttestationData(invalid_attestation.message, false),
+        );
     }
 }
 
@@ -6962,13 +7266,13 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_unseen.participants, i, true);
     }
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true, .block_payload);
 
     var proof_known = try types.SingleMessageAggregate.init(allocator);
     for (0..4) |i| {
         try types.aggregationBitsSet(&proof_known.participants, i, true);
     }
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_known, proof_known, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_known, proof_known, true, .block_payload);
 
     // Produce block at slot 3 (proposer_index = 3 % 4 = 3)
     const proposal_slot: types.Slot = 3;
@@ -7138,7 +7442,7 @@ test "produceBlock - older-but-justified source is accepted" {
     const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
     var proof = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_older_source, proof, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7158,15 +7462,11 @@ test "produceBlock - older-but-justified source is accepted" {
     try std.testing.expect(found_older);
 }
 
-test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (proposal_deadline_pct wiring)" {
-    // proposal_deadline_pct is wired (via BlockProductionParams.deadline_ns) into
-    // getProposalAttestations -> compactAttestations. The deadline only bites on COMPACTION:
-    // compactAttestations returns inputs as-is when each AttestationData has a single proof,
-    // but an elapsed deadline short-circuits the merge of multiple proofs sharing one att_data
-    // to empty (cf. "compactAttestations: elapsed deadline returns empty prefix"). So with an
-    // elapsed cutoff a single proof passes through (1), but two proofs for the SAME att_data are
-    // dropped (0) — proving deadline_ns threads produceBlock -> getProposalAttestations ->
-    // compactAttestations.
+test "produceBlock - interval 0 packages one warmed Type-1 proof without compaction" {
+    // Interval-0 block production must not start Type-1 aggregation. When multiple
+    // known proofs exist for the same AttestationData, produceBlock packages the
+    // single best already-warmed proof and leaves any further merge for the next
+    // interval-4 warm-up.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -7205,30 +7505,24 @@ test "produceBlock - elapsed deadline_ns short-circuits attestation compaction (
     };
     const proposer_index = proposal_slot % num_validators;
 
-    // Elapsed cutoff (1s in the past).
-    const elapsed: i64 = @intCast(zeam_utils.monotonicTimestampNs() - std.time.ns_per_s);
-
-    // Two disjoint proofs for the SAME att_data force compactAttestations to merge them; with
-    // the cutoff already elapsed the merge short-circuits to empty, so the produced block carries
-    // 0 attestations. A single proof would pass through untouched (the deadline is only consulted
-    // during a merge), and the sibling "older-but-justified source is accepted" test shows this
-    // att_data IS gathered when not deadline-bounded — so the 0 here is the cutoff's doing, not
-    // filtering. (One produceBlock call: getProposalHead mutates fork-choice, so it is not
-    // idempotent across calls.)
+    // Two disjoint proofs for the SAME att_data would require compactAttestations
+    // to merge into one full-coverage Type-1. Interval 0 now skips that FFI and
+    // carries only one of the already-warmed proofs.
     var proof_a = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_a.participants, 0, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true, .block_payload);
     var proof_b = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_b.participants, 1, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_b, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
         .proposer_index = proposer_index,
-        .deadline_ns = elapsed,
     });
     defer @constCast(&produced).deinit();
-    try std.testing.expectEqual(@as(usize, 0), produced.block.body.attestations.constSlice().len);
+    const atts = produced.block.body.attestations.constSlice();
+    try std.testing.expectEqual(@as(usize, 1), atts.len);
+    try std.testing.expectEqual(att_data, atts[0].data);
 }
 
 test "produceBlock - zero-hash source/target rejected by build_block" {
@@ -7274,7 +7568,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_zs = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zs.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_source, proof_zs, true, .block_payload);
 
     // Attestation with ZERO_HASH target root — must be rejected.
     const att_zero_target = types.AttestationData{
@@ -7285,7 +7579,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_zt = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_zt.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_zero_target, proof_zt, true, .block_payload);
 
     // Control: a valid attestation that must appear in the block, ensuring the
     // produced block is non-empty so the negative assertions below are not vacuous.
@@ -7297,7 +7591,7 @@ test "produceBlock - zero-hash source/target rejected by build_block" {
     };
     var proof_valid = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_valid.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_valid, proof_valid, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
@@ -7368,7 +7662,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     };
     var proof_aj = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_aj.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_already_justified, proof_aj, true, .block_payload);
 
     // (b) NEGATIVE: genesis self-vote — source.slot==0, target.slot==0.
     // getProposalAttestations drops any attestation with target.slot <= source.slot
@@ -7383,7 +7677,7 @@ test "produceBlock - already-justified target skipped, genesis self-vote filtere
     };
     var proof_gsv = try types.SingleMessageAggregate.init(allocator);
     for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_gsv.participants, i, true);
-    try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true);
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_genesis_self_vote, proof_gsv, true, .block_payload);
 
     const produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,

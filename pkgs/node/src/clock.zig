@@ -130,9 +130,17 @@ pub const Clock = struct {
             const cbWrapper = self.on_interval_cbs.items[i];
             cbWrapper.interval = self.current_interval + 1;
 
-            self.timer.run(
+            // Use `reset` (not `run`): under gossip load the outer `.once`
+            // loop can re-enter `tickInterval` while a previous interval
+            // timer for this same completion is still pending in the heap.
+            // `run` would re-insert the completion's intrusive heap node a
+            // second time, cycling the pairing heap (100% CPU spin in
+            // `Loop.tick`). `reset` cancels-then-re-arms a still-active timer
+            // via `c_cancel`, leaving the heap consistent.
+            self.timer.reset(
                 self.events.loop,
                 &cbWrapper.c,
+                &cbWrapper.c_cancel,
                 time_to_next_interval_ms,
                 OnIntervalCbWrapper,
                 cbWrapper,

@@ -6,12 +6,60 @@ const constants = @import("constants.zig");
 
 const simargs = @import("simargs");
 
-// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings
+/// Runtime gate for QUIC-stack info/debug logs.  Defaults to **false**
+/// (suppressed); flipped to true at startup when `DEBUG_QUIC=1` (or
+/// `true`/`yes`/`on`) is set in the environment.  See `quicAwareLogFn`
+/// for the scopes that are gated and `mainInner` for the env-var read.
+var quic_debug_enabled = std.atomic.Value(bool).init(false);
+
+/// Scopes whose `.info` / `.debug` messages are suppressed unless
+/// `DEBUG_QUIC=1`.  Keep this list in sync with the `std.log.scoped`
+/// callers in zquic + zig-libp2p that emit per-packet / per-frame
+/// chatter (the gossip-wedge investigation made
+/// `quic_runtime`/`zquic`/`connection_manager`/`tls` collectively the
+/// loudest sources on a long devnet run).  Warnings and errors from
+/// these scopes still pass through so genuine problems remain visible.
+fn isQuicStackScope(comptime scope: @TypeOf(.enum_literal)) bool {
+    return scope == .zquic or
+        scope == .quic_runtime or
+        scope == .quic_dcutr or
+        scope == .quic_relay or
+        scope == .connection_manager or
+        scope == .tls;
+}
+
+/// Custom log fn: gates info/debug for the QUIC stack scopes on the
+/// `quic_debug_enabled` atomic, then delegates to `std.log.defaultLog`
+/// (which still respects `log_scope_levels` for the other scopes
+/// configured below).
+fn quicAwareLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (comptime isQuicStackScope(scope)) {
+        // Levels are err=0, warn=1, info=2, debug=3.  Gate warn/info/debug
+        // behind DEBUG_QUIC (rust-libp2p principle: the QUIC transport's
+        // backpressure/outbox/SLOW-drive chatter is operational noise, off by
+        // default — set DEBUG_QUIC to surface it). Only err always passes
+        // through so a genuine fatal transport failure stays visible.
+        if (comptime @intFromEnum(level) >= @intFromEnum(std.log.Level.warn)) {
+            if (!quic_debug_enabled.load(.monotonic)) return;
+        }
+    }
+    std.log.defaultLog(level, scope, format, args);
+}
+
+// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings.
+// `logFn` is overridden to add a runtime DEBUG_QUIC gate (see above) for the noisy
+// QUIC-stack scopes; everything else continues to use `defaultLog`.
 pub const std_options: std.Options = .{
     .log_scope_levels = &[_]std.log.ScopeLevel{
         .{ .scope = .tokenizer, .level = .err },
         .{ .scope = .parser, .level = .err },
     },
+    .logFn = quicAwareLogFn,
 };
 
 const types = @import("@zeam/types");
@@ -99,11 +147,10 @@ pub const NodeCommand = struct {
     /// always aggregates at least one sig. Higher values trade slot latency
     /// for fewer sub-threshold aggregates on chatty subnets.
     @"min-aggregation-inputs": u32 = types.default_min_aggregation_inputs,
-    /// Single-message attestation aggregation deadline budget (see
-    /// `ChainOpts.proposal_deadline_pct`): the proposer truncates attestation
-    /// gathering at this percent of the proposal interval; the remainder is for
-    /// block signing and the Type-2 multi-message merge.
-    @"proposal-deadline-pct": u32 = node_lib.default_proposal_deadline_pct,
+    /// Interval-4 single-message attestation aggregation warm-up budget (see
+    /// `ChainOpts.type1_aggregation_deadline_pct`). Interval 0 does not run
+    /// Type-1 aggregation; it packages warmed proofs before signing and Type-2.
+    @"type1-aggregation-deadline-pct": u32 = node_lib.default_type1_aggregation_deadline_pct,
 
     /// Cap on the number of child STARK proofs the aggregator worker merges
     /// with raw signatures via `rec_xmss_aggregate`.
@@ -153,8 +200,8 @@ pub const NodeCommand = struct {
         .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. On by default; pass `--chain-worker false` to fall back to the legacy synchronous path as a kill-switch.",
         .@"rayon-threads" = "Override the rayon worker count used by the multisig aggregate prover. If unset, half of the post-system-thread budget goes to the Zig pool and half to rayon. Aggregators in CPU-rich environments benefit from a higher value (e.g. 12 on a 16-vCPU host); non-aggregators can leave it unset.",
         .@"min-aggregation-inputs" = "Minimum (children + gossip-sig) inputs required before the aggregator invokes the recursive STARK prover for an AttestationData. Default 2 skips the trivial 'no children + 1 local sig' case (the lone sig is already on the gossip topic, so peers can fold it in directly; building a 1-validator aggregate spends the full prover budget for zero consensus signal). Set 1 to revert to the earlier behavior that always aggregated at least one signature. Higher values trade slot latency for fewer sub-threshold aggregates on chatty subnets.",
-        .@"proposal-deadline-pct" = "Percentage of one proposal interval (SECONDS_PER_INTERVAL_MS, default 800ms) budgeted to the block-build/aggregation worker. This is an intra-interval split: the worker self-truncates at this percentage and the remaining (100-pct)% of the SAME interval is reserved for the finalize step (STF on the harvested partial body + propose-side sign + gossip publish), so the signed block is ready before the attestation interval. Default 90 (~720ms aggregation + ~80ms finalize/sign at the default 800ms interval). Lower this on slow validator hardware to widen the finalize/sign window; raise toward 99 to maximise aggregation throughput. Clamped to [0, 99] inside the consumer.",
-        .@"max-aggregation-children" = "Cap on the number of child STARK proofs the aggregator worker merges with raw signatures via rec_xmss_aggregate. Default 0 keeps per-call latency bounded by flat-prove cost (~0.5 s/call on typical aggregator hardware) by never taking the recursive code path; peer-published aggregates for the same att_data remain in latest_known_aggregated_payloads for the block proposer to compact at proposal time. Set 1 to allow at most one peer child to be merged (~1.5 s/call). Higher values reintroduce the multi-second tail (in one measurement, num_children=3-4 averaged ~4.8 s).",
+        .@"type1-aggregation-deadline-pct" = "Percentage of one proposal interval (SECONDS_PER_INTERVAL_MS, default 800ms) available to the interval-4 Type-1 proposer warm-up. Interval 0 does not run Type-1 aggregation; it packages already-warmed proofs, signs, and builds the Type-2 block proof. Default 100 (full interval-4 budget). The FFI is uninterruptible, so the deadline gates starting the next selected attestation data, not an already-running proof.",
+        .@"max-aggregation-children" = "Cap on the number of child STARK proofs the aggregator worker merges with raw signatures via rec_xmss_aggregate. Default 0 keeps per-call latency bounded by flat-prove cost (~0.5 s/call on typical aggregator hardware) by never taking the recursive code path; peer-published aggregates for the same att_data remain in latest_known_aggregated_payloads for the block proposer to package directly. Set 1 to allow at most one peer child to be merged (~1.5 s/call). Higher values reintroduce the multi-second tail (in one measurement, num_children=3-4 averaged ~4.8 s).",
         .@"max-aggregations-per-tick" = "Cap on the number of AttestationData the aggregator proves+publishes per tick. The keys form a greedy justification path: the first key advances latest_justified to its target, the next is sourced at that target, and so on, so N proves successively move justification ahead. Default 1 reproduces the single-aggregation behaviour exactly (one prove on the calling worker). 0 is treated as 1: an aggregator-role node always produces at least one aggregation per tick. Values >1 run the extra proves in parallel on the shared ThreadPool; since each prove drives Rayon internally, pair a higher value with a lower --rayon-threads to avoid CPU oversubscription (the reason #925 sequentialized the old multi-key prover).",
         .help = "Show help information for the node command",
     };
@@ -332,6 +379,22 @@ fn mainInner(init: std.process.Init) !void {
             std.process.exit(1);
         }
     };
+
+    // Honour the `DEBUG_QUIC` env var (mirrors `lean-quickstart`'s shell-side
+    // contract for ethlambda/quinn): unset / `0` / empty → suppress info+debug
+    // from the QUIC stack scopes; `1` / `true` / `yes` / `on` → unmute.  This
+    // must run before any QUIC-stack logging is emitted so the first messages
+    // (e.g. transport init) are filtered consistently.  Zig 0.16 removed
+    // `std.process.getEnvVarOwned`; the CLI binary already links libc (for
+    // rust glue + rocksdb), so `std.c.getenv` is the simplest no-alloc path.
+    if (std.c.getenv("DEBUG_QUIC")) |raw| {
+        const trimmed = std.mem.trim(u8, std.mem.span(raw), " \t\n\r");
+        const truthy = std.mem.eql(u8, trimmed, "1") or
+            std.ascii.eqlIgnoreCase(trimmed, "true") or
+            std.ascii.eqlIgnoreCase(trimmed, "yes") or
+            std.ascii.eqlIgnoreCase(trimmed, "on");
+        if (truthy) quic_debug_enabled.store(true, .monotonic);
+    }
 
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
@@ -555,23 +618,23 @@ fn mainInner(init: std.process.Init) !void {
             var network1: *networks.EthLibp2p = undefined;
             var network2: *networks.EthLibp2p = undefined;
             var network3: *networks.EthLibp2p = undefined;
-            // Initialize to empty slices to avoid undefined behavior in defer when mock_network=true
-            var listen_addresses1: []Multiaddr = &.{};
-            var listen_addresses2: []Multiaddr = &.{};
-            var listen_addresses3: []Multiaddr = &.{};
-            var connect_peers: []Multiaddr = &.{};
-            var connect_peers3: []Multiaddr = &.{};
+            // v2 takes string-shaped listen/connect multiaddrs (one or
+            // comma-separated). We allocate them after we know each network's
+            // peer id (so connect strings can carry `/p2p/<peer>`), keep them
+            // alive through the simulation, and free them at scope exit.
+            var listen_str1: ?[]u8 = null;
+            var listen_str2: ?[]u8 = null;
+            var listen_str3: ?[]u8 = null;
+            var connect_str1: ?[]u8 = null;
+            var connect_str2: ?[]u8 = null;
+            var connect_str3: ?[]u8 = null;
             defer {
-                for (listen_addresses1) |addr| addr.deinit();
-                if (listen_addresses1.len > 0) allocator.free(listen_addresses1);
-                for (listen_addresses2) |addr| addr.deinit();
-                if (listen_addresses2.len > 0) allocator.free(listen_addresses2);
-                for (listen_addresses3) |addr| addr.deinit();
-                if (listen_addresses3.len > 0) allocator.free(listen_addresses3);
-                for (connect_peers) |addr| addr.deinit();
-                if (connect_peers.len > 0) allocator.free(connect_peers);
-                for (connect_peers3) |addr| addr.deinit();
-                if (connect_peers3.len > 0) allocator.free(connect_peers3);
+                if (listen_str1) |s| allocator.free(s);
+                if (listen_str2) |s| allocator.free(s);
+                if (listen_str3) |s| allocator.free(s);
+                if (connect_str1) |s| allocator.free(s);
+                if (connect_str2) |s| allocator.free(s);
+                if (connect_str3) |s| allocator.free(s);
             }
 
             // Create shared registry for beam simulation with validator ID mappings
@@ -597,58 +660,93 @@ fn mainInner(init: std.process.Init) !void {
                 backend3 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {f}", .{backend1.gossip});
             } else {
-                network1 = try allocator.create(networks.EthLibp2p);
-                const key_pair1 = enr_lib.KeyPair.generate();
-                const priv_key1 = key_pair1.v4.toString();
-                listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
+                // Pure-Zig libp2p (v2) backed by zig-libp2p v0.1.3:
+                //   - Each network has a deterministic ECDSA-P-256 host
+                //     identity (so peer ids are stable across runs and we
+                //     can build connect strings between nodes BEFORE all
+                //     networks are init'd).
+                //   - Listen multiaddrs are UDP / quic-v1 (was TCP under
+                //     the Rust glue). QuicRuntime only does QUIC.
+                //   - connect_peers strings carry the `/p2p/<peer>` suffix
+                //     so the TLS handshake verifies the expected peer id.
+                const seed1 = [_]u8{0x01} ** 32;
+                const seed2 = [_]u8{0x02} ** 32;
+                const seed3 = [_]u8{0x03} ** 32;
+
+                listen_str1 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9001/quic-v1");
+                listen_str2 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9002/quic-v1");
+                listen_str3 = try allocator.dupe(u8, "/ip4/0.0.0.0/udp/9003/quic-v1");
+
+                // Derive every node's peer id upfront so we can build the
+                // full all-to-all connect mesh before any network is
+                // init'd. QuicRuntime in zig-libp2p v0.1.3 only routes
+                // outbound sends through connections it has dialed —
+                // inbound-only peers can't be the target of `sendRequest`
+                // — so making every node dial every other node is the
+                // cheapest fix at this layer.
+                const peer1_b58 = try networks.EthLibp2p.peerIdBase58FromSeed(allocator, seed1);
+                defer allocator.free(peer1_b58);
+                const peer2_b58 = try networks.EthLibp2p.peerIdBase58FromSeed(allocator, seed2);
+                defer allocator.free(peer2_b58);
+                const peer3_b58 = try networks.EthLibp2p.peerIdBase58FromSeed(allocator, seed3);
+                defer allocator.free(peer3_b58);
+
+                connect_str1 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9002/quic-v1/p2p/{s},/ip4/127.0.0.1/udp/9003/quic-v1/p2p/{s}",
+                    .{ peer2_b58, peer3_b58 },
+                );
+                connect_str2 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s},/ip4/127.0.0.1/udp/9003/quic-v1/p2p/{s}",
+                    .{ peer1_b58, peer3_b58 },
+                );
+                connect_str3 = try std.fmt.allocPrint(
+                    allocator,
+                    "/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{s},/ip4/127.0.0.1/udp/9002/quic-v1/p2p/{s}",
+                    .{ peer1_b58, peer2_b58 },
+                );
+
+                // ── Network 1 ───────────────────────────────────────────
+                // `EthLibp2p.init` returns a heap-allocated `*Self`; we
+                // do NOT need a separate `allocator.create` like the
+                // legacy `EthLibp2p` flow.
                 const fork_digest1 = try allocator.dupe(u8, chain_config.spec.fork_digest);
                 errdefer allocator.free(fork_digest1);
-                // Create empty registry for test network
                 const test_registry1 = try allocator.create(node_lib.NodeNameRegistry);
                 errdefer allocator.destroy(test_registry1);
                 test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry1.deinit();
 
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network1 = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 0,
                     .fork_digest = fork_digest1,
-                    .local_private_key = &priv_key1,
-                    .listen_addresses = listen_addresses1,
-                    .connect_peers = null,
+                    .listen_addresses = listen_str1.?,
+                    .connect_peers = connect_str1.?,
                     .node_registry = test_registry1,
+                    .host_identity_seed = seed1,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
-                // init a new lib2p network here to connect with network1
-                network2 = try allocator.create(networks.EthLibp2p);
-                const key_pair2 = enr_lib.KeyPair.generate();
-                const priv_key2 = key_pair2.v4.toString();
-                listen_addresses2 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")});
-                connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
+                // ── Network 2 ───────────────────────────────────────────
                 const fork_digest2 = try allocator.dupe(u8, chain_config.spec.fork_digest);
                 errdefer allocator.free(fork_digest2);
-                // Create empty registry for test network
                 const test_registry2 = try allocator.create(node_lib.NodeNameRegistry);
                 errdefer allocator.destroy(test_registry2);
                 test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry2.deinit();
 
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network2 = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 1,
                     .fork_digest = fork_digest2,
-                    .local_private_key = &priv_key2,
-                    .listen_addresses = listen_addresses2,
-                    .connect_peers = connect_peers,
+                    .listen_addresses = listen_str2.?,
+                    .connect_peers = connect_str2.?,
                     .node_registry = test_registry2,
+                    .host_identity_seed = seed2,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
-                // init network3 for node 3 (delayed sync node)
-                network3 = try allocator.create(networks.EthLibp2p);
-                const key_pair3 = enr_lib.KeyPair.generate();
-                const priv_key3 = key_pair3.v4.toString();
-                listen_addresses3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9003")});
-                connect_peers3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
+                // ── Network 3 (delayed sync node) ───────────────────────
                 const fork_digest3 = try allocator.dupe(u8, chain_config.spec.fork_digest);
                 errdefer allocator.free(fork_digest3);
                 const test_registry3 = try allocator.create(node_lib.NodeNameRegistry);
@@ -656,16 +754,16 @@ fn mainInner(init: std.process.Init) !void {
                 test_registry3.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer test_registry3.deinit();
 
-                network3.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network3 = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 2,
                     .fork_digest = fork_digest3,
-                    .local_private_key = &priv_key3,
-                    .listen_addresses = listen_addresses3,
-                    .connect_peers = connect_peers3,
+                    .listen_addresses = listen_str3.?,
+                    .connect_peers = connect_str3.?,
                     .node_registry = test_registry3,
+                    .host_identity_seed = seed3,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
-                logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- v2 ethlibp2p gossip {f}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
@@ -913,6 +1011,7 @@ fn mainInner(init: std.process.Init) !void {
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.@"network-id",
                 .node_key = leancmd.@"node-id",
+                .host_identity_key_path = leancmd.@"node-key",
                 .validator_config = leancmd.@"validator-config",
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.@"metrics-enable",
@@ -930,7 +1029,7 @@ fn mainInner(init: std.process.Init) !void {
                 .db_backend = leancmd.@"db-backend",
                 .rayon_threads = leancmd.@"rayon-threads",
                 .min_aggregation_inputs = leancmd.@"min-aggregation-inputs",
-                .proposal_deadline_pct = leancmd.@"proposal-deadline-pct",
+                .type1_aggregation_deadline_pct = leancmd.@"type1-aggregation-deadline-pct",
                 .max_aggregation_children = leancmd.@"max-aggregation-children",
                 .max_aggregations_per_tick = leancmd.@"max-aggregations-per-tick",
             };
