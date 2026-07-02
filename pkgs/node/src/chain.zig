@@ -4606,13 +4606,19 @@ pub const BeamChain = struct {
             return AttestationValidationError.AttestationTooFarInFuture;
         }
 
-        // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
-        const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
+        // 1. Validate that source, target, and head blocks exist in proto array (thread-safe).
+        //
+        // Source existence and the source-derived checks below are gossip-only. A block
+        // attestation's source is already validated by the STF against the block's canonical
+        // chain, and finalization prunes pre-finalized ancestors from proto-array — so a valid
+        // on-chain vote whose source sits at/below the finalized boundary must not be dropped
+        // here. The fork-choice tracker consumes only head.
+        const source_block = if (is_from_block) null else (self.forkChoice.getProtoNode(data.source.root) orelse {
             self.logger.debug("Attestation validation failed: unknown source block root=0x{x}", .{
                 &data.source.root,
             });
             return AttestationValidationError.UnknownSourceBlock;
-        };
+        });
 
         const target_block = self.forkChoice.getProtoNode(data.target.root) orelse {
             self.logger.debug("attestation validation failed: unknown target block slot={d} root=0x{x}", .{
@@ -4631,12 +4637,14 @@ pub const BeamChain = struct {
         };
 
         // 2. Validate slot relationships
-        if (source_block.slot > target_block.slot) {
-            self.logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
-                source_block.slot,
-                target_block.slot,
-            });
-            return AttestationValidationError.SourceSlotExceedsTarget;
+        if (source_block) |sb| {
+            if (sb.slot > target_block.slot) {
+                self.logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
+                    sb.slot,
+                    target_block.slot,
+                });
+                return AttestationValidationError.SourceSlotExceedsTarget;
+            }
         }
 
         //    Invariant: attestation.source.slot <= attestation.target.slot
@@ -4658,12 +4666,14 @@ pub const BeamChain = struct {
         }
 
         // 3. Validate checkpoint slots match block slots
-        if (source_block.slot != data.source.slot) {
-            self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
-                source_block.slot,
-                data.source.slot,
-            });
-            return AttestationValidationError.SourceCheckpointSlotMismatch;
+        if (source_block) |sb| {
+            if (sb.slot != data.source.slot) {
+                self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
+                    sb.slot,
+                    data.source.slot,
+                });
+                return AttestationValidationError.SourceCheckpointSlotMismatch;
+            }
         }
 
         //    Invariant: target_block.slot == attestation.target.slot
@@ -4686,14 +4696,15 @@ pub const BeamChain = struct {
 
         // 4. Ancestry: target must be an ancestor of head, and source an ancestor of
         // target. Rejects sibling-fork attestations (matches the spectest runner and the
-        // consensus spec). source/target/head are confirmed present above, so
-        // isAncestorOfBlock's descendant-exists invariant holds. Placed after the slot
-        // checks so the more specific slot errors take precedence.
+        // consensus spec). target/head are confirmed present above, so isAncestorOfBlock's
+        // descendant-exists invariant holds. Placed after the slot checks so the more
+        // specific slot errors take precedence. The source-ancestry check is gossip-only:
+        // source may be pruned on the block path (see the source lookup above).
         if (!self.forkChoice.isAncestorOfBlock(data.target.root, data.head.root)) {
             self.logger.debug("attestation validation failed: target not ancestor of head", .{});
             return AttestationValidationError.TargetNotAncestorOfHead;
         }
-        if (!self.forkChoice.isAncestorOfBlock(data.source.root, data.target.root)) {
+        if (!is_from_block and !self.forkChoice.isAncestorOfBlock(data.source.root, data.target.root)) {
             self.logger.debug("attestation validation failed: source not ancestor of target", .{});
             return AttestationValidationError.SourceNotAncestorOfTarget;
         }
@@ -6090,6 +6101,47 @@ test "attestation validation - comprehensive" {
             .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(future_attestation.message, false));
+    }
+
+    // Test 10: block path (is_from_block=true) skips the source existence check.
+    //
+    // A block attestation's source is validated by the STF against the block's canonical
+    // chain, and finalization prunes pre-finalized ancestors from proto-array. The fork-choice
+    // tracker consumes only head, so an unknown/pruned source must not drop the vote on the
+    // block path — while the gossip path still rejects it.
+    {
+        const unknown_source = [_]u8{0xFF} ** 32;
+        const att: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+                .source = types.Checkpoint{ .root = unknown_source, .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        // Gossip: source existence still enforced.
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestationData(att.message, false));
+        // Block: source skipped, validation passes.
+        try beam_chain.validateAttestationData(att.message, true);
+    }
+
+    // Test 11: block path still enforces head existence — head is the only field the tracker
+    // consumes, so an unresolvable head cannot be applied and must still be rejected.
+    {
+        const unknown_head = [_]u8{0xDD} ** 32;
+        const att: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = unknown_head, .slot = 2 },
+                .source = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestationData(att.message, true));
     }
 }
 
