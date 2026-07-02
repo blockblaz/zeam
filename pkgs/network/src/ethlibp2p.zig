@@ -1091,14 +1091,26 @@ pub const EthLibp2p = struct {
         };
         errdefer self.allocator.free(peer_owned);
 
-        var request = interface.ReqRespRequest.deserialize(self.allocator, method, r.payload) catch |e| {
-            self.logger.err(
-                "network-{d}:: inbound rpc SSZ decode method={s} from={s} failed: {any}",
-                .{ self.params.networkId, @tagName(method), peer_str, e },
-            );
-            self.allocator.free(peer_owned);
-            return;
-        };
+        // Empty-body /status interop: rust-libp2p (lantern) and gean open a
+        // /status stream and send NO request body — they expect the responder
+        // to reply with its Status without a request. zig-libp2p (v0.2.70+) now
+        // dispatches that empty stream with a "" payload instead of reaping it.
+        // Our status responder ignores the request Status entirely (returns
+        // chain.getStatus()), so a zeroed default is fine. Accept it here rather
+        // than failing SSZ decode (PayloadTooSmall) and dropping the response —
+        // which left the peer without an answer and kept it flapping. Scoped to
+        // .status only; blocks_by_* still require a valid decoded request.
+        var request = if (method == .status and r.payload.len == 0)
+            interface.ReqRespRequest{ .status = std.mem.zeroes(types.Status) }
+        else
+            interface.ReqRespRequest.deserialize(self.allocator, method, r.payload) catch |e| {
+                self.logger.err(
+                    "network-{d}:: inbound rpc SSZ decode method={s} from={s} failed: {any}",
+                    .{ self.params.networkId, @tagName(method), peer_str, e },
+                );
+                self.allocator.free(peer_owned);
+                return;
+            };
         defer request.deinit();
 
         const stream_ctx = self.allocator.create(ServerStreamContext) catch |e| {
