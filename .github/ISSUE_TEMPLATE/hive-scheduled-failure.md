@@ -17,8 +17,8 @@ This issue is auto-opened by the `hive` workflow and updated in place by later s
 
 ### Notes
 
-- The upstream `clients/zeam` Dockerfile in `ethereum/hive` selects the devnet4
-  binary from the pre-published `blockblaz/zeam:devnet4` image (no tag build
+- The upstream `clients/zeam` Dockerfile in `ethereum/hive` selects devnet
+  binaries from pre-published `blockblaz/zeam:devnetN` images (no tag build
   arg), so a failure here may reflect the published image rather than HEAD of
   `main`. Check the published image tag before assuming a regression in-tree.
 - Logs, per-test results, and the hiveview output are attached to the workflow
