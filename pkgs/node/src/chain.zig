@@ -4677,19 +4677,26 @@ pub const BeamChain = struct {
         // All fork-choice-derivable validation lives in one shared method on
         // ForkChoice (proto-array existence/slots, source/target/head
         // ancestry, slot-before-head, and the interval-based future-slot
-        // bound). The future-slot bound applies only to gossip — block-
-        // included attestations are trusted under the block's own validation.
+        // bound). `is_gossip` (= !is_from_block) selects the checks that apply
+        // only to a wire vote; a block-embedded attestation is trusted under the
+        // block's own STF validation for those.
         //
-        // The future-slot drop sits before the proto-node lookups inside the
-        // shared method: an attestation for a far-future slot referencing
-        // future blocks would otherwise bottom out at UnknownHeadBlock and
-        // make the caller enqueue a BlocksByRoot for a head that does not
-        // exist anywhere — a fetch-storm amplifier on aggregators.
+        // Gossip-only: the future-slot bound and the source-side
+        // existence/ancestry. The future-slot drop sits before the proto-node
+        // lookups — an attestation for a far-future slot referencing future
+        // blocks would otherwise bottom out at UnknownHeadBlock and make the
+        // caller enqueue a BlocksByRoot for a head that does not exist anywhere,
+        // a fetch-storm amplifier on aggregators. Source existence is skipped for
+        // block attestations because the STF already validated source against the
+        // block's canonical chain, and finalization prunes pre-finalized
+        // ancestors from proto-array — checking it here would drop valid on-chain
+        // votes once finalization advances past their source.
         //
-        // Ancestry is applied on BOTH paths (gossip and block): block-embedded
-        // attestations are also fed to the fork-choice tracker via onAttestation,
-        // so gating it on gossip would reopen the vote-splitting vector for
-        // attestations smuggled inside a block.
+        // Both paths: target/head existence and the head-side ancestry (target
+        // ancestor of head). Block-embedded attestations are fed to the
+        // fork-choice tracker via onAttestation and LMD weight flows along the
+        // head's ancestry, so those stay to close the vote-splitting vector.
+        // Source-side is FFG-only and does not steer LMD weight.
         self.forkChoice.validateAttestationDataForGossip(data, !is_from_block) catch |err| {
             self.logger.debug("attestation validation failed: error={any} slot={d} source={d} target={d} head={d} is_from_block={any}", .{
                 err,
@@ -6456,6 +6463,63 @@ test "attestation validation - comprehensive" {
             error.TargetCheckpointNotAncestorOfHead,
             beam_chain.validateAttestationData(invalid_attestation.message, false),
         );
+    }
+
+    // Test 14: block path (is_from_block=true) skips the source existence check.
+    //
+    // A block attestation's source is validated by the STF against the block's
+    // canonical chain, and finalization prunes pre-finalized ancestors from
+    // proto-array. The fork-choice tracker consumes only head, so an
+    // unknown/pruned source must not drop the vote on the block path — while the
+    // gossip path still rejects it.
+    {
+        const unknown_source = [_]u8{0xFF} ** 32;
+        const att: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+                .source = types.Checkpoint{ .root = unknown_source, .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestationData(att.message, false));
+        try beam_chain.validateAttestationData(att.message, true);
+    }
+
+    // Test 15: block path still enforces head existence — head is the only field
+    // the tracker consumes, so an unresolvable head cannot be applied.
+    {
+        const unknown_head = [_]u8{0xDD} ** 32;
+        const att: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = unknown_head, .slot = 2 },
+                .source = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestationData(att.message, true));
+    }
+
+    // Test 16: the head-side ancestry (target ancestor of head) still applies on
+    // the block path — relaxing the source-side does not reopen the vote-splitting
+    // vector. A sibling head is rejected on BOTH paths.
+    {
+        const att: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = sibling_head_root, .slot = 2 },
+                .source = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+                .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        try std.testing.expectError(error.TargetCheckpointNotAncestorOfHead, beam_chain.validateAttestationData(att.message, true));
     }
 }
 
