@@ -5497,7 +5497,7 @@ pub const BeamChain = struct {
         // root. Loading "database latest finalized" here can race/lag the
         // forkchoice checkpoint and make the RPC endpoint return an older state
         // than `/lean/v0/fork_choice` just reported.
-        var loaded_state = self.db.loadState(database.DbStatesNamespace, finalized_checkpoint.root) orelse {
+        const loaded_state = self.db.loadState(database.DbStatesNamespace, finalized_checkpoint.root) orelse {
             self.logger.warn(
                 "finalized state not available in database for forkchoice finalized slot={d} root=0x{x}",
                 .{ finalized_checkpoint.slot, &finalized_checkpoint.root },
