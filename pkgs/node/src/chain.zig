@@ -465,6 +465,16 @@ pub const BeamChain = struct {
     /// Joined at `deinit` so aggregate workers cannot outlive chain state.
     aggregate_wg: WaitGroup = .{},
 
+    /// In-flight second-level (cross-subnet) aggregate worker count. The
+    /// interval-3 pass merges the per-subnet first-level aggregates that
+    /// gossiped in after interval 2 into one combined aggregate per att_data.
+    /// Separate from `aggregate_inflight` so the two levels never coalesce each
+    /// other; bounded by the same `aggregate_max_inflight` ceiling.
+    l2_aggregate_inflight: std.atomic.Value(u32) = .init(0),
+
+    /// Joined at `deinit` so second-level aggregate workers cannot outlive chain state.
+    l2_aggregate_wg: WaitGroup = .{},
+
     /// Soft ceiling on `aggregate_inflight`. Copied from `ChainOpts` at init.
     aggregate_max_inflight: u32,
 
@@ -717,6 +727,8 @@ pub const BeamChain = struct {
             .aggregate_reschedule_intervals = .init(0),
             .aggregate_last_completed_slot = .init(0),
             .aggregate_wg = .{},
+            .l2_aggregate_inflight = .init(0),
+            .l2_aggregate_wg = .{},
             .attest_inflight = .init(0),
             .attest_wg = .{},
             .aggregate_max_inflight = opts.aggregate_max_inflight,
@@ -1775,6 +1787,7 @@ pub const BeamChain = struct {
         // Join any in-flight aggregate workers before tearing down
         // chain state they reference.
         self.thread_pool.waitAndWork(&self.aggregate_wg);
+        self.thread_pool.waitAndWork(&self.l2_aggregate_wg);
 
         // Same for in-flight propose workers (produceBlock + Type-2 merge +
         // publishBlock) — they reference chain state and must not outlive it.
@@ -5115,6 +5128,122 @@ pub const BeamChain = struct {
         chain.aggregate_last_completed_slot.store(@intCast(slot), .release);
     }
 
+    /// Submit the interval-3 second-level (cross-subnet) aggregate worker. The
+    /// first-level interval-2 pass aggregates this node's own-subnet raw
+    /// signatures; by interval 3 the per-subnet first-level aggregates from the
+    /// OTHER subnets have gossiped into `latest_new_aggregated_payloads`, so this
+    /// pass merges them (as recursive children, bounded by `max_aggregation_children`)
+    /// into one combined aggregate per att_data and publishes on the same
+    /// `aggregation` topic. Same aggregator gating as interval 2. Best-effort: if a
+    /// second-level worker is already in flight the tick is dropped (no reschedule);
+    /// the next slot re-runs it.
+    pub fn submitSecondLevelAggregateOnInterval(self: *Self, node: *@import("./node.zig").BeamNode, time_intervals: usize) void {
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        // Second-level aggregation exists solely to merge the per-subnet first-level
+        // aggregates as recursive children; with a zero child budget there is nothing
+        // to merge, so the pass is a strict no-op (default configuration).
+        if (self.forkChoice.max_aggregation_children == 0) return;
+        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) {
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_aggregator" }) catch {};
+            return;
+        }
+
+        switch (self.getSyncStatus()) {
+            .synced, .no_peers => {},
+            .fc_initing => {
+                self.logger.warn("skipping second-level aggregation for slot={d}: forkchoice initializing", .{slot});
+                zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
+                return;
+            },
+            .peers_materially_ahead => |info| {
+                self.logBehindPeersDebug("skipping second-level aggregation production", info);
+                zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "not_synced" }) catch {};
+                return;
+            },
+        }
+
+        // Soft ceiling shared with interval 2's cap; counted on a separate
+        // in-flight gauge so the two levels never coalesce each other.
+        const prev = self.l2_aggregate_inflight.fetchAdd(1, .acq_rel);
+        if (prev >= self.aggregate_max_inflight) {
+            _ = self.l2_aggregate_inflight.fetchSub(1, .acq_rel);
+            self.logger.info("coalescing second-level aggregation for slot={d}: {d} already in flight (cap={d})", .{ slot, prev, self.aggregate_max_inflight });
+            return;
+        }
+
+        self.thread_pool.spawnWg(&self.l2_aggregate_wg, secondLevelAggregateImpl, .{ self, node, slot }) catch {
+            _ = self.l2_aggregate_inflight.fetchSub(1, .acq_rel);
+            self.logger.warn("failed to enqueue second-level aggregation for slot={d}; skipping", .{slot});
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "spawn_failed" }) catch {};
+            return;
+        };
+    }
+
+    /// Worker body for the interval-3 second-level aggregate pass. Mirrors
+    /// `aggregateImpl` without the coalesce/reschedule bookkeeping: it re-runs the
+    /// same `aggregateForSlots` machinery, which now finds the gossiped per-subnet
+    /// aggregates as merge children. The selector's `snapshotKeyFullyCovered` guard
+    /// skips att_data already fully covered by interval 2, so this pass only proves
+    /// where the cross-subnet children add coverage.
+    fn secondLevelAggregateImpl(chain: *Self, node: *@import("./node.zig").BeamNode, trigger_slot: usize) void {
+        defer _ = chain.l2_aggregate_inflight.fetchSub(1, .acq_rel);
+        const worker_timer = zeam_metrics.zeam_aggregate_worker_duration_seconds.start();
+        defer _ = worker_timer.observe();
+
+        const clock_slot = chain.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        const work = Self.resolveAggregateWorkerSlot(trigger_slot, clock_slot);
+        const slot = work.slot;
+
+        const head_root = chain.forkChoice.getHead().blockRoot;
+        var borrow = chain.statesGet(head_root) orelse {
+            chain.logger.warn("skipping second-level aggregation for slot={d}: missing state for head root", .{slot});
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "missing_state" }) catch {};
+            return;
+        };
+        const pre_state = borrow.state.cloneForProjection(chain.allocator) catch |err| {
+            borrow.deinit();
+            chain.logger.warn("failed to clone pre-state for second-level aggregation at slot={d}: {any}", .{ slot, err });
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
+            return;
+        };
+        borrow.deinit();
+        defer {
+            pre_state.deinit();
+            chain.allocator.destroy(pre_state);
+        }
+
+        var slot_window_buf: [2]types.Slot = undefined;
+        var slot_window_len: usize = 0;
+        if (!work.is_clock_catch_up and slot > 0) {
+            slot_window_buf[slot_window_len] = @intCast(slot - 1);
+            slot_window_len += 1;
+        }
+        slot_window_buf[slot_window_len] = @intCast(slot);
+        slot_window_len += 1;
+
+        // Same OUTERMOST prove_gate ordering as interval 2 (prove_gate -> fcmutex).
+        chain.prove_gate.lock();
+        const aggregations = chain.forkChoice.aggregateForSlots(
+            &pre_state.validators,
+            slot_window_buf[0..slot_window_len],
+            pre_state,
+            @intCast(slot + 1),
+            node,
+            publishOneAggregate,
+        ) catch |err| {
+            chain.prove_gate.unlock();
+            chain.logger.warn("failed to second-level aggregate for slot={d}: {any}", .{ slot, err });
+            zeam_metrics.metrics.lean_aggregator_skipped_total.incr(.{ .reason = "other" }) catch {};
+            return;
+        };
+        chain.prove_gate.unlock();
+        defer chain.allocator.free(aggregations);
+
+        if (aggregations.len > 0) {
+            node.publishProducedAggregations(aggregations);
+        }
+    }
+
     /// Trigger off-loop block production for an already-resolved proposer duty.
     /// The "am I proposer this slot?" decision is the validator client's
     /// (`ValidatorClient.onInterval` resolves `proposer_id` via `getSlotProposer`
@@ -7606,13 +7735,11 @@ test "produceBlock - interval 0 packages one warmed Type-1 proof without compact
     };
     const proposer_index = proposal_slot % num_validators;
 
-    // proof_a already carries the full-coverage supermajority for att_data, so it
-    // alone justifies the target and the finality-advancing filter includes it.
-    // A second disjoint partial proof for the SAME att_data exists; interval 0 must
-    // pack the already-warmed full-coverage proof directly and NOT start Type-1
-    // compaction FFI to merge the two.
+    // Two disjoint proofs for the SAME att_data would require compactAttestations
+    // to merge into one full-coverage Type-1. Interval 0 skips that FFI and carries
+    // only one of the already-warmed proofs.
     var proof_a = try types.SingleMessageAggregate.init(allocator);
-    for (0..@intCast(num_validators)) |i| try types.aggregationBitsSet(&proof_a.participants, i, true);
+    try types.aggregationBitsSet(&proof_a.participants, 0, true);
     try beam_chain.forkChoice.storeAggregatedPayload(&att_data, proof_a, true, .block_payload);
     var proof_b = try types.SingleMessageAggregate.init(allocator);
     try types.aggregationBitsSet(&proof_b.participants, 1, true);

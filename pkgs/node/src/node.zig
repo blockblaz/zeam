@@ -3096,6 +3096,16 @@ pub const BeamNode = struct {
                     self.chain.submitAggregateOnInterval(self, interval);
                 }
             }
+
+            // Interval-3 second-level (cross-subnet) aggregation: merge the
+            // per-subnet first-level aggregates that gossiped in after interval 2
+            // into one combined aggregate per att_data. Same aggregator gating and
+            // off-loop worker dispatch as interval 2.
+            if (interval_in_slot == 3) {
+                const l2_agg_timer = zeam_metrics.zeam_node_aggregation_interval_tick_seconds.start();
+                defer _ = l2_agg_timer.observe();
+                self.chain.submitSecondLevelAggregateOnInterval(self, interval);
+            }
         }
     }
 
