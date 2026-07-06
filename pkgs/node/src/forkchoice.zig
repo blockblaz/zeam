@@ -3445,21 +3445,28 @@ pub const ForkChoice = struct {
     ///
     /// Signature, proof, registry-bound, and empty-bits checks are NOT here.
     /// They need chain/state context and are layered by the caller.
-    pub fn validateAttestationDataForGossip(self: *Self, data: types.AttestationData, check_future_slot: bool) GossipAttestationValidationError!void {
+    pub fn validateAttestationDataForGossip(self: *Self, data: types.AttestationData, is_gossip: bool) GossipAttestationValidationError!void {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        return self.validateAttestationDataForGossipUnlocked(data, check_future_slot);
+        return self.validateAttestationDataForGossipUnlocked(data, is_gossip);
     }
 
     // Internal unlocked version - assumes caller holds (at least shared) lock.
-    fn validateAttestationDataForGossipUnlocked(self: *Self, data: types.AttestationData, check_future_slot: bool) GossipAttestationValidationError!void {
+    //
+    // `is_gossip` selects the gossip-admission checks that apply only to a wire
+    // vote: the future-slot bound and the source-side existence/ancestry. A
+    // block-embedded attestation (is_gossip=false) has already had its
+    // source/target/head validated by the STF against the block's canonical
+    // chain, so those are skipped for it. target/head existence and the
+    // head-side ancestry apply on both paths.
+    fn validateAttestationDataForGossipUnlocked(self: *Self, data: types.AttestationData, is_gossip: bool) GossipAttestationValidationError!void {
         // The future-slot bound is hoisted before the proto-node lookups.
         // An attestation for a far-future slot referencing future blocks
         // would otherwise bottom out at UnknownHeadBlock and trigger a
         // BlocksByRoot fetch for a head that does not exist anywhere — a
         // fetch-storm amplifier on aggregators. Rejecting here means the
         // missing root is never derived and the fetch is never enqueued.
-        if (check_future_slot) {
+        if (is_gossip) {
             const now_intervals = self.fcStore.slot_clock.time.load(.monotonic);
             const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
             if (attestation_start_interval > now_intervals + constants.GOSSIP_DISPARITY_INTERVALS) {
@@ -3467,23 +3474,29 @@ pub const ForkChoice = struct {
             }
         }
 
-        // 1. Source, target, and head blocks must exist in the proto-array.
-        const source_idx = self.protoArray.indices.get(data.source.root) orelse {
+        // 1. Target and head must exist in the proto-array (both paths). Source
+        // existence is gossip-only: a block attestation's source is validated by
+        // the STF against the block's canonical chain, and finalization prunes
+        // pre-finalized ancestors from proto-array — so a valid on-chain vote
+        // whose source sits at/below the finalized boundary must not be dropped
+        // here. The fork-choice tracker consumes only head.
+        const source_idx: ?usize = if (is_gossip) (self.protoArray.indices.get(data.source.root) orelse {
             return GossipAttestationValidationError.UnknownSourceBlock;
-        };
+        }) else null;
         const target_idx = self.protoArray.indices.get(data.target.root) orelse {
             return GossipAttestationValidationError.UnknownTargetBlock;
         };
         const head_idx = self.protoArray.indices.get(data.head.root) orelse {
             return GossipAttestationValidationError.UnknownHeadBlock;
         };
-        const source_node = self.protoArray.nodes.items[source_idx];
         const target_node = self.protoArray.nodes.items[target_idx];
         const head_node = self.protoArray.nodes.items[head_idx];
 
         // 2. Slot relationships. History is linear and monotonic.
-        if (source_node.slot > target_node.slot) {
-            return GossipAttestationValidationError.SourceSlotExceedsTarget;
+        if (source_idx) |si| {
+            if (self.protoArray.nodes.items[si].slot > target_node.slot) {
+                return GossipAttestationValidationError.SourceSlotExceedsTarget;
+            }
         }
         // Invariant: attestation.source.slot <= attestation.target.slot
         if (data.source.slot > data.target.slot) {
@@ -3495,8 +3508,10 @@ pub const ForkChoice = struct {
         }
 
         // 3. Checkpoint slots must match their blocks' slots.
-        if (source_node.slot != data.source.slot) {
-            return GossipAttestationValidationError.SourceCheckpointSlotMismatch;
+        if (source_idx) |si| {
+            if (self.protoArray.nodes.items[si].slot != data.source.slot) {
+                return GossipAttestationValidationError.SourceCheckpointSlotMismatch;
+            }
         }
         if (target_node.slot != data.target.slot) {
             return GossipAttestationValidationError.TargetCheckpointSlotMismatch;
@@ -3505,13 +3520,17 @@ pub const ForkChoice = struct {
             return GossipAttestationValidationError.HeadCheckpointSlotMismatch;
         }
 
-        // 4. Ancestry: fork-choice weight accrues to every ancestor of the
-        // attested head, so a source off the target's chain (or a target off
-        // the head's chain) would steer weight onto a non-canonical branch.
-        // checkpointIsAncestor matches by root, so a sibling block at the same
-        // slot is correctly rejected. Reuse the unlocked walk — we already hold
-        // the shared lock here, so the locked variant would self-deadlock.
-        if (!self.checkpointIsAncestorUnlocked(data.source, data.target)) {
+        // 4. Ancestry. Head-side (target ancestor of head) applies on BOTH paths:
+        // block-embedded attestations are fed to the fork-choice tracker via
+        // onAttestation and LMD weight flows along the head's ancestry, so a
+        // target off the head's chain must be rejected on both paths to close the
+        // vote-splitting vector. Source-side (source ancestor of target) is
+        // FFG-only, does not steer LMD weight, and is already validated by the STF
+        // for block attestations — so it is gossip-only (source may be pruned on
+        // the block path). checkpointIsAncestor matches by root, so a sibling at
+        // the same slot is rejected. Reuse the unlocked walk — we hold the shared
+        // lock here, so the locked variant would self-deadlock.
+        if (is_gossip and !self.checkpointIsAncestorUnlocked(data.source, data.target)) {
             return GossipAttestationValidationError.SourceCheckpointNotAncestorOfTarget;
         }
         if (!self.checkpointIsAncestorUnlocked(data.target, data.head)) {
