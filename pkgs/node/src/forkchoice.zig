@@ -1516,11 +1516,19 @@ pub const ForkChoice = struct {
             for (candidates.items) |c| self.allocator.free(c.voters);
             candidates.deinit(self.allocator);
         }
+        // Only attestations sourced at the CURRENT justified checkpoint the block
+        // extends can justify a new target on top of it and so move
+        // justification/finalization forward; packing anything else is wasted block
+        // space. Use pre_state.latest_justified (the head state the proposer builds
+        // on, which equals the fork-choice store's justified at the canonical head)
+        // — the STF-consistent reference the rest of this selector already uses.
+        const pre_state_justified = pre_state.latest_justified;
         {
             var payload_it = self.latest_known_aggregated_payloads.iterator();
             while (payload_it.next()) |entry| {
                 const att_data = entry.key_ptr.*;
                 if (att_data.target.slot <= att_data.source.slot) continue;
+                if (!att_data.source.eql(&pre_state_justified)) continue;
                 const voters = try self.allocator.alloc(u8, num_validators);
                 @memset(voters, 0);
                 proposalCandidateParticipants(entry.value_ptr.*, voters, allow_type1_compaction);

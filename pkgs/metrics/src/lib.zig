@@ -78,6 +78,7 @@ const Metrics = struct {
     lean_attestations_valid_total: ForkChoiceAttestationsValidLabeledCounter,
     lean_attestations_invalid_total: ForkChoiceAttestationsInvalidLabeledCounter,
     lean_attestation_validation_time_seconds: ForkChoiceAttestationValidationTimeHistogram,
+    lean_attestation_construction_time_seconds: AttestationConstructionTimeHistogram,
     // Individual attestation signature metrics (renamed to match spec)
     lean_pq_sig_attestation_signing_time_seconds: PQSignatureSigningHistogram,
     lean_pq_sig_attestation_verification_time_seconds: PQSignatureVerificationHistogram,
@@ -183,6 +184,7 @@ const Metrics = struct {
     lean_block_building_payload_aggregation_time_seconds: BlockPayloadAggregationTimeHistogram,
     // zeam-specific: Type-2 multi-message STARK merge time (buildBlockProof), the proposal critical-path cost.
     zeam_block_proof_merge_time_seconds: BlockProofMergeTimeHistogram,
+    zeam_block_proof_deconstruct_time_seconds: BlockProofDeconstructTimeHistogram,
     lean_block_aggregated_payloads: BlockAggregatedPayloadsHistogram,
     lean_block_building_success_total: BlockBuildingSuccessCounter,
     lean_block_building_failures_total: BlockBuildingFailuresCounter,
@@ -544,6 +546,7 @@ const Metrics = struct {
     const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const AttestationConstructionTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25 });
     // Individual attestation signature metric types
     const PQSigAttestationSignaturesTotalCounter = metrics_lib.Counter(u64);
     const PQSigAttestationSignaturesValidCounter = metrics_lib.Counter(u64);
@@ -616,6 +619,7 @@ const Metrics = struct {
     const BlockBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     const BlockPayloadAggregationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
     const BlockProofMergeTimeHistogram = metrics_lib.HistogramVec(f32, struct { components: []const u8 }, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5 });
+    const BlockProofDeconstructTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5 });
     const BlockAggregatedPayloadsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128 });
     // Total participant count summed across all aggregated_attestations in
     // a block. Each attestation can have up to NUM_VALIDATORS participants;
@@ -801,6 +805,18 @@ fn observeFCBlockProcessingTimeHistogram(ctx: ?*anyopaque, value: f32) void {
 fn observeFCAttestationValidationTimeHistogram(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return; // No-op if not initialized
     const histogram: *Metrics.ForkChoiceAttestationValidationTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeAttestationConstructionTimeHistogram(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return; // No-op if not initialized
+    const histogram: *Metrics.AttestationConstructionTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeBlockProofDeconstructTimeHistogram(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return; // No-op if not initialized
+    const histogram: *Metrics.BlockProofDeconstructTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
     histogram.observe(value);
 }
 
@@ -1003,6 +1019,14 @@ pub var lean_attestation_validation_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeFCAttestationValidationTimeHistogram,
 };
+pub var lean_attestation_construction_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeAttestationConstructionTimeHistogram,
+};
+pub var zeam_block_proof_deconstruct_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeBlockProofDeconstructTimeHistogram,
+};
 pub var lean_pq_sig_attestation_signing_time_seconds: Histogram = .{
     .context = null,
     .observe = &observePQSignatureAttestationSigning,
@@ -1133,6 +1157,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, io, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations" }, .{}),
         .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, io, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations" }, .{}),
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation" }, .{}),
+        .lean_attestation_construction_time_seconds = Metrics.AttestationConstructionTimeHistogram.init("lean_attestation_construction_time_seconds", .{ .help = "Time taken to construct attestation data in constructAttestationData (fork-choice head/target/source reads)" }, .{}),
+        .zeam_block_proof_deconstruct_time_seconds = Metrics.BlockProofDeconstructTimeHistogram.init("zeam_block_proof_deconstruct_time_seconds", .{ .help = "deconstructType2BlockProof time: split a block's Type-2 merged proof back into per-attestation Type-1 proofs during onBlock re-aggregation (aggregators only)" }, .{}),
         // Individual attestation signature metrics
         .lean_pq_sig_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_sig_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation" }, .{}),
         .lean_pq_sig_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_sig_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature" }, .{}),
@@ -1302,6 +1328,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_state_transition_attestations_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_attestations_processing_time_seconds);
     lean_fork_choice_block_processing_time_seconds.context = @ptrCast(&metrics.lean_fork_choice_block_processing_time_seconds);
     lean_attestation_validation_time_seconds.context = @ptrCast(&metrics.lean_attestation_validation_time_seconds);
+    lean_attestation_construction_time_seconds.context = @ptrCast(&metrics.lean_attestation_construction_time_seconds);
+    zeam_block_proof_deconstruct_time_seconds.context = @ptrCast(&metrics.zeam_block_proof_deconstruct_time_seconds);
     lean_pq_sig_attestation_signing_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_attestation_signing_time_seconds);
     lean_pq_sig_attestation_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_attestation_verification_time_seconds);
     lean_pq_sig_aggregated_signatures_building_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_building_time_seconds);
