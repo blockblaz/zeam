@@ -264,13 +264,15 @@ pub const BeamChain = struct {
     /// Lock-free monotonic counter; safe to read from any thread.
     states_kept_existing_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // Cached finalized state loaded from database (separate from states
-    // map to avoid affecting pruning).
+    // map to avoid affecting pruning). The companion root is the forkchoice
+    // finalized block root used to load this state.
     //
     // Migrated from raw `*types.BeamState` to `*RcBeamState` so the
     // cache-hit path in `getFinalizedState` can use the same
     // tryAcquire-then-drop-lock dance as `statesGet` when chain-worker
     // is enabled. Mutation is still gated by `events_lock`.
     cached_finalized_state: ?*RcBeamState = null,
+    cached_finalized_state_root: ?types.Root = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
@@ -5653,61 +5655,65 @@ pub const BeamChain = struct {
             }
         }
 
-        // Check if we already have a cached state. Invalidate if it's behind
-        // the current finalized checkpoint (can happen if the cache was
-        // seeded from the DB at startup before any in-memory finalization
-        // happened).
+        // Check if we already have a cached state for this exact forkchoice
+        // finalized root. Do not key this off the state's embedded
+        // `latest_finalized`: a state at finalized slot N can legitimately
+        // embed an older latest-finalized checkpoint.
         if (self.cached_finalized_state) |cached_rc| {
-            if (std.mem.eql(u8, &cached_rc.state.latest_finalized.root, &finalized_checkpoint.root)) {
-                if (self.chain_worker != null) {
-                    // Lock-free read path: tryAcquire under the events
-                    // lock to defeat any concurrent free race, then drop
-                    // the lock so the borrow lifetime no longer pins
-                    // `events_lock`. Tier-5 depth must be decremented
-                    // BEFORE we return because we are NOT handing off
-                    // the lock to the borrow; the next tier-5 acquire
-                    // on this thread should see depth=0.
-                    const acq = cached_rc.tryAcquire();
-                    self.events_lock.unlock();
-                    locking.leaveTier5();
-                    t_ev.released();
-                    lock_held = false;
-                    if (acq) |acquired_rc| {
-                        return BorrowedState{
-                            .state = &acquired_rc.state,
-                            .backing = .none,
-                            .acquired_rc = acquired_rc,
-                        };
+            if (self.cached_finalized_state_root) |cached_root| {
+                if (std.mem.eql(u8, &cached_root, &finalized_checkpoint.root)) {
+                    if (self.chain_worker != null) {
+                        // Lock-free read path: tryAcquire under the events
+                        // lock to defeat any concurrent free race, then drop
+                        // the lock so the borrow lifetime no longer pins
+                        // `events_lock`. Tier-5 depth must be decremented
+                        // BEFORE we return because we are NOT handing off
+                        // the lock to the borrow; the next tier-5 acquire
+                        // on this thread should see depth=0.
+                        const acq = cached_rc.tryAcquire();
+                        self.events_lock.unlock();
+                        locking.leaveTier5();
+                        t_ev.released();
+                        lock_held = false;
+                        if (acq) |acquired_rc| {
+                            return BorrowedState{
+                                .state = &acquired_rc.state,
+                                .backing = .none,
+                                .acquired_rc = acquired_rc,
+                            };
+                        }
+                        // tryAcquire returned null — freeing thread won.
+                        // Today this should never happen (refcount stays
+                        // at 1 in production), but the safe-by-default
+                        // behavior is to report no entry.
+                        return null;
                     }
-                    // tryAcquire returned null — freeing thread won.
-                    // Today this should never happen (refcount stays
-                    // at 1 in production), but the safe-by-default
-                    // behavior is to report no entry.
-                    return null;
+                    // Legacy lock-based path: hand the events_lock off to
+                    // the borrow.  Backward-compat with --chain-worker=off.
+                    lock_held = false; // ownership of the lock moves into the borrow
+                    // tier-5 depth and LockTimer are HANDED OFF to the borrow:
+                    // BorrowedState.deinit calls leaveTier5() and t.released()
+                    // after unlocking. Do NOT close them here.
+                    return BorrowedState{
+                        .state = &cached_rc.state,
+                        .backing = .{ .events_mutex = &self.events_lock },
+                        .tier5_held = true,
+                        .timer = t_ev,
+                    };
                 }
-                // Legacy lock-based path: hand the events_lock off to
-                // the borrow.  Backward-compat with --chain-worker=off.
-                lock_held = false; // ownership of the lock moves into the borrow
-                // tier-5 depth and LockTimer are HANDED OFF to the borrow:
-                // BorrowedState.deinit calls leaveTier5() and t.released()
-                // after unlocking. Do NOT close them here.
-                return BorrowedState{
-                    .state = &cached_rc.state,
-                    .backing = .{ .events_mutex = &self.events_lock },
-                    .tier5_held = true,
-                    .timer = t_ev,
-                };
             }
             // Stale — fall through to DB load below.
         }
 
-        // Fallback: try to load from database. Allocate a BeamState
-        // value on the stack (well — a local), load into it, then
-        // hand it to RcBeamState.create which embeds it into the heap
-        // allocation (always-consume contract per c-2a).
-        var loaded_state: types.BeamState = undefined;
-        self.db.loadLatestFinalizedState(&loaded_state) catch |err| {
-            self.logger.warn("finalized state not available in database: {any}", .{err});
+        // Fallback: try to load the state for the exact forkchoice finalized
+        // root. Loading "database latest finalized" here can race/lag the
+        // forkchoice checkpoint and make the RPC endpoint return an older state
+        // than `/lean/v0/fork_choice` just reported.
+        const loaded_state = self.db.loadState(database.DbStatesNamespace, finalized_checkpoint.root) orelse {
+            self.logger.warn(
+                "finalized state not available in database for forkchoice finalized slot={d} root=0x{x}",
+                .{ finalized_checkpoint.slot, &finalized_checkpoint.root },
+            );
             return null;
         };
         // Past this line `loaded_state` owns interior allocations.
@@ -5730,8 +5736,9 @@ pub const BeamChain = struct {
 
         // Cache in separate field (not in states map to avoid affecting pruning)
         self.cached_finalized_state = new_rc;
+        self.cached_finalized_state_root = finalized_checkpoint.root;
 
-        self.logger.info("loaded finalized state from database at slot {d}", .{new_rc.state.slot});
+        self.logger.info("loaded finalized state from database at slot {d} root=0x{x}", .{ new_rc.state.slot, &finalized_checkpoint.root });
 
         if (self.chain_worker != null) {
             // Lock-free read path: bump the refcount we just stored and
