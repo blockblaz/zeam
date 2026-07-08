@@ -3537,8 +3537,20 @@ pub const ForkChoice = struct {
         if (!self.checkpointIsAncestorUnlocked(data.target, data.head)) {
             return GossipAttestationValidationError.TargetCheckpointNotAncestorOfHead;
         }
-        if (is_gossip and !self.checkpointIsAncestorUnlocked(self.fcStore.latest_finalized, data.head)) {
-            return GossipAttestationValidationError.HeadNotDescendantOfFinalized;
+        if (is_gossip) {
+            // Reject gossip attestations whose head is not in the finalized
+            // subtree. When head.slot >= finalized.slot the finalized
+            // checkpoint must be an ancestor of the head; when the head
+            // references a block at or below the finalized slot we check the
+            // reverse — the head must be an ancestor of finalized (i.e. it
+            // was on the canonical chain that led to finalization).
+            const in_finalized_subtree = if (data.head.slot >= self.fcStore.latest_finalized.slot)
+                self.checkpointIsAncestorUnlocked(self.fcStore.latest_finalized, data.head)
+            else
+                self.checkpointIsAncestorUnlocked(data.head, self.fcStore.latest_finalized);
+            if (!in_finalized_subtree) {
+                return GossipAttestationValidationError.HeadNotDescendantOfFinalized;
+            }
         }
 
         // 5. A vote cannot have observed its head before that head existed.
