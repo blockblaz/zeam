@@ -75,6 +75,7 @@ const GenesisConfigError = error{
     InvalidGenesisTime,
     MissingValidatorConfig,
     InvalidValidatorPubkeys,
+    ValidatorSigningKeysMustDiffer,
 };
 
 /// Parses genesis configuration from YAML.
@@ -152,6 +153,9 @@ fn parseValidatorEntriesFromYaml(
             return GenesisConfigError.InvalidValidatorPubkeys;
         if (prop_node != .scalar) return GenesisConfigError.InvalidValidatorPubkeys;
         proposal_pubkeys[idx] = try hexToBytes52(prop_node.scalar);
+        if (std.mem.eql(u8, &attestation_pubkeys[idx], &proposal_pubkeys[idx])) {
+            return GenesisConfigError.ValidatorSigningKeysMustDiffer;
+        }
     }
 
     return ValidatorEntries{
@@ -173,6 +177,24 @@ fn hexToBytes52(input: []const u8) !types.Bytes52 {
         return GenesisConfigError.InvalidValidatorPubkeys;
     };
     return bytes;
+}
+
+test "genesisConfigFromYAML rejects reused validator signing key" {
+    const yaml_content =
+        \\GENESIS_TIME: 1
+        \\GENESIS_VALIDATORS:
+        \\  - attestation_pubkey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+        \\    proposal_pubkey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+    ;
+
+    var yaml: Yaml = .{ .source = yaml_content };
+    defer yaml.deinit(std.testing.allocator);
+    try yaml.load(std.testing.allocator);
+
+    try std.testing.expectError(
+        GenesisConfigError.ValidatorSigningKeysMustDiffer,
+        genesisConfigFromYAML(std.testing.allocator, yaml, null),
+    );
 }
 
 // TODO: Enable and update this test once the YAML parsing for public keys PR is added

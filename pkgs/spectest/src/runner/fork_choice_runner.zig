@@ -734,6 +734,15 @@ fn processBlockStep(
     if (tick_to_slot) {
         const target_intervals = slotToIntervals(block.slot);
         try advanceForkchoiceIntervals(ctx, target_intervals, true);
+    } else {
+        const current_slot = ctx.fork_choice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        if (block.slot > current_slot +| node_constants.MAX_FUTURE_SLOT_TOLERANCE) {
+            return forkchoice.ForkChoiceError.BlockTooFarInFuture;
+        }
+    }
+
+    if (block.slot > parent_state_ptr.slot and block.slot - parent_state_ptr.slot > params.HISTORICAL_ROOTS_LIMIT) {
+        return forkchoice.ForkChoiceError.BlockSlotGapTooLarge;
     }
 
     // Heap-allocate so the pointer we store in `state_map`/`allocated_states`

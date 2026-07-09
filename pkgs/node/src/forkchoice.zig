@@ -269,6 +269,23 @@ const ProtoAttestation = struct {
     attestation_data: ?types.AttestationData = null,
 };
 
+fn attestationDataRootGreater(allocator: Allocator, a: types.AttestationData, b: types.AttestationData) !bool {
+    var a_root: types.Root = undefined;
+    var b_root: types.Root = undefined;
+    try zeam_utils.hashTreeRoot(types.AttestationData, a, &a_root, allocator);
+    try zeam_utils.hashTreeRoot(types.AttestationData, b, &b_root, allocator);
+    return std.mem.order(u8, &a_root, &b_root) == .gt;
+}
+
+fn shouldReplaceLatestAttestation(allocator: Allocator, current: ?ProtoAttestation, candidate: ProtoAttestation) !bool {
+    const existing = current orelse return true;
+    if (candidate.slot != existing.slot) return candidate.slot > existing.slot;
+
+    const existing_data = existing.attestation_data orelse return false;
+    const candidate_data = candidate.attestation_data orelse return false;
+    return attestationDataRootGreater(allocator, candidate_data, existing_data);
+}
+
 const AttestationTracker = struct {
     // prev latest attestation applied index null if not applied
     appliedIndex: ?usize = null,
@@ -1086,13 +1103,12 @@ pub const ForkChoice = struct {
         // fork's weight (head then falls to the lexicographic tie-break / deeper fork).
         // accept_new_attestations unions latest_new into latest_known
         // (head reads the highest-slot vote per validator), so do the same: keep the
-        // fresher of the two, gossip winning ties as it reflects the validator's
-        // current view, and never drop a known vote when latestNew is null/older.
+        // fresher of the two, resolving equal-slot ties by canonical attestation
+        // data root so arrival order cannot steer fork-choice weight.
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
             const new_vote = tracker.latestNew orelse continue;
-            const known_slot = (tracker.latestKnown orelse ProtoAttestation{}).slot;
-            if (tracker.latestKnown == null or new_vote.slot >= known_slot) {
+            if (try shouldReplaceLatestAttestation(self.allocator, tracker.latestKnown, new_vote)) {
                 tracker.latestKnown = new_vote;
                 try self.attestations.put(validator_id, tracker);
             }
@@ -1440,13 +1456,13 @@ pub const ForkChoice = struct {
 
                 // Tie-break (all tiers): higher target.slot (user rule 6 for
                 // justify; deepest-target for build), then more voters, then newer
-                // att slot, then lexicographic for determinism.
+                // att slot, then larger canonical attestation-data root.
                 const replace = if (best_idx) |bi| blk: {
                     if (tier != best_tier) break :blk tier < best_tier;
                     if (ad.target.slot != best_target_slot) break :blk ad.target.slot > best_target_slot;
                     if (count != best_count) break :blk count > best_count;
                     if (ad.slot != best_att_slot) break :blk ad.slot > best_att_slot;
-                    break :blk types.attestationDataLessThan({}, ad, candidates[bi].att_data);
+                    break :blk try attestationDataRootGreater(allocator, ad, candidates[bi].att_data);
                 } else true;
 
                 if (replace) {
@@ -2031,13 +2047,13 @@ pub const ForkChoice = struct {
         var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
         // update latest known attested head of the validator if already included on chain
         if (is_from_block) {
-            const attestation_tracker_latest_known_slot = (attestation_tracker.latestKnown orelse ProtoAttestation{}).slot;
-            if (attestation_slot > attestation_tracker_latest_known_slot) {
-                attestation_tracker.latestKnown = .{
-                    .index = new_head_index,
-                    .slot = attestation_slot,
-                    .attestation_data = attestation_data,
-                };
+            const candidate = ProtoAttestation{
+                .index = new_head_index,
+                .slot = attestation_slot,
+                .attestation_data = attestation_data,
+            };
+            if (try shouldReplaceLatestAttestation(self.allocator, attestation_tracker.latestKnown, candidate)) {
+                attestation_tracker.latestKnown = candidate;
 
                 // The gossip ("new") and on-chain
                 // ("known") pools stay strictly separate: `update_safe_target`
@@ -2055,14 +2071,13 @@ pub const ForkChoice = struct {
             if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic) + 1) {
                 return ForkChoiceError.InvalidFutureAttestation;
             }
-            // just update latest new attested head of the validator
-            const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
-            if (attestation_slot > attestation_tracker_latest_new_slot) {
-                attestation_tracker.latestNew = .{
-                    .index = new_head_index,
-                    .slot = attestation_slot,
-                    .attestation_data = attestation_data,
-                };
+            const candidate = ProtoAttestation{
+                .index = new_head_index,
+                .slot = attestation_slot,
+                .attestation_data = attestation_data,
+            };
+            if (try shouldReplaceLatestAttestation(self.allocator, attestation_tracker.latestNew, candidate)) {
+                attestation_tracker.latestNew = candidate;
             }
         }
         try self.attestations.put(validator_id, attestation_tracker);
@@ -3030,14 +3045,14 @@ pub const ForkChoice = struct {
 
         const parent_block_or_null = self.getBlockUnlocked(parent_root);
         if (parent_block_or_null) |parent_block| {
-            // we will use parent block later as per the finalization gadget
-            _ = parent_block;
-
             // Block admission only requires a known parent and a slot above
             // the finalized boundary; STF and signature verification are the
             // gating layers.
             if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
+            }
+            if (slot > parent_block.slot and slot - parent_block.slot > params.HISTORICAL_ROOTS_LIMIT) {
+                return ForkChoiceError.BlockSlotGapTooLarge;
             }
 
             // Per store.process_block: a block may include at most
@@ -3595,6 +3610,8 @@ pub const ForkChoiceError = error{
     InvalidSafeTargetCompute,
     DuplicateAttestationData,
     TooManyAttestationData,
+    BlockSlotGapTooLarge,
+    BlockTooFarInFuture,
 };
 
 /// Errors raised by the shared gossip attestation-data validator.
@@ -3620,6 +3637,29 @@ pub const GossipAttestationValidationError = error{
     AttestationSlotBeforeHead,
     AttestationTooFarInFuture,
 };
+
+test "shouldReplaceLatestAttestation breaks equal-slot ties by canonical data root" {
+    const allocator = std.testing.allocator;
+    const a = types.AttestationData{
+        .slot = 7,
+        .source = .{ .root = [_]u8{1} ** 32, .slot = 3 },
+        .target = .{ .root = [_]u8{2} ** 32, .slot = 5 },
+        .head = .{ .root = [_]u8{3} ** 32, .slot = 7 },
+    };
+    var b = a;
+    b.head.root = [_]u8{4} ** 32;
+
+    const a_wins = try attestationDataRootGreater(allocator, a, b);
+    const larger = if (a_wins) a else b;
+    const smaller = if (a_wins) b else a;
+
+    const current = ProtoAttestation{ .index = 1, .slot = 7, .attestation_data = smaller };
+    const replacement = ProtoAttestation{ .index = 2, .slot = 7, .attestation_data = larger };
+    const stale = ProtoAttestation{ .index = 3, .slot = 7, .attestation_data = smaller };
+
+    try std.testing.expect(try shouldReplaceLatestAttestation(allocator, current, replacement));
+    try std.testing.expect(!try shouldReplaceLatestAttestation(allocator, replacement, stale));
+}
 
 fn setupTestPrimitives() !*ThreadPool {
     return @import("./testing.zig").setupTestPrimitives(std.testing.allocator);
