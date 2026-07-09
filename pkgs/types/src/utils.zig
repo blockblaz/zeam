@@ -28,7 +28,7 @@ pub const RootHex = [64]u8;
 pub const ZERO_HASH = [_]u8{0x00} ** 32;
 pub const ZERO_SIGBYTES = [_]u8{0} ** SIGSIZE;
 
-pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidSlotIndex, DuplicateAttestationData, TooManyAttestationData };
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidJustificationVotesLength, EmptyValidatorRegistry, InvalidSlotIndex, DuplicateAttestationData, TooManyAttestationData };
 
 const json = std.json;
 
@@ -65,7 +65,7 @@ pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 // prepare the state to be pre state of the slot
 pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
     if (candidate < finalized) {
-        return StateTransitionError.InvalidJustifiableSlot;
+        return false;
     }
 
     const delta: f32 = @floatFromInt(candidate - finalized);

@@ -4797,11 +4797,14 @@ pub const BeamChain = struct {
                 data.head.slot,
                 is_from_block,
             });
-            // GossipAttestationValidationError is a strict subset of
+            // GossipAttestationValidationError variants are a subset of
             // AttestationValidationError (identical variant names), so the
             // error value coerces directly — callers that branch on a specific
             // reason (e.g. the block-import path enqueueing a BlocksByRoot fetch
             // on UnknownHeadBlock) still match the same global error value.
+            // Note: HeadNotDescendantOfFinalized is also present in
+            // AttestationValidationError; no fetch is enqueued for it because
+            // the block is pruned and unservable.
             return err;
         };
 
@@ -5980,6 +5983,9 @@ const AttestationValidationError = error{
     HeadOlderThanTarget,
     SourceCheckpointNotAncestorOfTarget,
     TargetCheckpointNotAncestorOfHead,
+    /// Head block's chain does not descend from the finalized checkpoint.
+    /// Hard reject — the block is pruned and unservable; no fetch is enqueued.
+    HeadNotDescendantOfFinalized,
     AttestationSlotBeforeHead,
     AttestationTooFarInFuture,
     EmptyAggregationBits,
