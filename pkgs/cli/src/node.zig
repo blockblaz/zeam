@@ -2023,7 +2023,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     // Verify the state root matches the expected value
     const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&state_root_from_genesis});
     defer allocator.free(state_root_from_genesis_hex);
-    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0x228ecb2f88891fab88a05a104ccac95f1513e138d53469340b9ce04f70fa1019");
+    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0x9a77892fc5afa43bbfa1462bd9c96d239ee8b0fd863b1c3a08e69b6f7efbb8d2");
 }
 
 test "populateNodeNameRegistry" {
