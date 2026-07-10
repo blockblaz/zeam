@@ -132,6 +132,13 @@ pub const BeamState = struct {
     pub fn getJustification(self: *const Self, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators = self.validatorCount();
+        if (num_validators == 0) {
+            return StateTransitionError.EmptyValidatorRegistry;
+        }
+        const expected_vote_count = self.justifications_roots.len() * num_validators;
+        if (self.justifications_validators.len() != expected_vote_count) {
+            return StateTransitionError.InvalidJustificationVotesLength;
+        }
         // Initialize justifications from state
         for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
             if (std.mem.eql(u8, &blockRoot, &utils.ZERO_HASH)) {
@@ -551,7 +558,10 @@ pub const BeamState = struct {
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
                             const root = entry.key_ptr.*;
-                            const slot = block_cache.get(root) orelse return StateTransitionError.InvalidJustificationRoot;
+                            const slot = block_cache.get(root) orelse {
+                                try roots_to_remove.append(allocator, root);
+                                continue;
+                            };
                             if (slot <= finalized_slot) {
                                 try roots_to_remove.append(allocator, root);
                             }
@@ -957,6 +967,41 @@ test "process_attestations silently skips pre-finalized target attestations" {
     try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
 }
 
+test "process_attestations rejects malformed justification vote layout" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    const pending_root = [_]u8{7} ** 32;
+    var pending_roots = try JustificationRoots.init(std.testing.allocator);
+    errdefer pending_roots.deinit();
+    try pending_roots.append(pending_root);
+
+    var pending_validators = try JustificationValidators.init(std.testing.allocator);
+    errdefer pending_validators.deinit();
+    try pending_validators.append(true);
+    try pending_validators.append(false);
+
+    state.justifications_roots.deinit();
+    state.justifications_roots = pending_roots;
+    state.justifications_validators.deinit();
+    state.justifications_validators = pending_validators;
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer attestations_list.deinit();
+
+    try std.testing.expectError(
+        StateTransitionError.InvalidJustificationVotesLength,
+        state.process_attestations(std.testing.allocator, attestations_list, logger, null),
+    );
+}
+
+test "slot before finalized is not justifiable" {
+    try std.testing.expectEqual(false, try utils.IsJustifiableSlot(10, 9));
+    try std.testing.expectEqual(false, try utils.IsJustifiableSlot(100, 90));
+}
+
 test "cloneForProjection clones projection fields and leaves historical_block_hashes empty" {
     const allocator = std.testing.allocator;
     var logger_config = zeam_utils.getTestLoggerConfig();
@@ -1264,17 +1309,23 @@ test "pruning keeps pending justifications" {
     defer block_5.deinit();
     try state.process_block_header(std.testing.allocator, block_5, logger);
 
-    // Phase 3: Seed a pending justification.
+    // Phase 3: Seed one pending canonical justification plus one off-chain
+    // pending tally that can come from a malformed decoded state.
     const slot_3_root = try state.historical_block_hashes.get(3);
+    const phantom_root = [_]u8{0xff} ** 32;
 
     var pending_roots = try JustificationRoots.init(std.testing.allocator);
     errdefer pending_roots.deinit();
     try pending_roots.append(slot_3_root);
+    try pending_roots.append(phantom_root);
 
     var pending_validators = try JustificationValidators.init(std.testing.allocator);
     errdefer pending_validators.deinit();
     try pending_validators.append(true);
     try pending_validators.append(false);
+    try pending_validators.append(false);
+    try pending_validators.append(false);
+    try pending_validators.append(true);
     try pending_validators.append(false);
 
     state.justifications_roots.deinit();
@@ -1311,13 +1362,17 @@ test "pruning keeps pending justifications" {
     try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
 
     var found = false;
+    var found_phantom = false;
     for (state.justifications_roots.constSlice()) |root| {
         if (std.mem.eql(u8, &root, &slot_3_root)) {
             found = true;
-            break;
+        }
+        if (std.mem.eql(u8, &root, &phantom_root)) {
+            found_phantom = true;
         }
     }
     try std.testing.expect(found);
+    try std.testing.expect(!found_phantom);
 }
 
 // Helper: build a chain block_1..block_6 shaped for the finalization scenario.
@@ -1455,7 +1510,7 @@ fn buildFinalizedSlot4Chain(
 // justified without re-entering the finalization-advance scan from below the
 // finalized boundary — which would otherwise call IsJustifiableSlot with a
 // candidate slot smaller than the finalized slot and abort state transition
-// with `InvalidJustifiableSlot`.
+// with a not-justifiable answer.
 test "stale finalized source justifies without rewinding finalization" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(null);
