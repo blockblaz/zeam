@@ -568,7 +568,10 @@ const Metrics = struct {
     const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
     const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
     // Network peer metric types
-    const LeanConnectedPeersGauge = metrics_lib.GaugeVec(u64, struct { client: []const u8, client_type: []const u8 });
+    // Bare total (parity with lantern/ream/grandine which export a single
+    // `lean_connected_peers` value). Was a per-peer 0/1 GaugeVec, which read as
+    // `1` under a non-summing query and diverged from every other client.
+    const LeanConnectedPeersGauge = metrics_lib.Gauge(u64);
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
     const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
     const LibP2pSwarmCommandDroppedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
@@ -1177,7 +1180,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures" }, .{}),
         .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures" }, .{}),
         // Network peer metrics
-        .lean_connected_peers = try Metrics.LeanConnectedPeersGauge.init(allocator, io, "lean_connected_peers", .{ .help = "Number of connected peers" }, .{}),
+        .lean_connected_peers = Metrics.LeanConnectedPeersGauge.init("lean_connected_peers", .{ .help = "Number of connected peers" }, .{}),
         .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, io, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
         .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, io, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
         .zeam_libp2p_swarm_command_dropped_total = try Metrics.LibP2pSwarmCommandDroppedCounter.init(allocator, io, "zeam_libp2p_swarm_command_dropped_total", .{ .help = "Total number of swarm commands dropped before reaching the rust-libp2p event loop, by reason (issue #808)" }, .{}),
