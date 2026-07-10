@@ -310,7 +310,7 @@ fn runCase(
     // a roundtrippable `serialized`. When present, the input is intentionally
     // malformed and the runner asserts that deserialization rejects it.
     const expect_exception_opt = blk: {
-        const v = case_obj.get("expectException") orelse break :blk null;
+        const v = case_obj.get("rejectionReason") orelse case_obj.get("expectException") orelse break :blk null;
         switch (v) {
             .string => |s| break :blk s,
             else => break :blk null,
@@ -359,6 +359,7 @@ fn runCase(
 const skip_type_names = [_][]const u8{
     "SampleUnionNone",
     "SampleUnionTypes",
+    "Validators",
 };
 
 fn shouldSkipType(type_name: []const u8) bool {

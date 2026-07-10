@@ -112,12 +112,23 @@ fn runCase(ctx: Context, value: JsonValue) FixtureError!void {
         },
     };
 
-    const operation = try expect_mod.expectStringField(FixtureError, case_obj, &.{"operation"}, ctx, "operation");
-    const input_obj = try expect_mod.expectObject(FixtureError, case_obj, &.{"input"}, ctx, "input");
+    const operation_value = case_obj.get("operation") orelse {
+        std.debug.print("fixture {s} case {s}: missing operation\n", .{ ctx.fixture_label, ctx.case_name });
+        return FixtureError.InvalidFixture;
+    };
+    const operation_obj_opt: ?std.json.ObjectMap = switch (operation_value) {
+        .object => |map| map,
+        else => null,
+    };
+    const operation = if (operation_obj_opt) |operation_obj|
+        try expect_mod.expectStringField(FixtureError, operation_obj, &.{"kind"}, ctx, "operation.kind")
+    else
+        try expect_mod.expectStringValue(FixtureError, operation_value, ctx, "operation");
+    const input_obj = operation_obj_opt orelse try expect_mod.expectObject(FixtureError, case_obj, &.{"input"}, ctx, "input");
     const output_obj = try expect_mod.expectObject(FixtureError, case_obj, &.{"output"}, ctx, "output");
 
     // Verify the embedded clock config matches zeam's compile-time constants.
-    if (output_obj.get("config")) |cfg_val| {
+    if (case_obj.get("config") orelse output_obj.get("config")) |cfg_val| {
         const cfg = try expect_mod.expectObjectValue(FixtureError, cfg_val, ctx, "output.config");
         try checkConfigU64(ctx, cfg, &.{ "secondsPerSlot", "seconds_per_slot" }, params.SECONDS_PER_SLOT, "secondsPerSlot");
         try checkConfigU64(ctx, cfg, &.{ "intervalsPerSlot", "intervals_per_slot" }, constants.INTERVALS_PER_SLOT, "intervalsPerSlot");
@@ -126,19 +137,19 @@ fn runCase(ctx: Context, value: JsonValue) FixtureError!void {
 
     if (std.mem.eql(u8, operation, "current_slot")) {
         const genesis_s = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "genesisTime", "genesis_time" }, ctx, "input.genesisTime");
-        const current_ms = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "currentTimeMs", "current_time_ms" }, ctx, "input.currentTimeMs");
+        const current_ms = try expectIntegralTimestampField(input_obj, &.{ "currentTimeMs", "current_time_ms", "currentTimeMilliseconds", "current_time_milliseconds" }, ctx, "input.currentTimeMs");
         const expected = try expect_mod.expectU64Field(FixtureError, output_obj, &.{"slot"}, ctx, "output.slot");
         const actual = currentSlot(genesis_s, current_ms);
         try expectEq(ctx, "current_slot", actual, expected);
     } else if (std.mem.eql(u8, operation, "current_interval")) {
         const genesis_s = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "genesisTime", "genesis_time" }, ctx, "input.genesisTime");
-        const current_ms = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "currentTimeMs", "current_time_ms" }, ctx, "input.currentTimeMs");
+        const current_ms = try expectIntegralTimestampField(input_obj, &.{ "currentTimeMs", "current_time_ms", "currentTimeMilliseconds", "current_time_milliseconds" }, ctx, "input.currentTimeMs");
         const expected = try expect_mod.expectU64Field(FixtureError, output_obj, &.{"interval"}, ctx, "output.interval");
         const actual = currentInterval(genesis_s, current_ms);
         try expectEq(ctx, "current_interval", actual, expected);
     } else if (std.mem.eql(u8, operation, "total_intervals")) {
         const genesis_s = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "genesisTime", "genesis_time" }, ctx, "input.genesisTime");
-        const current_ms = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "currentTimeMs", "current_time_ms" }, ctx, "input.currentTimeMs");
+        const current_ms = try expectIntegralTimestampField(input_obj, &.{ "currentTimeMs", "current_time_ms", "currentTimeMilliseconds", "current_time_milliseconds" }, ctx, "input.currentTimeMs");
         const expected = try expect_mod.expectU64Field(FixtureError, output_obj, &.{ "totalIntervals", "total_intervals" }, ctx, "output.totalIntervals");
         const actual = totalIntervals(genesis_s, current_ms);
         try expectEq(ctx, "total_intervals", actual, expected);
@@ -148,7 +159,7 @@ fn runCase(ctx: Context, value: JsonValue) FixtureError!void {
         const actual = slot * @as(u64, @intCast(INTERVALS_PER_SLOT));
         try expectEq(ctx, "from_slot", actual, expected);
     } else if (std.mem.eql(u8, operation, "from_unix_time")) {
-        const unix_s = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "unixSeconds", "unix_seconds" }, ctx, "input.unixSeconds");
+        const unix_s = try expectIntegralTimestampField(input_obj, &.{ "unixSeconds", "unix_seconds" }, ctx, "input.unixSeconds");
         const genesis_s = try expect_mod.expectU64Field(FixtureError, input_obj, &.{ "genesisTime", "genesis_time" }, ctx, "input.genesisTime");
         const expected = try expect_mod.expectU64Field(FixtureError, output_obj, &.{"interval"}, ctx, "output.interval");
         const actual = fromUnixTime(unix_s, genesis_s);
@@ -160,6 +171,37 @@ fn runCase(ctx: Context, value: JsonValue) FixtureError!void {
         );
         return FixtureError.UnsupportedFixture;
     }
+}
+
+fn expectIntegralTimestampField(
+    obj: std.json.ObjectMap,
+    field_names: []const []const u8,
+    ctx: Context,
+    label: []const u8,
+) FixtureError!u64 {
+    for (field_names) |fname| {
+        if (obj.get(fname)) |value| {
+            return switch (value) {
+                .integer => |i| if (i >= 0) @as(u64, @intCast(i)) else {
+                    std.debug.print("fixture {s} case {s}: field {s} negative\n", .{ ctx.fixture_label, ctx.case_name, label });
+                    return FixtureError.InvalidFixture;
+                },
+                .float => |f| {
+                    if (f < 0 or @floor(f) != f) {
+                        std.debug.print("fixture {s} case {s}: field {s} must be a whole non-negative timestamp\n", .{ ctx.fixture_label, ctx.case_name, label });
+                        return FixtureError.InvalidFixture;
+                    }
+                    return @intFromFloat(f);
+                },
+                else => {
+                    std.debug.print("fixture {s} case {s}: field {s} must be numeric\n", .{ ctx.fixture_label, ctx.case_name, label });
+                    return FixtureError.InvalidFixture;
+                },
+            };
+        }
+    }
+    std.debug.print("fixture {s} case {s}: missing field {s}\n", .{ ctx.fixture_label, ctx.case_name, label });
+    return FixtureError.InvalidFixture;
 }
 
 fn currentSlot(genesis_s: u64, current_ms: u64) u64 {

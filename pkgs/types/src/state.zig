@@ -420,14 +420,14 @@ pub const BeamState = struct {
 
             const head_slot: Slot = attestation_data.head.slot;
             const historical_len: Slot = @intCast(self.historical_block_hashes.len());
-            if (source_slot >= historical_len) {
-                return StateTransitionError.InvalidSlotIndex;
-            }
-            if (target_slot >= historical_len) {
-                return StateTransitionError.InvalidSlotIndex;
-            }
-            if (head_slot >= historical_len) {
-                return StateTransitionError.InvalidSlotIndex;
+            if (source_slot >= historical_len or target_slot >= historical_len or head_slot >= historical_len) {
+                logger.debug("skipping attestation outside local chain view: source={} target={} head={} historical_len={}", .{
+                    source_slot,
+                    target_slot,
+                    head_slot,
+                    historical_len,
+                });
+                continue;
             }
 
             const is_source_justified = try utils.isSlotJustified(finalized_slot, &self.justified_slots, source_slot);

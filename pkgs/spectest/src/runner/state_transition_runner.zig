@@ -189,11 +189,13 @@ fn runCase(
         },
     };
 
-    const expect_exception = switch (case_obj.get("expectException") orelse JsonValue{ .null = {} }) {
+    // Try "rejectionReason" (new leanSpec format) first, fall back to
+    // "expectException" (legacy format) so both generations work.
+    const expect_exception = switch (case_obj.get("rejectionReason") orelse case_obj.get("expectException") orelse JsonValue{ .null = {} }) {
         .string => |text| text,
         .null => null,
         else => {
-            std.debug.print("fixture {s} case {s}: expectException must be string or null\n", .{ ctx.fixture_label, ctx.case_name });
+            std.debug.print("fixture {s} case {s}: rejectionReason/expectException must be string or null\n", .{ ctx.fixture_label, ctx.case_name });
             return FixtureError.InvalidFixture;
         },
     };
