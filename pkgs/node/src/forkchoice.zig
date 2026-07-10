@@ -3436,8 +3436,9 @@ pub const ForkChoice = struct {
     ///  2. Checkpoint slot ordering: source.slot <= target.slot, head.slot >= target.slot.
     ///  3. Checkpoint slots match their blocks' slots (source, target, head).
     ///  4. Ancestry: source lies on target's chain, target lies on head's chain.
-    ///  5. The vote's slot does not precede the head it claims to have seen.
-    ///  6. The vote's slot has started locally within the disparity margin.
+    ///  5. Gossip votes must keep their head under the finalized subtree.
+    ///  6. The vote's slot does not precede the head it claims to have seen.
+    ///  7. The vote's slot has started locally within the disparity margin.
     ///
     /// The future-slot bound applies only to gossip; block-included
     /// attestations are trusted under the block's own validation and pass
@@ -3536,6 +3537,21 @@ pub const ForkChoice = struct {
         if (!self.checkpointIsAncestorUnlocked(data.target, data.head)) {
             return GossipAttestationValidationError.TargetCheckpointNotAncestorOfHead;
         }
+        if (is_gossip) {
+            // Reject gossip attestations whose head is not in the finalized
+            // subtree. When head.slot >= finalized.slot the finalized
+            // checkpoint must be an ancestor of the head; when the head
+            // references a block at or below the finalized slot we check the
+            // reverse — the head must be an ancestor of finalized (i.e. it
+            // was on the canonical chain that led to finalization).
+            const in_finalized_subtree = if (data.head.slot >= self.fcStore.latest_finalized.slot)
+                self.checkpointIsAncestorUnlocked(self.fcStore.latest_finalized, data.head)
+            else
+                self.checkpointIsAncestorUnlocked(data.head, self.fcStore.latest_finalized);
+            if (!in_finalized_subtree) {
+                return GossipAttestationValidationError.HeadNotDescendantOfFinalized;
+            }
+        }
 
         // 5. A vote cannot have observed its head before that head existed.
         if (data.slot < data.head.slot) {
@@ -3600,6 +3616,7 @@ pub const GossipAttestationValidationError = error{
     HeadOlderThanTarget,
     SourceCheckpointNotAncestorOfTarget,
     TargetCheckpointNotAncestorOfHead,
+    HeadNotDescendantOfFinalized,
     AttestationSlotBeforeHead,
     AttestationTooFarInFuture,
 };
@@ -5755,6 +5772,36 @@ const RebaseTestContext = struct {
         self.mock_chain.deinit(self.allocator);
     }
 };
+
+test "validateAttestationDataForGossip rejects head outside finalized subtree" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    // Finalize D on the canonical branch A->B->C->D while the attestation head
+    // is I on the sibling branch C->G->H->I. Source/target/head all exist and
+    // have valid ancestry among themselves, but the head is not below finalized.
+    ctx.fork_choice.fcStore.latest_finalized = .{
+        .root = createTestRoot(0xDD),
+        .slot = 5,
+    };
+
+    const data = types.AttestationData{
+        .slot = 7,
+        .source = .{ .root = createTestRoot(0xCC), .slot = 3 },
+        .target = .{ .root = createTestRoot(0x22), .slot = 6 },
+        .head = .{ .root = createTestRoot(0x33), .slot = 7 },
+    };
+
+    try std.testing.expectError(
+        GossipAttestationValidationError.HeadNotDescendantOfFinalized,
+        ctx.fork_choice.validateAttestationDataForGossip(data, true),
+    );
+
+    // Block-carried attestations are not gossip-admitted; the state transition
+    // owns their canonical-chain validation.
+    try ctx.fork_choice.validateAttestationDataForGossip(data, false);
+}
 
 test "getProposalAttestations: high-target keys survive cap with stale low-target backlog" {
     const allocator = std.testing.allocator;
