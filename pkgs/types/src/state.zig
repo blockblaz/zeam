@@ -351,6 +351,38 @@ pub const BeamState = struct {
         try self.process_attestations(allocator, staged_block.body.attestations, logger, cache);
     }
 
+    // Drop entries from a root-keyed justification tally whose block sits at or below the
+    // (new) finalized slot, freeing each removed value. `require_in_cache` controls the
+    // missing-root policy: the persisted target-keyed map must resolve every root (a miss is
+    // a corrupt state -> error), while the ephemeral source-keyed map tolerates misses
+    // (`orelse continue`) since it never persists.
+    fn pruneJustifiedRootsBelow(
+        allocator: Allocator,
+        map: *std.AutoHashMapUnmanaged(Root, []u8),
+        block_cache: *utils.RootToSlotCache,
+        finalized_slot: Slot,
+        require_in_cache: bool,
+    ) !void {
+        var roots_to_remove: std.ArrayList(Root) = .empty;
+        defer roots_to_remove.deinit(allocator);
+        var iter = map.iterator();
+        while (iter.next()) |entry| {
+            const root = entry.key_ptr.*;
+            const slot = block_cache.get(root) orelse if (require_in_cache)
+                return StateTransitionError.InvalidJustificationRoot
+            else
+                continue;
+            if (slot <= finalized_slot) {
+                try roots_to_remove.append(allocator, root);
+            }
+        }
+        for (roots_to_remove.items) |root| {
+            if (map.fetchRemove(root)) |kv| {
+                allocator.free(kv.value);
+            }
+        }
+    }
+
     fn process_attestations(self: *Self, allocator: Allocator, attestations: AggregatedAttestations, logger: zeam_utils.ModuleLogger, cache: ?*utils.RootToSlotCache) !void {
         const attestations_timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
         defer _ = attestations_timer.observe();
@@ -380,6 +412,27 @@ pub const BeamState = struct {
             justifications.deinit(allocator);
         }
         try self.getJustification(allocator, &justifications);
+        const shared_source = self.latest_justified;
+
+        // Shared-source tally keyed by the attestation's ACTUAL source root (not by
+        // target). Competing targets that share a source split the per-target vote
+        // above, so a source can stall finalization even though a supermajority
+        // builds on it. This map recognizes that shared source, but only counts a
+        // validator toward a source it truly attested from, so votes carrying a
+        // different (older or sibling) justified source are never miscounted as
+        // support for latest_justified. It is a within-call working set: the
+        // persisted per-target `justifications` cannot back it because it does not
+        // record each vote's source, so cross-block accumulation is the proposer's
+        // job (it packs the same-source votes together; see the fork-choice
+        // projection selector).
+        var source_justifications: std.AutoHashMapUnmanaged(Root, []u8) = .empty;
+        defer {
+            var it = source_justifications.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.value_ptr.*);
+            }
+            source_justifications.deinit(allocator);
+        }
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
@@ -487,6 +540,20 @@ pub const BeamState = struct {
             }
             logger.debug("target jcount={d} target_root=0x{x} justifications_len={d}\n", .{ target_justifications_count, &attestation_data.target.root, target_justifications.len });
 
+            // Tally the same validated voters under the attestation's ACTUAL source
+            // root, so shared-source finalization below counts only validators that
+            // genuinely built on that source.
+            const source_supporters = source_justifications.get(attestation_data.source.root) orelse sourcesupporters: {
+                const supporters = try allocator.alloc(u8, num_validators);
+                errdefer allocator.free(supporters);
+                @memset(supporters, 0);
+                try source_justifications.put(allocator, attestation_data.source.root, supporters);
+                break :sourcesupporters supporters;
+            };
+            for (validator_indices.items) |validator_index| {
+                source_supporters[validator_index] = 1;
+            }
+
             // as soon as we hit the threshold do justifications
             // note that this simplification works if weight of each validator is 1
             //
@@ -545,27 +612,67 @@ pub const BeamState = struct {
                     const delta: Slot = finalized_slot - old_finalized_slot;
                     if (delta > 0) {
                         try self.shiftJustifiedSlots(delta, allocator);
-
-                        var roots_to_remove: std.ArrayList(Root) = .empty;
-                        defer roots_to_remove.deinit(allocator);
-                        var iter = justifications.iterator();
-                        while (iter.next()) |entry| {
-                            const root = entry.key_ptr.*;
-                            const slot = block_cache.get(root) orelse return StateTransitionError.InvalidJustificationRoot;
-                            if (slot <= finalized_slot) {
-                                try roots_to_remove.append(allocator, root);
-                            }
-                        }
-                        for (roots_to_remove.items) |root| {
-                            if (justifications.fetchRemove(root)) |kv| {
-                                allocator.free(kv.value);
-                            }
-                        }
+                        try pruneJustifiedRootsBelow(allocator, &justifications, block_cache, finalized_slot, true);
                     }
                     const finalized_str_new = try self.latest_finalized.toJsonString(allocator);
                     defer allocator.free(finalized_str_new);
 
                     logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_new});
+                }
+            }
+        }
+
+        // Shared-source finalization. The per-target path above finalizes only when a
+        // single target crosses 2/3; competing targets that share a source split the
+        // vote and stall it (6 validators, S->X {0,1} and S->Y {2,3}: neither target
+        // reaches 4, yet 4 validators build on S). The source checkpoint is the
+        // block's pre-state `latest_justified`: a same-block target justification may
+        // move `self.latest_justified`, but the voters still attested WITH this
+        // original source. Counting that source bucket (not a union across targets)
+        // keeps votes carrying a different justified source from being miscounted as
+        // support here.
+        if (shared_source.slot > finalized_slot) {
+            const source_support_count: usize = blk: {
+                const bucket = source_justifications.get(shared_source.root) orelse break :blk 0;
+                var c: usize = 0;
+                for (bucket) |voted| {
+                    if (voted == 1) c += 1;
+                }
+                break :blk c;
+            };
+
+            if (3 * source_support_count >= 2 * num_validators) {
+                const src_slot = shared_source.slot;
+                // Adjacency safety guard, mirroring the per-target scan: every slot
+                // strictly between the finalized checkpoint and the shared source must be
+                // non-justifiable, i.e. it is the immediate justifiable successor of the
+                // finalized checkpoint. Preserves accountable safety without depending on
+                // any single (contested) target. The source is already justified, so
+                // justification does not move; only finalization.
+                var can_source_finalize = true;
+                const start_slot_usize: usize = @intCast(finalized_slot + 1);
+                const end_slot_usize: usize = @intCast(src_slot);
+                for (start_slot_usize..end_slot_usize) |slot_usize| {
+                    const slot: Slot = @intCast(slot_usize);
+                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
+                        can_source_finalize = false;
+                        break;
+                    }
+                }
+                logger.debug("----------------can_source_finalize ({d})={any} support={d}----------\n\n", .{ src_slot, can_source_finalize, source_support_count });
+                if (can_source_finalize) {
+                    const old_finalized_slot = finalized_slot;
+                    self.latest_finalized = shared_source;
+                    finalized_slot = self.latest_finalized.slot;
+
+                    const delta: Slot = finalized_slot - old_finalized_slot;
+                    if (delta > 0) {
+                        try self.shiftJustifiedSlots(delta, allocator);
+                        try pruneJustifiedRootsBelow(allocator, &justifications, block_cache, finalized_slot, true);
+                    }
+                    const finalized_str_src = try self.latest_finalized.toJsonString(allocator);
+                    defer allocator.free(finalized_str_src);
+                    logger.debug("\n\n\n-----------------SHARED-SOURCE FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_src});
                 }
             }
         }
@@ -1035,6 +1142,240 @@ test "process_attestations silently skips head root off the canonical chain" {
     try std.testing.expect(std.mem.eql(u8, &state.latest_justified.root, &utils.ZERO_HASH));
     try std.testing.expectEqual(@as(usize, 0), state.justifications_roots.len());
     try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
+}
+
+// Seed a linear history [slot0..slotN] into state directly (mirrors the manual
+// setup used by the head-root tests above) so shared-source tests can control
+// exactly which slots are justified without building/processing real blocks.
+// `latest_justified` is the checkpoint a supermajority would source at; the STF
+// finalizes it once the union of pending target votes crosses 2/3.
+fn seedLinearHistory(state: *BeamState, roots: []const Root, justified: []const bool, latest_justified: Checkpoint) !void {
+    for (roots) |root| {
+        try state.historical_block_hashes.append(root);
+    }
+    // justified_slots is indexed relative to the finalized slot (genesis, slot 0),
+    // i.e. entry i corresponds to slot i+1.
+    for (justified) |bit| {
+        try state.justified_slots.append(bit);
+    }
+    state.latest_justified = latest_justified;
+    state.slot = @intCast(roots.len);
+}
+
+test "shared source finalizes when a supermajority is split across targets" {
+    // 6 validators, source S (slot 1) already justified. Two competing targets
+    // that share S: {0,1} attest S->X (slot 2), {2,3} attest S->Y (slot 3).
+    // Neither target reaches the 4-of-6 supermajority, but 4 distinct validators
+    // build on S, so S must finalize instead of stalling on the split.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 6);
+    defer state.deinit();
+
+    const g_root = [_]u8{9} ** 32; // slot 0 (genesis, finalized boundary)
+    const s_root = [_]u8{1} ** 32; // slot 1 (shared source S)
+    const x_root = [_]u8{2} ** 32; // slot 2 (target X)
+    const y_root = [_]u8{3} ** 32; // slot 3 (target Y)
+    // justified_slots[0]=slot1 (S justified), [1]=slot2, [2]=slot3. S is the latest justified.
+    try seedLinearHistory(&state, &.{ g_root, s_root, x_root, y_root }, &.{ true, false, false }, .{ .root = s_root, .slot = 1 });
+
+    const att_x = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 0, 1 }, state.slot, .{ .root = s_root, .slot = 1 }, .{ .root = x_root, .slot = 2 });
+    const att_y = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 2, 3 }, state.slot, .{ .root = s_root, .slot = 1 }, .{ .root = y_root, .slot = 3 });
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_x);
+    try attestations_list.append(att_y);
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    // Source S (the latest justified) is finalized; justification stays at S.
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
+    try std.testing.expectEqualSlices(u8, &s_root, &state.latest_finalized.root);
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_justified.slot);
+    try std.testing.expectEqualSlices(u8, &s_root, &state.latest_justified.root);
+    // Invariant: justified never trails finalized.
+    try std.testing.expect(state.latest_justified.slot >= state.latest_finalized.slot);
+    // Neither contested target was justified.
+    try std.testing.expectEqual(false, try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 2));
+    try std.testing.expectEqual(false, try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 3));
+}
+
+test "shared source still finalizes after same-block target justification advances latest" {
+    // A single target at slot 3 crosses 2/3 from source S at slot 1. The ordinary
+    // per-target finalization path cannot finalize S because slot 2 is still
+    // justifiable, but the shared-source rule can. This also covers the case where
+    // `latest_justified` advances to the target before shared-source finalization
+    // runs; the source support must still be read from S, not the new target.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 6);
+    defer state.deinit();
+
+    const g_root = [_]u8{9} ** 32;
+    const s_root = [_]u8{1} ** 32;
+    const gap_root = [_]u8{2} ** 32;
+    const t_root = [_]u8{3} ** 32;
+    try seedLinearHistory(&state, &.{ g_root, s_root, gap_root, t_root }, &.{ true, false, false }, .{ .root = s_root, .slot = 1 });
+
+    const att_t = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 0, 1, 2, 3 }, state.slot, .{ .root = s_root, .slot = 1 }, .{ .root = t_root, .slot = 3 });
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_t);
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
+    try std.testing.expectEqualSlices(u8, &s_root, &state.latest_finalized.root);
+    try std.testing.expectEqual(@as(Slot, 3), state.latest_justified.slot);
+    try std.testing.expectEqualSlices(u8, &t_root, &state.latest_justified.root);
+}
+
+test "shared source does not count votes from a different source" {
+    // Safety: votes for competing targets that carry DIFFERENT justified sources
+    // must not be pooled into one source's support. finalized = S1 (slot 1),
+    // latest_justified = S2 (slot 2). Two validators source S1 -> T3 and two source
+    // S2 -> T4. A target-keyed union would see 4 voters and wrongly finalize S2,
+    // even though only 2 validators actually built on S2. Source-keyed tallying
+    // keeps them separate, so finalization does NOT advance.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 6);
+    defer state.deinit();
+
+    const g_root = [_]u8{9} ** 32; // slot 0
+    const s1_root = [_]u8{1} ** 32; // slot 1 (finalized)
+    const s2_root = [_]u8{2} ** 32; // slot 2 (latest justified)
+    const t3_root = [_]u8{3} ** 32; // slot 3 (target of S1 votes)
+    const t4_root = [_]u8{4} ** 32; // slot 4 (target of S2 votes)
+
+    // History slots 0..4. justified_slots is relative to finalized slot 1:
+    // index 0 == slot 2 (S2 justified), index 1 == slot 3, index 2 == slot 4.
+    try seedLinearHistory(&state, &.{ g_root, s1_root, s2_root, t3_root, t4_root }, &.{ true, false, false }, .{ .root = s2_root, .slot = 2 });
+    state.latest_finalized = .{ .root = s1_root, .slot = 1 };
+
+    // {0,1} source S1 (slot 1, == finalized boundary, so "justified") -> T3.
+    const att_s1 = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 0, 1 }, state.slot, .{ .root = s1_root, .slot = 1 }, .{ .root = t3_root, .slot = 3 });
+    // {2,3} source S2 (slot 2) -> T4.
+    const att_s2 = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 2, 3 }, state.slot, .{ .root = s2_root, .slot = 2 }, .{ .root = t4_root, .slot = 4 });
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_s1);
+    try attestations_list.append(att_s2);
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    // Only 2 validators sourced S2 (< 4), so S2 is NOT finalized; finalization
+    // stays at S1. (A target-keyed union bug would have advanced it to slot 2.)
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
+    try std.testing.expectEqualSlices(u8, &s1_root, &state.latest_finalized.root);
+}
+
+test "shared source does not finalize below the supermajority threshold" {
+    // 6 validators: {0,1} attest S->X, {2} attests S->Y => 3 source supporters
+    // (< 4). No target and no source reaches the threshold; nothing finalizes.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 6);
+    defer state.deinit();
+
+    const g_root = [_]u8{9} ** 32;
+    const s_root = [_]u8{1} ** 32;
+    const x_root = [_]u8{2} ** 32;
+    const y_root = [_]u8{3} ** 32;
+    try seedLinearHistory(&state, &.{ g_root, s_root, x_root, y_root }, &.{ true, false, false }, .{ .root = s_root, .slot = 1 });
+
+    const att_x = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 0, 1 }, state.slot, .{ .root = s_root, .slot = 1 }, .{ .root = x_root, .slot = 2 });
+    const att_y = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{2}, state.slot, .{ .root = s_root, .slot = 1 }, .{ .root = y_root, .slot = 3 });
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_x);
+    try attestations_list.append(att_y);
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_finalized.slot);
+}
+
+test "shared source finalization is independent of attestation order" {
+    // Same votes as the core scenario but appended in reversed order; the final
+    // finalized checkpoint must be identical (STF determinism).
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 6);
+    defer state.deinit();
+
+    const g_root = [_]u8{9} ** 32;
+    const s_root = [_]u8{1} ** 32;
+    const x_root = [_]u8{2} ** 32;
+    const y_root = [_]u8{3} ** 32;
+    try seedLinearHistory(&state, &.{ g_root, s_root, x_root, y_root }, &.{ true, false, false }, .{ .root = s_root, .slot = 1 });
+
+    const att_y = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 2, 3 }, state.slot, .{ .root = s_root, .slot = 1 }, .{ .root = y_root, .slot = 3 });
+    const att_x = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 0, 1 }, state.slot, .{ .root = s_root, .slot = 1 }, .{ .root = x_root, .slot = 2 });
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_y);
+    try attestations_list.append(att_x);
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
+    try std.testing.expectEqualSlices(u8, &s_root, &state.latest_finalized.root);
+}
+
+test "shared source adjacency guard blocks skip-finalization" {
+    // Source S sits at slot 2 while finalized is genesis (slot 0). Slot 1 is a
+    // justifiable slot strictly between them, so even a full supermajority on S
+    // must NOT finalize it; finalizing would skip over a slot a minority could
+    // still justify, breaking accountable safety.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 6);
+    defer state.deinit();
+
+    const g_root = [_]u8{9} ** 32; // slot 0
+    const a_root = [_]u8{8} ** 32; // slot 1 (justifiable, un-crossed gap)
+    const s_root = [_]u8{1} ** 32; // slot 2 (source S)
+    const x_root = [_]u8{2} ** 32; // slot 3 (target X)
+    const y_root = [_]u8{3} ** 32; // slot 4 (target Y)
+    // justified_slots[0]=slot1(false), [1]=slot2 S(true), [2]=slot3, [3]=slot4. S is latest justified.
+    try seedLinearHistory(&state, &.{ g_root, a_root, s_root, x_root, y_root }, &.{ false, true, false, false }, .{ .root = s_root, .slot = 2 });
+
+    const att_x = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 0, 1 }, state.slot, .{ .root = s_root, .slot = 2 }, .{ .root = x_root, .slot = 3 });
+    const att_y = try makeAggregatedAttestation(std.testing.allocator, &[_]usize{ 2, 3 }, state.slot, .{ .root = s_root, .slot = 2 }, .{ .root = y_root, .slot = 4 });
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| entry.deinit();
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_x);
+    try attestations_list.append(att_y);
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    // Adjacency guard held: no finalization advance.
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_finalized.slot);
 }
 
 test "process_attestations silently skips zero-hash head" {

@@ -1281,6 +1281,164 @@ pub const ForkChoice = struct {
         return true;
     }
 
+    /// True when the shared source (the checkpoint every candidate builds on,
+    /// = pre_state.latest_justified) can finalize under the shared-source rule:
+    /// it lies strictly past the finalized slot and no slot strictly between the
+    /// finalized checkpoint and the source is still justifiable. Mirrors the
+    /// adjacency guard of state.zig's shared-source finalization.
+    fn projectionSourceFinalizes(finalized_slot: types.Slot, source_slot: types.Slot) bool {
+        if (source_slot <= finalized_slot) return false;
+        var s: types.Slot = finalized_slot + 1;
+        while (s < source_slot) : (s += 1) {
+            if (types.IsJustifiableSlot(finalized_slot, s) catch false) return false;
+        }
+        return true;
+    }
+
+    const SourcePlanCandidate = struct {
+        idx: usize,
+        gain: usize,
+    };
+
+    fn sourcePlanCandidateLessThan(_: void, a: SourcePlanCandidate, b: SourcePlanCandidate) bool {
+        if (a.gain != b.gain) return a.gain > b.gain;
+        return a.idx < b.idx;
+    }
+
+    fn quorumThreshold(num_validators: usize) usize {
+        return (2 * num_validators + 2) / 3;
+    }
+
+    fn projectionSourceGain(source_support: []const u8, candidate: []const u8, num_validators: usize) usize {
+        var gain: usize = 0;
+        for (candidate, 0..) |v, i| {
+            if (v != 0 and i < num_validators and source_support[i] == 0) gain += 1;
+        }
+        return gain;
+    }
+
+    fn sourcePlanUpperBound(plan_candidates: []const SourcePlanCandidate, start: usize, remaining_picks: usize, current_count: usize) usize {
+        var upper_bound = current_count;
+        var used: usize = 0;
+        var i = start;
+        while (i < plan_candidates.len and used < remaining_picks) : (i += 1) {
+            upper_bound += plan_candidates[i].gain;
+            used += 1;
+        }
+        return upper_bound;
+    }
+
+    fn addSourcePlanVoters(support_counts: []usize, voters: []const u8, num_validators: usize, count: *usize) void {
+        for (voters, 0..) |v, i| {
+            if (v == 0 or i >= num_validators) continue;
+            if (support_counts[i] == 0) count.* += 1;
+            support_counts[i] += 1;
+        }
+    }
+
+    fn removeSourcePlanVoters(support_counts: []usize, voters: []const u8, num_validators: usize, count: *usize) void {
+        for (voters, 0..) |v, i| {
+            if (v == 0 or i >= num_validators) continue;
+            support_counts[i] -= 1;
+            if (support_counts[i] == 0) count.* -= 1;
+        }
+    }
+
+    fn findSourcePlanDfs(
+        candidates: []const ProjectionCandidate,
+        plan_candidates: []const SourcePlanCandidate,
+        start: usize,
+        remaining_picks: usize,
+        threshold: usize,
+        support_counts: []usize,
+        current_count: usize,
+        chosen: []usize,
+        chosen_len: *usize,
+        num_validators: usize,
+    ) bool {
+        if (current_count >= threshold) return true;
+        if (remaining_picks == 0 or start >= plan_candidates.len) return false;
+        if (sourcePlanUpperBound(plan_candidates, start, remaining_picks, current_count) < threshold) return false;
+
+        var i = start;
+        while (i < plan_candidates.len) : (i += 1) {
+            const plan_candidate = plan_candidates[i];
+            if (plan_candidate.gain == 0) continue;
+
+            chosen[chosen_len.*] = plan_candidate.idx;
+            chosen_len.* += 1;
+
+            var next_count = current_count;
+            addSourcePlanVoters(support_counts, candidates[plan_candidate.idx].voters, num_validators, &next_count);
+            if (findSourcePlanDfs(candidates, plan_candidates, i + 1, remaining_picks - 1, threshold, support_counts, next_count, chosen, chosen_len, num_validators)) {
+                return true;
+            }
+            removeSourcePlanVoters(support_counts, candidates[plan_candidate.idx].voters, num_validators, &next_count);
+
+            chosen_len.* -= 1;
+        }
+        return false;
+    }
+
+    fn markSourceFinalizationPlan(
+        pre_state: *const types.BeamState,
+        parent_root: [32]u8,
+        candidates: []const ProjectionCandidate,
+        processed: *std.AutoHashMap(types.AttestationData, void),
+        js: *const types.JustifiedSlots,
+        finalized_slot: types.Slot,
+        source: types.Checkpoint,
+        source_support: []const u8,
+        num_validators: usize,
+        remaining_slots: usize,
+        require_chain_match: bool,
+        plan_members: []u8,
+        plan_candidates_buf: []SourcePlanCandidate,
+        support_counts: []usize,
+        chosen_buf: []usize,
+    ) bool {
+        @memset(plan_members, 0);
+        if (num_validators == 0 or remaining_slots == 0) return false;
+
+        var base_count: usize = 0;
+        for (support_counts[0..num_validators], 0..) |*count, i| {
+            if (source_support[i] != 0) {
+                count.* = 1;
+                base_count += 1;
+            } else {
+                count.* = 0;
+            }
+        }
+
+        const threshold = quorumThreshold(num_validators);
+        if (base_count >= threshold) return false;
+
+        var plan_candidates_len: usize = 0;
+        for (candidates, 0..) |cand, idx| {
+            const ad = cand.att_data;
+            if (!ad.source.eql(&source)) continue;
+            if (processed.contains(ad)) continue;
+            if (!projectionCandidateEligible(pre_state, parent_root, js, finalized_slot, ad, require_chain_match)) continue;
+
+            const gain = projectionSourceGain(source_support, cand.voters, num_validators);
+            if (gain == 0) continue;
+            plan_candidates_buf[plan_candidates_len] = .{ .idx = idx, .gain = gain };
+            plan_candidates_len += 1;
+        }
+
+        const plan_candidates = plan_candidates_buf[0..plan_candidates_len];
+        std.mem.sortUnstable(SourcePlanCandidate, plan_candidates, {}, sourcePlanCandidateLessThan);
+
+        var chosen_len: usize = 0;
+        if (!findSourcePlanDfs(candidates, plan_candidates, 0, remaining_slots, threshold, support_counts, base_count, chosen_buf, &chosen_len, num_validators)) {
+            return false;
+        }
+        for (chosen_buf[0..chosen_len]) |idx| {
+            plan_members[idx] = 1;
+        }
+        return true;
+    }
+
     /// Whether `ad` passes every STF attestation-viability gate against the
     /// current projected chain view (state.zig:416-456), re-evaluated each round.
     /// `require_chain_match` gates the historical-hash root check: the block
@@ -1344,6 +1502,7 @@ pub const ForkChoice = struct {
         votes: *std.AutoHashMapUnmanaged(types.Root, []u8),
         js: *types.JustifiedSlots,
         finalized_slot: *types.Slot,
+        latest_justified_slot: *types.Slot,
         ad: types.AttestationData,
         num_validators: usize,
     ) !void {
@@ -1354,8 +1513,9 @@ pub const ForkChoice = struct {
         }
         if (3 * count < 2 * num_validators) return;
 
-        // Justify the target.
+        // Justify the target and advance the projected latest justified slot.
         setSlotJustifiedForBuild(finalized_slot.*, js, ad.target.slot, true);
+        if (ad.target.slot > latest_justified_slot.*) latest_justified_slot.* = ad.target.slot;
         if (votes.fetchRemove(ad.target.root)) |kv| allocator.free(kv.value);
 
         // Finalize the source when eligible (uses the OLD finalized base for the
@@ -1369,7 +1529,7 @@ pub const ForkChoice = struct {
         }
     }
 
-    /// Shared projection-based attestation_data selector — the core of PR #1149's
+    /// Shared projection-based attestation_data selector: the core of PR #1149's
     /// idea expressed inline without a tier enum. Projects justification and
     /// finalization forward in pure data (mirroring state.zig process_attestations)
     /// with NO STF and NO XMSS in the loop, returning the att_data keys a block at
@@ -1395,6 +1555,30 @@ pub const ForkChoice = struct {
         const num_validators: usize = @intCast(pre_state.validatorCount());
 
         var proj_finalized_slot: types.Slot = pre_state.latest_finalized.slot;
+        // The shared source is the checkpoint that finalizes under the shared-source
+        // rule: pre_state.latest_justified. Only candidates whose source equals it
+        // count toward its support. `proj_latest_justified_slot` tracks the running
+        // projected latest justified slot (advances as per-target justifications settle).
+        const proj_source = pre_state.latest_justified;
+        const proj_source_slot: types.Slot = proj_source.slot;
+        var proj_latest_justified_slot: types.Slot = pre_state.latest_justified.slot;
+
+        // Shared-source support (state.zig mirror): validators that attested WITH the
+        // shared source, accumulated only from selected candidates whose source
+        // matches; never seeded from the target-keyed pending votes, which do not
+        // record each vote's source. The plan buffers let the selector find an exact
+        // within-cap source-finalizing subset instead of relying on marginal gain.
+        const proj_source_support = try allocator.alloc(u8, num_validators);
+        defer allocator.free(proj_source_support);
+        @memset(proj_source_support, 0);
+        const source_plan_members = try allocator.alloc(u8, candidates.len);
+        defer allocator.free(source_plan_members);
+        const source_plan_candidates = try allocator.alloc(SourcePlanCandidate, candidates.len);
+        defer allocator.free(source_plan_candidates);
+        const source_plan_support_counts = try allocator.alloc(usize, num_validators);
+        defer allocator.free(source_plan_support_counts);
+        const source_plan_chosen = try allocator.alloc(usize, candidates.len);
+        defer allocator.free(source_plan_chosen);
 
         // R1: clone justified_slots and extend to slot-1 (process_block_header).
         var proj_justified_slots = try zeam_utils.clone(types.JustifiedSlots, &pre_state.justified_slots, allocator);
@@ -1417,11 +1601,49 @@ pub const ForkChoice = struct {
         var selected_len: usize = 0;
 
         while (selected_len < max_select) {
-            // Scan: pick the single best eligible candidate by tier priority
-            // (FINALIZE > JUSTIFY[highest target] > BUILD), re-evaluating
-            // eligibility against the current projected state every round (R6).
+            // Round setup for the shared-source rule. `proj_source_support` is the
+            // current support for the shared source (voters from already-selected
+            // candidates whose source matches). `source_achievable` means an exact
+            // subset of still-eligible same-source candidates can cross 2/3 within
+            // the remaining attestation cap.
+            var base_source_count: usize = 0;
+            for (proj_source_support) |v| {
+                if (v != 0) base_source_count += 1;
+            }
+            const source_projected_finalized = base_source_count >= quorumThreshold(num_validators);
+            const source_finalizable = !source_projected_finalized and proj_source_slot > proj_finalized_slot and projectionSourceFinalizes(proj_finalized_slot, proj_source_slot);
+            const remaining_slots = max_select - selected_len;
+            const source_achievable = source_finalizable and markSourceFinalizationPlan(
+                pre_state,
+                parent_root,
+                candidates,
+                &processed,
+                &proj_justified_slots,
+                proj_finalized_slot,
+                proj_source,
+                proj_source_support,
+                num_validators,
+                remaining_slots,
+                require_chain_match,
+                source_plan_members,
+                source_plan_candidates,
+                source_plan_support_counts,
+                source_plan_chosen,
+            );
+
+            // Scan: pick the candidate that pushes FINALIZATION to the farthest
+            // slot; on a tie, the one that pushes JUSTIFICATION farthest. A pick
+            // can finalize per-target (a single target crosses 2/3 and its source
+            // finalizes) or via the shared source (its voters complete, or advance
+            // toward, the 2/3 union building on the source even with split targets).
+            // When a split-source finalization is achievable this block, picks from
+            // the exact within-cap plan all share the source finalized slot, so the
+            // needed coverage is packed before the cap is spent. Eligibility is
+            // re-evaluated against the current projected state every round (R6).
             var best_idx: ?usize = null;
-            var best_tier: u8 = 255; // 0 finalize, 1 justify, 2 build
+            var best_fin_slot: types.Slot = 0;
+            var best_just_slot: types.Slot = 0;
+            var best_source_gain: usize = 0;
             var best_target_slot: types.Slot = 0;
             var best_count: usize = 0;
             var best_att_slot: types.Slot = 0;
@@ -1433,16 +1655,43 @@ pub const ForkChoice = struct {
 
                 const count = projectionUnionCount(votes.get(ad.target.root), cand.voters, num_validators);
                 const crosses = 3 * count >= 2 * num_validators;
-                var tier: u8 = 2;
-                if (crosses) {
-                    tier = if (projectionFinalizes(proj_finalized_slot, ad.source.slot, ad.target.slot)) 0 else 1;
+
+                // Marginal new shared-source voters this candidate adds, but only
+                // if it actually sources at the shared source (else it cannot count
+                // toward finalizing it).
+                const sources_here = ad.source.eql(&proj_source);
+                var source_gain: usize = 0;
+                if (sources_here) {
+                    source_gain = projectionSourceGain(proj_source_support, cand.voters, num_validators);
                 }
 
-                // Tie-break (all tiers): higher target.slot (user rule 6 for
-                // justify; deepest-target for build), then more voters, then newer
-                // att slot, then lexicographic for determinism.
+                // Resulting finalized slot if this candidate were selected: the max
+                // of the per-target finalizer and the shared-source finalizer, where
+                // the latter counts both an immediate cross and a contribution to an
+                // achievable split-source finalization.
+                var fin_slot = proj_finalized_slot;
+                if (crosses and projectionFinalizes(proj_finalized_slot, ad.source.slot, ad.target.slot)) {
+                    fin_slot = ad.source.slot;
+                }
+                var completes_source = false;
+                if (sources_here and source_finalizable and proj_source_slot > fin_slot) {
+                    completes_source = 3 * (base_source_count + source_gain) >= 2 * num_validators;
+                    if (completes_source or source_plan_members[idx] != 0) fin_slot = proj_source_slot;
+                }
+
+                // Resulting latest justified slot: a crossing target justifies it.
+                const just_slot = if (crosses) @max(proj_latest_justified_slot, ad.target.slot) else proj_latest_justified_slot;
+                // Marginal source coverage only ranks when a source finalization is
+                // in play, so ordinary build/justify selection is unaffected.
+                const ranked_gain = if (source_achievable and (source_plan_members[idx] != 0 or completes_source)) source_gain else 0;
+
+                // Rank: farthest finalization, then farthest justification, then
+                // greedy source coverage, then deepest target (coverage/build), more
+                // voters, newer att slot, and finally lexicographic for determinism.
                 const replace = if (best_idx) |bi| blk: {
-                    if (tier != best_tier) break :blk tier < best_tier;
+                    if (fin_slot != best_fin_slot) break :blk fin_slot > best_fin_slot;
+                    if (just_slot != best_just_slot) break :blk just_slot > best_just_slot;
+                    if (ranked_gain != best_source_gain) break :blk ranked_gain > best_source_gain;
                     if (ad.target.slot != best_target_slot) break :blk ad.target.slot > best_target_slot;
                     if (count != best_count) break :blk count > best_count;
                     if (ad.slot != best_att_slot) break :blk ad.slot > best_att_slot;
@@ -1451,7 +1700,9 @@ pub const ForkChoice = struct {
 
                 if (replace) {
                     best_idx = idx;
-                    best_tier = tier;
+                    best_fin_slot = fin_slot;
+                    best_just_slot = just_slot;
+                    best_source_gain = ranked_gain;
                     best_target_slot = ad.target.slot;
                     best_count = count;
                     best_att_slot = ad.slot;
@@ -1465,10 +1716,20 @@ pub const ForkChoice = struct {
             out[selected_len] = ad;
             selected_len += 1;
 
-            // Accumulate voters by target.root (R3) and settle induced
-            // justification/finalization (R7) before the next round's re-scan.
+            // Accumulate voters by target.root (R3); additionally record voters
+            // under the shared-source support when this pick sources there. Then
+            // settle induced justification/finalization (R7) before the next round's
+            // re-scan. Shared-source finalization is intentionally not applied to
+            // the projected finalized slot here: unlike per-target finalization, the
+            // STF runs it after the whole attestation loop, so same-block candidates
+            // must remain eligible against the pre-shared-source finalized slot.
             try projectionAddVoters(allocator, &votes, ad.target.root, cand.voters, num_validators);
-            try projectionSettle(allocator, &votes, &proj_justified_slots, &proj_finalized_slot, ad, num_validators);
+            if (ad.source.eql(&proj_source)) {
+                for (cand.voters, 0..) |v, i| {
+                    if (v != 0 and i < num_validators) proj_source_support[i] = 1;
+                }
+            }
+            try projectionSettle(allocator, &votes, &proj_justified_slots, &proj_finalized_slot, &proj_latest_justified_slot, ad, num_validators);
         }
 
         return out[0..selected_len];
@@ -5951,6 +6212,311 @@ test "selectProjectionAttestationData: split votes across distinct att_data with
     );
     try std.testing.expectEqual(@as(usize, 1), selected_partial.len);
     try std.testing.expectEqual(@as(types.Slot, 9), selected_partial[0].target.slot);
+}
+
+test "selectProjectionAttestationData: split-source finalizer packed under a tight cap (STF mirror)" {
+    // Mirror of the STF shared-source test. Source S (slot 1) is the latest
+    // justified; finalized is genesis. Two competing targets share S: X (slot 2,
+    // voters {0,1}) and Y (slot 3, voter {2}), so neither crosses 2/3 (threshold 3
+    // of 4), but their voter union (3) finalizes S. A deeper build R (slot 5) whose
+    // voter {0} is already covered by X adds nothing to the source union. With cap=2
+    // the selector MUST pack the coverage that finalizes S (X and Y) rather than
+    // spend a slot on the redundant deeper R, or the block would not finalize what
+    // the STF will.
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 6);
+    defer ctx.deinit();
+
+    const state = &ctx.mock_chain.genesis_state;
+    const s_root = createTestRoot(0xA1); // slot 1, shared source (latest justified)
+    const x_root = createTestRoot(0xB2); // slot 2, target X
+    const y_root = createTestRoot(0xC3); // slot 3, target Y
+    const r_root = createTestRoot(0xD4); // slot 5, deeper build, redundant voters
+    const proposal_slot: types.Slot = 8;
+
+    state.latest_finalized = .{ .root = types.ZERO_HASH, .slot = 0 };
+    state.latest_justified = .{ .root = s_root, .slot = 1 };
+    while (state.historical_block_hashes.len() <= proposal_slot) {
+        try state.historical_block_hashes.append(types.ZERO_HASH);
+    }
+    state.historical_block_hashes.slice()[1] = s_root;
+    state.historical_block_hashes.slice()[2] = x_root;
+    state.historical_block_hashes.slice()[3] = y_root;
+    state.historical_block_hashes.slice()[5] = r_root;
+    // justified_slots relative to finalized slot 0: index 0 == slot 1 (source S).
+    try state.justified_slots.append(true);
+
+    const mkAtt = struct {
+        fn f(att_slot: types.Slot, target_root: types.Root, target_slot: types.Slot) types.AttestationData {
+            return .{
+                .slot = att_slot,
+                .head = .{ .root = target_root, .slot = target_slot },
+                .target = .{ .root = target_root, .slot = target_slot },
+                .source = .{ .root = createTestRoot(0xA1), .slot = 1 },
+            };
+        }
+    }.f;
+
+    const mkVoters = struct {
+        fn f(alloc: Allocator, n: usize, ids: []const usize) ![]u8 {
+            const v = try alloc.alloc(u8, n);
+            @memset(v, 0);
+            for (ids) |id| v[id] = 1;
+            return v;
+        }
+    }.f;
+
+    const n = state.validatorCount(); // 4 in the mock chain
+    const threshold = (2 * n + 2) / 3; // smallest count with 3*count >= 2*n
+    try std.testing.expectEqual(@as(usize, 3), threshold);
+
+    const voters_x = try mkVoters(allocator, n, &.{ 0, 1 });
+    defer allocator.free(voters_x);
+    const voters_y = try mkVoters(allocator, n, &.{2});
+    defer allocator.free(voters_y);
+    const voters_r = try mkVoters(allocator, n, &.{0}); // subset of X: 0 new source voters
+    defer allocator.free(voters_r);
+
+    const candidates = [_]ForkChoice.ProjectionCandidate{
+        .{ .att_data = mkAtt(5, r_root, 5), .voters = voters_r },
+        .{ .att_data = mkAtt(2, x_root, 2), .voters = voters_x },
+        .{ .att_data = mkAtt(3, y_root, 3), .voters = voters_y },
+    };
+
+    var out: [2]types.AttestationData = undefined;
+    const selected = try ctx.fork_choice.selectProjectionAttestationData(
+        state,
+        createTestRoot(0xFF),
+        proposal_slot,
+        &candidates,
+        2, // tight cap: only room for the coverage that finalizes S
+        true,
+        &out,
+    );
+
+    // The split-source coverage (X + Y) is packed; the redundant deeper R is dropped.
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    var saw_x = false;
+    var saw_y = false;
+    var saw_r = false;
+    for (selected) |k| {
+        if (k.target.slot == 2) saw_x = true;
+        if (k.target.slot == 3) saw_y = true;
+        if (k.target.slot == 5) saw_r = true;
+    }
+    try std.testing.expect(saw_x and saw_y);
+    try std.testing.expect(!saw_r);
+}
+
+test "selectProjectionAttestationData: shared-source plan avoids overlapping greedy miss" {
+    // 8 validators, threshold 6, cap=2. Candidate A has the largest immediate
+    // source gain ({0,1,2,3}) but overlaps both useful candidates; A+B or A+C only
+    // cover 5 voters. B+C ({0,1,4} + {2,3,5}) is the only two-candidate plan that
+    // finalizes S, so the selector must choose that exact plan rather than the
+    // largest marginal gain.
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 6);
+    defer ctx.deinit();
+
+    const validator_count: usize = 8;
+    const attestation_pubkeys = try allocator.alloc(types.Bytes52, validator_count);
+    defer allocator.free(attestation_pubkeys);
+    const proposal_pubkeys = try allocator.alloc(types.Bytes52, validator_count);
+    defer allocator.free(proposal_pubkeys);
+    for (attestation_pubkeys, proposal_pubkeys, 0..) |*apk, *ppk, i| {
+        @memset(apk, @intCast(i + 1));
+        @memset(ppk, @intCast(i + 1));
+    }
+
+    var state: types.BeamState = undefined;
+    try state.genGenesisState(allocator, .{
+        .genesis_time = 0,
+        .validator_attestation_pubkeys = attestation_pubkeys,
+        .validator_proposal_pubkeys = proposal_pubkeys,
+    });
+    defer state.deinit();
+
+    const s_root = createTestRoot(0xA1);
+    const a_root = createTestRoot(0xB1);
+    const b_root = createTestRoot(0xB2);
+    const c_root = createTestRoot(0xB3);
+    const proposal_slot: types.Slot = 8;
+
+    state.latest_finalized = .{ .root = types.ZERO_HASH, .slot = 0 };
+    state.latest_justified = .{ .root = s_root, .slot = 1 };
+    while (state.historical_block_hashes.len() <= proposal_slot) {
+        try state.historical_block_hashes.append(types.ZERO_HASH);
+    }
+    state.historical_block_hashes.slice()[1] = s_root;
+    state.historical_block_hashes.slice()[2] = b_root;
+    state.historical_block_hashes.slice()[3] = c_root;
+    state.historical_block_hashes.slice()[5] = a_root;
+    try state.justified_slots.append(true);
+
+    const mkAtt = struct {
+        fn f(att_slot: types.Slot, target_root: types.Root, target_slot: types.Slot) types.AttestationData {
+            return .{
+                .slot = att_slot,
+                .head = .{ .root = target_root, .slot = target_slot },
+                .target = .{ .root = target_root, .slot = target_slot },
+                .source = .{ .root = createTestRoot(0xA1), .slot = 1 },
+            };
+        }
+    }.f;
+
+    const mkVoters = struct {
+        fn f(alloc: Allocator, n: usize, ids: []const usize) ![]u8 {
+            const v = try alloc.alloc(u8, n);
+            @memset(v, 0);
+            for (ids) |id| v[id] = 1;
+            return v;
+        }
+    }.f;
+
+    const threshold = (2 * validator_count + 2) / 3;
+    try std.testing.expectEqual(@as(usize, 6), threshold);
+
+    const voters_a = try mkVoters(allocator, validator_count, &.{ 0, 1, 2, 3 });
+    defer allocator.free(voters_a);
+    const voters_b = try mkVoters(allocator, validator_count, &.{ 0, 1, 4 });
+    defer allocator.free(voters_b);
+    const voters_c = try mkVoters(allocator, validator_count, &.{ 2, 3, 5 });
+    defer allocator.free(voters_c);
+
+    const candidates = [_]ForkChoice.ProjectionCandidate{
+        .{ .att_data = mkAtt(5, a_root, 5), .voters = voters_a },
+        .{ .att_data = mkAtt(2, b_root, 2), .voters = voters_b },
+        .{ .att_data = mkAtt(3, c_root, 3), .voters = voters_c },
+    };
+
+    var out: [2]types.AttestationData = undefined;
+    const selected = try ctx.fork_choice.selectProjectionAttestationData(
+        &state,
+        createTestRoot(0xFF),
+        proposal_slot,
+        &candidates,
+        2,
+        true,
+        &out,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    var saw_a = false;
+    var saw_b = false;
+    var saw_c = false;
+    for (selected) |k| {
+        if (k.target.slot == 5) saw_a = true;
+        if (k.target.slot == 2) saw_b = true;
+        if (k.target.slot == 3) saw_c = true;
+    }
+    try std.testing.expect(saw_b and saw_c);
+    try std.testing.expect(!saw_a);
+}
+
+test "selectProjectionAttestationData: shared-source finalization is deferred for same-block eligibility" {
+    // The STF runs shared-source finalization after its attestation loop, not after
+    // the first selected subset crosses the source threshold. After X+Y project a
+    // source finalization at S (slot 1), D (source genesis -> target slot 9) is
+    // still valid in the same block because target 9 is justifiable relative to the
+    // old finalized slot 0. If the projection advances finalized to S mid-selection,
+    // D is incorrectly filtered out because slot 9 is not justifiable relative to 1.
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 6);
+    defer ctx.deinit();
+
+    const validator_count: usize = 4;
+    const attestation_pubkeys = try allocator.alloc(types.Bytes52, validator_count);
+    defer allocator.free(attestation_pubkeys);
+    const proposal_pubkeys = try allocator.alloc(types.Bytes52, validator_count);
+    defer allocator.free(proposal_pubkeys);
+    for (attestation_pubkeys, proposal_pubkeys, 0..) |*apk, *ppk, i| {
+        @memset(apk, @intCast(i + 1));
+        @memset(ppk, @intCast(i + 1));
+    }
+
+    var state: types.BeamState = undefined;
+    try state.genGenesisState(allocator, .{
+        .genesis_time = 0,
+        .validator_attestation_pubkeys = attestation_pubkeys,
+        .validator_proposal_pubkeys = proposal_pubkeys,
+    });
+    defer state.deinit();
+
+    const g_root = createTestRoot(0x01);
+    const s_root = createTestRoot(0xA1);
+    const x_root = createTestRoot(0xB2);
+    const y_root = createTestRoot(0xC3);
+    const d_root = createTestRoot(0xD4);
+    const proposal_slot: types.Slot = 10;
+
+    state.latest_finalized = .{ .root = g_root, .slot = 0 };
+    state.latest_justified = .{ .root = s_root, .slot = 1 };
+    while (state.historical_block_hashes.len() <= proposal_slot) {
+        try state.historical_block_hashes.append(types.ZERO_HASH);
+    }
+    state.historical_block_hashes.slice()[0] = g_root;
+    state.historical_block_hashes.slice()[1] = s_root;
+    state.historical_block_hashes.slice()[2] = x_root;
+    state.historical_block_hashes.slice()[3] = y_root;
+    state.historical_block_hashes.slice()[9] = d_root;
+    try state.justified_slots.append(true);
+
+    const mkAtt = struct {
+        fn f(source: types.Checkpoint, att_slot: types.Slot, target_root: types.Root, target_slot: types.Slot) types.AttestationData {
+            return .{
+                .slot = att_slot,
+                .head = .{ .root = target_root, .slot = target_slot },
+                .target = .{ .root = target_root, .slot = target_slot },
+                .source = source,
+            };
+        }
+    }.f;
+
+    const mkVoters = struct {
+        fn f(alloc: Allocator, n: usize, ids: []const usize) ![]u8 {
+            const v = try alloc.alloc(u8, n);
+            @memset(v, 0);
+            for (ids) |id| v[id] = 1;
+            return v;
+        }
+    }.f;
+
+    const voters_x = try mkVoters(allocator, validator_count, &.{ 0, 1 });
+    defer allocator.free(voters_x);
+    const voters_y = try mkVoters(allocator, validator_count, &.{2});
+    defer allocator.free(voters_y);
+    const voters_d = try mkVoters(allocator, validator_count, &.{3});
+    defer allocator.free(voters_d);
+
+    const source_s: types.Checkpoint = .{ .root = s_root, .slot = 1 };
+    const source_g: types.Checkpoint = .{ .root = g_root, .slot = 0 };
+    const candidates = [_]ForkChoice.ProjectionCandidate{
+        .{ .att_data = mkAtt(source_s, 2, x_root, 2), .voters = voters_x },
+        .{ .att_data = mkAtt(source_s, 3, y_root, 3), .voters = voters_y },
+        .{ .att_data = mkAtt(source_g, 9, d_root, 9), .voters = voters_d },
+    };
+
+    var out: [3]types.AttestationData = undefined;
+    const selected = try ctx.fork_choice.selectProjectionAttestationData(
+        &state,
+        createTestRoot(0xFF),
+        proposal_slot,
+        &candidates,
+        3,
+        true,
+        &out,
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), selected.len);
+    var saw_x = false;
+    var saw_y = false;
+    var saw_d = false;
+    for (selected) |k| {
+        if (k.target.slot == 2) saw_x = true;
+        if (k.target.slot == 3) saw_y = true;
+        if (k.target.slot == 9) saw_d = true;
+    }
+    try std.testing.expect(saw_x and saw_y and saw_d);
 }
 
 fn makeProposalSelectionTestAttData(slot: types.Slot, target_slot: types.Slot, root_byte: u8) types.AttestationData {
