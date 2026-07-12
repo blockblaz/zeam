@@ -1,9 +1,7 @@
-// Unified networking_codec runner. The spec emits a flat fixture format —
-// each case carries a `codecName` plus codec-specific `input`/`output` —
-// so the runner dispatches on the codec name and skips families it doesn't
-// yet cover (RLP-bound, secp256k1-bound, protobuf-bound). The handlers
-// here favour reusing zeam's production codecs (snappyz, snappyframesz,
-// multiformats.uvarint, network.GossipTopic) over re-implementing them.
+// Unified networking_codec runner. The spec has used both a flat fixture
+// format (`codecName` + `input`) and a discriminated-union format (`codec`
+// object with `kind`). Accept both so older and newer leanSpec vectors stay
+// consumable.
 const std = @import("std");
 
 const expect_mod = @import("../json_expect.zig");
@@ -117,8 +115,15 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
         },
     };
 
-    const codec = try expect_mod.expectStringField(FixtureError, case_obj, &.{"codecName"}, ctx, "codecName");
-    const input_obj = try expect_mod.expectObject(FixtureError, case_obj, &.{"input"}, ctx, "input");
+    const codec_obj_opt = case_obj.get("codec");
+    const codec = if (codec_obj_opt) |codec_value| blk: {
+        const codec_obj = try expect_mod.expectObjectValue(FixtureError, codec_value, ctx, "codec");
+        break :blk try expect_mod.expectStringField(FixtureError, codec_obj, &.{"kind"}, ctx, "codec.kind");
+    } else try expect_mod.expectStringField(FixtureError, case_obj, &.{"codecName"}, ctx, "codecName");
+    const input_obj = if (codec_obj_opt) |codec_value|
+        try expect_mod.expectObjectValue(FixtureError, codec_value, ctx, "codec")
+    else
+        try expect_mod.expectObject(FixtureError, case_obj, &.{"input"}, ctx, "input");
     const output_obj = try expect_mod.expectObject(FixtureError, case_obj, &.{"output"}, ctx, "output");
 
     if (std.mem.eql(u8, codec, "varint")) {
@@ -135,6 +140,8 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
         return runSnappyBlock(allocator, ctx, input_obj, output_obj);
     } else if (std.mem.eql(u8, codec, "snappy_frame")) {
         return runSnappyFrame(allocator, ctx, input_obj, output_obj);
+    } else if (std.mem.eql(u8, codec, "decode_failure")) {
+        return runDecodeFailure(allocator, ctx, input_obj);
     }
 
     std.debug.print(
@@ -142,6 +149,43 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
         .{ ctx.fixture_label, codec },
     );
     return FixtureError.SkippedFixture;
+}
+
+fn runDecodeFailure(allocator: Allocator, ctx: Context, input_obj: std.json.ObjectMap) FixtureError!void {
+    const decoder = try expect_mod.expectStringField(FixtureError, input_obj, &.{"decoder"}, ctx, "codec.decoder");
+    const raw_hex = try expect_mod.expectStringField(FixtureError, input_obj, &.{ "rawBytes", "raw_bytes" }, ctx, "codec.rawBytes");
+    const raw = try parseHexBytes(allocator, ctx, raw_hex, "codec.rawBytes");
+
+    if (std.mem.eql(u8, decoder, "varint")) {
+        if (decodeVarintRejects(raw)) return;
+    } else if (std.mem.eql(u8, decoder, "snappy_block")) {
+        if (snappyz.decode(allocator, raw)) |_| {
+            return FixtureError.FixtureMismatch;
+        } else |_| return;
+    } else if (std.mem.eql(u8, decoder, "snappy_frame")) {
+        if (snappyframesz.decode(allocator, raw)) |_| {
+            return FixtureError.FixtureMismatch;
+        } else |_| return;
+    } else {
+        return FixtureError.SkippedFixture;
+    }
+
+    std.debug.print(
+        "fixture {s} case {s}: expected decoder {s} to reject input\n",
+        .{ ctx.fixture_label, ctx.case_name, decoder },
+    );
+    return FixtureError.FixtureMismatch;
+}
+
+fn decodeVarintRejects(bytes: []const u8) bool {
+    var shift: u6 = 0;
+    for (bytes, 0..) |byte, i| {
+        if (i >= 10) return true;
+        if ((byte & 0x80) == 0) return false;
+        if (shift >= 63) return true;
+        shift += 7;
+    }
+    return true;
 }
 
 fn runVarint(allocator: Allocator, ctx: Context, input_obj: std.json.ObjectMap, output_obj: std.json.ObjectMap) FixtureError!void {
@@ -187,8 +231,8 @@ fn encodeVarint(buf: *[10]u8, value: u64) []u8 {
 }
 
 fn runGossipTopic(allocator: Allocator, ctx: Context, input_obj: std.json.ObjectMap, output_obj: std.json.ObjectMap) FixtureError!void {
-    const kind_str = try expect_mod.expectStringField(FixtureError, input_obj, &.{"kind"}, ctx, "input.kind");
-    const fork_digest = try expect_mod.expectStringField(FixtureError, input_obj, &.{ "forkDigest", "fork_digest" }, ctx, "input.forkDigest");
+    const kind_str = try expect_mod.expectStringField(FixtureError, input_obj, &.{ "topicKind", "topic_kind", "kind" }, ctx, "input.topicKind");
+    const fork_digest = try expect_mod.expectStringField(FixtureError, input_obj, &.{ "forkDigest", "fork_digest", "networkName", "network_name" }, ctx, "input.forkDigest");
     const expected_topic = try expect_mod.expectStringField(FixtureError, output_obj, &.{ "topicString", "topic_string" }, ctx, "output.topicString");
 
     const gossip_topic: network.GossipTopic = blk: {

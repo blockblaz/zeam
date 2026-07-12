@@ -110,17 +110,10 @@ fn runCase(ctx: Context, value: JsonValue) FixtureError!void {
     const finalized_slot = try expect_mod.expectU64Field(FixtureError, case_obj, &.{ "finalizedSlot", "finalized_slot" }, ctx, "finalizedSlot");
 
     const output_obj = try expect_mod.expectObject(FixtureError, case_obj, &.{"output"}, ctx, "output");
-    const expected_delta = try expect_mod.expectU64Field(FixtureError, output_obj, &.{"delta"}, ctx, "output.delta");
+    const expected_delta = try expectI64Field(output_obj, &.{"delta"}, ctx, "output.delta");
     const expected_is_justifiable = try expectBoolField(output_obj, &.{ "isJustifiable", "is_justifiable" }, ctx, "output.isJustifiable");
 
-    if (slot < finalized_slot) {
-        std.debug.print(
-            "fixture {s} case {s}: slot {d} < finalizedSlot {d}\n",
-            .{ ctx.fixture_label, ctx.case_name, slot, finalized_slot },
-        );
-        return FixtureError.InvalidFixture;
-    }
-    const actual_delta: u64 = slot - finalized_slot;
+    const actual_delta: i64 = @as(i64, @intCast(slot)) - @as(i64, @intCast(finalized_slot));
     if (actual_delta != expected_delta) {
         std.debug.print(
             "fixture {s} case {s}: delta mismatch (expected {d}, got {d})\n",
@@ -129,7 +122,7 @@ fn runCase(ctx: Context, value: JsonValue) FixtureError!void {
         return FixtureError.FixtureMismatch;
     }
 
-    const actual_is_justifiable = types.IsJustifiableSlot(finalized_slot, slot) catch |err| {
+    const actual_is_justifiable = if (slot < finalized_slot) false else types.IsJustifiableSlot(finalized_slot, slot) catch |err| {
         std.debug.print(
             "fixture {s} case {s}: IsJustifiableSlot failed: {s}\n",
             .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
@@ -144,6 +137,33 @@ fn runCase(ctx: Context, value: JsonValue) FixtureError!void {
         );
         return FixtureError.FixtureMismatch;
     }
+}
+
+fn expectI64Field(
+    obj: std.json.ObjectMap,
+    field_names: []const []const u8,
+    ctx: Context,
+    label: []const u8,
+) FixtureError!i64 {
+    for (field_names) |fname| {
+        if (obj.get(fname)) |value| {
+            return switch (value) {
+                .integer => |i| @intCast(i),
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}: field {s} must be integer\n",
+                        .{ ctx.fixture_label, ctx.case_name, label },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+        }
+    }
+    std.debug.print(
+        "fixture {s} case {s}: missing field {s}\n",
+        .{ ctx.fixture_label, ctx.case_name, label },
+    );
+    return FixtureError.InvalidFixture;
 }
 
 fn expectBoolField(

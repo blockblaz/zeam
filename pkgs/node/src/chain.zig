@@ -4746,6 +4746,13 @@ pub const BeamChain = struct {
             });
             return BlockValidationError.SlotNotAfterParent;
         }
+        if (block.slot - parent_block.?.slot > params.HISTORICAL_ROOTS_LIMIT) {
+            self.logger.debug("block validation failed: slot gap {d} exceeds HISTORICAL_ROOTS_LIMIT {d}", .{
+                block.slot - parent_block.?.slot,
+                params.HISTORICAL_ROOTS_LIMIT,
+            });
+            return BlockValidationError.BlockSlotGapTooLarge;
+        }
 
         // 5. Finalized-descendant check - reject forks that branch off from
         // pre-finalization ancestors. This is the gossip-level DoS defense that
@@ -6008,6 +6015,8 @@ pub const BlockValidationError = error{
     InvalidProposerIndex,
     /// Block slot is not greater than parent slot
     SlotNotAfterParent,
+    /// Block slot is too far beyond parent slot to process boundedly
+    BlockSlotGapTooLarge,
     /// Block's parent chain does not descend from the finalized checkpoint
     NotFinalizedDescendant,
 };
