@@ -490,7 +490,6 @@ pub const EthLibp2p = struct {
     /// SignedKey extension carries the secp256k1 host pubkey. Nothing
     /// is written to disk.
     fn startQuicTransport(self: *Self) !void {
-        const now_sec = @divTrunc(zl.wall_time.milliTimestamp(), 1000);
         const host_pub_compressed: [33]u8 = self.host_signer.kp.public_key.toCompressedSec1();
 
         var cert_seed: [32]u8 = undefined;
@@ -504,8 +503,12 @@ pub const EthLibp2p = struct {
                     .sign_ctx = self.host_signer,
                 },
             },
-            .not_before_sec = now_sec - 3600,
-            .not_after_sec = now_sec + 365 * 24 * 3600,
+            // Fixed, effectively-unbounded validity window matching the
+            // reference libp2p-TLS impls (rust-libp2p/rcgen: 1975..4096;
+            // go-libp2p: now-1h..now+100y). Clock-skew independent so no
+            // peer verifier rejects on NotBefore/NotAfter.
+            .not_before_sec = zl.security.libp2p_tls_cert.libp2p_not_before_sec,
+            .not_after_sec = zl.security.libp2p_tls_cert.libp2p_not_after_sec,
             .cert_key_seed = cert_seed,
         });
         defer gen.deinit(self.allocator);
