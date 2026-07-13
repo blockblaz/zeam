@@ -51,13 +51,17 @@ jobs:
         # an empty single-parent commit, publish the parent commit instead so
         # git tags, Docker metadata, and devnet branches point at the code that
         # is actually being released.
-        if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 2 ]; then
+        HEAD_PARENT_WORDS=$(git rev-list --parents -n 1 HEAD | wc -w)
+        if [ "$HEAD_PARENT_WORDS" -eq 2 ]; then
           PARENT_SHA=$(git rev-parse HEAD^)
           PARENT_TREE=$(git rev-parse HEAD^^{tree})
           if [ "$PR_HEAD_TREE" = "$PARENT_TREE" ]; then
             RELEASE_SHA="$PARENT_SHA"
             echo "ℹ️ Release PR head is an empty commit; publishing parent ${RELEASE_SHA:0:8}"
           fi
+        elif [ "$HEAD_PARENT_WORDS" -gt 2 ] && [ "$PR_HEAD_TREE" = "$MAIN_TREE" ]; then
+          RELEASE_SHA=$(git rev-parse origin/main)
+          echo "ℹ️ Release PR head is a merge commit matching current main; publishing ${RELEASE_SHA:0:8}"
         fi
 
         RELEASE_SHORT_SHA=$(git rev-parse --short "$RELEASE_SHA")
