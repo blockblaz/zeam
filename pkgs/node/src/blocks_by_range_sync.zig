@@ -158,14 +158,20 @@ pub fn forkMismatchRecoveryStart(
     return recovery_start;
 }
 
+pub fn shouldAttemptForkMismatchRangeRecovery(range_attempt: u8, max_attempts: u8) bool {
+    return range_attempt < max_attempts;
+}
+
 /// Proposal liveness guard for nodes that look "synced" by finalized-slot
 /// status but are clearly stale by wall-clock head lag.
 pub fn shouldSuppressProposalForHeadLag(
     wall_head_lag_slots: u64,
     max_proposal_head_lag_slots: u64,
     latest_justified_slot: types.Slot,
+    has_fresher_peer_near_wall: bool,
 ) bool {
     if (latest_justified_slot == 0) return false; // preserve pre-justification cold start
+    if (!has_fresher_peer_near_wall) return false;
     return wall_head_lag_slots > max_proposal_head_lag_slots;
 }
 
@@ -420,10 +426,20 @@ test "forkMismatchRecoveryStart falls back when anchor is outside peer range his
     );
 }
 
+test "shouldAttemptForkMismatchRangeRecovery stops before u8 overflow" {
+    try std.testing.expect(shouldAttemptForkMismatchRangeRecovery(1, constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS));
+    try std.testing.expect(!shouldAttemptForkMismatchRangeRecovery(
+        constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+        constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+    ));
+    try std.testing.expect(!shouldAttemptForkMismatchRangeRecovery(255, 255));
+}
+
 test "shouldSuppressProposalForHeadLag preserves cold start and blocks stale justified forks" {
-    try std.testing.expect(!shouldSuppressProposalForHeadLag(100, 4, 0));
-    try std.testing.expect(!shouldSuppressProposalForHeadLag(4, 4, 1));
-    try std.testing.expect(shouldSuppressProposalForHeadLag(5, 4, 1));
+    try std.testing.expect(!shouldSuppressProposalForHeadLag(100, 4, 0, true));
+    try std.testing.expect(!shouldSuppressProposalForHeadLag(4, 4, 1, true));
+    try std.testing.expect(!shouldSuppressProposalForHeadLag(100, 4, 1, false));
+    try std.testing.expect(shouldSuppressProposalForHeadLag(5, 4, 1, true));
 }
 
 test "shouldForceFullPeerStatusRefresh fires when stuck behind a cluster of stale peers" {

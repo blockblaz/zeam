@@ -1722,6 +1722,11 @@ pub const BeamNode = struct {
         self: *Self,
         snap: networkFactory.Network.PendingRequestSnapshot,
     ) bool {
+        if (!blocks_by_range_sync.shouldAttemptForkMismatchRangeRecovery(
+            snap.range_attempt,
+            constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+        )) return false;
+
         const anchor = self.chain.forkChoice.getLatestJustified();
         const recovery_start = blocks_by_range_sync.forkMismatchRecoveryStart(
             snap.start_slot,
