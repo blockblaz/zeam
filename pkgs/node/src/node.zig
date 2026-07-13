@@ -1718,6 +1718,45 @@ pub const BeamNode = struct {
         };
     }
 
+    fn initiateForkMismatchRangeRecovery(
+        self: *Self,
+        snap: networkFactory.Network.PendingRequestSnapshot,
+    ) bool {
+        const anchor = self.chain.forkChoice.getLatestJustified();
+        const recovery_start = blocks_by_range_sync.forkMismatchRecoveryStart(
+            snap.start_slot,
+            anchor.slot,
+            snap.peer_head_slot,
+            constants.MIN_SLOTS_FOR_BLOCK_REQUESTS,
+        ) orelse return false;
+
+        if (!self.network.peerSupportsBlocksByRange(snap.peer_id_copy)) return false;
+
+        const remaining = snap.peer_head_slot - recovery_start + 1;
+        const requested_count: u64 = @min(remaining, params.MAX_REQUEST_BLOCKS);
+        self.logger.warn(
+            "blocks_by_range fork recovery: re-anchoring peer {s}{f} from justified slot={d} start_slot={d} count={d} after failed start_slot={d}",
+            .{
+                snap.peer_id_copy,
+                self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
+                anchor.slot,
+                recovery_start,
+                requested_count,
+                snap.start_slot,
+            },
+        );
+        self.initiateBlocksByRangeCatchUp(.{
+            .peer_id = snap.peer_id_copy,
+            .start_slot = recovery_start,
+            .count = requested_count,
+            .peer_head_slot = snap.peer_head_slot,
+            .peer_head_root = snap.peer_head_root,
+            .our_head_root_at_start = anchor.root,
+            .attempt = snap.range_attempt + 1,
+        });
+        return true;
+    }
+
     /// `blocks_by_root` catch-up: fetch the peer head and walk parents via the existing
     /// batched parent-fetch path (used when `blocks_by_range` is unavailable or gap is small).
     fn initiateCatchUpViaBlocksByRoot(self: *Self, status: CatchUpPeerStatus, our_head_slot: types.Slot) void {
@@ -1922,7 +1961,9 @@ pub const BeamNode = struct {
                     },
                 );
                 self.network.finalizePendingRequest(request_id);
-                self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
+                if (action != .abort_fallback or !self.initiateForkMismatchRangeRecovery(snap)) {
+                    self.syncFetchPeerHeadByRoot(snap.peer_id_copy, snap.peer_head_root);
+                }
             },
             .pre_finalized_complete => {
                 self.recordRangeSyncOutcome("pre_finalized_noop");
@@ -2027,7 +2068,7 @@ pub const BeamNode = struct {
             !std.mem.eql(u8, &signed_block.block.parent_root, &view.our_head_root_at_start))
         {
             self.logger.warn(
-                "blocks_by_range: fork mismatch on first chunk slot={d} start_slot={d} (parent 0x{x} != our head-at-start 0x{x}); aborting range batch",
+                "blocks_by_range: fork mismatch on first chunk slot={d} start_slot={d} (parent 0x{x} != expected anchor 0x{x}); aborting range batch",
                 .{
                     signed_block.block.slot,
                     view.start_slot,

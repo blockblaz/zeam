@@ -37,6 +37,7 @@ const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
 const invalid_block_cache = @import("./invalid_block_cache.zig");
 const InvalidBlockSet = invalid_block_cache.InvalidBlockSet;
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 
 /// Bound on the in-memory invalid-block-roots cache (see
 /// `BeamChain.invalid_block_roots`). 10 000 32-byte roots ≈ 320 KB plus
@@ -5301,6 +5302,21 @@ pub const BeamChain = struct {
                     return;
                 }
             },
+        }
+
+        const wall_head_lag = self.wall_head_lag_slots.load(.monotonic);
+        const latest_justified_slot = self.forkChoice.getLatestJustified().slot;
+        if (blocks_by_range_sync.shouldSuppressProposalForHeadLag(
+            wall_head_lag,
+            constants.BLOCK_PROPOSAL_MAX_HEAD_LAG_SLOTS,
+            latest_justified_slot,
+        )) {
+            const head = self.forkChoice.getHead();
+            self.logger.warn(
+                "skipping block production for slot={d} proposer={d}: local head is {d} wall-clock slots behind (head_slot={d}, latest_justified_slot={d})",
+                .{ slot, proposer_id, wall_head_lag, head.slot, latest_justified_slot },
+            );
+            return;
         }
 
         // Single-flight: at most one propose at a time. fetchAdd-then-compare is a soft ceiling,

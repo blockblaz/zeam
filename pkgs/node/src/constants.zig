@@ -181,6 +181,12 @@ pub fn gossipStallThresholdMs() u64 {
 // batched `blocks_by_range` request, so anything beyond a few slots prefers range sync.
 pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 4;
 
+// Refuse to produce a block when our local head is this many wall-clock slots
+// behind, once the chain has reached its first justification. This prevents a
+// recovered/stale minority fork from minting current-slot blocks on an ancient
+// parent while sync recovery is trying to import the heavier branch.
+pub const BLOCK_PROPOSAL_MAX_HEAD_LAG_SLOTS: u64 = 4;
+
 // Maximum `blocks_by_range` catch-up attempts (peer rotation + fallback) before
 // switching to head-by-root parent walk.
 pub const MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS: u8 = 3;
