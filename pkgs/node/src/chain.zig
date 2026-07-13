@@ -37,6 +37,7 @@ const RcBeamState = rc_beam_state.RcBeamState;
 const chain_worker = @import("./chain_worker.zig");
 const invalid_block_cache = @import("./invalid_block_cache.zig");
 const InvalidBlockSet = invalid_block_cache.InvalidBlockSet;
+const blocks_by_range_sync = @import("./blocks_by_range_sync.zig");
 
 /// Bound on the in-memory invalid-block-roots cache (see
 /// `BeamChain.invalid_block_roots`). 10 000 32-byte roots ≈ 320 KB plus
@@ -5272,6 +5273,21 @@ pub const BeamChain = struct {
     /// publishBlock) runs on a `thread_pool` worker so the multi-second
     /// prod-scheme merge never freezes the slot loop. At most one propose is in
     /// flight; a second trigger is dropped (the next slot re-proposes).
+    fn hasFresherPeerNearWall(self: *Self, our_head_slot: types.Slot, wall_head_lag_slots: u64) bool {
+        const wall_slot = our_head_slot +| wall_head_lag_slots;
+        var peer_guard = self.connected_peers.iterateLocked();
+        defer peer_guard.deinit();
+        var peer_iter = peer_guard.iter;
+        while (peer_iter.next()) |entry| {
+            const status = entry.value_ptr.latest_status orelse continue;
+            if (status.head_slot <= our_head_slot) continue;
+            if (status.head_slot +| constants.BLOCK_PROPOSAL_MAX_HEAD_LAG_SLOTS >= wall_slot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub fn submitPropose(self: *Self, node: *@import("./node.zig").BeamNode, slot: usize, proposer_id: usize) void {
         // Sync gating (the checks the old on-loop maybeDoProposal performed).
         switch (self.getSyncStatus()) {
@@ -5301,6 +5317,22 @@ pub const BeamChain = struct {
                     return;
                 }
             },
+        }
+
+        const wall_head_lag = self.wall_head_lag_slots.load(.monotonic);
+        const latest_justified_slot = self.forkChoice.getLatestJustified().slot;
+        const head = self.forkChoice.getHead();
+        if (blocks_by_range_sync.shouldSuppressProposalForHeadLag(
+            wall_head_lag,
+            constants.BLOCK_PROPOSAL_MAX_HEAD_LAG_SLOTS,
+            latest_justified_slot,
+            self.hasFresherPeerNearWall(head.slot, wall_head_lag),
+        )) {
+            self.logger.warn(
+                "skipping block production for slot={d} proposer={d}: local head is {d} wall-clock slots behind (head_slot={d}, latest_justified_slot={d})",
+                .{ slot, proposer_id, wall_head_lag, head.slot, latest_justified_slot },
+            );
+            return;
         }
 
         // Single-flight: at most one propose at a time. fetchAdd-then-compare is a soft ceiling,

@@ -129,6 +129,52 @@ pub fn shouldCatchUpFromPeerStatus(
     return cappedSyncGapSlots(peer_head_slot, our_head_slot, wall_slot) > 0;
 }
 
+/// Recovery start for a `blocks_by_range` first-chunk fork mismatch.
+///
+/// A normal range starts at `our_head_slot + 1`, so the first block must extend
+/// our head-at-request. If the peer is on a heavier sibling fork, that check
+/// fails. Recovery can still use range sync when we have a recent common-ish
+/// anchor such as latest justified: request from `anchor_slot + 1` and validate
+/// the first chunk against `anchor_root` instead of the stale head.
+///
+/// Returns null when the anchor cannot improve on the failed request or is
+/// likely outside the peer's advertised recent-history window; callers should
+/// then fall back to the by-root parent walk from peer head.
+pub fn forkMismatchRecoveryStart(
+    failed_start_slot: types.Slot,
+    anchor_slot: types.Slot,
+    peer_head_slot: types.Slot,
+    min_slots_for_block_requests: u64,
+) ?types.Slot {
+    const recovery_start = anchor_slot +| 1;
+    if (recovery_start >= failed_start_slot) return null;
+    if (recovery_start > peer_head_slot) return null;
+
+    if (peer_head_slot >= min_slots_for_block_requests) {
+        const history_start = peer_head_slot - min_slots_for_block_requests;
+        if (recovery_start < history_start) return null;
+    }
+
+    return recovery_start;
+}
+
+pub fn shouldAttemptForkMismatchRangeRecovery(range_attempt: u8, max_attempts: u8) bool {
+    return range_attempt < max_attempts;
+}
+
+/// Proposal liveness guard for nodes that look "synced" by finalized-slot
+/// status but are clearly stale by wall-clock head lag.
+pub fn shouldSuppressProposalForHeadLag(
+    wall_head_lag_slots: u64,
+    max_proposal_head_lag_slots: u64,
+    latest_justified_slot: types.Slot,
+    has_fresher_peer_near_wall: bool,
+) bool {
+    if (latest_justified_slot == 0) return false; // preserve pre-justification cold start
+    if (!has_fresher_peer_near_wall) return false;
+    return wall_head_lag_slots > max_proposal_head_lag_slots;
+}
+
 /// Pure decider for the "stuck mesh cluster" recovery path.
 ///
 /// Fires when ALL of:
@@ -357,6 +403,43 @@ test "shouldCatchUpFromPeerStatus small gaps use by-root not threshold gate" {
     const gap = cappedSyncGapSlots(small_gap_peer, 0, 100);
     try std.testing.expect(gap < constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD);
     try std.testing.expect(shouldCatchUpFromPeerStatus(small_gap_peer, 0, 0, 0, 100));
+}
+
+test "forkMismatchRecoveryStart re-anchors to a recent justified ancestor" {
+    try std.testing.expectEqual(
+        @as(?types.Slot, 9340),
+        forkMismatchRecoveryStart(9649, 9339, 14735, constants.MIN_SLOTS_FOR_BLOCK_REQUESTS),
+    );
+}
+
+test "forkMismatchRecoveryStart falls back when anchor cannot improve failed range" {
+    try std.testing.expectEqual(
+        @as(?types.Slot, null),
+        forkMismatchRecoveryStart(9340, 9339, 14735, constants.MIN_SLOTS_FOR_BLOCK_REQUESTS),
+    );
+}
+
+test "forkMismatchRecoveryStart falls back when anchor is outside peer range history" {
+    try std.testing.expectEqual(
+        @as(?types.Slot, null),
+        forkMismatchRecoveryStart(15169, 9337, 15169, constants.MIN_SLOTS_FOR_BLOCK_REQUESTS),
+    );
+}
+
+test "shouldAttemptForkMismatchRangeRecovery stops before u8 overflow" {
+    try std.testing.expect(shouldAttemptForkMismatchRangeRecovery(1, constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS));
+    try std.testing.expect(!shouldAttemptForkMismatchRangeRecovery(
+        constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+        constants.MAX_BLOCKS_BY_RANGE_SYNC_ATTEMPTS,
+    ));
+    try std.testing.expect(!shouldAttemptForkMismatchRangeRecovery(255, 255));
+}
+
+test "shouldSuppressProposalForHeadLag preserves cold start and blocks stale justified forks" {
+    try std.testing.expect(!shouldSuppressProposalForHeadLag(100, 4, 0, true));
+    try std.testing.expect(!shouldSuppressProposalForHeadLag(4, 4, 1, true));
+    try std.testing.expect(!shouldSuppressProposalForHeadLag(100, 4, 1, false));
+    try std.testing.expect(shouldSuppressProposalForHeadLag(5, 4, 1, true));
 }
 
 test "shouldForceFullPeerStatusRefresh fires when stuck behind a cluster of stale peers" {
