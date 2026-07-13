@@ -132,8 +132,7 @@ impl PrivateKey {
             }
         }
 
-        let sig =
-            XmssScheme::sign(&sk, epoch, message).map_err(|_| SigningError::SigningFailed)?;
+        let sig = XmssScheme::sign(&sk, epoch, message).map_err(|_| SigningError::SigningFailed)?;
         Ok(Signature::new(sig))
     }
 }
@@ -684,7 +683,11 @@ mod advance_preparation_tests {
         while !sk.get_prepared_interval().contains(&epoch) {
             let before = sk.get_prepared_interval();
             sk.advance_preparation();
-            assert_ne!(sk.get_prepared_interval(), before, "advance must make progress");
+            assert_ne!(
+                sk.get_prepared_interval(),
+                before,
+                "advance must make progress"
+            );
         }
 
         let msg = [0u8; MESSAGE_LENGTH];
