@@ -407,8 +407,8 @@ test "shouldCatchUpFromPeerStatus small gaps use by-root not threshold gate" {
 
 test "forkMismatchRecoveryStart re-anchors to a recent justified ancestor" {
     try std.testing.expectEqual(
-        @as(?types.Slot, 9340),
-        forkMismatchRecoveryStart(9649, 9339, 14735, constants.MIN_SLOTS_FOR_BLOCK_REQUESTS),
+        @as(?types.Slot, 12_001),
+        forkMismatchRecoveryStart(12_100, 12_000, 14_735, constants.MIN_SLOTS_FOR_BLOCK_REQUESTS),
     );
 }
 
