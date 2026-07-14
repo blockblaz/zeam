@@ -28,7 +28,11 @@ use config::*;
 
 use leansig::serialization::Serializable;
 use leansig::signature::SignatureScheme;
+// Exposes get_activation_interval / get_prepared_interval / advance_preparation
+// on the secret key, needed to slide the signing window forward (see sign()).
+use leansig::signature::SignatureSchemeSecretKey;
 use leansig::MESSAGE_LENGTH;
+use std::sync::Mutex;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -42,9 +46,12 @@ pub type HashSigPublicKey = XmssPublicKey;
 pub type HashSigSignature = XmssSignature;
 pub type HashSigPrivateKey = XmssSecretKey;
 
-#[repr(C)]
+// Not `#[repr(C)]`: Zig only ever holds this behind an `opaque` pointer and
+// never inspects its layout, and the `Mutex` field is not FFI-safe. The lock
+// guards the interior mutation done by `sign` (advance_preparation) so the
+// shared key handle can be signed from multiple worker threads safely.
 pub struct PrivateKey {
-    inner: HashSigPrivateKey,
+    inner: Mutex<HashSigPrivateKey>,
 }
 
 #[repr(C)]
@@ -57,8 +64,9 @@ pub struct Signature {
     pub inner: HashSigSignature,
 }
 
-/// KeyPair structure for FFI - holds both public and private keys
-#[repr(C)]
+/// KeyPair structure for FFI - holds both public and private keys.
+/// Not `#[repr(C)]` because `PrivateKey` now holds a non-FFI-safe `Mutex`;
+/// Zig only accesses this via `opaque` pointers, never by layout.
 pub struct KeyPair {
     pub public_key: PublicKey,
     pub private_key: PrivateKey,
@@ -78,7 +86,9 @@ pub enum VerificationError {
 
 impl PrivateKey {
     pub fn new(inner: HashSigPrivateKey) -> Self {
-        Self { inner }
+        Self {
+            inner: Mutex::new(inner),
+        }
     }
 
     pub fn generate<R: rand::CryptoRng>(
@@ -97,8 +107,32 @@ impl PrivateKey {
         message: &[u8; MESSAGE_LENGTH],
         epoch: u32,
     ) -> Result<Signature, SigningError> {
-        let sig = XmssScheme::sign(&self.inner, epoch, message)
-            .map_err(|_| SigningError::SigningFailed)?;
+        let mut sk = self.inner.lock().map_err(|_| SigningError::SigningFailed)?;
+        let target = epoch as u64;
+
+        // leansig's sign() panics (aborting the process) if the epoch is outside
+        // the key's activation window. Return a recoverable error instead so a
+        // spent key just fails to sign rather than crashing the node.
+        if !sk.get_activation_interval().contains(&target) {
+            return Err(SigningError::SigningFailed);
+        }
+
+        // The secret key only keeps two consecutive bottom trees "prepared" in
+        // memory at once, covering 2^(LOG_LIFETIME/2 + 1) epochs starting at 0
+        // (131072 for LOG_LIFETIME=32). Signing an epoch beyond that window
+        // requires sliding it forward with advance_preparation, otherwise
+        // leansig's sign() panics with "key not yet prepared" — this is the
+        // crash seen at slot 131072. advance_preparation self-limits at the
+        // activation boundary, so guard against a non-advancing loop.
+        while !sk.get_prepared_interval().contains(&target) {
+            let before = sk.get_prepared_interval();
+            sk.advance_preparation();
+            if sk.get_prepared_interval() == before {
+                return Err(SigningError::SigningFailed);
+            }
+        }
+
+        let sig = XmssScheme::sign(&sk, epoch, message).map_err(|_| SigningError::SigningFailed)?;
         Ok(Signature::new(sig))
     }
 }
@@ -500,7 +534,11 @@ pub unsafe extern "C" fn hashsig_private_key_to_bytes(
     unsafe {
         let private_key_ref = &*private_key;
 
-        let sk_bytes = xmss_secret_key_to_ssz(&private_key_ref.inner);
+        let sk_guard = match private_key_ref.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        let sk_bytes = xmss_secret_key_to_ssz(&sk_guard);
 
         if sk_bytes.len() > buffer_len {
             return 0;
@@ -616,5 +654,46 @@ mod test_scheme {
                 0
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod advance_preparation_tests {
+    use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::SchemeAbortingTargetSumLifetime8Dim46Base8 as TestScheme;
+    use leansig::signature::{SignatureScheme, SignatureSchemeSecretKey};
+    use leansig::MESSAGE_LENGTH;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    // Reproduces the slot-131072 crash shape at small scale. With LOG_LIFETIME=8
+    // each bottom tree covers 2^4=16 epochs, so the key is only "prepared" for
+    // the first 32 epochs [0,32) even though it is activated for more. Signing an
+    // epoch past that window is exactly what panicked in production; the fix is
+    // to advance_preparation until the window covers it.
+    #[test]
+    fn advance_preparation_lets_key_sign_past_initial_window() {
+        let mut rng = StdRng::from_seed([7u8; 32]);
+        let (_pk, mut sk) = TestScheme::key_gen(&mut rng, 0, 40);
+        let epoch: u64 = 35;
+
+        // Precondition: fresh key is not prepared for epoch 35.
+        assert!(!sk.get_prepared_interval().contains(&epoch));
+
+        // The advance loop the glue's sign() runs.
+        while !sk.get_prepared_interval().contains(&epoch) {
+            let before = sk.get_prepared_interval();
+            sk.advance_preparation();
+            assert_ne!(
+                sk.get_prepared_interval(),
+                before,
+                "advance must make progress"
+            );
+        }
+
+        let msg = [0u8; MESSAGE_LENGTH];
+        assert!(
+            TestScheme::sign(&sk, epoch as u32, &msg).is_ok(),
+            "signing must succeed once the window is advanced"
+        );
     }
 }
