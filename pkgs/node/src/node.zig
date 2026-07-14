@@ -58,6 +58,9 @@ const NodeOpts = struct {
     /// `--chain-worker` (bool); `--chain-worker false` is the
     /// kill-switch for the legacy synchronous path.
     chain_worker_enabled: bool = true,
+    /// Optional experimental ethp2p RS-broadcast adapter config. When set,
+    /// `init` enables it on the node-layer `Network` (non-fatal on failure).
+    ethp2p: ?networks.Ethp2pConfig = null,
     /// CLI knob (`--min-aggregation-inputs`) for the per-att_data
     /// aggregation threshold; see `default_min_aggregation_inputs`.
     min_aggregation_inputs: u32 = types.default_min_aggregation_inputs,
@@ -218,6 +221,15 @@ pub const BeamNode = struct {
         var network = try networkFactory.Network.init(allocator, opts.backend);
         var network_init_cleanup = true;
         errdefer if (network_init_cleanup) network.deinit();
+
+        // Experimental ethp2p RS-broadcast adapter (never fatal — libp2p is the
+        // primary transport). Enabled here so the tee in `Network.publish` and
+        // the drive in `onInterval` see a live adapter.
+        if (opts.ethp2p) |ep_cfg| {
+            network.enableEthp2p(ep_cfg) catch |e| {
+                std.log.scoped(.ethp2p).err("ethp2p enable failed (continuing without it): {any}", .{e});
+            };
+        }
 
         const chain = try allocator.create(chainFactory.BeamChain);
         // `BeamChain.init` failure: only the empty `*BeamChain` allocation exists — destroy
@@ -2942,6 +2954,11 @@ pub const BeamNode = struct {
 
     pub fn onInterval(ptr: *anyopaque, itime_intervals: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+
+        // Drive the optional ethp2p RS-broadcast adapter on the libxev thread
+        // (same thread as gossip `publish`, so no lock is needed). No-op when
+        // the adapter is disabled.
+        self.network.tickEthp2p(@intCast(@divFloor(zeam_utils.monotonicTimestampNs(), std.time.ns_per_ms)));
 
         // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
         if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {

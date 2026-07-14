@@ -64,6 +64,14 @@
             .url = "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.2.89.tar.gz",
             .hash = "zig_libp2p-0.2.89-lil2hMltKgA7YdmHAS_eavWH0unkgsQhybBFEWqukws4",
         },
+        // Optional parallel RS-erasure-coded broadcast transport (ethp2p),
+        // wired only under `-Dethp2p=true`. Lazy so the default build neither
+        // fetches nor compiles it (nor its transitive zquic dependency).
+        .zig_ethp2p = .{
+            .url = "https://github.com/blockblaz/zig-ethp2p/archive/refs/tags/v0.1.3.tar.gz",
+            .hash = "zig_ethp2p-0.1.3-TcaWEpowCgCJdD_tCwd3SGQRxj9heTMCXQp_wGRFNBdY",
+            .lazy = true,
+        },
     },
     .paths = .{""},
 }

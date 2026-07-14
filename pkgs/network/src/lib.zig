@@ -44,6 +44,12 @@ pub const EthLibp2pParams = ethlibp2p.EthLibp2pParams;
 
 pub const gossip_codec = @import("./gossip_codec.zig");
 
+/// Optional ethp2p parallel RS-broadcast adapter (compile-time gated by
+/// `-Dethp2p`; a stub otherwise). See `ethp2p.zig`.
+pub const ethp2p = @import("./ethp2p.zig");
+pub const Ethp2pBroadcast = ethp2p.Ethp2pBroadcast;
+pub const Ethp2pConfig = ethp2p.Config;
+
 test "get tests" {
     @import("std").testing.refAllDecls(@This());
 }

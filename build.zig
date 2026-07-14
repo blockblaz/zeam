@@ -167,6 +167,11 @@ pub fn build(b: *Builder) !void {
     build_options.addOption([]const u8, "prover", @tagName(prover));
     build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
+    // Optional parallel ethp2p RS-broadcast transport (off by default). When
+    // false the adapter selector picks a stub and `zig_ethp2p` is never
+    // imported, so the default binary is unchanged.
+    const ethp2p_enabled = b.option(bool, "ethp2p", "Compile in the experimental ethp2p parallel RS-broadcast transport (default: false)") orelse false;
+    build_options.addOption(bool, "ethp2p", ethp2p_enabled);
     // Absolute path to test-keys for pre-generated validator keys
     build_options.addOption([]const u8, "test_keys_path", b.pathFromRoot("test-keys/hash-sig-keys"));
     // Optional slot-time override, for tests/sims that need a wider slot than the preset's.
@@ -345,6 +350,16 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     zeam_network.addImport("zig_libp2p", zig_libp2p_dep.module("zig_libp2p"));
+
+    // Optional ethp2p RS-broadcast transport. Only realize (fetch + import)
+    // the lazy `zig_ethp2p` dependency under `-Dethp2p=true`; otherwise the
+    // adapter selector compiles a stub that never imports it. (`build_options`
+    // is imported into `zeam_network` just below.)
+    if (ethp2p_enabled) {
+        if (b.lazyDependency("zig_ethp2p", .{ .target = target, .optimize = optimize })) |dep| {
+            zeam_network.addImport("zig_ethp2p", dep.module("zig_ethp2p"));
+        }
+    }
 
     // The publish-side forensic log line in v2 includes the build git SHA
     // so receivers across the fleet can correlate
