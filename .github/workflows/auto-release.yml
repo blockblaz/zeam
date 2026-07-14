@@ -255,8 +255,13 @@ jobs:
         build-args: |
           GIT_COMMIT=${{ needs.create-tags.outputs.release_sha }}
           GIT_BRANCH=${{ needs.create-tags.outputs.docker_tag || github.event.pull_request.head.ref }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        # No GHA build cache here: `cache-to: type=gha,mode=max` on the large
+        # zeam image (prover staticlib + rust deps), written by both matrix legs
+        # at once, exhausts the repo's GHA cache quota and buildkit aborts the
+        # whole solve with "error writing layer blob: failed to reserve cache",
+        # failing the push and blocking the release (v0.5.8 and v0.5.9 both hit
+        # this). Dockerfile.prebuilt just packages an already-built binary, so
+        # the layer cache saves little; reliability of the release push wins.
         provenance: false
 
   create-manifest:
