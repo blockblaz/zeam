@@ -21,6 +21,7 @@ const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const SlotDriverWatchdog = node_lib.SlotDriverWatchdog;
 const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
+const getNumCpus = @import("cpu_count.zig").getNumCpus;
 const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
@@ -310,6 +311,7 @@ pub const Node = struct {
     pub fn init(
         self: *Self,
         allocator: std.mem.Allocator,
+        io: std.Io,
         options: *const NodeOptions,
     ) !void {
         self.allocator = allocator;
@@ -529,7 +531,7 @@ pub const Node = struct {
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(zeam_utils.unixTimestampSeconds()));
         }
 
-        const cpu_count = std.Thread.getCpuCount() catch 2;
+        const cpu_count = try getNumCpus(allocator, io);
         const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
         const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
 
