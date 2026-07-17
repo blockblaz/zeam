@@ -480,6 +480,44 @@ pub const EthLibp2p = struct {
         self.drain_thread = try Thread.spawn(.{}, drainEventsTrampoline, .{self});
     }
 
+    /// Mint a fresh self-signed QUIC TLS cert + key (PEM) bound to this node's
+    /// secp256k1 host identity — the SAME facility `startQuicTransport` uses for
+    /// the primary libp2p transport. Every call generates a new ephemeral cert
+    /// key, so the material is unique per node and per process (never shipped or
+    /// shared). Intended for an auxiliary QUIC transport (the optional ethp2p
+    /// adapter) that needs its own listener identity.
+    ///
+    /// Available after `init` (the host signer is created there), independent of
+    /// `run`/`startQuicTransport`. Caller owns both returned PEMs.
+    pub fn generateAuxQuicCertPems(
+        self: *Self,
+        allocator: std.mem.Allocator,
+    ) !struct { cert_pem: []u8, key_pem: []u8 } {
+        const host_pub_compressed: [33]u8 = self.host_signer.kp.public_key.toCompressedSec1();
+
+        var cert_seed: [32]u8 = undefined;
+        try fillRandomBytes(&cert_seed);
+
+        var gen = try zl.security.libp2p_tls_cert.generate(self.allocator, .{
+            .host_identity = .{
+                .secp256k1 = .{
+                    .public_key_sec1_compressed = host_pub_compressed,
+                    .sign = Secp256k1HostSigner.sign,
+                    .sign_ctx = self.host_signer,
+                },
+            },
+            .not_before_sec = zl.security.libp2p_tls_cert.libp2p_not_before_sec,
+            .not_after_sec = zl.security.libp2p_tls_cert.libp2p_not_after_sec,
+            .cert_key_seed = cert_seed,
+        });
+        defer gen.deinit(self.allocator);
+
+        const cert_pem = try zl.security.libp2p_tls_cert.certDerToPem(allocator, gen.cert_der);
+        errdefer allocator.free(cert_pem);
+        const key_pem = try zl.security.libp2p_tls_cert.ecdsaP256SeedToPem(allocator, gen.cert_key_seed);
+        return .{ .cert_pem = cert_pem, .key_pem = key_pem };
+    }
+
     /// Mints a fresh libp2p TLS cert from this node's secp256k1 host
     /// identity and starts a `QuicRuntime` on `params.listen_addresses`.
     /// The cert + key PEMs are handed to zquic in-memory via zig-libp2p

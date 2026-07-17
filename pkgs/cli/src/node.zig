@@ -115,23 +115,32 @@ fn ethp2pPortOffset() u16 {
     return std.fmt.parseInt(u16, v, 10) catch 1;
 }
 
-/// PEM cert/key paths for the ethp2p QUIC listener. Default to the image's
-/// bundled devnet self-signed cert; override with `ZEAM_ETHP2P_SERVER_CERT` /
-/// `ZEAM_ETHP2P_SERVER_KEY`. The returned slice is either an env-string span or
-/// a static literal — process-lifetime, not owned by the caller.
-fn ethp2pCertPath() []const u8 {
-    if (std.c.getenv("ZEAM_ETHP2P_SERVER_CERT")) |p| return std.mem.span(p);
-    return "/app/resources/ethp2p/cert.pem";
-}
-fn ethp2pKeyPath() []const u8 {
-    if (std.c.getenv("ZEAM_ETHP2P_SERVER_KEY")) |p| return std.mem.span(p);
-    return "/app/resources/ethp2p/key.pem";
-}
 /// TLS SNI used on ethp2p dials. `ZEAM_ETHP2P_SERVER_NAME` or a static default;
 /// env-span / static literal, not owned.
 fn ethp2pServerName() []const u8 {
     if (std.c.getenv("ZEAM_ETHP2P_SERVER_NAME")) |p| return std.mem.span(p);
     return "127.0.0.1";
+}
+
+/// Write `bytes` to `<dir>/<name>` (creating `dir`) and return the allocated
+/// path. Used to materialise the runtime-generated ethp2p TLS PEMs, which the
+/// adapter consumes by path (it has no in-memory PEM entry point). The files
+/// live under the node's private data dir and are overwritten each run.
+fn ethp2pWritePem(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, bytes: []const u8) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().createDirPath(io, dir) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+    errdefer allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var writer = file.writer(io, &wbuf);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+    return path;
 }
 
 /// The substring after `key` in `s`, up to the next `/` (or end). Used to pull
@@ -153,16 +162,20 @@ fn parseQuicIpPort(ma: []const u8) ?QuicIpPort {
 }
 
 /// Free the allocations owned by a config built via `Node.buildEthp2pConfig`:
-/// the (env or derived) listen address and static-peer strings. `local_peer_id`
-/// (the long-lived `node_key`) and the env-span/static cert/key/server_name are
-/// NOT owned here. Both `listen_addr` and `static_peers` are consumed
-/// synchronously by the adapter's `start` (endpoint bind + dials), so freeing
-/// them after `beam_node.init` returns is safe; only `local_peer_id` is retained
-/// by the RS engine, and `node_key` outlives the process.
+/// the listen address, static-peer strings, and the cert/key file paths (all
+/// heap-owned — env values are duped, derived/generated ones are freshly
+/// allocated). `local_peer_id` (the long-lived `node_key`) and the static
+/// `server_name` are NOT owned here. `listen_addr`, `static_peers` and the
+/// PEM files are consumed synchronously by the adapter's `start` (endpoint bind
+/// + dials), so freeing the path strings after `beam_node.init` returns is safe;
+/// only `local_peer_id` is retained by the RS engine, and `node_key` outlives
+/// the process.
 fn freeEthp2pConfig(allocator: std.mem.Allocator, cfg: networks.Ethp2pConfig) void {
     if (cfg.listen_addr) |la| allocator.free(la);
     for (cfg.static_peers) |p| allocator.free(p);
     allocator.free(cfg.static_peers);
+    if (cfg.server_certificate_pem_path) |p| allocator.free(p);
+    if (cfg.server_private_key_pem_path) |p| allocator.free(p);
 }
 
 pub const NodeOptions = struct {
@@ -415,12 +428,17 @@ pub const Node = struct {
     /// - Listen: `ZEAM_ETHP2P_LISTEN`, else `0.0.0.0:<own libp2p QUIC port + offset>`.
     /// - Peers: `ZEAM_ETHP2P_STATIC_PEERS` (comma), else each libp2p connect-peer's
     ///   `ip:<port + offset>`.
-    /// - Cert/key: `ZEAM_ETHP2P_SERVER_CERT` / `_KEY`, else `/app/resources/ethp2p/*`.
+    /// - Cert/key: `ZEAM_ETHP2P_SERVER_CERT` / `_KEY` (paths), else a fresh
+    ///   per-node self-signed TLS cert is generated at runtime from the node's
+    ///   host identity (the same facility the libp2p QUIC transport uses) and
+    ///   written under the data dir — matching how libp2p mints its cert.
+    ///   Nothing is committed or shared. Only produced when we listen.
     /// - SNI: `ZEAM_ETHP2P_SERVER_NAME`, else `127.0.0.1`.
     ///
-    /// Owned allocations (`listen_addr` when set, `static_peers`) are released by
-    /// `freeEthp2pConfig` after `beam_node.init` — the adapter's `start` binds the
-    /// listener and dials synchronously and retains neither.
+    /// Owned allocations (`listen_addr`, `static_peers`, cert/key paths) are
+    /// released by `freeEthp2pConfig` after `beam_node.init` — the adapter's
+    /// `start` binds the listener (reading the PEM files) and dials synchronously
+    /// and retains none of these.
     fn buildEthp2pConfig(self: *Self, allocator: std.mem.Allocator) !networks.Ethp2pConfig {
         const offset = ethp2pPortOffset();
 
@@ -454,6 +472,34 @@ pub const Node = struct {
             }
             break :blk try peers.toOwnedSlice(allocator);
         };
+        errdefer {
+            for (static_peers) |p| allocator.free(p);
+            allocator.free(static_peers);
+        }
+
+        // TLS server identity — only needed when we actually listen. Prefer
+        // explicit env paths; otherwise mint a fresh per-node cert at runtime
+        // from the node's host identity (never shipped/shared) and write the
+        // PEMs under the data dir for the adapter to read by path.
+        var cert_path: ?[]const u8 = null;
+        errdefer if (cert_path) |p| allocator.free(p);
+        var key_path: ?[]const u8 = null;
+        errdefer if (key_path) |p| allocator.free(p);
+        if (listen_addr != null) {
+            if (try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_CERT")) |c| {
+                cert_path = c;
+                key_path = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_KEY");
+            } else {
+                const pems = try self.network.generateAuxQuicCertPems(allocator);
+                defer allocator.free(pems.cert_pem);
+                defer allocator.free(pems.key_pem);
+                const dir = try std.fmt.allocPrint(allocator, "{s}/ethp2p", .{self.options.database_path});
+                defer allocator.free(dir);
+                cert_path = try ethp2pWritePem(allocator, dir, "cert.pem", pems.cert_pem);
+                key_path = try ethp2pWritePem(allocator, dir, "key.pem", pems.key_pem);
+                self.logger.info("ethp2p: generated per-node TLS cert at {s}", .{dir});
+            }
+        }
 
         self.logger.info(
             "ethp2p: config peer_id={s} listen={?s} static_peers={d} (libp2p port offset +{d})",
@@ -463,8 +509,8 @@ pub const Node = struct {
         return .{
             .local_peer_id = self.options.node_key,
             .listen_addr = listen_addr,
-            .server_certificate_pem_path = ethp2pCertPath(),
-            .server_private_key_pem_path = ethp2pKeyPath(),
+            .server_certificate_pem_path = cert_path,
+            .server_private_key_pem_path = key_path,
             .static_peers = static_peers,
             .server_name = ethp2pServerName(),
         };
