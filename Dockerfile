@@ -95,13 +95,17 @@ COPY .git/refs .git/refs
 #   amd64: x86-64-v3 (AVX2, no AVX512) — portable across modern x86_64 servers
 #   arm64: generic CPU — QEMU-compatible when cross-building
 ARG TARGETARCH
+# Set to true to compile in the experimental ethp2p parallel RS-broadcast
+# transport (`docker build --build-arg ETHP2P=true ...`). Default off: the
+# adapter is comptime-excluded and its `zig_ethp2p` dependency is not fetched.
+ARG ETHP2P=false
 RUN --mount=type=cache,target=/root/.cache/zig \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/rust/target \
-    EXTRA_ZIG_FLAGS="" && \
+    EXTRA_ZIG_FLAGS="-Dethp2p=${ETHP2P}" && \
     if [ "$TARGETARCH" = "amd64" ]; then \
-        EXTRA_ZIG_FLAGS="-Dcpu=x86_64_v3 -Drust-target-cpu=x86-64-v3"; \
+        EXTRA_ZIG_FLAGS="$EXTRA_ZIG_FLAGS -Dcpu=x86_64_v3 -Drust-target-cpu=x86-64-v3"; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
         export RUSTFLAGS="-C target-cpu=generic"; \
     fi && \

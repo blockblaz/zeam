@@ -395,6 +395,11 @@ pub const Network = struct {
     blocks_by_range_active: std.AutoHashMap(BlocksByRangeKey, void),
     blocks_by_range_active_lock: zeam_utils.SyncMutex = .{},
 
+    /// Optional experimental ethp2p RS-broadcast adapter (feature `-Dethp2p`,
+    /// enabled at runtime via `enableEthp2p`). When set, outbound gossip is
+    /// teed into it and it is driven from `tickEthp2p`. Null = disabled.
+    ethp2p: ?*networks.Ethp2pBroadcast = null,
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, backend: networks.NetworkInterface) !Self {
@@ -462,6 +467,8 @@ pub const Network = struct {
 
         self.connected_peers.deinit();
         self.allocator.destroy(self.connected_peers);
+
+        if (self.ethp2p) |adapter| adapter.deinit();
     }
 
     /// Publish a gossip message via the configured backend. Returns `true`
@@ -470,7 +477,25 @@ pub const Network = struct {
     /// full). Callers should treat `false` as "this message did not
     /// leave the host" and surface it accordingly.
     pub fn publish(self: *Self, data: *const networks.GossipMessage) !bool {
-        return self.backend.gossip.publish(data);
+        const accepted = try self.backend.gossip.publish(data);
+        // Tee into the parallel ethp2p RS-broadcast network (best-effort;
+        // never affects the libp2p publish result).
+        if (self.ethp2p) |adapter| adapter.publishGossip(data);
+        return accepted;
+    }
+
+    /// Enable the experimental ethp2p RS-broadcast adapter. Requires the build
+    /// to have been configured with `-Dethp2p=true`; otherwise the stub's
+    /// `start` returns `error.Ethp2pNotCompiledIn`.
+    pub fn enableEthp2p(self: *Self, cfg: networks.Ethp2pConfig) !void {
+        if (self.ethp2p != null) return;
+        self.ethp2p = try networks.Ethp2pBroadcast.start(self.allocator, self.backend, cfg);
+    }
+
+    /// Drive the ethp2p adapter (no-op when disabled). Called on the same
+    /// thread as `publish` from the node's periodic `onInterval`.
+    pub fn tickEthp2p(self: *Self, now_ms: i64) void {
+        if (self.ethp2p) |adapter| adapter.tick(now_ms);
     }
 
     pub fn refreshGossipMesh(self: *Self) void {

@@ -68,6 +68,20 @@ pub const ValidatorAssignment = struct {
     }
 };
 
+/// Runtime toggle for the experimental ethp2p transport: truthy `ZEAM_ETHP2P`
+/// env var. Only consulted when the binary was built with `-Dethp2p=true`
+/// (see the comptime guard at the call site). Mirrors the `DEBUG_QUIC` /
+/// `ZEAM_STRESS_*` env-var convention; a CLI flag would trip zigcli's
+/// comptime branch quota.
+fn ethp2pRuntimeEnabled() bool {
+    const raw = std.c.getenv("ZEAM_ETHP2P") orelse return false;
+    const v = std.mem.trim(u8, std.mem.span(raw), " \t\n\r");
+    return std.mem.eql(u8, v, "1") or
+        std.ascii.eqlIgnoreCase(v, "true") or
+        std.ascii.eqlIgnoreCase(v, "yes") or
+        std.ascii.eqlIgnoreCase(v, "on");
+}
+
 pub const NodeOptions = struct {
     network_id: u32,
     node_key: []const u8,
@@ -656,6 +670,15 @@ pub const Node = struct {
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
+            // Experimental ethp2p RS-broadcast: compiled in only under
+            // `-Dethp2p=true`, and then enabled at runtime only when the
+            // `ZEAM_ETHP2P` env var is truthy (zeam's env-var toggle
+            // convention; a CLI flag would trip zigcli's comptime branch
+            // quota). Off by default on both axes.
+            .ethp2p = if (comptime networks.ethp2p.enabled)
+                (if (ethp2pRuntimeEnabled()) networks.Ethp2pConfig{ .local_peer_id = "zeam-ethp2p" } else null)
+            else
+                null,
             .min_aggregation_inputs = options.min_aggregation_inputs,
             .max_aggregation_children = options.max_aggregation_children,
             .max_aggregations_per_tick = options.max_aggregations_per_tick,
