@@ -82,6 +82,55 @@ fn ethp2pRuntimeEnabled() bool {
         std.ascii.eqlIgnoreCase(v, "on");
 }
 
+/// Read a trimmed, non-empty env var and dupe it from `allocator`, else null.
+fn ethp2pEnvDup(allocator: std.mem.Allocator, name: [*:0]const u8) !?[]const u8 {
+    const raw = std.c.getenv(name) orelse return null;
+    const v = std.mem.trim(u8, std.mem.span(raw), " \t\n\r");
+    if (v.len == 0) return null;
+    return try allocator.dupe(u8, v);
+}
+
+/// Parse a comma-separated env var into an owned list of trimmed entries.
+fn ethp2pEnvList(allocator: std.mem.Allocator, name: [*:0]const u8) ![]const []const u8 {
+    const joined = (try ethp2pEnvDup(allocator, name)) orelse return &.{};
+    defer allocator.free(joined);
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(allocator);
+    var it = std.mem.tokenizeScalar(u8, joined, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len > 0) try list.append(allocator, try allocator.dupe(u8, t));
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Build the experimental ethp2p adapter config from env, with a UNIQUE
+/// per-node identity. Without this, every enabled node started the adapter with
+/// the same hard-coded `local_peer_id` ("zeam-ethp2p") and no operator peering
+/// config — enabling it across a fleet produced identity collisions and a
+/// dial-only/no-peers transport that was unusable and confusing.
+///
+/// Identity: `ZEAM_ETHP2P_PEER_ID` if set, else `zeam-ethp2p-<node_key_index>`
+/// (unique within a devnet fleet). Peering: `ZEAM_ETHP2P_LISTEN`,
+/// `ZEAM_ETHP2P_SERVER_CERT`, `ZEAM_ETHP2P_SERVER_KEY`,
+/// `ZEAM_ETHP2P_STATIC_PEERS` (comma-separated), `ZEAM_ETHP2P_SERVER_NAME`.
+///
+/// Strings are allocated from `allocator` (the node's long-lived allocator) and
+/// intentionally not freed: the adapter borrows them for the whole process, and
+/// this runs once at startup.
+fn ethp2pRuntimeConfig(allocator: std.mem.Allocator, node_key_index: usize) !networks.Ethp2pConfig {
+    const peer_id = (try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_PEER_ID")) orelse
+        try std.fmt.allocPrint(allocator, "zeam-ethp2p-{d}", .{node_key_index});
+    return .{
+        .local_peer_id = peer_id,
+        .listen_addr = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_LISTEN"),
+        .server_certificate_pem_path = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_CERT"),
+        .server_private_key_pem_path = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_KEY"),
+        .static_peers = try ethp2pEnvList(allocator, "ZEAM_ETHP2P_STATIC_PEERS"),
+        .server_name = (try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_NAME")) orelse "127.0.0.1",
+    };
+}
+
 pub const NodeOptions = struct {
     network_id: u32,
     node_key: []const u8,
@@ -676,7 +725,7 @@ pub const Node = struct {
             // convention; a CLI flag would trip zigcli's comptime branch
             // quota). Off by default on both axes.
             .ethp2p = if (comptime networks.ethp2p.enabled)
-                (if (ethp2pRuntimeEnabled()) networks.Ethp2pConfig{ .local_peer_id = "zeam-ethp2p" } else null)
+                (if (ethp2pRuntimeEnabled()) try ethp2pRuntimeConfig(allocator, options.node_key_index) else null)
             else
                 null,
             .min_aggregation_inputs = options.min_aggregation_inputs,
