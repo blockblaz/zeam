@@ -822,6 +822,12 @@ pub const BlockCache = struct {
 /// `PeerInfo` is parameterised so this helper does not depend on the
 /// concrete network module — `network.zig` instantiates
 /// `ConnectedPeersImpl(networkFactory.PeerInfo)` once.
+///
+/// Result of a `blocks_by_range` capability lookup. `unknown` (peer absent from
+/// the connected set) is deliberately distinct from `unsupported` (peer observed
+/// to lack the protocol) — see `blocksByRangeSupport`.
+pub const RangeSupport = enum { supported, unsupported, unknown };
+
 pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
     return struct {
         const Self = @This();
@@ -966,14 +972,36 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             return self.selectPeerExcluding(allocator, null, false, min_slot);
         }
 
-        pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
-            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return true;
+        /// Whether `peer_id` can serve `blocks_by_range`.
+        ///
+        /// `.unknown` means the peer is not in the connected set — it says NOTHING
+        /// about the peer's protocol support and MUST NOT be treated as
+        /// `.unsupported`. Conflating the two wedged a devnet node: a peer-map miss
+        /// was reported as "peer does not support blocks_by_range", which degraded a
+        /// 13k-slot catch-up to per-block `blocks_by_root` that can never converge.
+        pub fn blocksByRangeSupport(self: *Self, peer_id: []const u8) RangeSupport {
+            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return .supported;
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
-            const entry = self.map.get(peer_id) orelse return false;
-            return !entry.blocks_by_range_unavailable;
+            const entry = self.map.get(peer_id) orelse return .unknown;
+            return if (entry.blocks_by_range_unavailable) .unsupported else .supported;
         }
 
+        /// Optimistic view of `blocksByRangeSupport`: only a peer we have positively
+        /// observed to lack `blocks_by_range` is treated as unsupported. An unknown
+        /// peer stays eligible — the RPC itself will fail cleanly if it is gone,
+        /// which is far cheaper than silently falling back to per-block catch-up.
+        pub fn peerSupportsBlocksByRange(self: *Self, peer_id: []const u8) bool {
+            return self.blocksByRangeSupport(peer_id) != .unsupported;
+        }
+
+        /// NOTE: currently has no callers — nothing ever observes a genuine
+        /// "blocks_by_range unsupported" RPC error, so `blocks_by_range_unavailable`
+        /// is always false in practice. That is intentional for now: the flag is
+        /// sticky (never reset), so wiring it to anything transient (a transport
+        /// error, a timeout) would permanently disable range sync for that peer and
+        /// recreate the per-block catch-up wedge. Only wire this to a definitive
+        /// protocol-negotiation failure, and add a reset/TTL when you do.
         pub fn markBlocksByRangeUnavailable(self: *Self, peer_id: []const u8) void {
             if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return;
             self.rwlock.lock();

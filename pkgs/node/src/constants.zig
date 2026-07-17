@@ -181,6 +181,18 @@ pub fn gossipStallThresholdMs() u64 {
 // batched `blocks_by_range` request, so anything beyond a few slots prefers range sync.
 pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 4;
 
+// Hard ceiling on a `blocks_by_root` parent-walk catch-up. by-root fetches ONE
+// block per request, so the time to close a gap grows linearly with it: past a
+// few dozen slots the walk can never outrun block production and the node falls
+// permanently behind while storming its peers with retries.
+//
+// A devnet node wedged exactly this way: a peer-map miss was misreported as
+// "peer does not support blocks_by_range", which dropped a 13,429-slot catch-up
+// into by-root. Head froze for 5+ hours and the retry loop reached 2.4M requests.
+// Beyond this bound we now refuse to by-root and wait for a range-capable peer —
+// being visibly stuck is strictly better than a self-DoS that cannot converge.
+pub const MAX_BLOCKS_BY_ROOT_CATCHUP_GAP: u64 = 64;
+
 // Refuse to produce a block when our local head is this many wall-clock slots
 // behind, once the chain has reached its first justification. This prevents a
 // recovered/stale minority fork from minting current-slot blocks on an ancient

@@ -1818,10 +1818,21 @@ pub const BeamNode = struct {
                     );
                 },
                 else => {
-                    self.network.markPeerBlocksByRangeUnavailable(range_sync.peer_id);
-                    self.recordRangeSyncOutcome("unavailable");
+                    // Do NOT mark the peer blocks_by_range-unavailable here. These are
+                    // LOCAL send-side failures (NoBlocksRequested, OOM) and transport
+                    // errors (Disconnected/IoError) — none of them say anything about
+                    // the peer's protocol support. The flag is sticky, so poisoning a
+                    // peer on a transient transport blip permanently disables range
+                    // sync against it; once every peer had been blipped, catch-up could
+                    // only ever use per-block blocks_by_root and the node wedged
+                    // (devnet: head frozen 5+h, 2.4M-request retry storm).
+                    //
+                    // Only a definitive protocol-level error response from the peer may
+                    // set that flag — that path lives in `onReqRespResponse`, gated on
+                    // `blocks_by_range_sync.isBlocksByRangeUnavailable(code, message)`.
+                    self.recordRangeSyncOutcome("send_failed");
                     self.logger.warn(
-                        "blocks_by_range catch-up from peer {s}{f} start_slot={d} count={d} failed: {any}; falling back to blocks_by_root",
+                        "blocks_by_range catch-up from peer {s}{f} start_slot={d} count={d} failed to send: {any}; will retry range on a later status (peer NOT marked range-incapable)",
                         .{
                             range_sync.peer_id,
                             self.node_registry.getNodeNameFromPeerId(range_sync.peer_id),
@@ -1830,7 +1841,6 @@ pub const BeamNode = struct {
                             err,
                         },
                     );
-                    self.syncFetchPeerHeadByRoot(range_sync.peer_id, range_sync.peer_head_root);
                 },
             }
         };
@@ -1889,6 +1899,26 @@ pub const BeamNode = struct {
             });
         } else {
             if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+                // Only reachable when the peer is positively known to lack
+                // blocks_by_range (`.unsupported`); an unknown/absent peer no longer
+                // lands here — see `ConnectedPeers.blocksByRangeSupport`.
+                //
+                // by-root walks parents one block per request, so it cannot close a
+                // large gap faster than the chain grows. Refuse rather than start a
+                // walk that provably will not converge and will storm every peer;
+                // the next status from a range-capable peer drives the real catch-up.
+                if (gap > constants.MAX_BLOCKS_BY_ROOT_CATCHUP_GAP) {
+                    self.logger.warn(
+                        "peer {s}{f} cannot serve blocks_by_range and gap={d} exceeds the blocks_by_root walk limit ({d}) — skipping this peer for catch-up",
+                        .{
+                            status.peer_id,
+                            self.node_registry.getNodeNameFromPeerId(status.peer_id),
+                            gap,
+                            constants.MAX_BLOCKS_BY_ROOT_CATCHUP_GAP,
+                        },
+                    );
+                    return;
+                }
                 self.logger.info(
                     "peer {s}{f} does not support blocks_by_range (gap={d} slots), using blocks_by_root catch-up",
                     .{
