@@ -2418,3 +2418,35 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
 // LockedMap / ConnectedPeers concurrency smokes above are the merge
 // gate for the lock-correctness side; a separate sim run is the merge
 // gate for the throughput side.
+
+test "ConnectedPeers: blocksByRangeSupport distinguishes unknown from unsupported" {
+    // Regression for the sync wedge: an unknown (not-connected) peer must be
+    // reported as `.unknown`, NOT `.unsupported`. Conflating the two dropped a
+    // 13k-slot catch-up into per-block blocks_by_root that never converged.
+    const TestPeerInfo = struct {
+        peer_id: []const u8,
+        connected_at: i64 = 0,
+        blocks_by_range_unavailable: bool = false,
+    };
+    const CP = ConnectedPeersImpl(TestPeerInfo);
+    var cp = CP.init(testing.allocator);
+    defer cp.deinit();
+
+    // Absent peer → unknown, and optimistically still eligible.
+    try testing.expectEqual(RangeSupport.unknown, cp.blocksByRangeSupport("peer-absent"));
+    try testing.expect(cp.peerSupportsBlocksByRange("peer-absent"));
+
+    // Connected peer with no observed failure → supported.
+    try cp.connect("peer-a");
+    try testing.expectEqual(RangeSupport.supported, cp.blocksByRangeSupport("peer-a"));
+    try testing.expect(cp.peerSupportsBlocksByRange("peer-a"));
+
+    // Positively observed to lack the protocol → unsupported (and ineligible).
+    cp.markBlocksByRangeUnavailable("peer-a");
+    try testing.expectEqual(RangeSupport.unsupported, cp.blocksByRangeSupport("peer-a"));
+    try testing.expect(!cp.peerSupportsBlocksByRange("peer-a"));
+
+    // Reconnect rebuilds a fresh PeerInfo → flag clears (recovery path).
+    try cp.connect("peer-a");
+    try testing.expectEqual(RangeSupport.supported, cp.blocksByRangeSupport("peer-a"));
+}
