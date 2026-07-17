@@ -189,6 +189,23 @@ jobs:
         echo "All build attempts failed"
         exit 1
 
+    # The optional ethp2p adapter and its lazy `zig_ethp2p` dependency are only
+    # imported under `-Dethp2p=true`, so the default build above can stay green
+    # while that path is broken. Compile it here to keep the flag honest.
+    - name: build (ethp2p adapter)
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build --fetch -Dethp2p=true && zig build -Dethp2p=true; then
+            echo "Successfully built ethp2p variant on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All ethp2p build attempts failed"
+        exit 1
+
   build-all-provers:
     name: build-all-provers
     runs-on: ${{ matrix.os }}
