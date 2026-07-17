@@ -104,31 +104,65 @@ fn ethp2pEnvList(allocator: std.mem.Allocator, name: [*:0]const u8) ![]const []c
     return try list.toOwnedSlice(allocator);
 }
 
-/// Build the experimental ethp2p adapter config from env, with a UNIQUE
-/// per-node identity. Without this, every enabled node started the adapter with
-/// the same hard-coded `local_peer_id` ("zeam-ethp2p") and no operator peering
-/// config — enabling it across a fleet produced identity collisions and a
-/// dial-only/no-peers transport that was unusable and confusing.
-///
-/// Identity: `ZEAM_ETHP2P_PEER_ID` if set, else `zeam-ethp2p-<node_key_index>`
-/// (unique within a devnet fleet). Peering: `ZEAM_ETHP2P_LISTEN`,
-/// `ZEAM_ETHP2P_SERVER_CERT`, `ZEAM_ETHP2P_SERVER_KEY`,
-/// `ZEAM_ETHP2P_STATIC_PEERS` (comma-separated), `ZEAM_ETHP2P_SERVER_NAME`.
-///
-/// Strings are allocated from `allocator` (the node's long-lived allocator) and
-/// intentionally not freed: the adapter borrows them for the whole process, and
-/// this runs once at startup.
-fn ethp2pRuntimeConfig(allocator: std.mem.Allocator, node_key_index: usize) !networks.Ethp2pConfig {
-    const peer_id = (try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_PEER_ID")) orelse
-        try std.fmt.allocPrint(allocator, "zeam-ethp2p-{d}", .{node_key_index});
-    return .{
-        .local_peer_id = peer_id,
-        .listen_addr = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_LISTEN"),
-        .server_certificate_pem_path = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_CERT"),
-        .server_private_key_pem_path = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_KEY"),
-        .static_peers = try ethp2pEnvList(allocator, "ZEAM_ETHP2P_STATIC_PEERS"),
-        .server_name = (try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_SERVER_NAME")) orelse "127.0.0.1",
-    };
+/// Port shift applied to each libp2p QUIC port to derive its ethp2p port
+/// (`ZEAM_ETHP2P_PORT_OFFSET`, default 1 — the ethlambda convention
+/// "ethp2p = gossipsub port + 1"). Base QUIC ports must be spaced by more than
+/// this offset so a node's ethp2p port never collides with another node's
+/// libp2p port on a shared host network.
+fn ethp2pPortOffset() u16 {
+    const raw = std.c.getenv("ZEAM_ETHP2P_PORT_OFFSET") orelse return 1;
+    const v = std.mem.trim(u8, std.mem.span(raw), " \t\n\r");
+    return std.fmt.parseInt(u16, v, 10) catch 1;
+}
+
+/// PEM cert/key paths for the ethp2p QUIC listener. Default to the image's
+/// bundled devnet self-signed cert; override with `ZEAM_ETHP2P_SERVER_CERT` /
+/// `ZEAM_ETHP2P_SERVER_KEY`. The returned slice is either an env-string span or
+/// a static literal — process-lifetime, not owned by the caller.
+fn ethp2pCertPath() []const u8 {
+    if (std.c.getenv("ZEAM_ETHP2P_SERVER_CERT")) |p| return std.mem.span(p);
+    return "/app/resources/ethp2p/cert.pem";
+}
+fn ethp2pKeyPath() []const u8 {
+    if (std.c.getenv("ZEAM_ETHP2P_SERVER_KEY")) |p| return std.mem.span(p);
+    return "/app/resources/ethp2p/key.pem";
+}
+/// TLS SNI used on ethp2p dials. `ZEAM_ETHP2P_SERVER_NAME` or a static default;
+/// env-span / static literal, not owned.
+fn ethp2pServerName() []const u8 {
+    if (std.c.getenv("ZEAM_ETHP2P_SERVER_NAME")) |p| return std.mem.span(p);
+    return "127.0.0.1";
+}
+
+/// The substring after `key` in `s`, up to the next `/` (or end). Used to pull
+/// fields out of a QUIC multiaddr like `/ip4/127.0.0.1/udp/9001/quic-v1/...`.
+fn multiaddrSegAfter(s: []const u8, key: []const u8) ?[]const u8 {
+    const idx = std.mem.indexOf(u8, s, key) orelse return null;
+    const rest = s[idx + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    return rest[0..end];
+}
+
+const QuicIpPort = struct { ip: []const u8, port: u16 };
+
+fn parseQuicIpPort(ma: []const u8) ?QuicIpPort {
+    const ip = multiaddrSegAfter(ma, "/ip4/") orelse multiaddrSegAfter(ma, "/ip6/") orelse return null;
+    const port_s = multiaddrSegAfter(ma, "/udp/") orelse return null;
+    const port = std.fmt.parseInt(u16, port_s, 10) catch return null;
+    return .{ .ip = ip, .port = port };
+}
+
+/// Free the allocations owned by a config built via `Node.buildEthp2pConfig`:
+/// the (env or derived) listen address and static-peer strings. `local_peer_id`
+/// (the long-lived `node_key`) and the env-span/static cert/key/server_name are
+/// NOT owned here. Both `listen_addr` and `static_peers` are consumed
+/// synchronously by the adapter's `start` (endpoint bind + dials), so freeing
+/// them after `beam_node.init` returns is safe; only `local_peer_id` is retained
+/// by the RS engine, and `node_key` outlives the process.
+fn freeEthp2pConfig(allocator: std.mem.Allocator, cfg: networks.Ethp2pConfig) void {
+    if (cfg.listen_addr) |la| allocator.free(la);
+    for (cfg.static_peers) |p| allocator.free(p);
+    allocator.free(cfg.static_peers);
 }
 
 pub const NodeOptions = struct {
@@ -368,6 +402,72 @@ pub const Node = struct {
             }
         };
         db.* = try database.Db.openBackend(allocator, logger_config.logger(.database), database_path, backend);
+    }
+
+    /// Build the experimental ethp2p adapter config. Every field follows the
+    /// precedence explicit-env → derived-from-libp2p → default, so an operator
+    /// can enable the transport with just `ZEAM_ETHP2P=1` (endpoints auto-derived
+    /// from the node's own libp2p QUIC ports with a `+offset` shift, cert/key from
+    /// the image's bundled devnet PEMs) while retaining full manual control.
+    ///
+    /// - Identity: the node's `node_key` (unique per node; retained by the RS
+    ///   engine, and outlives the process — never freed).
+    /// - Listen: `ZEAM_ETHP2P_LISTEN`, else `0.0.0.0:<own libp2p QUIC port + offset>`.
+    /// - Peers: `ZEAM_ETHP2P_STATIC_PEERS` (comma), else each libp2p connect-peer's
+    ///   `ip:<port + offset>`.
+    /// - Cert/key: `ZEAM_ETHP2P_SERVER_CERT` / `_KEY`, else `/app/resources/ethp2p/*`.
+    /// - SNI: `ZEAM_ETHP2P_SERVER_NAME`, else `127.0.0.1`.
+    ///
+    /// Owned allocations (`listen_addr` when set, `static_peers`) are released by
+    /// `freeEthp2pConfig` after `beam_node.init` — the adapter's `start` binds the
+    /// listener and dials synchronously and retains neither.
+    fn buildEthp2pConfig(self: *Self, allocator: std.mem.Allocator) !networks.Ethp2pConfig {
+        const offset = ethp2pPortOffset();
+
+        // Listen: explicit env, else derive from our own libp2p QUIC listen port
+        // (bind on 0.0.0.0 so containerised nodes are reachable).
+        var listen_addr: ?[]const u8 = try ethp2pEnvDup(allocator, "ZEAM_ETHP2P_LISTEN");
+        errdefer if (listen_addr) |la| allocator.free(la);
+        if (listen_addr == null) {
+            if (parseQuicIpPort(self.listen_addresses_str)) |own| {
+                listen_addr = try std.fmt.allocPrint(allocator, "0.0.0.0:{d}", .{@as(u32, own.port) + offset});
+            }
+        }
+
+        // Static peers: explicit env, else derive from libp2p connect-peers.
+        const static_peers: []const []const u8 = blk: {
+            const env_peers = try ethp2pEnvList(allocator, "ZEAM_ETHP2P_STATIC_PEERS");
+            if (env_peers.len > 0) break :blk env_peers;
+            allocator.free(env_peers);
+            var peers: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (peers.items) |p| allocator.free(p);
+                peers.deinit(allocator);
+            }
+            var it = std.mem.splitScalar(u8, self.connect_peers_str, ',');
+            while (it.next()) |ma| {
+                const trimmed = std.mem.trim(u8, ma, " \t");
+                if (trimmed.len == 0) continue;
+                const ipp = parseQuicIpPort(trimmed) orelse continue;
+                const peer_s = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ ipp.ip, @as(u32, ipp.port) + offset });
+                try peers.append(allocator, peer_s);
+            }
+            break :blk try peers.toOwnedSlice(allocator);
+        };
+
+        self.logger.info(
+            "ethp2p: config peer_id={s} listen={?s} static_peers={d} (libp2p port offset +{d})",
+            .{ self.options.node_key, listen_addr, static_peers.len, offset },
+        );
+
+        return .{
+            .local_peer_id = self.options.node_key,
+            .listen_addr = listen_addr,
+            .server_certificate_pem_path = ethp2pCertPath(),
+            .server_private_key_pem_path = ethp2pKeyPath(),
+            .static_peers = static_peers,
+            .server_name = ethp2pServerName(),
+        };
     }
 
     pub fn init(
@@ -704,6 +804,21 @@ pub const Node = struct {
             },
         );
 
+        // Experimental ethp2p RS-broadcast config: compiled in only under
+        // `-Dethp2p=true`, enabled at runtime only when `ZEAM_ETHP2P` is truthy
+        // (env-var toggle — a CLI flag would trip zigcli's comptime branch
+        // quota). Off by default on both axes. Endpoints default to the node's
+        // own libp2p QUIC addresses shifted by `ZEAM_ETHP2P_PORT_OFFSET` (default
+        // +1) and are fully overridable via env; identity is the per-node
+        // `node_key`. The owned strings (listen_addr, static_peers) are consumed
+        // synchronously by the adapter's `start`, so they are freed once
+        // `beam_node.init` returns.
+        const ethp2p_cfg: ?networks.Ethp2pConfig = if (comptime networks.ethp2p.enabled)
+            (if (ethp2pRuntimeEnabled()) try self.buildEthp2pConfig(allocator) else null)
+        else
+            null;
+        defer if (ethp2p_cfg) |c| freeEthp2pConfig(allocator, c);
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -719,15 +834,7 @@ pub const Node = struct {
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
             .chain_worker_enabled = options.chain_worker_enabled,
-            // Experimental ethp2p RS-broadcast: compiled in only under
-            // `-Dethp2p=true`, and then enabled at runtime only when the
-            // `ZEAM_ETHP2P` env var is truthy (zeam's env-var toggle
-            // convention; a CLI flag would trip zigcli's comptime branch
-            // quota). Off by default on both axes.
-            .ethp2p = if (comptime networks.ethp2p.enabled)
-                (if (ethp2pRuntimeEnabled()) try ethp2pRuntimeConfig(allocator, options.node_key_index) else null)
-            else
-                null,
+            .ethp2p = ethp2p_cfg,
             .min_aggregation_inputs = options.min_aggregation_inputs,
             .max_aggregation_children = options.max_aggregation_children,
             .max_aggregations_per_tick = options.max_aggregations_per_tick,
