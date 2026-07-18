@@ -299,14 +299,36 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// True when the peer's `blocks_by_range` handler is missing or explicitly unsupported.
+/// True when the peer's `blocks_by_range` handler is genuinely missing or
+/// explicitly unsupported — i.e. a protocol-level rejection, NOT a transport
+/// failure.
+///
+/// The distinction matters because the caller uses this to set a sticky
+/// `blocks_by_range_unavailable` flag on the peer. A transport-level failure
+/// while a range request is in flight — a mid-stream QUIC teardown, an IO
+/// error, a timeout — surfaces as RPC error code 1
+/// (`RPC_ERR_INVALID_REQUEST`) with a *transport* message ("Disconnected",
+/// "IoError", "peer disconnected", ...), which is indistinguishable by code
+/// alone from a real "invalid request" rejection. Classifying those as
+/// unavailable poisoned every range-capable peer after a routine stream
+/// teardown and wedged catch-up: a node fell behind, issued large range
+/// requests, the big transfers hit teardowns, and each one permanently marked a
+/// still-connected peer as lacking blocks_by_range until no range peer
+/// remained. So: transport messages are transient (never unavailable); only an
+/// explicit "unsupported protocol" reply, or a bare code-1 with a
+/// non-transport message, counts as unavailable.
 pub fn isBlocksByRangeUnavailable(code: u32, message: []const u8) bool {
-    if (code == constants.RPC_ERR_INVALID_REQUEST) return true;
+    // Transient transport failures — never a protocol capability signal.
+    const transient = [_][]const u8{ "disconnect", "ioerror", "io error", "timeout", "timed out", "reset", "closed", "cancel", "eof", "broken pipe" };
+    for (transient) |needle| {
+        if (containsIgnoreCase(message, needle)) return false;
+    }
+    // Explicit protocol-level rejection.
     const needles = [_][]const u8{ "unsupported", "not available", "not supported", "unknown protocol" };
     for (needles) |needle| {
         if (containsIgnoreCase(message, needle)) return true;
     }
-    return false;
+    return code == constants.RPC_ERR_INVALID_REQUEST;
 }
 
 pub fn syncEndDecision(input: SyncEndInput) SyncEndAction {
@@ -514,6 +536,24 @@ test "isBlocksByRangeUnavailable detects unsupported responses" {
     try std.testing.expect(isBlocksByRangeUnavailable(constants.RPC_ERR_INVALID_REQUEST, "unsupported"));
     try std.testing.expect(isBlocksByRangeUnavailable(99, "Method not supported"));
     try std.testing.expect(!isBlocksByRangeUnavailable(constants.RPC_ERR_RESOURCE_UNAVAILABLE, "outside history window"));
+    // A bare code-1 with no recognizable message is still treated as unavailable.
+    try std.testing.expect(isBlocksByRangeUnavailable(constants.RPC_ERR_INVALID_REQUEST, "invalid request"));
+}
+
+test "isBlocksByRangeUnavailable does NOT flag transport failures" {
+    // Regression for the catch-up wedge: a mid-stream QUIC teardown / IO error /
+    // timeout during a range request surfaces as RPC code 1 with a TRANSPORT
+    // message, not a protocol rejection. These must NOT mark the peer as lacking
+    // blocks_by_range — doing so poisoned every range-capable peer and wedged
+    // catch-up (observed devnet messages: "IoError", "Disconnected",
+    // "peer disconnected").
+    const RPC1 = constants.RPC_ERR_INVALID_REQUEST;
+    try std.testing.expect(!isBlocksByRangeUnavailable(RPC1, "IoError"));
+    try std.testing.expect(!isBlocksByRangeUnavailable(RPC1, "Disconnected"));
+    try std.testing.expect(!isBlocksByRangeUnavailable(RPC1, "peer disconnected"));
+    try std.testing.expect(!isBlocksByRangeUnavailable(RPC1, "stream reset"));
+    try std.testing.expect(!isBlocksByRangeUnavailable(RPC1, "request timed out"));
+    try std.testing.expect(!isBlocksByRangeUnavailable(RPC1, "connection closed"));
 }
 
 test "syncEndDecision unavailable skips retry" {
