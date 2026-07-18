@@ -126,7 +126,20 @@ fn ethp2pServerName() []const u8 {
 /// path. Used to materialise the runtime-generated ethp2p TLS PEMs, which the
 /// adapter consumes by path (it has no in-memory PEM entry point). The files
 /// live under the node's private data dir and are overwritten each run.
-fn ethp2pWritePem(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, bytes: []const u8) ![]u8 {
+///
+/// When `enforce_mode` is non-null the file is forced to that mode — used to
+/// make the private key owner-only (`0o600`) so a copy of it plus the cert
+/// cannot be used to impersonate this node's ethp2p listener.
+///
+/// `createFile`'s `.permissions` only applies when the file is *created*; an
+/// already-existing file (e.g. a `key.pem` a prior build wrote with the default
+/// `0o666`) keeps its old, lax mode after truncation. So we also
+/// `setPermissions` explicitly, and do it while the file is still empty — before
+/// the key bytes are written — so the secret is never briefly present at a
+/// looser mode. `0o600` carries no group/other bits, so umask cannot widen it.
+/// The public cert passes `null` and keeps the create-time default (umask'd),
+/// which must not be force-set to `0o666` (that would make it world-writable).
+fn ethp2pWritePem(allocator: std.mem.Allocator, dir: []const u8, name: []const u8, bytes: []const u8, enforce_mode: ?std.Io.File.Permissions) ![]u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
     std.Io.Dir.cwd().createDirPath(io, dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
@@ -134,8 +147,11 @@ fn ethp2pWritePem(allocator: std.mem.Allocator, dir: []const u8, name: []const u
     };
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
     errdefer allocator.free(path);
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    const create_perms = enforce_mode orelse .default_file;
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = create_perms });
     defer file.close(io);
+    // Tighten an already-existing file in place, before writing any bytes.
+    if (enforce_mode) |mode| try file.setPermissions(io, mode);
     var wbuf: [4096]u8 = undefined;
     var writer = file.writer(io, &wbuf);
     try writer.interface.writeAll(bytes);
@@ -505,8 +521,11 @@ pub const Node = struct {
                 defer allocator.free(pems.key_pem);
                 const dir = try std.fmt.allocPrint(allocator, "{s}/ethp2p", .{self.options.database_path});
                 defer allocator.free(dir);
-                cert_path = try ethp2pWritePem(allocator, dir, "cert.pem", pems.cert_pem);
-                key_path = try ethp2pWritePem(allocator, dir, "key.pem", pems.key_pem);
+                cert_path = try ethp2pWritePem(allocator, dir, "cert.pem", pems.cert_pem, null);
+                // Private key: owner-only (0o600), enforced even if key.pem
+                // already exists with looser perms. A readable key + the cert is
+                // enough to impersonate this node's ethp2p listener.
+                key_path = try ethp2pWritePem(allocator, dir, "key.pem", pems.key_pem, std.Io.File.Permissions.fromMode(0o600));
                 self.logger.info("ethp2p: generated per-node TLS cert at {s}", .{dir});
             }
         }
