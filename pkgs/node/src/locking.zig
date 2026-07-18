@@ -828,6 +828,14 @@ pub const BlockCache = struct {
 /// to lack the protocol) — see `blocksByRangeSupport`.
 pub const RangeSupport = enum { supported, unsupported, unknown };
 
+/// How long a `blocks_by_range`-unavailable mark stays in effect before the peer
+/// is retried. The mark is otherwise only cleared on reconnect, so a peer that
+/// stays connected after being marked would be excluded from range sync forever.
+/// A TTL bounds the damage of any misclassification (e.g. a transport error that
+/// slipped past `isBlocksByRangeUnavailable`) to a few minutes rather than the
+/// lifetime of the connection — the reset/TTL the marking path always required.
+pub const BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S: i64 = 300;
+
 pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
     return struct {
         const Self = @This();
@@ -980,11 +988,21 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// was reported as "peer does not support blocks_by_range", which degraded a
         /// 13k-slot catch-up to per-block `blocks_by_root` that can never converge.
         pub fn blocksByRangeSupport(self: *Self, peer_id: []const u8) RangeSupport {
-            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return .supported;
+            return self.blocksByRangeSupportAt(peer_id, zeam_utils.unixTimestampSeconds());
+        }
+
+        /// Time-injectable core of `blocksByRangeSupport`. A mark is honoured only
+        /// while it is younger than `BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S`; past that
+        /// the peer is retried (reported `.supported`) so a stuck-connected,
+        /// possibly-misclassified peer self-heals instead of being excluded from
+        /// range sync for the life of the connection.
+        pub fn blocksByRangeSupportAt(self: *Self, peer_id: []const u8, now_s: i64) RangeSupport {
+            if (!@hasField(PeerInfo, "blocks_by_range_unavailable_at")) return .supported;
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
             const entry = self.map.get(peer_id) orelse return .unknown;
-            return if (entry.blocks_by_range_unavailable) .unsupported else .supported;
+            const marked_at = entry.blocks_by_range_unavailable_at orelse return .supported;
+            return if (now_s - marked_at < BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S) .unsupported else .supported;
         }
 
         /// Optimistic view of `blocksByRangeSupport`: only a peer we have positively
@@ -995,19 +1013,20 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             return self.blocksByRangeSupport(peer_id) != .unsupported;
         }
 
-        /// NOTE: currently has no callers — nothing ever observes a genuine
-        /// "blocks_by_range unsupported" RPC error, so `blocks_by_range_unavailable`
-        /// is always false in practice. That is intentional for now: the flag is
-        /// sticky (never reset), so wiring it to anything transient (a transport
-        /// error, a timeout) would permanently disable range sync for that peer and
-        /// recreate the per-block catch-up wedge. Only wire this to a definitive
-        /// protocol-negotiation failure, and add a reset/TTL when you do.
+        /// Mark a peer as lacking `blocks_by_range`, stamping the current time so
+        /// the mark can expire (see `blocksByRangeSupportAt` /
+        /// `BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S`). The caller
+        /// (`node.zig` → `isBlocksByRangeUnavailable`) must pass ONLY genuine
+        /// protocol rejections here, never transport errors/timeouts: a sticky
+        /// mark on a transient failure permanently disabled range sync for a
+        /// still-connected peer and recreated the per-block catch-up wedge. The
+        /// TTL is the safety net for any misclassification that slips through.
         pub fn markBlocksByRangeUnavailable(self: *Self, peer_id: []const u8) void {
-            if (!@hasField(PeerInfo, "blocks_by_range_unavailable")) return;
+            if (!@hasField(PeerInfo, "blocks_by_range_unavailable_at")) return;
             self.rwlock.lock();
             defer self.rwlock.unlock();
             const entry = self.map.getPtr(peer_id) orelse return;
-            entry.blocks_by_range_unavailable = true;
+            entry.blocks_by_range_unavailable_at = zeam_utils.unixTimestampSeconds();
         }
 
         /// Pick a random connected peer, optionally excluding one id (for RPC retry).
@@ -1023,6 +1042,7 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
             var candidates: std.ArrayList([]const u8) = .empty;
             defer candidates.deinit(allocator);
 
+            const now_s = if (comptime @hasField(PeerInfo, "blocks_by_range_unavailable_at")) zeam_utils.unixTimestampSeconds() else 0;
             var it = self.map.iterator();
             while (it.next()) |entry| {
                 if (exclude) |ex| {
@@ -1034,8 +1054,11 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
                         if (ms > peer_head_slot) continue;
                     }
                 }
-                if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable")) {
-                    if (entry.value_ptr.blocks_by_range_unavailable) continue;
+                if (range_capable_only and @hasField(PeerInfo, "blocks_by_range_unavailable_at")) {
+                    // Honour the mark only within its TTL (see blocksByRangeSupportAt).
+                    if (entry.value_ptr.blocks_by_range_unavailable_at) |marked_at| {
+                        if (now_s - marked_at < BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S) continue;
+                    }
                 }
                 try candidates.append(allocator, entry.value_ptr.peer_id);
             }
@@ -2426,7 +2449,7 @@ test "ConnectedPeers: blocksByRangeSupport distinguishes unknown from unsupporte
     const TestPeerInfo = struct {
         peer_id: []const u8,
         connected_at: i64 = 0,
-        blocks_by_range_unavailable: bool = false,
+        blocks_by_range_unavailable_at: ?i64 = null,
     };
     const CP = ConnectedPeersImpl(TestPeerInfo);
     var cp = CP.init(testing.allocator);
@@ -2442,9 +2465,21 @@ test "ConnectedPeers: blocksByRangeSupport distinguishes unknown from unsupporte
     try testing.expect(cp.peerSupportsBlocksByRange("peer-a"));
 
     // Positively observed to lack the protocol → unsupported (and ineligible).
+    // Bracket the wall-clock mark timestamp so the TTL-boundary asserts below are
+    // skew-proof: the internal mark ts ∈ [t0, t1].
+    const t0 = zeam_utils.unixTimestampSeconds();
     cp.markBlocksByRangeUnavailable("peer-a");
+    const t1 = zeam_utils.unixTimestampSeconds();
     try testing.expectEqual(RangeSupport.unsupported, cp.blocksByRangeSupport("peer-a"));
     try testing.expect(!cp.peerSupportsBlocksByRange("peer-a"));
+
+    // The mark EXPIRES after the TTL even without a reconnect: a peer that stays
+    // connected must self-heal, so a misclassified transport error can never
+    // wedge range sync for the life of the connection. Drive time deterministically
+    // via the -At variant. Just inside the TTL (measured from the earliest possible
+    // mark) → still unsupported; at/after the TTL (from the latest) → supported.
+    try testing.expectEqual(RangeSupport.unsupported, cp.blocksByRangeSupportAt("peer-a", t0 + BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S - 1));
+    try testing.expectEqual(RangeSupport.supported, cp.blocksByRangeSupportAt("peer-a", t1 + BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S));
 
     // Reconnect rebuilds a fresh PeerInfo → flag clears (recovery path).
     try cp.connect("peer-a");

@@ -14,9 +14,15 @@ pub const PeerInfo = struct {
     peer_id: []const u8,
     connected_at: i64,
     latest_status: ?types.Status = null,
-    /// Set when a `blocks_by_range` RPC fails with an "unsupported / not available"
-    /// error so catch-up uses `blocks_by_root` instead of retrying range on this peer.
-    blocks_by_range_unavailable: bool = false,
+    /// Unix-seconds timestamp of the last time a `blocks_by_range` RPC failed
+    /// with a genuine "unsupported / not available" protocol rejection, so
+    /// catch-up uses `blocks_by_root` instead of retrying range on this peer.
+    /// `null` means available. The mark EXPIRES after
+    /// `locking.BLOCKS_BY_RANGE_UNAVAILABLE_TTL_S`: without a TTL a peer that
+    /// stays connected after being marked would never recover (the flag only
+    /// reset on reconnect), which is exactly how a misclassified transport
+    /// error could wedge catch-up permanently.
+    blocks_by_range_unavailable_at: ?i64 = null,
 };
 
 test "Network: preferred blocks_by_root peer is a hint with fallback" {
