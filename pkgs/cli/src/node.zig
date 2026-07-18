@@ -452,6 +452,14 @@ pub const Node = struct {
             }
         }
 
+        // Our own libp2p QUIC port, used to skip the self-entry that the
+        // genesis peer list always contains (every node appears in
+        // `nodes.yaml`, including itself). A `connect()` to our own ethp2p
+        // listener blocks `start()` in its synchronous handshake-poll loop —
+        // the server-side accept only runs later in `tick()`, so the self-dial
+        // never completes and stalls dialing of the real peers behind it.
+        const own_port: ?u16 = if (parseQuicIpPort(self.listen_addresses_str)) |own| own.port else null;
+
         // Static peers: explicit env, else derive from libp2p connect-peers.
         const static_peers: []const []const u8 = blk: {
             const env_peers = try ethp2pEnvList(allocator, "ZEAM_ETHP2P_STATIC_PEERS");
@@ -467,6 +475,8 @@ pub const Node = struct {
                 const trimmed = std.mem.trim(u8, ma, " \t");
                 if (trimmed.len == 0) continue;
                 const ipp = parseQuicIpPort(trimmed) orelse continue;
+                // Genesis peer lists include this node itself; never dial self.
+                if (own_port) |op| if (ipp.port == op) continue;
                 const peer_s = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ ipp.ip, @as(u32, ipp.port) + offset });
                 try peers.append(allocator, peer_s);
             }
