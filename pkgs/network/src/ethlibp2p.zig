@@ -1452,8 +1452,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
 fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerror!void {
     const ctx: *ServerStreamContext = @ptrCast(@alignCast(ptr));
     if (ctx.finished) return error.StreamFinished;
-    _ = code;
-    try ctx.parent.host.sendErrorResponse(ctx.channel_id, message);
+    try ctx.parent.host.sendErrorResponseWithCode(ctx.channel_id, @intCast(code), message);
     ctx.finished = true;
 }
 
