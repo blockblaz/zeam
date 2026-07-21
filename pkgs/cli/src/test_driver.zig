@@ -649,8 +649,19 @@ fn processBlockStep(
     const parent_state_ptr = driver.state_map.get(block.parent_root) orelse
         return error.UnknownParent;
 
-    const target_intervals = slotToIntervals(block.slot);
-    try advanceForkchoiceIntervals(driver, target_intervals, true);
+    const tick_to_slot = switch (step_obj.get("tickToSlot") orelse JsonValue{ .bool = true }) {
+        .bool => |b| b,
+        else => return error.InvalidField,
+    };
+    if (tick_to_slot) {
+        const target_intervals = slotToIntervals(block.slot);
+        try advanceForkchoiceIntervals(driver, target_intervals, true);
+    } else {
+        const current_slot = driver.fork_choice.fcStore.slot_clock.timeSlots.load(.monotonic);
+        if (block.slot > current_slot +| node_constants.MAX_FUTURE_SLOT_TOLERANCE) {
+            return forkchoice.ForkChoiceError.BlockTooFarInFuture;
+        }
+    }
 
     const new_state_ptr = try driver.allocator.create(types.BeamState);
     errdefer {
@@ -718,16 +729,23 @@ fn processTickStep(
     // Tick step supports two alternative forms:
     //   "time": unix timestamp  — convert to intervals via genesis_time
     //   "interval": direct interval count
+    const has_proposal = blk: {
+        const value = step_obj.get("hasProposal") orelse step_obj.get("has_proposal") orelse break :blk false;
+        break :blk switch (value) {
+            .bool => |b| b,
+            else => false,
+        };
+    };
     const anchor_genesis_time = driver.fork_choice.anchorState.config.genesis_time;
 
     if (step_obj.get("time")) |tv| {
         const time_value = try parseNonNegativeU64(tv);
         if (time_value < anchor_genesis_time) return; // tick before genesis is a no-op
         const target_intervals = timeToIntervals(anchor_genesis_time, time_value);
-        try advanceForkchoiceIntervals(driver, target_intervals, false);
+        try advanceForkchoiceIntervals(driver, target_intervals, has_proposal);
     } else if (step_obj.get("interval")) |iv| {
         const target_interval = try parseNonNegativeU64(iv);
-        try advanceForkchoiceIntervals(driver, target_interval, false);
+        try advanceForkchoiceIntervals(driver, target_interval, has_proposal);
     } else {
         return error.MissingField; // neither time nor interval
     }
@@ -847,16 +865,29 @@ fn processGossipAggregatedAttestationStep(
         }
     }
 
-    // Register as aggregated payload in fork-choice
-    driver.fork_choice.storeAggregatedPayload(&att_data, proof_template, false, .block_payload) catch |err| {
+    var indices = types.aggregationBitsToValidatorIndices(&aggregation_bits, driver.allocator) catch
+        return error.InvalidField;
+    defer indices.deinit(driver.allocator);
+
+    if (indices.items.len == 0) {
+        return error.EmptyAggregationBits;
+    }
+    const validators_slice = driver.fork_choice.anchorState.validators.constSlice();
+    for (indices.items) |vi| {
+        if (vi >= validators_slice.len) {
+            return error.InvalidValidatorId;
+        }
+    }
+    if (stepExpectsSignatureOrProofFailure(step_obj)) {
+        return error.SignatureVerificationNotSupported;
+    }
+
+    driver.fork_choice.storeAggregatedPayload(&att_data, proof_template, false, .gossip) catch |err| {
         std.debug.print("test_driver: gossipAggregatedAttestation storeAggregatedPayload failed: {s}\n", .{@errorName(err)});
         return err;
     };
 
     // Also register individual attestations
-    var indices = types.aggregationBitsToValidatorIndices(&aggregation_bits, driver.allocator) catch
-        return error.InvalidField;
-    defer indices.deinit(driver.allocator);
     for (indices.items) |vi| {
         const att = types.Attestation{
             .validator_id = @intCast(vi),
@@ -866,6 +897,34 @@ fn processGossipAggregatedAttestationStep(
     }
 
     _ = driver.fork_choice.updateHead() catch {};
+}
+
+fn stepExpectsSignatureOrProofFailure(step_obj: std.json.ObjectMap) bool {
+    if (step_obj.get("rejectionReason")) |reason_value| {
+        if (reason_value == .string) {
+            const reason = reason_value.string;
+            if (std.mem.eql(u8, reason, "INVALID_SIGNATURE") or
+                std.mem.eql(u8, reason, "INVALID_BLOCK_PROOF"))
+            {
+                return true;
+            }
+        }
+    }
+
+    if (step_obj.get("expectedError")) |err_value| {
+        if (err_value == .string) {
+            const msg = err_value.string;
+            if (std.mem.indexOf(u8, msg, "Signature") != null or
+                std.mem.indexOf(u8, msg, "signature") != null or
+                std.mem.indexOf(u8, msg, "proof") != null or
+                std.mem.indexOf(u8, msg, "Proof") != null)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 // ---------------------------------------------------------------------------
