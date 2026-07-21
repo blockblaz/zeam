@@ -122,6 +122,34 @@ fn ethp2pServerName() []const u8 {
     return "127.0.0.1";
 }
 
+/// Hive marks multi-subnet aggregators with HIVE_AGGREGATE_SUBNET_IDS, but its
+/// zeam wrapper only forwards --is-aggregator. Treat the env var as a startup
+/// fallback so aggregator nodes subscribe to every assigned attestation subnet.
+fn hiveAggregateSubnetIdsEnv() ?[]const u8 {
+    const raw = std.c.getenv("HIVE_AGGREGATE_SUBNET_IDS") orelse return null;
+    const v = std.mem.trim(u8, std.mem.span(raw), " \t\n\r");
+    if (v.len == 0) return null;
+    return v;
+}
+
+fn parseAggregateSubnetIds(allocator: std.mem.Allocator, subnet_ids_str: []const u8) ![]u32 {
+    var list: std.ArrayList(u32) = .empty;
+    errdefer list.deinit(allocator);
+
+    var it = std.mem.splitScalar(u8, subnet_ids_str, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\n\r");
+        if (trimmed.len == 0) continue;
+        const id = std.fmt.parseInt(u32, trimmed, 10) catch |err| {
+            std.log.warn("invalid subnet id '{s}': {any}", .{ trimmed, err });
+            return error.InvalidSubnetId;
+        };
+        try list.append(allocator, id);
+    }
+
+    return try list.toOwnedSlice(allocator);
+}
+
 /// Write `bytes` to `<dir>/<name>` (creating `dir`) and return the allocated
 /// path. Used to materialise the runtime-generated ethp2p TLS PEMs, which the
 /// adapter consumes by path (it has no in-memory PEM entry point). The files
@@ -1384,26 +1412,18 @@ pub fn buildStartOptions(
     opts.is_aggregator = node_cmd.@"is-aggregator";
     opts.chain_worker_enabled = node_cmd.@"chain-worker";
 
-    // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
+    // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2").
+    // In Hive, HIVE_AGGREGATE_SUBNET_IDS carries the same value for multi-subnet aggregators.
+    const aggregate_subnet_ids_arg = node_cmd.@"aggregate-subnet-ids" orelse
+        if (opts.is_aggregator) hiveAggregateSubnetIdsEnv() else null;
+
     // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
     if (node_cmd.@"aggregate-subnet-ids" != null and !node_cmd.@"is-aggregator") {
         std.log.err("--aggregate-subnet-ids requires --is-aggregator to be set", .{});
         return error.AggregateSubnetIdsRequiresIsAggregator;
     }
-    if (node_cmd.@"aggregate-subnet-ids") |subnet_ids_str| {
-        var list: std.ArrayList(u32) = .empty;
-        var it = std.mem.splitScalar(u8, subnet_ids_str, ',');
-        while (it.next()) |part| {
-            const trimmed = std.mem.trim(u8, part, " ");
-            if (trimmed.len == 0) continue;
-            const id = std.fmt.parseInt(u32, trimmed, 10) catch |err| {
-                std.log.warn("invalid subnet id '{s}': {any}", .{ trimmed, err });
-                list.deinit(allocator);
-                return error.InvalidSubnetId;
-            };
-            try list.append(allocator, id);
-        }
-        opts.aggregation_subnet_ids = try list.toOwnedSlice(allocator);
+    if (aggregate_subnet_ids_arg) |subnet_ids_str| {
+        opts.aggregation_subnet_ids = try parseAggregateSubnetIds(allocator, subnet_ids_str);
     }
 
     // Resolve attestation_committee_count: CLI flag takes precedence over config.yaml.
@@ -2401,6 +2421,21 @@ test "attestationCommitteeCountFromYAML returns null when field is absent" {
 
     const count = attestationCommitteeCountFromYAML(validator_config);
     try std.testing.expect(count == null);
+}
+
+test "parseAggregateSubnetIds trims comma-separated ids" {
+    const allocator = std.testing.allocator;
+
+    const ids = try parseAggregateSubnetIds(allocator, "0, 1,\t2,,");
+    defer allocator.free(ids);
+
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, ids);
+}
+
+test "parseAggregateSubnetIds rejects invalid ids" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidSubnetId, parseAggregateSubnetIds(allocator, "0,nope"));
 }
 
 test "attestation_committee_count: zero value is clamped to 1 with a warning" {
