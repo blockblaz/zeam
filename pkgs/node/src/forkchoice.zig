@@ -3484,7 +3484,8 @@ pub const ForkChoice = struct {
         // missing root is never derived and the fetch is never enqueued.
         if (is_gossip) {
             const now_intervals = self.fcStore.slot_clock.time.load(.monotonic);
-            const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
+            const attestation_start_interval = std.math.mul(u64, data.slot, constants.INTERVALS_PER_SLOT) catch
+                return GossipAttestationValidationError.AttestationTooFarInFuture;
             if (attestation_start_interval > now_intervals + constants.GOSSIP_DISPARITY_INTERVALS) {
                 return GossipAttestationValidationError.AttestationTooFarInFuture;
             }
