@@ -61,8 +61,8 @@
             .hash = "thread_pool-0.1.0-m6B8f9j4AAAWx5c9ytLrH_NlntTMxSg049v76xVsgoSw",
         },
         .zig_libp2p = .{
-            .url = "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.2.89.tar.gz",
-            .hash = "zig_libp2p-0.2.89-lil2hMltKgA7YdmHAS_eavWH0unkgsQhybBFEWqukws4",
+            .url = "https://github.com/blockblaz/zig-libp2p/archive/refs/tags/v0.2.90.tar.gz",
+            .hash = "zig_libp2p-0.2.90-lil2hHdyKgAfzB0t9KNYv1G-esu4FB0q1R8Wjp2mJVKI",
         },
         // Optional parallel RS-erasure-coded broadcast transport (ethp2p),
         // wired only under `-Dethp2p=true`. Lazy so the default build neither
