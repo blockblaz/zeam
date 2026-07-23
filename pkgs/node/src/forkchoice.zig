@@ -1522,7 +1522,7 @@ pub const ForkChoice = struct {
         // via re-scan, up to max_attestations_data.
         const num_validators: usize = @intCast(pre_state.validatorCount());
 
-        // Build projection candidates from the known aggregated payloads: each
+        // Build projection candidates from all validated aggregated payloads: each
         // distinct att_data with the union of its proofs' participants as the
         // available voter set. The cheap time-forward guard (target>source) skips
         // genesis self-votes up front; the selector's eligibility filter would
@@ -1540,19 +1540,13 @@ pub const ForkChoice = struct {
         // — the STF-consistent reference the rest of this selector already uses.
         const pre_state_justified = pre_state.latest_justified;
         {
-            var payload_it = self.latest_known_aggregated_payloads.iterator();
-            while (payload_it.next()) |entry| {
-                const att_data = entry.key_ptr.*;
-                if (att_data.target.slot <= att_data.source.slot) continue;
-                if (!att_data.source.eql(&pre_state_justified)) continue;
-                const voters = try self.allocator.alloc(u8, num_validators);
-                @memset(voters, 0);
-                proposalCandidateParticipants(entry.value_ptr.*, voters, allow_type1_compaction);
-                candidates.append(self.allocator, .{ .att_data = att_data, .voters = voters }) catch |e| {
-                    self.allocator.free(voters);
-                    return e;
-                };
-            }
+            try collectProposalPayloadCandidates(
+                self,
+                &candidates,
+                num_validators,
+                pre_state_justified,
+                allow_type1_compaction,
+            );
         }
 
         const cap: usize = self.config.spec.max_attestations_data;
@@ -1575,7 +1569,9 @@ pub const ForkChoice = struct {
         // covering the most uncovered validators until all are covered.
         var child_payloads_consumed: usize = 0;
         for (selected_keys) |att_data| {
-            const payloads = self.latest_known_aggregated_payloads.getPtr(att_data) orelse continue;
+            const known_payloads = self.latest_known_aggregated_payloads.getPtr(att_data);
+            const new_payloads = self.latest_new_aggregated_payloads.getPtr(att_data);
+            if (known_payloads == null and new_payloads == null) continue;
 
             var covered = try std.DynamicBitSet.initEmpty(self.allocator, 0);
             defer covered.deinit();
@@ -1584,20 +1580,8 @@ pub const ForkChoice = struct {
                 var best_proof: ?*const types.SingleMessageAggregate = null;
                 var best_new_coverage: usize = 0;
 
-                for (payloads.items) |*stored| {
-                    var new_coverage: usize = 0;
-                    for (0..stored.proof.participants.len()) |i| {
-                        if (stored.proof.participants.get(i) catch false) {
-                            if (i >= covered.capacity() or !covered.isSet(i)) {
-                                new_coverage += 1;
-                            }
-                        }
-                    }
-                    if (new_coverage > best_new_coverage) {
-                        best_new_coverage = new_coverage;
-                        best_proof = &stored.proof;
-                    }
-                }
+                selectBestProposalProof(known_payloads, &covered, &best_proof, &best_new_coverage);
+                selectBestProposalProof(new_payloads, &covered, &best_proof, &best_new_coverage);
 
                 if (best_proof == null or best_new_coverage == 0) break;
 
@@ -1719,6 +1703,13 @@ pub const ForkChoice = struct {
             );
             collectSourceCoverageFromPayloadsForData(
                 &self.latest_known_aggregated_payloads,
+                agg_att.data,
+                committee_count_u32,
+                payload_seen,
+                gossip_available,
+            );
+            collectSourceCoverageFromPayloadsForData(
+                &self.latest_new_aggregated_payloads,
                 agg_att.data,
                 committee_count_u32,
                 payload_seen,
@@ -4866,6 +4857,76 @@ fn payloadParticipantCount(stored: *const types.StoredAggregatedPayload, limit: 
     return count;
 }
 
+fn projectionCandidateVoters(candidates: *std.ArrayList(ForkChoice.ProjectionCandidate), att_data: types.AttestationData) ?[]u8 {
+    for (candidates.items) |*candidate| {
+        if (attestationDataEqual(candidate.att_data, att_data)) {
+            return @constCast(candidate.voters);
+        }
+    }
+    return null;
+}
+
+fn collectProposalPayloadCandidates(
+    fork_choice: *ForkChoice,
+    candidates: *std.ArrayList(ForkChoice.ProjectionCandidate),
+    num_validators: usize,
+    pre_state_justified: types.Checkpoint,
+    allow_type1_compaction: bool,
+) !void {
+    var known_it = fork_choice.latest_known_aggregated_payloads.iterator();
+    while (known_it.next()) |entry| {
+        try collectProposalPayloadCandidate(
+            fork_choice,
+            candidates,
+            num_validators,
+            pre_state_justified,
+            entry.key_ptr.*,
+            allow_type1_compaction,
+        );
+    }
+
+    var new_it = fork_choice.latest_new_aggregated_payloads.iterator();
+    while (new_it.next()) |entry| {
+        try collectProposalPayloadCandidate(
+            fork_choice,
+            candidates,
+            num_validators,
+            pre_state_justified,
+            entry.key_ptr.*,
+            allow_type1_compaction,
+        );
+    }
+}
+
+fn collectProposalPayloadCandidate(
+    fork_choice: *ForkChoice,
+    candidates: *std.ArrayList(ForkChoice.ProjectionCandidate),
+    num_validators: usize,
+    pre_state_justified: types.Checkpoint,
+    att_data: types.AttestationData,
+    allow_type1_compaction: bool,
+) !void {
+    if (att_data.target.slot <= att_data.source.slot) return;
+    if (!att_data.source.eql(&pre_state_justified)) return;
+
+    const known_payloads = fork_choice.latest_known_aggregated_payloads.get(att_data);
+    const new_payloads = fork_choice.latest_new_aggregated_payloads.get(att_data);
+
+    if (projectionCandidateVoters(candidates, att_data)) |voters| {
+        @memset(voters, 0);
+        proposalCandidateParticipantsFromPayloadSources(known_payloads, new_payloads, voters, allow_type1_compaction);
+        return;
+    }
+
+    const voters = try fork_choice.allocator.alloc(u8, num_validators);
+    @memset(voters, 0);
+    proposalCandidateParticipantsFromPayloadSources(known_payloads, new_payloads, voters, allow_type1_compaction);
+    candidates.append(fork_choice.allocator, .{ .att_data = att_data, .voters = voters }) catch |e| {
+        fork_choice.allocator.free(voters);
+        return e;
+    };
+}
+
 /// Build the proposal selector's voter set from stored Type-1 payloads.
 ///
 /// When proposal-time compaction is enabled, the block can merge every stored
@@ -4890,6 +4951,69 @@ fn proposalCandidateParticipants(maybe_list: ?AggregatedPayloadsList, out: []u8,
         }
     }
     if (best) |idx| copyPayloadParticipants(&list.items[idx], out);
+}
+
+fn proposalCandidateParticipantsFromPayloadSources(
+    known_payloads: ?AggregatedPayloadsList,
+    new_payloads: ?AggregatedPayloadsList,
+    out: []u8,
+    allow_type1_compaction: bool,
+) void {
+    if (allow_type1_compaction) {
+        proposalCandidateParticipants(known_payloads, out, true);
+        proposalCandidateParticipants(new_payloads, out, true);
+        return;
+    }
+
+    var best_payload: ?*const StoredAggregatedPayload = null;
+    var best_count: usize = 0;
+    selectLargestPayload(known_payloads, out.len, &best_payload, &best_count);
+    selectLargestPayload(new_payloads, out.len, &best_payload, &best_count);
+    if (best_payload) |payload| copyPayloadParticipants(payload, out);
+}
+
+fn selectLargestPayload(
+    maybe_list: ?AggregatedPayloadsList,
+    limit: usize,
+    best_payload: *?*const StoredAggregatedPayload,
+    best_count: *usize,
+) void {
+    const list = maybe_list orelse return;
+    for (list.items) |*stored| {
+        const count = payloadParticipantCount(stored, limit);
+        if (count > best_count.*) {
+            best_payload.* = stored;
+            best_count.* = count;
+        }
+    }
+}
+
+fn payloadNewCoverage(stored: *const StoredAggregatedPayload, covered: *const std.DynamicBitSet) usize {
+    var new_coverage: usize = 0;
+    for (0..stored.proof.participants.len()) |i| {
+        if (stored.proof.participants.get(i) catch false) {
+            if (i >= covered.capacity() or !covered.isSet(i)) {
+                new_coverage += 1;
+            }
+        }
+    }
+    return new_coverage;
+}
+
+fn selectBestProposalProof(
+    maybe_list: ?*AggregatedPayloadsList,
+    covered: *const std.DynamicBitSet,
+    best_proof: *?*const types.SingleMessageAggregate,
+    best_new_coverage: *usize,
+) void {
+    const list = maybe_list orelse return;
+    for (list.items) |*stored| {
+        const new_coverage = payloadNewCoverage(stored, covered);
+        if (new_coverage > best_new_coverage.*) {
+            best_new_coverage.* = new_coverage;
+            best_proof.* = &stored.proof;
+        }
+    }
 }
 
 /// Union of all validator indices available for `key` in the snapshot — raw
@@ -5013,6 +5137,34 @@ test "proposalCandidateParticipants models union only when compaction is enabled
     @memset(out[0..], 0);
     proposalCandidateParticipants(list, out[0..], true);
     try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1, 1 }, out[0..]);
+}
+
+test "proposalCandidateParticipantsFromPayloadSources uses fresh gossip payloads at interval 0" {
+    const allocator = std.testing.allocator;
+
+    var known: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &known);
+    var fresh: AggregatedPayloadsList = .empty;
+    defer deinitAggregatedPayloadsList(allocator, &fresh);
+
+    {
+        var payload = try makeStoredPayloadForTest(allocator, 1, &.{0});
+        errdefer payload.proof.deinit();
+        try known.append(allocator, payload);
+    }
+    {
+        var payload = try makeStoredPayloadForTest(allocator, 1, &.{ 1, 2 });
+        errdefer payload.proof.deinit();
+        try fresh.append(allocator, payload);
+    }
+
+    var out = [_]u8{0} ** 3;
+    proposalCandidateParticipantsFromPayloadSources(known, fresh, out[0..], false);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 1 }, out[0..]);
+
+    @memset(out[0..], 0);
+    proposalCandidateParticipantsFromPayloadSources(known, fresh, out[0..], true);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1 }, out[0..]);
 }
 
 test "snapshotKeyFullyCovered (#985): payload-only key with two payloads is mergeable, not covered" {
@@ -5925,6 +6077,54 @@ test "getProposalAttestations: high-target keys survive cap with stale low-targe
         if (att.data.target.slot >= 100) high_target_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 4), high_target_count);
+}
+
+test "getProposalAttestationsPreAggregated includes fresh gossip aggregates" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    const source_root = createTestRoot(0xAA);
+    const target_root = createTestRoot(0x99);
+    const proposal_slot: types.Slot = 12;
+
+    ctx.mock_chain.genesis_state.latest_finalized = .{ .root = source_root, .slot = 0 };
+    ctx.mock_chain.genesis_state.latest_justified = .{ .root = source_root, .slot = 0 };
+    while (ctx.mock_chain.genesis_state.historical_block_hashes.len() <= proposal_slot) {
+        try ctx.mock_chain.genesis_state.historical_block_hashes.append(types.ZERO_HASH);
+    }
+    ctx.mock_chain.genesis_state.historical_block_hashes.slice()[0] = source_root;
+    ctx.mock_chain.genesis_state.historical_block_hashes.slice()[9] = target_root;
+
+    const att_data = types.AttestationData{
+        .slot = 10,
+        .head = .{ .root = target_root, .slot = 9 },
+        .target = .{ .root = target_root, .slot = 9 },
+        .source = .{ .root = source_root, .slot = 0 },
+    };
+
+    var proof = try types.SingleMessageAggregate.init(allocator);
+    defer proof.deinit();
+    try types.aggregationBitsSet(&proof.participants, 1, true);
+    try types.aggregationBitsSet(&proof.participants, 2, true);
+    try ctx.fork_choice.storeAggregatedPayload(&att_data, proof, false, .gossip);
+
+    var result = try ctx.fork_choice.getProposalAttestationsPreAggregated(
+        &ctx.mock_chain.genesis_state,
+        proposal_slot,
+        target_root,
+    );
+    defer {
+        for (result.attestations.slice()) |*att| att.deinit();
+        result.attestations.deinit();
+        for (result.signatures.slice()) |*sig| sig.deinit();
+        result.signatures.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.attestations.constSlice().len);
+    try std.testing.expect(attestationDataEqual(att_data, result.attestations.constSlice()[0].data));
+    try std.testing.expect(result.attestations.constSlice()[0].aggregation_bits.get(1) catch false);
+    try std.testing.expect(result.attestations.constSlice()[0].aggregation_bits.get(2) catch false);
 }
 
 test "selectProjectionAttestationData: split votes across distinct att_data with the same target.root justify the target (R3)" {
